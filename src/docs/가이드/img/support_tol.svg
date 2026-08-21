@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 320" font-family="'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+  <rect width="660" height="320" fill="#ffffff"/>
+  <text x="330" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#111827">지지율 판정 — 허용오차 support_tol_mm = 10이 필수인 이유</text>
+
+  <!-- ===== 왼쪽: tol=10 정상 동작 ===== -->
+  <text x="165" y="52" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#15803d">✓ tol=10 — 실측 오차를 흡수</text>
+  <!-- 지지 박스 2개 (상면 210 vs 213) -->
+  <rect x="50" y="160" width="120" height="100" fill="#fde68a" stroke="#b45309"/>
+  <rect x="170" y="154" width="120" height="106" fill="#fde68a" stroke="#b45309"/>
+  <text x="110" y="278" text-anchor="middle" font-size="11.5" fill="#92400e">실측 상면 210</text>
+  <text x="230" y="278" text-anchor="middle" font-size="11.5" fill="#92400e">실측 213 (오차)</text>
+  <!-- 허용 밴드 base_z ± 10 -->
+  <rect x="45" y="139" width="250" height="30" fill="#bbf7d0" fill-opacity="0.6"/>
+  <text x="300" y="150" font-size="11.5" fill="#15803d">base_z=213</text>
+  <text x="300" y="164" font-size="11.5" fill="#15803d">± 10 밴드</text>
+  <!-- 새 박스 (양쪽에 걸침) -->
+  <rect x="90" y="94" width="180" height="60" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="180" y="129" text-anchor="middle" font-size="12.5" fill="#1d4ed8" font-weight="bold">새 박스</text>
+  <text x="170" y="296" text-anchor="middle" font-size="12" fill="#15803d">두 상면 모두 base_z±10 안 → 지지 인정</text>
+
+  <!-- ===== 오른쪽: tol=5 실패 ===== -->
+  <text x="495" y="52" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#b91c1c">❌ tol=5 — 양자화(10mm 단위)를 못 넘음</text>
+  <!-- 양자화 후 상면 210 vs 220 (차이 10) -->
+  <rect x="380" y="170" width="120" height="90" fill="#fde68a" stroke="#b45309"/>
+  <rect x="500" y="145" width="120" height="115" fill="#fde68a" stroke="#b45309"/>
+  <text x="440" y="278" text-anchor="middle" font-size="11.5" fill="#92400e">양자화 → 210</text>
+  <text x="560" y="278" text-anchor="middle" font-size="11.5" fill="#92400e">양자화 → 220</text>
+  <!-- tol=5 밴드 (좁음, base_z=220) -->
+  <rect x="375" y="133" width="250" height="14" fill="#fecaca" fill-opacity="0.7"/>
+  <!-- 새 박스 -->
+  <rect x="420" y="85" width="180" height="60" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.6" stroke-dasharray="5,3"/>
+  <text x="510" y="120" text-anchor="middle" font-size="12" fill="#374151">차이 10 &gt; tol 5</text>
+  <!-- 왼쪽 상면 탈락 표시 -->
+  <g stroke="#dc2626" stroke-width="2.2">
+    <line x1="430" y1="162" x2="446" y2="178"/><line x1="446" y1="162" x2="430" y2="178"/>
+  </g>
+  <text x="495" y="296" text-anchor="middle" font-size="12" fill="#b91c1c">→ 지지율 붕괴, 2층부터 NO_FEASIBLE_POSE (함정 #10)</text>
+</svg>

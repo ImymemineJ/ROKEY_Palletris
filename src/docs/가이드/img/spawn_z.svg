@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 300" font-family="'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+  <rect width="600" height="300" fill="#ffffff"/>
+  <text x="300" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#111827">스폰 z 규약 — spawn_point의 z는 "박스 밑면" (함정 #7)</text>
+
+  <!-- 왼쪽 패널: 잘못된 경우 -->
+  <text x="150" y="52" text-anchor="middle" font-size="14" font-weight="bold" fill="#b91c1c">❌ 810을 중심(translate)에 대입</text>
+  <!-- 벨트 -->
+  <rect x="50" y="200" width="200" height="15" fill="#9ca3af" stroke="#4b5563"/>
+  <text x="150" y="235" text-anchor="middle" font-size="11.5" fill="#6b7280">벨트 상면 z=800</text>
+  <!-- 박스: 중심 810 → 밑면 640, 관통 -->
+  <rect x="105" y="155" width="90" height="85" fill="#fecaca" stroke="#dc2626" stroke-width="1.5"/>
+  <rect x="105" y="200" width="90" height="40" fill="#dc2626" fill-opacity="0.45"/>
+  <circle cx="150" cy="197.5" r="3.5" fill="#7f1d1d"/>
+  <text x="150" y="150" text-anchor="middle" font-size="11.5" fill="#b91c1c">중심=810 → 밑면 640</text>
+  <text x="150" y="262" text-anchor="middle" font-size="12" fill="#b91c1c" font-weight="bold">벨트를 160mm 관통 → 물리 폭발</text>
+
+  <!-- 오른쪽 패널: 올바른 경우 -->
+  <text x="450" y="52" text-anchor="middle" font-size="14" font-weight="bold" fill="#15803d">✓ translate_z = 810 + h/2</text>
+  <rect x="350" y="200" width="200" height="15" fill="#9ca3af" stroke="#4b5563"/>
+  <text x="450" y="235" text-anchor="middle" font-size="11.5" fill="#6b7280">벨트 상면 z=800</text>
+  <!-- 박스: 밑면 810 (낙하 10mm 시각화로 살짝 띄움) -->
+  <rect x="405" y="110" width="90" height="85" fill="#bbf7d0" stroke="#16a34a" stroke-width="1.5"/>
+  <circle cx="450" cy="152.5" r="3.5" fill="#14532d"/>
+  <text x="450" y="104" text-anchor="middle" font-size="11.5" fill="#166534">중심 = 810 + h/2 = 980 (5호) · 낙하 10mm</text>
+  <text x="450" y="262" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">착지 속도 0.44 m/s — 안전</text>
+
+  <!-- 가운데 구분선 -->
+  <line x1="300" y1="40" x2="300" y2="280" stroke="#e5e7eb" stroke-width="1.5"/>
+</svg>

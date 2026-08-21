@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 320" font-family="'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+  <rect width="640" height="320" fill="#ffffff"/>
+  <text x="320" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#111827">heightmap 개념 — 3D 적재 상태를 "셀별 현재 높이" 2D 배열로</text>
+
+  <!-- 측면: 팔레트 위 박스들 -->
+  <rect x="60" y="160" width="520" height="16" fill="#86efac" stroke="#16a34a"/>
+  <text x="592" y="173" font-size="11.5" fill="#166534">팔레트</text>
+  <!-- 스택 1: 210+210 -->
+  <rect x="60" y="107.5" width="85" height="52.5" fill="#fde68a" stroke="#b45309"/>
+  <rect x="60" y="55" width="85" height="52.5" fill="#fcd34d" stroke="#b45309"/>
+  <!-- 박스 2: 280 -->
+  <rect x="145" y="90" width="102" height="70" fill="#fde68a" stroke="#b45309"/>
+  <!-- 빈 공간 -->
+  <!-- 박스 3: 340 -->
+  <rect x="380" y="75" width="120" height="85" fill="#fde68a" stroke="#b45309"/>
+
+  <!-- 화살표 -->
+  <g stroke="#374151" stroke-width="1.8" fill="#374151">
+    <line x1="320" y1="185" x2="320" y2="215"/><polygon points="320,215 315,206 325,206"/>
+  </g>
+  <text x="332" y="205" font-size="12" fill="#374151">위에서 본 높이만 기록</text>
+
+  <!-- 셀 스트립 -->
+  <g font-size="12" text-anchor="middle">
+    <rect x="60"  y="225" width="85"  height="34" fill="#fef3c7" stroke="#9ca3af"/>
+    <text x="102.5" y="247" fill="#92400e" font-weight="bold">420</text>
+    <rect x="145" y="225" width="102" height="34" fill="#fef9e7" stroke="#9ca3af"/>
+    <text x="196" y="247" fill="#92400e" font-weight="bold">280</text>
+    <rect x="247" y="225" width="133" height="34" fill="#f9fafb" stroke="#9ca3af"/>
+    <text x="313.5" y="247" fill="#6b7280" font-weight="bold">0</text>
+    <rect x="380" y="225" width="120" height="34" fill="#fef9e7" stroke="#9ca3af"/>
+    <text x="440" y="247" fill="#92400e" font-weight="bold">340</text>
+    <rect x="500" y="225" width="80" height="34" fill="#f9fafb" stroke="#9ca3af"/>
+    <text x="540" y="247" fill="#6b7280" font-weight="bold">0</text>
+  </g>
+  <text x="60" y="280" font-size="12.5" fill="#374151">hm[80][120] : 셀 하나 = 10mm × 10mm, 값 = 그 자리의 현재 높이(mm)</text>
+  <text x="60" y="300" font-size="12" fill="#6b7280">박스를 놓으면 → 점유 셀들의 값을 (밑면 + 박스 높이)로 갱신. 배치 결정은 전부 이 배열 위에서.</text>
+</svg>

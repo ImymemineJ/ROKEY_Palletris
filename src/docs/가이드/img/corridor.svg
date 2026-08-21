@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 330" font-family="'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+  <rect width="640" height="330" fill="#ffffff"/>
+  <text x="320" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#111827">수직 접근 통로 검사 — "자리"만 보지 말고 "내려올 길"을 봐라</text>
+
+  <!-- ===== 왼쪽: 통로 막힘 ===== -->
+  <text x="165" y="52" text-anchor="middle" font-size="14" font-weight="bold" fill="#b91c1c">❌ 기하학적으론 들어가지만…</text>
+  <line x1="30" y1="280" x2="300" y2="280" stroke="#374151" stroke-width="2"/>
+  <!-- 좌측 타워 (3단) -->
+  <rect x="50" y="230" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <rect x="50" y="180" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <rect x="50" y="130" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <!-- 우측 타워 (2단) -->
+  <rect x="190" y="230" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <rect x="190" y="180" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <!-- 후보 박스 (틈에 딱 맞음) -->
+  <rect x="122" y="214" width="66" height="66" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="5,3"/>
+  <!-- 그리퍼 -->
+  <rect x="143" y="60" width="24" height="140" fill="#94a3b8" stroke="#475569"/>
+  <rect x="112" y="196" width="86" height="12" fill="#64748b" stroke="#475569"/>
+  <!-- 충돌 표시 -->
+  <g stroke="#dc2626" stroke-width="2.5">
+    <line x1="112" y1="126" x2="128" y2="142"/><line x1="128" y1="126" x2="112" y2="142"/>
+  </g>
+  <text x="165" y="308" text-anchor="middle" font-size="12.5" fill="#b91c1c" font-weight="bold">그리퍼·손목이 이웃 스택에 걸림</text>
+
+  <!-- ===== 오른쪽: 통로 열림 ===== -->
+  <text x="480" y="52" text-anchor="middle" font-size="14" font-weight="bold" fill="#15803d">✓ 통로 검사를 통과한 자리</text>
+  <line x1="340" y1="280" x2="610" y2="280" stroke="#374151" stroke-width="2"/>
+  <rect x="360" y="230" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <rect x="360" y="180" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <rect x="360" y="130" width="70" height="50" fill="#fde68a" stroke="#b45309"/>
+  <!-- 통로 기둥 (박스 + 여유 30mm) -->
+  <rect x="455" y="60" width="96" height="154" fill="#dbeafe" fill-opacity="0.7" stroke="#2563eb" stroke-dasharray="5,3"/>
+  <!-- 후보 박스 -->
+  <rect x="470" y="214" width="66" height="66" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
+  <!-- 그리퍼 (통로 안) -->
+  <rect x="491" y="60" width="24" height="140" fill="#94a3b8" stroke="#475569"/>
+  <rect x="460" y="196" width="86" height="12" fill="#64748b" stroke="#475569"/>
+  <text x="480" y="308" text-anchor="middle" font-size="12.5" fill="#15803d" font-weight="bold">(박스+여유 30mm) 폭 기둥에 더 높은 셀 없음</text>
+</svg>
