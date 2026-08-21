@@ -7,7 +7,7 @@ mkdir -p "$HOME/.ros"
 cp "$REPO/scripts/fastdds_whitelist.xml" "$HOME/.ros/"
 echo ">> ~/.ros/fastdds_whitelist.xml 배치 완료"
 
-MARK="# >>> pjt_ws env >>>"
+MARK="# >>> palletris_ws env >>>"
 if grep -q "$MARK" "$HOME/.bashrc" 2>/dev/null; then
   echo ">> ~/.bashrc 에 이미 설정이 있습니다. 건너뜁니다."
 else
@@ -19,7 +19,7 @@ export ROS_DOMAIN_ID=115
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTRTPS_DEFAULT_PROFILES_FILE=\$HOME/.ros/fastdds_whitelist.xml
 [ -f "$REPO/install/setup.bash" ] && source "$REPO/install/setup.bash"
-# <<< pjt_ws env <<<
+# <<< palletris_ws env <<<
 BASHRC
   echo ">> ~/.bashrc 설정 추가 완료. 새 터미널을 열거나 'source ~/.bashrc' 하세요."
 fi

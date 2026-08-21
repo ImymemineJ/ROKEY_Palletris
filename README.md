@@ -20,8 +20,8 @@
 ## 처음 받는 사람 (3분)
 
 ```bash
-git clone <이 저장소 URL> ~/pjt_ws
-cd ~/pjt_ws
+git clone <이 저장소 URL> ~/palletris_ws
+cd ~/palletris_ws
 bash scripts/setup_env.sh          # ~/.bashrc 설정 + fastdds 파일 배치
 source ~/.bashrc
 colcon build --symlink-install
