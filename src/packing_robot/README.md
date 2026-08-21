@@ -546,6 +546,15 @@ Stop -> Play -> Script Editor > File > Open > tools/run_pick_place.py > Ctrl+Ent
 - [x] **B2 = G1 (책상판)** — `scripts/verify_reach.py` 11/11 통과. 최악점 팔레트 먼 코너 상단
       1435 mm, 실효 reach 1550 대비 **여유 +115 mm**. 작업명세서 §3.4 표와 일치
 - [ ] **B2 = G1 (Isaac Lula 판)** — `scripts/verify_reach_isaac.py`. 김학민 A3 배치 스크립트 이후
+- [x] **H2017 URDF -> USD** — `scripts/import_h2017_usd.py` 로 `~/isaac_assets/h2017.usd` 생성.
+      GUI 로 하지 않는 이유는 USD 를 커밋 못 하기 때문이다 — 파일 대신 **만드는 스크립트**를
+      커밋해야 4대에서 같은 로봇이 나온다. 검증: 회전관절 6 · `tool0` 프림 존재
+      (`merge_fixed_joints=False`) · `joint_2` maxForce 1000 · 아티큘레이션 솔버 32/4
+- [x] **드라이브 게인 1000/100 실측 확정** — `scripts/verify_drive_hold.py`.
+      수평 완전전개(joint_2 최악)에서 처짐 **0.114 deg = 1.7 m 끝에서 3 mm**, 진동 0.000.
+      ⚠ 임포터의 `default_drive_strength` / `default_position_drive_damping` 는 **효과가 없다**
+      (1000/100 과 5000/500 으로 임포트한 결과가 소수점까지 동일). 임포트 후 직접 박는다.
+      확정값이므로 `system.yaml` 에 `robot.drive` 로 올릴 것 — 공용 파일이라 4인 리뷰 필요
 - [ ] **B1** `h2017_descriptor.yaml` 로 Lula 기동 → G5
 - [ ] **B3** `Gripper.grasp/release/is_holding` — `docs/흡착_그리퍼_트러블슈팅.md` 먼저 읽을 것
 - [ ] **B4** `robot_motion.py` 소켓 핸들러 6종 + `orchestrator.py` 단일 사이클
