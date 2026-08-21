@@ -1,0 +1,22 @@
+# 이 파일의 GitHub 아이디를 실제 아이디로 바꾼 뒤 커밋할 것.
+# 여기 적힌 사람은 해당 경로가 바뀐 PR 에 자동으로 리뷰어로 붙는다.
+#
+#  @hakmin  = 김학민 (트랙 A)
+#  @byeongjik = 김병직 (트랙 B)
+#  @jungin  = 정정인 (트랙 C)
+#  @beomjin = 민범진 (트랙 D)
+
+/src/packing_sim/        @hakmin
+/src/packing_common/     @hakmin
+/scripts/                @hakmin
+
+/src/packing_robot/      @byeongjik
+
+/src/packing_algo/       @jungin
+
+/src/packing_db/         @beomjin
+
+# ── 공용: 바꾸면 전원이 영향받는다. 4명 전부 리뷰어로 붙는다 ──
+/src/packing_msgs/                        @beomjin @hakmin @byeongjik @jungin
+/src/packing_bringup/config/system.yaml   @beomjin @hakmin @byeongjik @jungin
+/docs/                                    @beomjin @hakmin @byeongjik @jungin

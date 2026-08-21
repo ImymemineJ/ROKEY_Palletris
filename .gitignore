@@ -1,0 +1,42 @@
+# ── USD 씬: git merge 불가 + 수백 MB~GB. 절대 커밋 금지 (작업명세서 §1.7) ──
+*.usd
+*.usda
+*.usdc
+Collected_*/
+*.mdl
+*.exr
+*.hdr
+
+# ── colcon 빌드 산출물 ──
+build/
+install/
+log/
+
+# ── 파이썬 ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ── SQLite (scripts/gen_master_db.py 로 언제든 재생성) ──
+*.db
+*.db-wal
+*.db-shm
+
+# ── 실행 결과 / 로그 / 녹화 ──
+results/
+*.mp4
+*.bag
+*.mcap
+rosbag2_*/
+
+# ── 에디터 / OS ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ── 예외: 설정 예시는 커밋한다 ──
+!scripts/fastdds_whitelist.xml

@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Isaac 이 필요 없는 패키지만 빌드한다.
+  # packing_sim / packing_robot 은 isaacsim 을 import 하므로 CI 에서 제외.
+  colcon:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 의존성 설치
+        run: |
+          apt-get update
+          apt-get install -y python3-pip python3-pytest python3-numpy python3-scipy python3-yaml
+          rosdep update || true
+          rosdep install --from-paths src --ignore-src -y \
+            --skip-keys "isaacsim isaacsim-core" || true
+
+      - name: 빌드
+        shell: bash
+        run: |
+          . /opt/ros/jazzy/setup.sh
+          colcon build --symlink-install \
+            --packages-select packing_msgs packing_common packing_algo packing_db
+
+      - name: 테스트
+        shell: bash
+        run: |
+          . /opt/ros/jazzy/setup.sh
+          . install/setup.sh
+          colcon test --packages-select packing_common packing_algo --event-handlers console_direct+
+          colcon test-result --verbose
+
+  # 저장소에 들어오면 안 되는 것들을 막는다.
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 커밋되면 안 되는 파일 검사
+        shell: bash
+        run: |
+          bad=$(git ls-files | grep -E '(\.(usd|usda|usdc|db|db-wal|db-shm)$)|(^(build|install|log)/)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::커밋되면 안 되는 파일이 있습니다:"
+            echo "$bad"
+            echo "→ git rm --cached <파일> 로 빼고 .gitignore 를 확인하세요."
+            exit 1
+          fi
+          echo "OK"
+
+      - name: 5MB 넘는 파일 검사
+        shell: bash
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            sz=$(stat -c%s "$f")
+            if [ "$sz" -gt 5242880 ]; then
+              echo "::error::$f ($((sz/1024/1024)) MB)"
+              fail=1
+            fi
+          done < <(git ls-files)
+          if [ "$fail" = "1" ]; then
+            echo "에셋은 git 이 아니라 scripts/sync_scene.sh (rsync) 로 배포합니다."
+            exit 1
+          fi
+          echo "OK"
