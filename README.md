@@ -1,4 +1,4 @@
-# 스마트 물류창고 로봇팔 3D 패킹 시스템
+# Project Palletris — 스마트 물류창고 로봇팔 3D 패킹 시스템
 
 컨베이어 + 로봇팔로 박스를 구역 분류하고, heightmap 기반 3D 최적화 패킹으로
 팔레트에 적재한 뒤 트럭에 상차하는 디지털 트윈 시스템.
@@ -9,24 +9,79 @@
 | 미들웨어 | ROS 2 Jazzy |
 | 시뮬레이터 | NVIDIA Isaac Sim 5.1 |
 | 로봇 | 두산 H2017 (페데스탈 500mm) |
-| `ROS_DOMAIN_ID` | **115** (전원 동일) |
+| 워크스페이스 | `~/palletris_ws` |
 
 ## 문서
 
 - `docs/작업명세서.md` — **인터페이스·수치의 정본**
 - `docs/설계결정서.md` — 왜 이렇게 정했는지의 근거
-- `docs/GitHub_협업_가이드.md` — 브랜치·PR·충돌 규칙
+- `docs/가이드/공통가이드_전원필독.md` · `docs/가이드/트랙A~D_*.md`
 
-## 처음 받는 사람 (3분)
+---
+
+## 개발 환경 세팅
+
+### 1. 저장소 받기
 
 ```bash
-git clone <이 저장소 URL> ~/palletris_ws
+git clone git@github.com:ImymemineJ/Project_Palletris.git ~/palletris_ws
 cd ~/palletris_ws
-bash scripts/setup_env.sh          # ~/.bashrc 설정 + fastdds 파일 배치
+```
+
+### 2. FastDDS 화이트리스트 배치
+
+유선망(10.10.0.1~4)으로만 통신하도록 제한하는 설정이다.
+없으면 DDS가 wifi·docker0 등 모든 인터페이스를 뒤져 노드 발견이 불안정해진다.
+
+```bash
+mkdir -p ~/.ros
+cp scripts/fastdds_whitelist.xml ~/.ros/
+```
+
+> 실습실 유선망에 연결하기 전(개인 노트북 단독 작업 등)에는 이 설정이 오히려
+> 통신을 막을 수 있다. 그때는 아래 `FASTRTPS_DEFAULT_PROFILES_FILE` 줄만 주석 처리한다.
+
+### 3. `~/.bashrc` 맨 아래에 추가 (작업명세서 §1.1)
+
+```bash
+source /opt/ros/jazzy/setup.bash
+export ROS_DOMAIN_ID=115
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTRTPS_DEFAULT_PROFILES_FILE=$HOME/.ros/fastdds_whitelist.xml
+source $HOME/palletris_ws/install/setup.bash
+```
+
+`nano ~/.bashrc` → 맨 아래에 붙여넣기 → **Ctrl+O** → **Enter** → **Ctrl+X**
+
+> ⚠️ **`ROS_DOMAIN_ID` 는 4명 전원 `115` 여야 한다.**
+> 값이 다르면 ROS2 통신이 **에러 없이 그냥 안 된다.** 수업 자료에 50과 103으로
+> 어긋나게 적혀 있으니 그대로 따르지 말 것. (설계결정서 §10.1)
+>
+> `install/setup.bash` 는 첫 빌드 전에는 없어서 `No such file` 경고가 뜬다. 빌드하면 사라진다.
+
+### 4. 적용 및 확인
+
+```bash
 source ~/.bashrc
+echo $ROS_DOMAIN_ID        # → 115
+ls ~/.ros/                 # → fastdds_whitelist.xml
+```
+
+### 5. 빌드
+
+```bash
+cd ~/palletris_ws
 colcon build --symlink-install
 source install/setup.bash
 ```
+
+### 6. 자기 브랜치로 이동
+
+```bash
+git switch track/sim       # 김학민 / 병직 track/robot / 정인 track/algo / 범진 track/db
+```
+
+---
 
 ## 트랙 담당
 
