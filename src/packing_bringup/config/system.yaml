@@ -111,10 +111,27 @@ robot:
     pad_xy_mm: [[80, 55], [80, -55], [-80, 55], [-80, -55]]   # tool0 로컬, z = 그리퍼 길이
     body_mass_kg: 2.0               # 유효 가반 20 − 2 ≈ 18 kg (구 사양서 §2)
     max_grip_distance_mm: 20        # 패드가 상판을 무는 거리. 작을수록 "닿아야만" 잡힌다
-    coaxial_force_limit_n: 39.0     # 16 kgf = 157 N ÷ 4패드 (구 사양서 §4-4)
-    shear_force_limit_n: 15.0       # 전단은 축력의 30~50%
     retry_interval_s: 10.0          # ★ "재시도 간격"이 아니라 닫기를 시도하는 **총 시간**
                                     #   0 이면 즉시 포기해 영영 Open 에 머문다
+    # ★ 씬에서는 사실상 무제한이다. 39 / 15 (= 16 kgf ÷ 4패드) 는 작업순서.md 의 **계획값**이고,
+    #   실제로 작동한 h2017_cell.usd 는 둘 다 1e6 이다. 트러블슈팅 문제② 결론 —
+    #   하드 리미트가 하중을 대신 받아버려 이 값들이 힘을 아예 못 보므로 재현성이 없다.
+    #   16 kgf 규제는 아래 controller_limits 로 컨트롤러가 한다.
+    coaxial_force_limit_n: 1000000.0   # YAML 1.1 은 1.0e6 을 문자열로 읽는다. 지수표기 쓰지 말 것
+    shear_force_limit_n: 1000000.0
+    controller_limits:
+      suction_limit_kgf: 16.0       # Ø50 x 4패드 실용 흡착력 (진공 −60 kPa · 안전계수 3 포함)
+      box_mass_limit_kg: 10.0       # 골판지 상판 강성. 10 < 16 이라 이쪽이 먼저 걸린다
+      assumed_box_mass_kg: 9.0      # 지시에 mass_kg 이 없을 때. 사양서 최대 박스(5호)
+    # 패드 D6 조인트. **전부 h2017_cell.usd 실측값이다** — 임의로 고치지 말 것.
+    #   6축을 다 잠그면 구속이 생긴 자세 그대로 굳어 박스가 40 mm 떠서 붙는다.
+    #   Z 로 슬롯을 열어 두고 drive 스프링이 끌어당기는 구조여야 밀착한다.
+    pad_joint:
+      trans_z_limit_mm: [0.0, 5.0]  # Z 만 5 mm 슬롯. X/Y 는 잠금(high < low)
+      rot_limit_deg: 3.0            # rotX/rotY/rotZ ±3° — 패드가 상판에 순응할 여유
+      drive_trans_z: {stiffness: 20000.0, damping: 400.0}
+      drive_rot_xy: {stiffness: 100.0, damping: 0.0}
+      drive_rot_z: {stiffness: 10000.0, damping: 0.0}
   approach_offset_mm: 200
   release_speed_threshold_mm_s: 5.0
   release_wait_timeout_s: 3.0
