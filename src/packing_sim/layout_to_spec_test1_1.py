@@ -6,14 +6,27 @@
 좌우가 뒤집힌 채 19 m 떨어져 있었다. 씬을 사양에 맞춘다.
 
 하는 일
-  1) 벨트 길이를 사양 구간(0 ~ stopper_x)에 맞춰 x 스케일을 다시 잡는다.
+  1) 벨트 조각을 **사양이 정한 구간**에 맞춰 x 스케일을 다시 잡는다.
+     조각 0 = stage1.main_range_mm (0~7500), 조각 1 = pickup_range_mm (7500~10000).
   2) 벨트를 x=0 에서 시작하도록 옮기고 흐름을 +X 로 돌린다.
   3) 스토퍼는 세우지 않는다 (있으면 지운다). 박스는 벨트를 멈춰서 세운다.
   4) 페데스탈 D400 x H(pedestal_height) 원기둥을 로봇 베이스 자리에 세운다.
   5) 팔레트를 pallet_origin 에 놓는다 (원점은 모서리, 상면이 origin.z).
-  6) 팔레트 반출 컨베이어 상판을 트럭 바닥 높이에 깐다. 적재가 끝난 팔레트를
-     들지 않고 그대로 밀어 트럭에 넣으므로 팔레트 밑면이 여기에 얹힌다.
+  6) 팔레트 반출 컨베이어 상판을 **도크 바닥(z=0)** 과 같은 면에 깐다.
   7) H2017 을 페데스탈 위(로봇 베이스 좌표)에 올린다.
+
+★★ z = 0 은 **도크 바닥 = 트럭 적재함 바닥**이다 (작업명세서 §3.1).
+   팔레트 밑면 z=0 · 팔레트 상면 z=150 · 반출 롤러 상면 z=0 · 야드 지면 z=-850.
+   `truck.bed_height_mm`(850) 은 **야드 지면 대비 도크 높이**이지 월드 z 가 아니다.
+   ⚠ 2026-08-22 이전 판은 이 값을 팔레트 z 로 써서 팔레트를 z 850~1000 에 띄웠고,
+     그러면 적재 상단이 도달범위 밖으로 나간다 (필요 2193 > 실효 1550).
+     구 사양서 §5-1 이 "받침대 1,580 이 필요하다 -> 도크로 해결한다" 로 이미 기각한
+     방향이다. 그래서 여기서는 bed_height_mm 을 높이로 쓰지 않는다.
+
+★ 벨트를 왜 균등 분할하지 않나 — `set_velocity("b_pickup")` 이 세우는 구간이
+   곧 조각 하나이기 때문이다. 사양 §3.2 의 픽업 구간은 7500~10000 (2500 mm) 이고
+   그 폭에서 버퍼 4개 x 480 = 1920 ≤ 2500 이 성립한다. 균등 분할(5000/5000)로 두면
+   벨트를 세울 때 5000 mm 가 통째로 서서 그 계산이 무의미해진다.
 
 높이(800mm)와 속도(0.5m/s)는 set_belt_800_test1_1.py 가 이미 맞춰 놨다.
 여기서는 건드리지 않는다.
@@ -55,18 +68,34 @@ PALLET_Y_MM = os.environ.get("PL_PALLET_Y")
 
 SPEC = json.loads(os.environ["PL_SPEC"])
 
-# 라인을 이루는 조각들. 사양 구간을 이 순서대로 균등 분할해 이어 붙인다.
+# 라인을 이루는 조각들. **순서대로** 아래 SEG_KEYS 의 구간을 하나씩 맡는다.
+#   /World/ConveyorTrack  = "main"      (0 ~ 7500)
+#   /World/ConveyorTrack1 = "b_pickup"  (7500 ~ 10000)
+# 이 순서가 conveyor_ctl.py 의 seg -> 그래프 경로 표와 짝이다. 바꾸면 둘 다 고친다.
 TRACKS = ["/World/ConveyorTrack", "/World/ConveyorTrack1"]
+SEG_KEYS = ["main", "b_pickup"]
 # GUI 붙여넣기 사고로 /World 밖 루트에 생긴 조각. 지운다.
 STRAY = ["/ConveyorTrack1"]
 ENDSTOP_ROOT = "/World/EndStops"
 PEDESTAL = "/World/Pedestal"
 OUTFEED = "/World/PalletOutfeed"
 ROBOT = "/World/robot"
-# H2017. 관절 한계·드라이브 게인이 URDF/system.yaml 로 교정된 판이다
-# (h2017/HANDOFF.md 참조). 다른 판을 쓰려면 PL_ROBOT_USD 로 준다.
+# H2017 **흡착 그리퍼가 붙은 판** — 로봇 트랙(B)이 만든 정본이다.
+#   ~/isaac_assets/h2017_suction.usd
+#     /h2017/SurfaceGripper  [IsaacSurfaceGripper]  coaxial 1e6 · maxGripDistance 20mm
+#     /h2017/gripper/{body, visuals/pad_0..3, mount, pads/pad_0..3}
+#   만드는 법은 scripts/build_gripper_usd.py (없으면 그걸 돌려 다시 만든다).
+#
+# ⚠ 예전 기본값이던 isaac_scenes/robot/h2017.usd 는 **그리퍼가 없는 맨팔**이다.
+#   그걸 쓰면 robot_motion.py 가 SurfaceGripper 프림을 못 찾아 grasp 가 아예 안 된다
+#   (실측 2026-08-22: 프림 69개에 SurfaceGripper·pad 0개).
+#
+# 참조하면 default prim(/h2017)의 내용이 ROBOT 아래에 그대로 깔린다:
+#   /World/robot/root_joint        아티큘레이션 루트
+#   /World/robot/root_joint/tool0  EE 프레임
+#   /World/robot/SurfaceGripper    흡착
 ROBOT_USD = os.environ.get(
-    "PL_ROBOT_USD", "/home/rokey/isaac_scenes/robot/h2017.usd")
+    "PL_ROBOT_USD", os.path.expanduser("~/isaac_assets/h2017_suction.usd"))
 PALLET = "/World/Pallet"
 
 # Isaac Sim 헤드리스 실측 (2026-08-22), A05 로 교체하고 scale=(4.180, 0.8019, 1.0399)
@@ -87,6 +116,25 @@ mm = lambda v: v / 1000.0
 belt_x1 = mm(SPEC["conveyor"]["stopper_x_mm"])            # 벨트 토출단 = 스토퍼
 belt_x0 = 0.0                                             # 사양 라인 시작
 belt_len = belt_x1 - belt_x0
+
+# 조각별 구간 [x0, x1] (m). 사양 §3.2 를 그대로 읽는다 — 균등 분할이 아니다.
+#   main     = conveyor.stage1.main_range_mm   [0,    7500]
+#   b_pickup = conveyor.pickup_range_mm        [7500, 10000]
+_conv = SPEC["conveyor"]
+SEG_RANGE_M = {
+    "main": [mm(v) for v in _conv["stage1"]["main_range_mm"]],
+    "b_pickup": [mm(v) for v in _conv["pickup_range_mm"]],
+}
+# 사양 자체가 어긋나 있으면 씬을 만들기 전에 멈춘다. 벨트에 틈이 생기거나
+# 겹치면 박스가 그 자리에서 걸리는데, 씬을 다 만든 뒤에는 원인을 찾기 어렵다.
+_m, _p = SEG_RANGE_M["main"], SEG_RANGE_M["b_pickup"]
+if abs(_m[1] - _p[0]) > 1e-9:
+    raise SystemExit(
+        f"사양 불일치: main 끝 {_m[1]*1000:.0f} != pickup 시작 {_p[0]*1000:.0f} mm. "
+        "system.yaml 의 conveyor.stage1.main_range_mm 와 pickup_range_mm 를 맞춰라.")
+if abs(_p[1] - belt_x1) > 1e-9:
+    raise SystemExit(
+        f"사양 불일치: pickup 끝 {_p[1]*1000:.0f} != stopper_x {belt_x1*1000:.0f} mm.")
 base = [mm(v) for v in SPEC["zones"]["robot_base_world_mm"][ZONE]]
 spec_base_y = base[1]
 if ROBOT_Y_MM is not None:
@@ -154,20 +202,17 @@ for stray in STRAY:
 tracks = [p for p in TRACKS if layer.GetPrimAtPath(Sdf.Path(p)) is not None]
 if not tracks:
     raise SystemExit(f"벨트 조각이 하나도 없다: {TRACKS}")
+if len(tracks) != len(SEG_KEYS):
+    raise SystemExit(
+        f"조각 {len(tracks)}개인데 사양 구간은 {len(SEG_KEYS)}개다 ({SEG_KEYS}). "
+        "GUI 에서 조각을 더 붙였거나 지웠다면 TRACKS/SEG_KEYS 를 같이 고쳐라.")
 
 # 폭은 사용자가 GUI 에서 정한 값(첫 조각)을 기준으로 모든 조각에 통일한다.
 belt_sy = float(Gf.Vec3d(layer.GetAttributeAtPath(
     Sdf.Path(tracks[0]).AppendProperty("xformOp:scale")).default)[1])
 belt_w = ROLLER_W_PER_SCALE * belt_sy
-seg = belt_len / len(tracks)
-new_sx = seg / ROLLER_LEN_PER_SCALE
-# 월드 속도 = graph:variable:Velocity x scale.x 다 (실측 2026-08-22:
-# scale.x 2.5161 · Velocity 0.5 -> 1.2588 m/s, 이득 2.518 = scale.x).
-# 예전에 "A05 는 이득 1.0" 이라고 적어 둔 것은 오측이었다.
-belt_vel = round(BELT_MPS / new_sx, 6)
-print(f"조각 {len(tracks)}개 · 구간당 {seg*1000:.0f}mm · scale.x {new_sx:.4f} · "
-      f"폭 {belt_w*1000:.0f}mm (scale.y {belt_sy:.4f}, 사용자 값 유지)")
-print(f"속도 {BELT_MPS} m/s -> Velocity {belt_vel} (= {BELT_MPS} / scale.x)\n")
+print(f"조각 {len(tracks)}개 · 폭 {belt_w*1000:.0f}mm "
+      f"(scale.y {belt_sy:.4f}, 사용자 값 유지)\n")
 
 for i, tp in enumerate(tracks):
     path = Sdf.Path(tp)
@@ -177,7 +222,18 @@ for i, tp in enumerate(tracks):
     o = layer.GetAttributeAtPath(path.AppendProperty("xformOp:orient"))
     old_t, old_s = Gf.Vec3d(t.default), Gf.Vec3d(s.default)
 
-    seg_x1 = belt_x0 + seg * (i + 1)          # 이 조각의 토출단
+    seg_key = SEG_KEYS[i]
+    seg_x0, seg_x1 = SEG_RANGE_M[seg_key]     # 이 조각이 맡는 사양 구간
+    seg_len = seg_x1 - seg_x0
+    new_sx = seg_len / ROLLER_LEN_PER_SCALE
+    # 월드 속도 = graph:variable:Velocity x scale.x 다 (실측 2026-08-22:
+    # scale.x 2.5161 · Velocity 0.5 -> 1.2588 m/s, 이득 2.518 = scale.x).
+    # 예전에 "A05 는 이득 1.0" 이라고 적어 둔 것은 오측이었다.
+    # ★ 조각마다 scale.x 가 다르므로 Velocity 도 **조각마다** 달라야 한다.
+    #   구간을 균등 분할하던 때에는 하나로 충분했지만 7500/2500 에서는 아니다.
+    #   한 값으로 두면 픽업 벨트가 본선의 3배 속도로 돌아 박스가 튀어 나간다.
+    belt_vel = round(BELT_MPS / new_sx, 6)
+
     # orient 180 이라 조각이 원점에서 -X 로 뻗는다. 토출단을 seg_x1 에 두려면
     # 원점을 그만큼 +X 로 민다.
     new_tx = seg_x1 + ROLLER_NEAR_PER_SCALE * new_sx
@@ -187,10 +243,11 @@ for i, tp in enumerate(tracks):
     # GUI 에서 조각을 복제하면 orient 가 틀어져 있을 수 있다. 180° 로 통일한다.
     if o is not None:
         o.default = Gf.Quatd(6.123233995736766e-17, Gf.Vec3d(0.0, 0.0, 1.0))
-    print(f"{tp}")
-    print(f"      롤러 {belt_x0*1000 + seg*i*1000:.0f}~{seg_x1*1000:.0f}mm   "
+    print(f"{tp}   seg=\"{seg_key}\"")
+    print(f"      롤러 {seg_x0*1000:.0f}~{seg_x1*1000:.0f}mm ({seg_len*1000:.0f})   "
           f"scale {old_s[0]:.4f},{old_s[1]:.4f} -> {new_sx:.4f},{belt_sy:.4f}   "
           f"translate.x {old_t[0]:.4f} -> {new_tx:.4f}")
+    print(f"      속도 {BELT_MPS} m/s -> Velocity {belt_vel} (= {BELT_MPS} / {new_sx:.4f})")
 
     # 흐름을 월드 +X 로.
     #
@@ -276,44 +333,46 @@ print(f"팔레트 모서리 ({porg[0]:.3f}, {porg[1]:.3f})  {pw*1000:.0f}x{pd*10
       f"상면 z={porg[2]:.3f}")
 
 # ── 5) 팔레트 반출 컨베이어 상판 ─────────────────────────────
-# 적재한 팔레트를 그대로 트럭에 밀어 넣는다. 그래서 팔레트 밑면 = 트럭
-# 적재함 바닥 높이여야 한다 (truck.bed_height_mm). 팔레트가 바닥에 있으면
-# 다시 들어 올려야 하므로 이 씬에서는 처음부터 이 높이에서 쌓는다.
+# 적재한 팔레트를 **들지 않고 그대로 밀어** 트럭에 넣는다. 그래서 팔레트 밑면과
+# 트럭 바닥의 높이차가 0 이어야 하는데, z=0 도크 규약이 그것을 이미 만족한다
+# (작업명세서 §3.1) — 팔레트 밑면 z=0 이 곧 트럭 적재함 바닥이다.
+# 반출 롤러 상면도 **z=0** 이다. 바닥에 얹는 구조물이 아니라 바닥과 같은 면이라
+# 상판을 z 0 아래로 묻는다.
+#
+# ⚠ 여기에 truck.bed_height_mm(850) 을 쓰지 않는다. 그건 **야드 지면 대비**
+#   도크 높이이지 월드 z 가 아니다. 예전 판이 이걸 높이로 써서 팔레트를
+#   z 850~1000 에 띄웠고, 그러면 적재 상단이 도달범위 밖으로 나간다.
+#   (구 사양서 §5-1 이 "받침대 1,580 필요 -> 도크로 해결" 로 기각한 방향이다.)
 #
 # 지금은 상판만 있는 정적 콜라이더다. 롤러/체인 구동은 아직 안 넣었다 —
 # 반출 시퀀스를 만들 때 여기에 physxSurfaceVelocity 를 걸면 된다.
 drop("/World", "PalletOutfeed")
-truck = SPEC.get("truck")
-if truck is None:
-    # 팔레트를 바닥에 두는 배치다. 반출 상판을 깔 근거가 없으므로 건너뛴다.
-    # (2026-08-22 셀 90도 회전 머지로 truck 섹션이 빠졌다. 트럭 상차 높이를
-    #  다시 쓰려면 system.yaml 에 truck.bed_height_mm 을 넣으면 된다.)
-    print("반출 컨베이어 건너뜀 — system.yaml 에 truck.bed_height_mm 이 없다. "
-          "팔레트는 바닥 기준이다.")
-else:
-    bed = mm(truck["bed_height_mm"])
-    pw_, pd_ = mm(pal["width_mm"]), mm(pal["depth_mm"])
-    if abs((porg[2] - mm(pal["thickness_mm"])) - bed) > 1e-6:
-        print(f"  ※ 팔레트 밑면 {(porg[2]-mm(pal['thickness_mm']))*1000:.0f}mm 와 "
-              f"트럭 바닥 {bed*1000:.0f}mm 가 안 맞는다. "
-              f"system.yaml 의 pallet_origin.z 는 (bed + thickness) 여야 한다.")
-    OF_T = 0.15          # 상판 두께
-    OF_MARGIN = 0.05     # 팔레트보다 옆으로 내민 양
-    OF_RUN = 1.00        # 반출 방향(+X)으로 더 뻗은 길이
-    ox0, ox1 = porg[0] - OF_MARGIN, porg[0] + pw_ + OF_RUN
-    oy0, oy1 = porg[1] - OF_MARGIN, porg[1] + pd_ + OF_MARGIN
-    spec = define(OUTFEED, "Cube", ["PhysicsCollisionAPI", "PhysxCollisionAPI"])
-    put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
-    put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
-        [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
-    put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
-        [Gf.Vec3f(0.30, 0.32, 0.36)])
-    put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
-    xform(spec, ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0, bed - OF_T / 2.0),
-          (ox1 - ox0, oy1 - oy0, OF_T))
-    print(f"반출 컨베이어 x {ox0*1000:.0f}~{ox1*1000:.0f}  "
-          f"y {oy0*1000:.0f}~{oy1*1000:.0f}  "
-          f"상면 z={bed*1000:.0f} (트럭 바닥 높이)")
+DOCK_Z = 0.0             # 도크 바닥 = 트럭 적재함 바닥 = 반출 롤러 상면
+pallet_bottom = porg[2] - mm(pal["thickness_mm"])
+if abs(pallet_bottom - DOCK_Z) > 1e-6:
+    raise SystemExit(
+        f"팔레트 밑면이 {pallet_bottom*1000:.0f}mm 다 — 도크 바닥(0)이 아니다. "
+        f"system.yaml 의 pallet_origin_world_mm[{ZONE}].z 는 "
+        f"pallet.thickness_mm({pal['thickness_mm']}) 여야 한다 (작업명세서 §3.1).")
+pw_, pd_ = mm(pal["width_mm"]), mm(pal["depth_mm"])
+OF_T = 0.15          # 상판 두께
+OF_MARGIN = 0.05     # 팔레트보다 옆으로 내민 양
+OF_RUN = 1.00        # 반출 방향(+X)으로 더 뻗은 길이
+ox0, ox1 = porg[0] - OF_MARGIN, porg[0] + pw_ + OF_RUN
+oy0, oy1 = porg[1] - OF_MARGIN, porg[1] + pd_ + OF_MARGIN
+spec = define(OUTFEED, "Cube", ["PhysicsCollisionAPI", "PhysxCollisionAPI"])
+put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
+put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
+    [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
+    [Gf.Vec3f(0.30, 0.32, 0.36)])
+put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
+# 상면이 DOCK_Z 이므로 중심은 그보다 두께의 반만큼 아래다.
+xform(spec, ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0, DOCK_Z - OF_T / 2.0),
+      (ox1 - ox0, oy1 - oy0, OF_T))
+print(f"반출 컨베이어 x {ox0*1000:.0f}~{ox1*1000:.0f}  "
+      f"y {oy0*1000:.0f}~{oy1*1000:.0f}  "
+      f"상면 z={DOCK_Z*1000:.0f} (도크 바닥 = 트럭 적재함 바닥)")
 
 # ── 6) H2017 ────────────────────────────────────────────────
 # 베이스는 페데스탈 상면이다. base_link 가 프림 원점이므로 그대로 얹으면 된다.

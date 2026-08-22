@@ -13,12 +13,16 @@ set -e
 HERE="$(dirname "$(readlink -f "$0")")"
 SPEC_YAML="$HOME/palletris_ws/src/packing_bringup/config/system.yaml"
 
-export PL_SPEC="$(python3 -c "
+# ★ `export VAR="$(...)"` 로 쓰면 export 의 종료코드가 0 이라 set -e 가 yaml 실패를
+#   못 잡는다. system.yaml 이 깨져도 그대로 진행해 엉뚱한 JSONDecodeError 로 끝난다
+#   (2026-08-22 충돌 마커가 커밋됐을 때 실제로 그랬다). 그래서 대입과 export 를 나눈다.
+PL_SPEC="$(python3 -c "
 import yaml, json, sys
 c = yaml.safe_load(open('$SPEC_YAML'))
-# truck 은 없을 수도 있다 (팔레트를 바닥에 두는 배치). 있으면 넘긴다.
+# truck 은 씬에 야드 지면을 그릴 때만 쓴다. 높이 계산에는 안 들어간다 (작업명세서 §3.1).
 json.dump({k: c[k] for k in ('zones', 'conveyor', 'pallet', 'robot', 'truck') if k in c}, sys.stdout)
 ")"
+export PL_SPEC
 
 USDLIB="$HOME/isaacsim/extscache/omni.usd.libs-1.0.1+69cbf6ad.lx64.r.cp311"
 export PYTHONPATH="$USDLIB"
