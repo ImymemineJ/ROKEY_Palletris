@@ -75,9 +75,9 @@ H2017_USD = os.path.expanduser("~/isaac_assets/h2017.usd")
 def mm(v): return v / 1000.0
 
 def place_zone(world, zone: str):
-    base = CFG["zones"]["robot_base_world_mm"][zone]      # [10900, 0, 700]
+    base = CFG["zones"]["robot_base_world_mm"][zone]      # [10900, 0, 900]
     porg = CFG["zones"]["pallet_origin_world_mm"][zone]   # [10300, 300, 150]
-    # ★ 2026-08-22: 페데스탈 700, 셀 90도 회전(팔레트가 로봇 +Y 쪽)
+    # ★ 2026-08-22: 페데스탈 900(저녁 700→900, 다층 실측), 셀 90도 회전(팔레트가 로봇 +Y 쪽)
 
     # 1) 페데스탈: 바닥(0)부터 base_z까지 기둥. 중심 z = base_z/2
     world.scene.add(FixedCuboid(
