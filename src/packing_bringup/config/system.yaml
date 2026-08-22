@@ -72,7 +72,10 @@ heightmap:
 
 robot:
   pedestal_height_mm: 700           # 구 사양서 §3 도달 계산 결과. G1 실측으로 확정할 것
-  gripper_length_mm: 150            # 확정 시 §3.4 재계산
+  # ★ B0 확정 (2026-08-21, 김병직). 구 저장소 h2017_cell.usd 그리퍼 메시 실측값.
+  gripper_length_mm: 150            # 플랜지(tool0) ~ 흡착 접촉면
+  gripper_body_diameter_mm: 245     # 몸통 원기둥. 밑면이 흡착면과 같은 평면이다
+  gripper_pad_span_mm: [210, 160]   # Ø50 패드 4개의 바깥 치수
   approach_offset_mm: 200
   release_speed_threshold_mm_s: 5.0
   release_wait_timeout_s: 3.0
