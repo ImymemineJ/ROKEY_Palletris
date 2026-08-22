@@ -45,10 +45,10 @@ from packing_common.frames import *
 
 def test_roundtrip():
     assert mm_to_cell(340) == 34 and mm_to_cell(480) == 48
-    assert m_to_mm(mm_to_m(11200)) == 11200
+    assert m_to_mm(mm_to_m(10300)) == 10300
 
 def test_frames_center_bottom():
-    origin = [11200, -600, 150]
+    origin = [10300, 300, 150]        # ★ 셀 90도 회전 (2026-08-22)
     # 3호(h=210) 박스 중심이 월드 (11.37, -0.475, 0.255+0.105)에 있으면
     # PlacePose는 x=170, y=125, z=105(밑면)여야 한다... 손계산 케이스 3개
     p = world_to_pallet_place([11.370, -0.475, 0.360], 0.0, 210, origin)
@@ -77,8 +77,8 @@ class HeightmapPacker:
     def __init__(self, cfg):
         hm_cfg = cfg["heightmap"]; pal = cfg["pallet"]
         self.cell = hm_cfg["cell_mm"]                       # 10
-        self.W = pal["width_mm"]  // self.cell              # 80  (Px)
-        self.D = pal["depth_mm"]  // self.cell              # 120 (Py)
+        self.W = pal["width_mm"]  // self.cell              # 120 (Px)  ← 셀 90도 회전으로 바뀜
+        self.D = pal["depth_mm"]  // self.cell              # 80  (Py)
         self.hm = np.zeros((self.W, self.D), dtype=np.int32)
         self.max_stack = pal["max_stack_mm"]                # ★ G1 전까지 이 값만 바꿔가며 실험
         self.w_h, self.w_s = hm_cfg["w_height"], hm_cfg["w_support"]
@@ -313,7 +313,7 @@ MultiThreadedExecutor, 각 호출을 소요시간(ms)과 함께 info 로그.
 | 증상 | 처방 |
 |---|---|
 | 2층부터 NO_FEASIBLE_POSE | `support_tol_mm=10` + 양자화 (함정 #10) |
-| 박스가 팔레트 밖에 놓임 | 김병직과 frames.py 같은 것 import? 원점 (11200,−600,150)? (함정 #11) |
+| 박스가 팔레트 밖에 놓임 | 김병직과 frames.py 같은 것 import? 원점 **(10300, 300, 150)**? (함정 #11) |
 | plan이 느림 | sliding_window_view 썼는지 → maximum_filter1d로 (함정 #25) |
 | fill_rate가 이상하게 낮음 | 분모가 850 고정 아닌지 — 실제 최고 높이 (함정 #19) |
 | 90° 배치가 이상함 | yaw=90이면 (w,d) 스왑 — plan과 update 양쪽 다 |
