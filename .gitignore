@@ -38,5 +38,12 @@ rosbag2_*/
 *.swp
 .DS_Store
 
+# ── 로컬 전용: 김병직 작업 규칙 · 구 자료 정본 목록 ──
+#   팀 공유용이 아니라 판단 기준을 내가 관리하는 것이다.
+#   ★ 선행 / 를 반드시 붙인다. 그냥 `CLAUDE.md` 로 쓰면 팀 공유본인
+#     docs/team/CLAUDE.md 까지 걸린다.
+/CLAUDE.md
+/docs/기존자료_정본.md
+
 # ── 예외: 설정 예시는 커밋한다 ──
 !scripts/fastdds_whitelist.xml

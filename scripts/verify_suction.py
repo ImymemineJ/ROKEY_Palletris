@@ -58,18 +58,139 @@ LIFT_MM = 300.0             # 잡고 들어 올릴 높이
 
 
 # ─────────────────────────────────────────────────────────────
-def make_belt(stage, top_z, cx, cy):
-    """정적 콜라이더 판. 흡착 대상이 아니므로 scale 을 써도 된다 — 대조군이기도 하다."""
+def _vis_box(stage, path, center, size, rgb):
+    """보이기만 하는 상자. **물리 없음** — 영상용이다."""
+    from pxr import Gf, UsdGeom
+    c = UsdGeom.Cube.Define(stage, path)
+    c.CreateSizeAttr(1.0)
+    c.CreateExtentAttr([Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+    c.CreateDisplayColorAttr([Gf.Vec3f(*rgb)])
+    xf = UsdGeom.Xformable(c.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(*[float(v) for v in center]))
+    xf.AddScaleOp().Set(Gf.Vec3d(*[float(v) for v in size]))
+
+
+def _vis_cyl(stage, path, center, r, h, axis, rgb):
+    """보이기만 하는 원기둥. **물리 없음.**"""
+    from pxr import Gf, UsdGeom
+    c = UsdGeom.Cylinder.Define(stage, path)
+    c.CreateRadiusAttr(float(r))
+    c.CreateHeightAttr(float(h))
+    c.CreateAxisAttr(axis)
+    c.CreateExtentAttr([Gf.Vec3f(-r, -r, -h / 2.0), Gf.Vec3f(r, r, h / 2.0)])
+    c.CreateDisplayColorAttr([Gf.Vec3f(*rgb)])
+    xf = UsdGeom.Xformable(c.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(*[float(v) for v in center]))
+
+
+def make_belt(stage, top_z, cx, cy, size=(1.4, 1.2)):
+    """롤러 컨베이어. **충돌은 안 보이는 판 하나가 전부 맡는다.**
+
+    보이는 것(롤러·프레임·다리)에는 물리를 안 준다. 롤러마다 콜라이더를 주면 박스가
+    롤러 사이에서 떨거나 끼고, 물리 비용도 는다. 상면이 평평한 판 하나가 정직하고 싸다.
+    `MakeInvisible()` 은 렌더만 끈다 — `CollisionAPI` 는 그대로 산다.
+
+    ★ size 는 팔레트와 안 겹치게 잡아야 한다. 겹치면 놓으러 내려갈 때 팔이 벨트에
+      막혀서 "제어가 안 된다" 로 오독하게 된다 (verify_b4_cycle 에서 실제로 밟았다).
+    """
     from pxr import Gf, UsdGeom, UsdPhysics
+    lx, ly = float(size[0]), float(size[1])
+
+    # 충돌 — 상면이 top_z 인 판. 안 보이게 한다.
     cube = UsdGeom.Cube.Define(stage, BELT)
     cube.CreateSizeAttr(1.0)
     cube.CreateExtentAttr([Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
-    cube.CreateDisplayColorAttr([Gf.Vec3f(0.25, 0.27, 0.30)])
     xf = UsdGeom.Xformable(cube.GetPrim())
     xf.ClearXformOpOrder()
     xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, top_z - 0.05))
-    xf.AddScaleOp().Set(Gf.Vec3d(1.4, 1.2, 0.10))
+    xf.AddScaleOp().Set(Gf.Vec3d(lx, ly, 0.10))
     UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    UsdGeom.Imageable(cube.GetPrim()).MakeInvisible()
+
+    # 보이는 것 ── 롤러 · 옆 프레임 · 다리
+    vis = "/World/BeltVisual"
+    UsdGeom.Scope.Define(stage, vis)
+    rr, pitch = 0.038, 0.095
+    n = max(1, int(lx / pitch))
+    x0 = cx - (n - 1) * pitch / 2.0
+    for i in range(n):
+        _vis_cyl(stage, "%s/roller_%02d" % (vis, i),
+                 (x0 + i * pitch, cy, top_z - rr), rr, ly - 0.06, "Y", (0.55, 0.57, 0.60))
+    for k, sgn in ((0, +1), (1, -1)):
+        _vis_box(stage, "%s/frame_%d" % (vis, k),
+                 (cx, cy + sgn * (ly / 2.0 - 0.015), top_z - 0.045),
+                 (lx, 0.03, 0.13), (0.16, 0.34, 0.52))
+    for k, (sx, sy) in enumerate(((+1, +1), (+1, -1), (-1, +1), (-1, -1))):
+        _vis_cyl(stage, "%s/leg_%d" % (vis, k),
+                 (cx + sx * (lx / 2.0 - 0.08), cy + sy * (ly / 2.0 - 0.05),
+                  (top_z - 0.11) / 2.0), 0.028, top_z - 0.11, "Z", (0.30, 0.32, 0.35))
+
+
+def make_pallet(stage, origin_mm, cfg):
+    """목재 팔레트. 충돌은 안 보이는 판 하나, 보이는 것은 상판·블록·하판이다.
+
+    놓은 박스가 얹힐 자리가 없으면 바닥까지 떨어진다. 상면이 `origin_mm[2]` 다.
+    """
+    from pxr import Gf, UsdGeom, UsdPhysics
+    p = cfg["pallet"]
+    w, d = p["width_mm"] / 1000.0, p["depth_mm"] / 1000.0
+    t = p["thickness_mm"] / 1000.0
+    ox, oy, oz = [v / 1000.0 for v in origin_mm]
+    cx, cy = ox + w / 2.0, oy + d / 2.0
+
+    cube = UsdGeom.Cube.Define(stage, "/World/TestPallet")
+    cube.CreateSizeAttr(1.0)
+    cube.CreateExtentAttr([Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+    xf = UsdGeom.Xformable(cube.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, oz - t / 2.0))
+    xf.AddScaleOp().Set(Gf.Vec3d(w, d, t))
+    UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    UsdGeom.Imageable(cube.GetPrim()).MakeInvisible()
+
+    vis = "/World/PalletVisual"
+    UsdGeom.Scope.Define(stage, vis)
+    wood, dark = (0.70, 0.53, 0.31), (0.58, 0.42, 0.24)
+    deck, blk = 0.025, t - 2 * 0.025           # 상판 25 · 블록 100 · 하판 25 = 150
+    bw = 0.11                                  # 판재 폭
+    n_top = 7
+    for i in range(n_top):                     # 상판 — 폭(X) 방향으로 배열, 길이는 깊이(Y)
+        x = ox + bw / 2.0 + i * (w - bw) / (n_top - 1)
+        _vis_box(stage, "%s/top_%d" % (vis, i), (x, cy, oz - deck / 2.0),
+                 (bw, d, deck), wood)
+    for i in range(3):                         # 블록 3x3
+        for j in range(3):
+            _vis_box(stage, "%s/blk_%d%d" % (vis, i, j),
+                     (ox + 0.06 + i * (w - 0.12) / 2.0,
+                      oy + 0.06 + j * (d - 0.12) / 2.0, oz - deck - blk / 2.0),
+                     (0.12, 0.12, blk), dark)
+    for j in range(3):                         # 하판 — 깊이(Y) 방향으로 3장
+        y = oy + bw / 2.0 + j * (d - bw) / 2.0
+        _vis_box(stage, "%s/bot_%d" % (vis, j), (cx, y, oz - t + deck / 2.0),
+                 (w, bw, deck), dark)
+
+
+def make_pedestal(stage, base_xyz_m, cfg, diameter_m=0.4):
+    """로봇 받침대. 바닥(z=0)에서 베이스까지 세운다.
+
+    **콜라이더까지 준다.** 없으면 팔이 받침대를 통과해도 시뮬이 안 잡는다 — 실제로는
+    부딪히는 물건이라 없는 편이 위험하다. 원기둥이라 scale 없이 치수가 나온다.
+    """
+    from pxr import Gf, UsdGeom, UsdPhysics
+    h = cfg["robot"]["pedestal_height_mm"] / 1000.0
+    cyl = UsdGeom.Cylinder.Define(stage, "/World/TestPedestal")
+    cyl.CreateRadiusAttr(diameter_m / 2.0)
+    cyl.CreateHeightAttr(h)
+    cyl.CreateAxisAttr("Z")
+    cyl.CreateExtentAttr([Gf.Vec3f(-diameter_m / 2.0, -diameter_m / 2.0, -h / 2.0),
+                          Gf.Vec3f(diameter_m / 2.0, diameter_m / 2.0, h / 2.0)])
+    cyl.CreateDisplayColorAttr([Gf.Vec3f(0.35, 0.37, 0.40)])
+    xf = UsdGeom.Xformable(cyl.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(base_xyz_m[0], base_xyz_m[1], h / 2.0))
+    UsdPhysics.CollisionAPI.Apply(cyl.GetPrim())
 
 
 def make_box(stage, geom, dims, pos, mass):
@@ -243,6 +364,7 @@ def main():
 
         # ── 씬 ─────────────────────────────────────────────
         make_belt(stage, belt_z, pick_x, 0.0)
+        make_pedestal(stage, S.base, cfg)
         box_pos = (pick_x, 0.0, belt_z + half_h + 0.001)
         make_box(stage, a.geom, dims, box_pos, mass)
 
@@ -362,6 +484,11 @@ def main():
         print("\nRESULT(%s): %s" % (a.geom, "통과" if ok_all else "실패"))
         if a.hold and a.gui:
             V.hold_open(S)
+    except BaseException:
+        # Kit 이 stdout 을 갈아치운 상태라 트레이스백이 조용히 사라진다. 로그로 남긴다.
+        import traceback
+        print("\n!! 예외\n" + traceback.format_exc())
+        raise
     finally:
         tee.close()
         kit.close()

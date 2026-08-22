@@ -30,7 +30,10 @@ isaac_python(3.11)과 ROS 2 Jazzy(3.12)는 파이썬이 달라 한 프로세스�
 """
 
 APPROACH_GAP_MM = 2.0        # 접근 시 남길 간극. transZ 슬롯(5 mm)보다 작아야 한다
-GRIP_TOL_MM = 2.0            # 흡착 후 허용 간극. 넘으면 "떠서 붙은" 것으로 본다
+# 흡착 후 허용 간극. **패드 transZ 슬롯 5 mm 에서 온 값이다** — 임의로 정한 것이 아니다.
+#   접근 2 mm 로 잡으면 1.2~1.4 mm, 접근 5 mm 로 잡으면 6.4 mm 가 나온다. 3 mm 가 그 사이다.
+#   ★ 2.0 으로 뒀다가 멀쩡한 흡착(2.41 mm)을 실패로 판정했다. 도착 잔차가 얹히기 때문이다.
+GRIP_TOL_MM = 3.0
 
 _STATUS = ("Open", "Closing", "Closed")
 
@@ -96,6 +99,8 @@ class Gripper:
         self.release_damping = float(r.get("release_damping", 5.0))
         self.release_damping_s = float(r.get("release_damping_duration_s", 0.5))
         self.settle_s = float(r.get("settle_wait_s", 0.5))
+        self._g = None                       # begin_grasp 진행 상태
+        self._r = None                       # begin_release 진행 상태
 
     # ── 조회 ─────────────────────────────────────────────────
     def status(self):
@@ -121,45 +126,145 @@ class Gripper:
         """흡착면~박스 윗면 간극 [mm]. `gap_fn` 을 안 줬으면 None."""
         return self._gap_fn() if self._gap_fn else None
 
-    # ── 조작 ─────────────────────────────────────────────────
-    def grasp(self, box_prim_path=None, timeout_s=None, steps_settle=None):
-        """흡착한다. 붙을 때까지 물리를 돌린다.
+    # ── 조작 (비차단) ────────────────────────────────────────
+    #
+    #  `robot_motion.py` 는 Isaac 메인 루프를 세우면 안 된다 (공통가이드 §3 규칙 1).
+    #  그래서 **상태를 뱉는 begin/poll 이 본체**이고, 아래 grasp()/release() 는 그걸
+    #  자기가 스텝 돌려 감싼 편의 함수다. 구현이 하나여야 검증도 하나로 끝난다.
 
-        ★ 부르기 전에 흡착면을 박스 윗면 **APPROACH_GAP_MM 이내**로 내려놓아야 한다.
-          5 mm 에서 부르면 6 mm 떠서 붙고, 그대로 성공으로 보고된다.
-
-        Args:
-            box_prim_path: 주면 **그 박스를 잡았는지**까지 확인한다. 옆 박스를 문 것을
-                성공으로 세지 않으려면 줘야 한다.
-            timeout_s: 기본은 `suction.retry_interval_s` (그리퍼가 닫기를 시도하는 총 시간)
-            steps_settle: 붙은 뒤 더 돌릴 스텝 수. 기본 0.2 s
-        Returns:
-            bool
-        """
-        timeout_s = self.retry_s if timeout_s is None else timeout_s
+    def begin_grasp(self, box_prim_path=None, timeout_s=None):
+        """흡착을 건다. **기다리지 않는다.** 이후 `poll_grasp()` 로 결과를 본다."""
         self.view.apply_gripper_action([1.0])
+        self._g = {"box": box_prim_path,
+                   "left": max(1, int((self.retry_s if timeout_s is None else timeout_s)
+                                      / self.dt)),
+                   "settle": int(0.2 / self.dt), "done": None}
 
-        n = max(1, int(timeout_s / self.dt))
-        for _ in range(n):
-            self._step()
-            if self.is_holding():
-                break
-
-        for _ in range(steps_settle if steps_settle is not None else int(0.2 / self.dt)):
-            self._step()
-
-        ok, why = self._grasp_verdict(box_prim_path)
+    def poll_grasp(self):
+        """None = 진행 중, True/False = 판정 끝. 물리 스텝마다 한 번씩 부른다."""
+        g = self._g
+        if g is None:
+            return None
+        if g["done"] is not None:
+            return g["done"]
+        if not self.is_holding():
+            g["left"] -= 1
+            if g["left"] > 0:
+                return None
+        elif g["settle"] > 0:                 # 붙었으면 조금 더 안정화시킨 뒤 잰다
+            g["settle"] -= 1
+            return None
+        ok, why = self._grasp_verdict(g["box"])
+        g["done"] = ok
+        self._report("PICKED" if ok else "PICK_FAILED")
         if ok:
-            self._report("PICKED")
-            self._log("[gripper] 흡착 성공  %s%s"
-                      % (self.gripped(), self._gap_str()))
+            self._log("[gripper] 흡착 성공  %s%s" % (self.gripped(), self._gap_str()))
         else:
-            self._report("PICK_FAILED")
             self._log("[gripper] !! 흡착 실패 — %s  (상태 %s, 잡은 것 %s%s)"
                       % (why, self.status(), self.gripped() or "없음", self._gap_str()))
         return ok
 
+    def begin_release(self, extra_settle_s=None):
+        """놓기를 시작한다. **기다리지 않는다.** 명세서 6.5 순서를 poll 이 진행한다.
+
+            TCP 정지 대기(타임아웃 있음) -> 릴리스 -> damping 스파이크 -> 게인 원복
+            -> settle 대기
+        """
+        settle = self.settle_s if extra_settle_s is None else extra_settle_s
+        self._r = {"phase": "wait", "left": int(self.release_timeout_s / self.dt),
+                   "spike": int(self.release_damping_s / self.dt),
+                   "settle": int(settle / self.dt), "prev": None, "waited": 0.0,
+                   "gains": None, "done": None}
+
+    def poll_release(self):
+        """None = 진행 중, True/False = 판정 끝."""
+        import numpy as np
+        r = self._r
+        if r is None:
+            return None
+        if r["done"] is not None:
+            return r["done"]
+
+        if r["phase"] == "wait":
+            # ⚠ 타임아웃이 반드시 있어야 한다. 팔이 미세하게 계속 떨면 임계값에 영원히
+            #   못 내려가서 무한루프가 된다 (명세서 6.5).
+            still = self._tool_pose_fn is None
+            if not still:
+                cur = np.asarray(self._tool_pose_fn(), dtype=float)
+                if r["prev"] is not None:
+                    still = float(np.linalg.norm(cur - r["prev"])) / self.dt \
+                        < self.release_speed_m_s
+                r["prev"] = cur
+            r["left"] -= 1
+            r["waited"] += self.dt
+            if not still and r["left"] > 0:
+                return None
+            if not still:
+                self._log("[gripper] release 대기 타임아웃 %.1f s — 강제 진행"
+                          % self.release_timeout_s)
+            self.view.apply_gripper_action([-1.0])
+            r["phase"] = "spike"
+            r["gains"] = self._spike_on()
+            return None
+
+        if r["phase"] == "spike":
+            r["spike"] -= 1
+            if r["spike"] > 0:
+                return None
+            self._spike_off(r["gains"])       # ★ 반드시 되돌린다. 안 그러면 팔이 굳는다
+            r["phase"] = "settle"
+            return None
+
+        r["settle"] -= 1
+        if r["settle"] > 0:
+            return None
+        ok = not self.is_holding()
+        r["done"] = ok
+        self._log("[gripper] %s  (정지 대기 %.2f s, 상태 %s)"
+                  % ("놓음" if ok else "!! 안 놓아진다", r["waited"], self.status()))
+        if ok:
+            self._report("PLACED")
+        return ok
+
+    # ── 조작 (차단 — 단일 스레드 호출자용) ──────────────────
+    def grasp(self, box_prim_path=None, timeout_s=None, steps_settle=None):
+        """흡착한다. 붙을 때까지 **자기가 물리를 돌린다.**
+
+        ★ 부르기 전에 흡착면을 박스 윗면 **APPROACH_GAP_MM 이내**로 내려놓아야 한다.
+          5 mm 에서 부르면 6 mm 떠서 붙고, 그대로 성공으로 보고된다.
+        """
+        self.begin_grasp(box_prim_path, timeout_s)
+        if steps_settle is not None:
+            self._g["settle"] = steps_settle
+        while True:
+            self._step()
+            r = self.poll_grasp()
+            if r is not None:
+                return r
+
+    def release(self, extra_settle_s=None):
+        """놓는다. 명세서 6.5 순서를 지키며 **자기가 물리를 돌린다.**"""
+        self.begin_release(extra_settle_s)
+        while True:
+            self._step()
+            r = self.poll_release()
+            if r is not None:
+                return r
+
+    def open(self):
+        """무조건 연다. 예외 경로에서 쓴다 — 대기도 스파이크도 없다.
+
+        진행 중이던 release 의 damping 스파이크가 걸려 있으면 먼저 되돌린다.
+        """
+        if self._r and self._r["phase"] == "spike":
+            self._spike_off(self._r["gains"])
+        self._g = self._r = None
+        self.view.apply_gripper_action([-1.0])
+        self._step()
+
+    # ── 내부 ─────────────────────────────────────────────────
     def _grasp_verdict(self, box_prim_path):
+        """붙었다고 볼 수 있는가. **상태만으로 판정하지 않는다.**"""
         if not self.is_holding():
             return False, "안 잡혔다"
         if box_prim_path and not any(box_prim_path in g for g in self.gripped()):
@@ -170,70 +275,19 @@ class Gripper:
             return False, "%.2f mm 떠서 붙었다 (허용 %.1f)" % (gap, GRIP_TOL_MM)
         return True, ""
 
-    def release(self, extra_settle_s=None):
-        """놓는다. 박스가 튀지 않게 명세서 6.5 순서를 지킨다.
-
-            TCP 가 멈출 때까지 대기 (타임아웃 있음) -> 릴리스 -> damping 스파이크
-            -> 게인 원복 -> settle 대기
-
-        ⚠ 타임아웃이 **반드시** 있어야 한다. 팔이 미세하게 계속 떨면 임계값에 영원히
-          못 내려가서 무한루프가 된다 (명세서 6.5).
-        """
-        waited = self._wait_until_still()
-        self.view.apply_gripper_action([-1.0])
-        self._step()
-
-        self._damping_spike()
-
-        for _ in range(int((extra_settle_s if extra_settle_s is not None
-                            else self.settle_s) / self.dt)):
-            self._step()
-
-        ok = not self.is_holding()
-        self._log("[gripper] %s  (정지 대기 %.2f s, 상태 %s)"
-                  % ("놓음" if ok else "!! 안 놓아진다", waited, self.status()))
-        if ok:
-            self._report("PLACED")
-        return ok
-
-    def open(self):
-        """무조건 연다. 예외 경로에서 쓴다 — 대기도 스파이크도 없다."""
-        self.view.apply_gripper_action([-1.0])
-        self._step()
-
-    # ── 내부 ─────────────────────────────────────────────────
-    def _wait_until_still(self):
-        """TCP 속도가 임계값 밑으로 내려갈 때까지 물리를 돌린다. 돌린 시간(s)을 돌려준다."""
-        if self._tool_pose_fn is None:
-            return 0.0
-        import numpy as np
-        t = 0.0
-        prev = np.asarray(self._tool_pose_fn(), dtype=float)
-        while t < self.release_timeout_s:
-            self._step()
-            t += self.dt
-            cur = np.asarray(self._tool_pose_fn(), dtype=float)
-            speed = float(np.linalg.norm(cur - prev)) / self.dt
-            prev = cur
-            if speed < self.release_speed_m_s:
-                return t
-        self._log("[gripper] release 대기 타임아웃 %.1f s — 강제 진행" % self.release_timeout_s)
-        return t
-
-    def _damping_spike(self):
-        """놓는 순간 팔이 반동으로 흔들리지 않게 damping 을 잠깐 올렸다 되돌린다."""
+    def _spike_on(self):
+        """damping 을 잠깐 올린다. 원래 게인을 돌려준다 (없으면 None)."""
         if self.art is None:
-            for _ in range(int(self.release_damping_s / self.dt)):
-                self._step()
-            return
+            return None
         ctl = self.art.get_articulation_controller()
         kps, kds = ctl.get_gains()
-        try:
-            ctl.set_gains(kds=kds * self.release_damping)
-            for _ in range(int(self.release_damping_s / self.dt)):
-                self._step()
-        finally:
-            ctl.set_gains(kps=kps, kds=kds)          # ★ 예외가 나도 반드시 되돌린다
+        ctl.set_gains(kds=kds * self.release_damping)
+        return (kps, kds)
+
+    def _spike_off(self, gains):
+        if gains is None:
+            return
+        self.art.get_articulation_controller().set_gains(kps=gains[0], kds=gains[1])
 
     def _gap_str(self):
         gap = self.gap_mm()
