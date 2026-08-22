@@ -169,7 +169,7 @@
   <text x="960" y="812" font-size="11.5" fill="#7f1d1d">· 어떤 콜백(타이머 포함)에서도 spin_until_future_complete 금지</text>
   <text x="960" y="832" font-size="11.5" fill="#7f1d1d">· 단위: DB·config = mm 정수 / 코드 = m / heightmap = 셀(10mm)</text>
   <text x="960" y="852" font-size="11.5" fill="#7f1d1d">· PlacePose: x,y = 박스 중심 · z = 박스 밑면 / yaw0 = size_w가 +X</text>
-  <text x="960" y="872" font-size="11.5" fill="#7f1d1d">· 팔레트 원점(B) = 월드 (11200, −600, 150) · max_stack 850</text>
+  <text x="960" y="872" font-size="11.5" fill="#7f1d1d">· 팔레트 원점(B) = 월드 (10300, 300, 150) · max_stack 1300 · z=0 은 도크 바닥</text>
   <text x="960" y="892" font-size="11.5" fill="#7f1d1d">· Isaac 프로세스에 rclpy 금지 (py3.11 vs 3.12 ABI)</text>
 
   <text x="780" y="948" text-anchor="middle" font-size="11.5" fill="#6b7280">네트워크: 유선 2.5G 스위치 · 10.10.0.1~4 · ROS_DOMAIN_ID=115 · FastDDS 유선 whitelist — 통신이 안 보이면 G6부터 재확인</text>

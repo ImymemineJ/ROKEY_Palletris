@@ -427,11 +427,18 @@ def pallet_slot(stage, idx, dims):
 def _box_dims(prim):
     """박스 로컬 치수 (w, d, h) [m].
 
+<<<<<<< HEAD
     예전엔 xformOp:scale 만 읽었다. 스폰 박스가 Cube(size=1) + scale 이었기
     때문인데, 흡착이 스케일 걸린 프림을 못 다뤄서 scale 없는 Mesh 로 바뀌었다
     (spawn_feeder._make_box). 그래서 **extent 를 먼저 보고 scale 은 있으면 곱한다**
     — 두 방식 다 받는다. scale 만 읽으면 새 박스가 전부 (0.4, 0.3, 0.3) 로 잡혀
     팔레트 슬롯이 어긋난다.
+=======
+    예전엔 xformOp:scale 만 읽었다. 스폰 박스가 Cube(size=1) + scale 이었기 때문인데,
+    치수를 지오메트리에 굽는 Mesh 로 바뀌면서 scale 이 없어졌다 (spawn_feeder._make_box).
+    그래서 **extent 를 먼저 보고 scale 은 있으면 곱한다** — 두 방식 다 받는다.
+    scale 만 읽으면 새 박스가 전부 (0.4, 0.3, 0.3) 로 잡혀 팔레트 슬롯이 어긋난다.
+>>>>>>> origin/main
     """
     ext = UsdGeom.Boundable(prim).GetExtentAttr().Get()
     d = ([float(ext[1][i] - ext[0][i]) for i in range(3)] if ext
