@@ -67,6 +67,13 @@ def load_joints(urdf=URDF):
             "type": j.get("type"),
             "lower": float(lim.get("lower")) if lim is not None else None,
             "upper": float(lim.get("upper")) if lim is not None else None,
+            # 속도·토크 한계. 웨이포인트 보간 속도를 여기서 가져간다
+            # (scripts/verify_cycle.py). H2017 은 joint_1~3 이 M0609 보다 35~45% 느려서
+            # 사이클 타임에 M0609 값을 재사용하면 안 된다 (사양서 7-3).
+            "velocity": float(lim.get("velocity")) if lim is not None
+            and lim.get("velocity") else None,
+            "effort": float(lim.get("effort")) if lim is not None
+            and lim.get("effort") else None,
         }
     return out
 
