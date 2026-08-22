@@ -4,6 +4,7 @@ Isaac Sim GUI 에서 돌린다.
 
     ./run_spawn_feeder.sh                       # test1.usd 를 열고 피더를 붙인다
     PL_N=20 PL_INTERVAL=2 ./run_spawn_feeder.sh
+    PL_STAGE=~/isaac_scenes/project_1/test1-1.usd ./run_spawn_feeder.sh   # 벨트 1개 씬
 
 이미 스테이지를 열어 둔 상태라면 Script Editor 에 이 파일 내용을 붙여넣어도 된다
 (현재 열린 스테이지가 test1.usd 면 다시 열지 않는다).
@@ -44,13 +45,19 @@ import omni.usd
 from omni.physx import get_physx_interface
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
-STAGE_PATH = "/home/rokey/isaac_scenes/project_1/test1.usd"
+# PL_STAGE 로 다른 USD 를 지정할 수 있다 (예: 벨트 1개짜리 test1-1.usd).
+DEFAULT_STAGE = "/home/rokey/isaac_scenes/project_1/test1.usd"
+STAGE_PATH = os.environ.get("PL_STAGE", DEFAULT_STAGE)
 
 N_BOXES = int(os.environ.get("PL_N", 10))
 INTERVAL = float(os.environ.get("PL_INTERVAL", 3.0))   # 박스 사이 간격 [초]
 SEED = os.environ.get("PL_SEED")                       # 없으면 매번 다른 랜덤
 SPAWN = os.environ.get("PL_SPAWN", "cube")
 DROP_H = float(os.environ.get("PL_DROP_H", "0.30"))   # 벨트면 위 낙하 높이 [m]
+# 벨트 위에 동시에 올려둘 박스 수. 0 이면 무제한 (기존 동작).
+# 1 로 두면 한 개씩 — 로봇이 그 박스를 집어 올려 벨트에서 빠져야 다음이 들어온다.
+# 팔레타이징 사이클(집기 -> 놓기 -> 복귀)에 투입을 맞추는 용도다.
+MAX_ON_BELT = int(os.environ.get("PL_MAX_ON_BELT", 0))
 
 BOX_ROOT = "/World/Boxes"
 LOOKS_ROOT = "/World/Looks"
@@ -59,7 +66,7 @@ CUBE_PATH = "/World/Cube"
 BOX_SPECS = {
     "3호": (0.340, 0.250, 0.210),
     "4호": (0.410, 0.310, 0.280),
-    "5호": (0.480, 0.360, 0.340),
+    "5호": (0.480, 0.380, 0.340),
 }
 BOX_MASS = {"3호": 3.0, "4호": 5.0, "5호": 9.0}
 BOX_RATIO = {"3호": 0.50, "4호": 0.30, "5호": 0.20}
@@ -90,6 +97,8 @@ FALLBACK = {
 }
 
 BELT_TOP_Z = FALLBACK["cube"]["top"]    # start() 에서 실측값으로 덮어쓴다
+# 게이팅 판정용 벨트 흐름축 범위 [m]. _measure() 가 실측값으로 채운다.
+BELT_FLOW_RANGE = None
 BELT_HALF_W = FALLBACK["cube"]["half"]
 EDGE_MARGIN = 0.08       # 벨트 가장자리 여유 [m]
 YAW_JITTER_DEG = 15.0
@@ -151,12 +160,50 @@ def stop():
 
 
 # ─────────────────────────────────────────────────────────────
+def _on_belt_count():
+    """아직 벨트 위에 남아 있는 박스 수.
+
+    로봇이 집어 올리면 z 가 벨트면 위로 뜨고, 팔레트에 놓으면 흐름축 범위
+    밖으로 나간다. 둘 중 하나만 봐서는 안 된다 — 적재가 높아지면 팔레트 위
+    박스도 벨트면(800mm)보다 높아지므로 흐름축 범위를 같이 본다.
+    """
+    stage = _state.get("stage")
+    if stage is None or BELT_FLOW_RANGE is None:
+        return 0
+    lo, hi, i_flow = BELT_FLOW_RANGE
+    n = 0
+    for path in _state.get("paths", []):
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            continue
+        attr = prim.GetAttribute("xformOp:translate")
+        t = attr.Get() if attr else None
+        if t is None:
+            continue
+        # 낙하 중인 박스도 세야 한다 (벨트면 위 DROP_H 까지).
+        if lo <= t[i_flow] <= hi and BELT_TOP_Z - 0.10 <= t[2] <= BELT_TOP_Z + DROP_H + 0.5:
+            n += 1
+    return n
+
+
 def _on_step(dt):
     if _state.get("spawned", 0) >= N_BOXES:
         return
     _state["elapsed"] += dt
     if _state["elapsed"] < INTERVAL:
         return
+    # 벨트에 이미 MAX_ON_BELT 개가 올라가 있으면 기다린다. 로봇이 하나 집어
+    # 올려 벨트에서 빠져야 다음이 들어온다. elapsed 는 계속 쌓아 두므로
+    # 자리가 나는 즉시 투입된다.
+    if MAX_ON_BELT > 0:
+        n = _on_belt_count()
+        if n >= MAX_ON_BELT:
+            if _state.get("waiting") != n:
+                _state["waiting"] = n
+                print(f"[feeder] 대기 — 벨트 위 {n}/{MAX_ON_BELT}개. "
+                      f"하나 빠지면 다음 박스를 넣는다.")
+            return
+        _state["waiting"] = None
     _state["elapsed"] = 0.0
     _spawn_one()
 
@@ -188,13 +235,22 @@ def _measure(stage):
     bbox 는 purpose 를 전부 넣고 잡는다 — default 만 넣으면 proxy 로 잡힌
     충돌 메시가 빠져서 빈 범위가 나온다.
     """
-    global BELT_TOP_Z, BELT_HALF_W
+    global BELT_TOP_Z, BELT_HALF_W, BELT_FLOW_RANGE
     if SPAWN not in SPAWN_POINTS:
         raise ValueError(f"PL_SPAWN 은 {' | '.join(SPAWN_POINTS)}: {SPAWN!r}")
 
     track_path, (flow_axis, flow_sign), inset = SPAWN_POINTS[SPAWN]
     cross_axis = "y" if flow_axis == "x" else "x"
     fb = FALLBACK[SPAWN]
+
+    # 벨트 자체가 없으면 FALLBACK 좌표는 허공을 가리킨다. 조용히 넘어가면
+    # 박스가 바닥으로 떨어지므로 여기서 끊는다.
+    if not stage.GetPrimAtPath(track_path):
+        raise RuntimeError(
+            f"[feeder] 투입 벨트 {track_path} 가 이 스테이지에 없다 "
+            f"(PL_SPAWN={SPAWN!r}, 스테이지={STAGE_PATH}). "
+            f"이 스테이지에 있는 투입구를 PL_SPAWN 으로 고르거나 "
+            f"벨트가 있는 USD 를 PL_STAGE 로 열어라.")
 
     prim, prim_path = None, f"{track_path}/<{'|'.join(DECK_NAMES)}>"
     for deck in DECK_NAMES:
@@ -230,6 +286,7 @@ def _measure(stage):
 
     BELT_TOP_Z = float(mx[2])
     BELT_HALF_W = float((mx[i_cross] - mn[i_cross]) / 2.0)
+    BELT_FLOW_RANGE = (float(mn[i_flow]), float(mx[i_flow]), i_flow)
     center = (along, cross_c) if flow_axis == "x" else (cross_c, along)
 
     print(f"[feeder] 벨트 실측 {prim_path}")

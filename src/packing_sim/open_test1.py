@@ -10,7 +10,7 @@ import sys
 
 import omni.usd
 
-STAGE = "/home/rokey/isaac_scenes/project_1/test1.usd"
+STAGE = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/project_1/test1.usd")
 omni.usd.get_context().open_stage(STAGE)
 
 if os.environ.get("PL_NO_FEEDER"):

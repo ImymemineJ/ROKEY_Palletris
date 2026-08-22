@@ -2,6 +2,7 @@
 # test1.usd 를 열고 투입구 피더를 붙인다. Play 를 누르면 박스가 하나씩 떨어진다.
 #   ./run_spawn_feeder.sh
 #   PL_N=20 PL_INTERVAL=2 PL_SPAWN=feeder ./run_spawn_feeder.sh
+#   PL_STAGE=~/isaac_scenes/project_1/test1-1.usd ./run_spawn_feeder.sh   # 벨트 1개 씬
 #   PL_CAM_SPEED=2 ./run_spawn_feeder.sh        # 이번 실행만 카메라 속도 지정
 set -e
 
