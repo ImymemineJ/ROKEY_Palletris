@@ -1,4 +1,4 @@
-"""공장 투입구 피더 — Play 하면 박스가 하나씩 벨트 위로 떨어진다 (총 10개).
+"""공장 투입구 피더 — Play 하면 박스가 하나씩 벨트 위로 떨어진다 (기본 10개, 12초 간격).
 
 Isaac Sim GUI 에서 돌린다.
 
@@ -18,6 +18,11 @@ Isaac Sim GUI 에서 돌린다.
     test1.usd 에 이미 있는 /World/Looks/BoxNo{3,4,5} 머티리얼을 쓰고,
     없으면 만든다. displayColor 도 같이 넣는다.
   · Stop 하면 스폰한 박스를 전부 지우고 카운터를 리셋한다. 다시 Play 하면 처음부터.
+
+흔들림 (PL_JITTER, 기본 1)
+  0 으로 두면 가로 지터와 요 흔들림을 끈다. 박스가 항상 벨트 한가운데에
+  0도 또는 90도 로 반듯하게 떨어진다. 픽 지점까지 벨트가 세워 주면 로봇이
+  볼 자세가 완전히 고정되므로, 로봇 사이클을 붙일 때 이렇게 쓴다.
 
 투입 위치 (PL_SPAWN)
   스테이지에서 벨트 메시 bbox 를 재서 폭 중심 · 상면 · 진입단을 그때그때 구한다.
@@ -50,7 +55,11 @@ DEFAULT_STAGE = "/home/rokey/isaac_scenes/project_1/test1.usd"
 STAGE_PATH = os.environ.get("PL_STAGE", DEFAULT_STAGE)
 
 N_BOXES = int(os.environ.get("PL_N", 10))
-INTERVAL = float(os.environ.get("PL_INTERVAL", 3.0))   # 박스 사이 간격 [초]
+# 박스 사이 간격 [초]. 사양 stage1.spawn_interval_s 값이다.
+# 예전 기본값은 3초였는데, 벨트가 픽 지점에서 멈춰 로봇 사이클(10초)을
+# 기다리는 방식으로 바뀌면서 3초로는 벨트에 박스가 계속 쌓였다.
+# 사이클보다 길게 잡아야 줄이 늘어나지 않는다 (12 > 10).
+INTERVAL = float(os.environ.get("PL_INTERVAL", 12.0))
 SEED = os.environ.get("PL_SEED")                       # 없으면 매번 다른 랜덤
 SPAWN = os.environ.get("PL_SPAWN", "cube")
 DROP_H = float(os.environ.get("PL_DROP_H", "0.30"))   # 벨트면 위 낙하 높이 [m]
@@ -58,6 +67,10 @@ DROP_H = float(os.environ.get("PL_DROP_H", "0.30"))   # 벨트면 위 낙하 높
 # 1 로 두면 한 개씩 — 로봇이 그 박스를 집어 올려 벨트에서 빠져야 다음이 들어온다.
 # 팔레타이징 사이클(집기 -> 놓기 -> 복귀)에 투입을 맞추는 용도다.
 MAX_ON_BELT = int(os.environ.get("PL_MAX_ON_BELT", 0))
+# 가로 위치와 요(yaw) 를 얼마나 흔들지. 1 이면 기존대로 랜덤, 0 이면 항상
+# 벨트 한가운데에 반듯하게 떨어뜨린다. 로봇이 고정된 픽 자세 하나로 집게
+# 하려면 0 이다 (belt_cycle 이 x 를 고정해 주고, 이게 y 와 yaw 를 고정한다).
+JITTER = float(os.environ.get("PL_JITTER", "1"))
 
 BOX_ROOT = "/World/Boxes"
 LOOKS_ROOT = "/World/Looks"
@@ -80,8 +93,9 @@ BOX_SLUG = {"3호": "No3", "4호": "No4", "5호": "No5"}
 #
 #   이름: (조각 프림, (흐름 축, 부호), 진입단에서 안쪽으로 넣을 거리 [m])
 SPAWN_POINTS = {
-    # 공장 투입구. ConveyorTrack 은 x=0 쪽으로 들어와 -X 로 흐른다.
-    "cube":   ("/World/ConveyorTrack",    ("x", -1), 0.50),
+    # 공장 투입구. system.yaml 좌표계에서 라인은 x=0 에서 +X 로 흐르고,
+    # 진입단에서 0.50m 안쪽 = x=500mm 가 사양의 spawn_point_mm 다.
+    "cube":   ("/World/ConveyorTrack",    ("x", +1), 0.50),
     # 로봇까지 이어지는 본선 시작점. ConveyorTrack_03 은 +Y 로 흐른다.
     "feeder": ("/World/ConveyorTrack_03", ("y", +1), 0.40),
 }
@@ -92,7 +106,7 @@ DECK_NAMES = ("Rollers", "Belt")
 
 # 실측이 안 될 때만 쓰는 값 (2026-08-21 헤드리스 실측 기록).
 FALLBACK = {
-    "cube":   {"top": 1.7805, "center": (-0.500, 0.000), "half": 0.5005},
+    "cube":   {"top": 0.8000, "center": (0.500, 0.000), "half": 0.7730},
     "feeder": {"top": 1.7805, "center": (-9.496, 1.896), "half": 0.4500},
 }
 
@@ -303,12 +317,13 @@ def _spawn_one():
     name = rng.choices(list(BOX_SPECS), weights=[BOX_RATIO[k] for k in BOX_SPECS])[0]
     dims = BOX_SPECS[name]
 
-    yaw = (90.0 if rng.random() < 0.5 else 0.0) + rng.uniform(-YAW_JITTER_DEG, YAW_JITTER_DEG)
+    yaw = (90.0 if rng.random() < 0.5 else 0.0) + \
+        rng.uniform(-YAW_JITTER_DEG, YAW_JITTER_DEG) * JITTER
     c, s = abs(math.cos(math.radians(yaw))), abs(math.sin(math.radians(yaw)))
     # 벨트를 가로지르는 방향의 반폭 (진행축에 따라 x/y 가 바뀐다)
     half = (dims[0] * c + dims[1] * s) / 2.0 if axis == "x" else (dims[0] * s + dims[1] * c) / 2.0
     jitter = max(0.0, BELT_HALF_W - EDGE_MARGIN - half)
-    off = rng.uniform(-jitter, jitter)
+    off = rng.uniform(-jitter, jitter) * JITTER
 
     # (cx, cy) 는 실측한 벨트 폭 중심이므로 off 만 걸면 항상 벨트 안이다.
     x = cx + off if axis == "x" else cx

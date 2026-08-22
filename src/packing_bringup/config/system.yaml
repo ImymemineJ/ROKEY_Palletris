@@ -29,14 +29,14 @@ zones:
   list: ["A", "B", "C"]
   buffer_capacity: 4
   pallet_origin_world_mm:
-    A: [11200,   900, 150]
-    B: [11200,  -600, 150]
-    C: [11200, -2100, 150]
+    A: [11200,   900, 1000]
+    B: [11200, -1400, 1000]
+    C: [11200, -2100, 1000]
   robot_base_world_mm:
     # z = 페데스탈 높이. 구 사양서 §3-1 "로봇 베이스 (600, −300, 700)" 기준
-    A: [10900,  1500, 700]
-    B: [10900,     0, 700]
-    C: [10900, -1500, 700]
+    A: [10900,  1500, 1800]
+    B: [10900,  -800, 1800]
+    C: [10900, -1500, 1800]
 
 conveyor:
   belt_velocity_mps: 0.5
@@ -57,7 +57,15 @@ pallet:
   depth_mm: 1200              # Py
   thickness_mm: 150
   max_stack_mm: 1300          # 1t 트럭 내高 1600 − 팔레트 150 − 천장여유 150 (구 사양서 §5-1·§3-1)
-                              # → 적재 상단 z = 150 + 1300 = 1450
+                              # 팔레트 상면 기준 높이다. 월드 z 는 pallet_origin.z + 1300.
+
+truck:
+  # ★ bed_height_mm 은 가정값이다 (1t 포터/봉고 적재함 지상고 실측 850).
+  # 확정되면 여기만 고치면 씬·도달검증이 전부 따라온다.
+  # 팔레트를 적재 후 그대로 반출 컨베이어로 트럭에 밀어 넣으므로,
+  # 팔레트 **밑면**이 이 높이에 있어야 한다.
+  bed_height_mm: 850
+  interior_height_mm: 1600
 
 heightmap:
   cell_mm: 10
@@ -71,7 +79,10 @@ heightmap:
   topk_support_check: 50
 
 robot:
-  pedestal_height_mm: 700           # 구 사양서 §3 도달 계산 결과. G1 실측으로 확정할 것
+  # 팔레트가 트럭 바닥 높이(850)로 올라가면서 700 -> 1800. 700 이면 적재 상단
+  # (월드 z 2500) 이 리치 밖이다. scripts/verify_reach.py 로 역산·검증했다:
+  #   700/900/1100/1300 실패, 1588 이상 필요, 1600 통과(+7mm) · 1800 통과(+63mm)
+  pedestal_height_mm: 1800
   gripper_length_mm: 150            # 확정 시 §3.4 재계산
   approach_offset_mm: 200
   release_speed_threshold_mm_s: 5.0
