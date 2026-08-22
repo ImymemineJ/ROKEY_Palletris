@@ -241,7 +241,7 @@ def _on_timeline(event):
 # 관절을 푸는 게 아니라 박스를 키네마틱으로 바꿔 옮긴다. 목적은 "벨트가
 # 언제 멈추고 언제 다시 도는지" 를 눈으로 확인하는 것 하나다.
 # set_robot() 으로 갈아 끼우면 이 코드는 안 불린다.
-def _pallet_slot(stage, idx, dims):
+def pallet_slot(stage, idx, dims):
     """팔레트 위 적재 자리. 단순 격자다 — 진짜 패킹은 packing.py 쪽 몫이다."""
     prim = stage.GetPrimAtPath(PALLET)
     if not prim or not prim.IsValid():
@@ -270,7 +270,7 @@ def _stub_begin(stage, prim, pose):
     # 물리를 끄고(키네마틱) 손으로 옮긴다. 안 그러면 중력에 그냥 떨어진다.
     UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
     dims = _box_dims(prim)
-    t1 = _pallet_slot(stage, _state["placed"], dims)
+    t1 = pallet_slot(stage, _state["placed"], dims)
     # 이송 높이는 출발지와 목적지 **둘 다** 위여야 한다. 팔레트가 트럭 바닥
     # 높이로 올라가면서 적재 상단이 벨트면보다 훨씬 높아졌다 — 벨트 기준으로
     # 고정하면 높은 층에 놓을 때 박스를 아래로 끌고 가 팔레트를 들이받는다.

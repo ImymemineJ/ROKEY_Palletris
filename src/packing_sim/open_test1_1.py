@@ -10,6 +10,7 @@
 # 끄는 법
 #   PL_NO_FEEDER=1   피더 없이 스테이지만
 #   PL_NO_CYCLE=1    벨트를 계속 돌린다 (예전 동작). 박스는 끝에서 떨어진다.
+#   PL_NO_ROBOT=1    H2017 대신 스텁이 집는다 (박스를 순간이동시킨다).
 #
 # 자주 쓰는 값
 #   PL_N, PL_INTERVAL   투입 개수/간격 (기본 10개, 12초 = 사양 stage1)
@@ -43,6 +44,12 @@ else:
     import spawn_feeder
     spawn_feeder.start()
     print("[open_test1_1] 피더 부착 완료.")
+
+if os.environ.get("PL_NO_ROBOT"):
+    print("[open_test1_1] PL_NO_ROBOT — 스텁이 집는다 (H2017 안 씀).")
+else:
+    import robot_h2017
+    robot_h2017.attach()
 
 if os.environ.get("PL_NO_CYCLE"):
     print("[open_test1_1] PL_NO_CYCLE — 벨트를 계속 돌린다.")

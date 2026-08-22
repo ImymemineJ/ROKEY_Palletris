@@ -13,6 +13,7 @@
   5) 팔레트를 pallet_origin 에 놓는다 (원점은 모서리, 상면이 origin.z).
   6) 팔레트 반출 컨베이어 상판을 트럭 바닥 높이에 깐다. 적재가 끝난 팔레트를
      들지 않고 그대로 밀어 트럭에 넣으므로 팔레트 밑면이 여기에 얹힌다.
+  7) H2017 을 페데스탈 위(로봇 베이스 좌표)에 올린다.
 
 높이(800mm)와 속도(0.5m/s)는 set_belt_800_test1_1.py 가 이미 맞춰 놨다.
 여기서는 건드리지 않는다.
@@ -61,6 +62,11 @@ STRAY = ["/ConveyorTrack1"]
 ENDSTOP_ROOT = "/World/EndStops"
 PEDESTAL = "/World/Pedestal"
 OUTFEED = "/World/PalletOutfeed"
+ROBOT = "/World/robot"
+# H2017. 관절 한계·드라이브 게인이 URDF/system.yaml 로 교정된 판이다
+# (h2017/HANDOFF.md 참조). 다른 판을 쓰려면 PL_ROBOT_USD 로 준다.
+ROBOT_USD = os.environ.get(
+    "PL_ROBOT_USD", "/home/rokey/isaac_scenes/robot/h2017.usd")
 PALLET = "/World/Pallet"
 
 # Isaac Sim 헤드리스 실측 (2026-08-22), A05 로 교체하고 scale=(4.180, 0.8019, 1.0399)
@@ -308,6 +314,22 @@ else:
     print(f"반출 컨베이어 x {ox0*1000:.0f}~{ox1*1000:.0f}  "
           f"y {oy0*1000:.0f}~{oy1*1000:.0f}  "
           f"상면 z={bed*1000:.0f} (트럭 바닥 높이)")
+
+# ── 6) H2017 ────────────────────────────────────────────────
+# 베이스는 페데스탈 상면이다. base_link 가 프림 원점이므로 그대로 얹으면 된다.
+drop("/World", "robot")
+if os.path.exists(ROBOT_USD):
+    spec = Sdf.CreatePrimInLayer(layer, Sdf.Path(ROBOT))
+    spec.specifier = Sdf.SpecifierDef
+    spec.typeName = "Xform"
+    spec.referenceList.prependedItems.append(Sdf.Reference(ROBOT_USD))
+    xform(spec, (base[0], base[1], base[2]), (1.0, 1.0, 1.0))
+    print(f"로봇 {ROBOT} <- {ROBOT_USD}")
+    print(f"      베이스 ({base[0]:.3f}, {base[1]:.3f}, {base[2]:.3f}) "
+          f"= 페데스탈 상면")
+else:
+    print(f"로봇 건너뜀 — {ROBOT_USD} 가 없다. "
+          f"h2017/HANDOFF.md 의 make_h2017_usd.py 로 만들어라.")
 
 layer.Save()
 print(f"\n저장 완료: {USD_PATH}")
