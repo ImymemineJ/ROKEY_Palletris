@@ -630,8 +630,13 @@ def main():
         #  세 존의 팔레트가 이 라인 위에 800 씩 붙어 2400 (= 트럭 바닥, 5-2) 이 된다.
         cen = pallet_to_world(pw / 2.0, pd / 2.0)
         span = np.abs(CR @ np.array([pw, pd]))          # 회전 후 월드축 투영 (mm)
+        #  ★ 롤러 상면 = **팔레트 밑면** = 트럭 적재함 바닥 = 월드 z 0 (도크 규약).
+        #    팔레트를 들지 않고 그대로 밀어 넣으므로 세 면이 같은 높이다.
+        #    ⚠ truck.bed_height_mm(850) 을 여기 쓰면 안 된다 — 그건 월드 z 가 아니라
+        #      **야드 지면 대비** 도크 높이다. 쓰면 슬래브가 팔레트 위에 떠서 상판처럼 보인다.
+        bed = origin[2] - cfg["pallet"]["thickness_mm"]      # = 0
         VisualCuboid(prim_path="/World/vis/roller", name="vis_roller",
-                     position=np.array([cen[0], 0.0, -0.075]),
+                     position=np.array([cen[0], 0.0, (bed - 75.0) / 1000.0]),
                      scale=np.array([(span[0] + 400.0) / 1000.0, 6.0, 0.15]),
                      color=np.array([0.30, 0.30, 0.34]))
 
