@@ -8,7 +8,7 @@
 | OS | Ubuntu 24.04 LTS |
 | 미들웨어 | ROS 2 Jazzy |
 | 시뮬레이터 | NVIDIA Isaac Sim 5.1 |
-| 로봇 | 두산 H2017 (페데스탈 500mm) |
+| 로봇 | 두산 H2017 (페데스탈 700mm) |
 | 워크스페이스 | `~/palletris_ws` |
 
 ## 문서
