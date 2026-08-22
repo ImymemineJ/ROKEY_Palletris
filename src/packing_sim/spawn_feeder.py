@@ -17,6 +17,8 @@ Isaac Sim GUI 에서 돌린다.
   · 색은 호수 고정 — 3호 빨강 / 4호 초록 / 5호 파랑.
     test1.usd 에 이미 있는 /World/Looks/BoxNo{3,4,5} 머티리얼을 쓰고,
     없으면 만든다. displayColor 도 같이 넣는다.
+  · 박스는 **scale 없는 Mesh** 다. Cube + xformOp:scale 로 만들면 로봇이
+    흡착할 때 박스가 42.8mm 뜬 채로 붙는다 — _make_box 주석 참고.
   · Stop 하면 스폰한 박스를 전부 지우고 카운터를 리셋한다. 다시 Play 하면 처음부터.
 
 흔들림 (PL_JITTER, 기본 1)
@@ -342,11 +344,36 @@ def _spawn_one():
 
 
 def _make_box(stage, path, name, dims, pos, yaw_deg):
-    cube = UsdGeom.Cube.Define(stage, path)
-    prim = cube.GetPrim()
-    cube.CreateSizeAttr(1.0)
-    cube.CreateExtentAttr([Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
-    cube.CreateDisplayColorAttr([Gf.Vec3f(*BOX_COLOR[name])])
+    """박스 하나. dims = (w, d, h) [m].
+
+    ★ xformOp:scale 을 걸지 않는다. 치수를 지오메트리에 직접 굽는다.
+      SurfaceGripper 의 런타임 구속 앵커 계산이 프림 스케일을 처리하지 못해
+      **흡착하면 박스가 상판에서 42.8mm 떨어진 채 붙는다.**
+      구 저장소에서 단일 변수로 확인된 값이다:
+
+          Cube size=1.0, scale=(0.34, 0.25, 0.21)  ->  +42.8mm
+          Cube size=0.2, scale=(1, 1, 1)           ->   -0.0mm
+
+      바꾼 건 scale 하나뿐이다 — 원인은 치수가 아니라 스케일 그 자체다.
+      USD 를 뒤져도 안 보인다. SurfaceGripper 는 USD 의 attachment point
+      조인트를 건드리지 않고 PhysX 내부에 따로 구속을 만들기 때문이다.
+
+      직육면체가 필요한데 Cube 는 한 변만 지정할 수 있어서, 점을 직접 박은
+      Mesh 로 만든다. translate / orient 는 그대로 써도 된다.
+    """
+    hx, hy, hz = dims[0] / 2.0, dims[1] / 2.0, dims[2] / 2.0
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    prim = mesh.GetPrim()
+
+    pts = [(-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
+           (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz)]
+    mesh.CreatePointsAttr([Gf.Vec3f(*q) for q in pts])
+    mesh.CreateFaceVertexCountsAttr([4] * 6)
+    mesh.CreateFaceVertexIndicesAttr([0, 3, 2, 1,  4, 5, 6, 7,  0, 1, 5, 4,
+                                      1, 2, 6, 5,  2, 3, 7, 6,  3, 0, 4, 7])
+    mesh.CreateExtentAttr([Gf.Vec3f(-hx, -hy, -hz), Gf.Vec3f(hx, hy, hz)])
+    mesh.CreateSubdivisionSchemeAttr("none")     # 없으면 모서리가 둥글어진다
+    mesh.CreateDisplayColorAttr([Gf.Vec3f(*BOX_COLOR[name])])
 
     xf = UsdGeom.Xformable(prim)
     xf.ClearXformOpOrder()
@@ -354,13 +381,14 @@ def _make_box(stage, path, name, dims, pos, yaw_deg):
     half = math.radians(yaw_deg) / 2.0
     xf.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
         Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half))))
-    xf.AddScaleOp().Set(Gf.Vec3d(*dims))
+    # ★ AddScaleOp 을 넣지 않는다. 넣어야 한다면 반드시 (1, 1, 1) 이어야 한다.
 
     UsdPhysics.CollisionAPI.Apply(prim)
+    # 직육면체라 convexHull 근사 오차가 없다.
+    UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr("convexHull")
     PhysxSchema.PhysxCollisionAPI.Apply(prim)
     UsdPhysics.RigidBodyAPI.Apply(prim)
     UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(BOX_MASS[name])
-
 
     mat = UsdShade.Material(stage.GetPrimAtPath(f"{LOOKS_ROOT}/Box{BOX_SLUG[name]}"))
     if mat:
