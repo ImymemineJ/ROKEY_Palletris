@@ -52,6 +52,8 @@ import _paths                                          # noqa: E402
 import import_h2017_usd as IMP                         # make_abs_urdf 재사용  # noqa: E402
 
 ASSET = Path.home() / "isaac_assets/h2017.usd"
+# 흡착 그리퍼가 붙은 판 (scripts/build_gripper_usd.py 가 만든다). B3 이후는 이쪽을 쓴다.
+ASSET_SUCTION = Path.home() / "isaac_assets/h2017_suction.usd"
 PRIM = "/World/h2017"
 EE_FRAME = "tool0"
 
@@ -97,7 +99,7 @@ def start_log(path):
     return tee
 
 
-def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False):
+def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False, asset=None):
     """h2017 을 씬에 올리고 Lula 를 물린다. **SimulationApp 이 이미 떠 있어야 한다.**
 
     반환 네임스페이스: world, art, lula, ik, base(m), ready(rad), hz, grip(m), cfg,
@@ -111,8 +113,9 @@ def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False):
     grip = cfg["robot"]["gripper_length_mm"] / 1000.0
     base = np.array(cfg["zones"]["robot_base_world_mm"][zone], dtype=float) / 1000.0
 
-    if not ASSET.exists():
-        sys.exit("no asset: %s\n  -> run scripts/import_h2017_usd.py first" % ASSET)
+    asset = Path(asset) if asset else ASSET
+    if not asset.exists():
+        sys.exit("no asset: %s\n  -> run scripts/import_h2017_usd.py first" % asset)
 
     # Lula 는 URDF 로 기구학을 만든다. `package://` 는 못 읽으므로 절대경로 임시본을 쓴다.
     tmp = tempfile.mkdtemp(prefix="h2017_lula_")
@@ -129,7 +132,7 @@ def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False):
     from isaacsim.core.utils.types import ArticulationAction
 
     world = World(stage_units_in_meters=1.0, physics_dt=1.0 / hz, rendering_dt=1.0 / hz)
-    add_reference_to_stage(usd_path=str(ASSET), prim_path=prim)
+    add_reference_to_stage(usd_path=str(asset), prim_path=prim)
     SingleXFormPrim(prim).set_world_pose(position=base)      # ★ reset 전에. docstring 2번
     if ground:
         world.scene.add_default_ground_plane()

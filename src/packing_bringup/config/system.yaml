@@ -81,6 +81,16 @@ robot:
   gripper_length_mm: 150            # 플랜지(tool0) ~ 흡착 접촉면
   gripper_body_diameter_mm: 245     # 몸통 원기둥. 밑면이 흡착면과 같은 평면이다
   gripper_pad_span_mm: [210, 160]   # Ø50 패드 4개의 바깥 치수
+  # 흡착 (B3). 힘 상한은 물리로 못 건다 — 컨트롤러에서 규제한다 (흡착_그리퍼_트러블슈팅 문제②)
+  suction:
+    pad_diameter_mm: 50
+    pad_xy_mm: [[80, 55], [80, -55], [-80, 55], [-80, -55]]   # tool0 로컬, z = 그리퍼 길이
+    body_mass_kg: 2.0               # 유효 가반 20 − 2 ≈ 18 kg (구 사양서 §2)
+    max_grip_distance_mm: 20        # 패드가 상판을 무는 거리. 작을수록 "닿아야만" 잡힌다
+    coaxial_force_limit_n: 39.0     # 16 kgf = 157 N ÷ 4패드 (구 사양서 §4-4)
+    shear_force_limit_n: 15.0       # 전단은 축력의 30~50%
+    retry_interval_s: 10.0          # ★ "재시도 간격"이 아니라 닫기를 시도하는 **총 시간**
+                                    #   0 이면 즉시 포기해 영영 Open 에 머문다
   approach_offset_mm: 200
   release_speed_threshold_mm_s: 5.0
   release_wait_timeout_s: 3.0
