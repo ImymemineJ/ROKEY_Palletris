@@ -14,6 +14,7 @@ class HeightmapPacker:
         self.hm = np.zeros((self.W, self.D), dtype=np.int32)
         self.max_stack = pal["max_stack_mm"]                # ★ G1 전까지 이 값만 바꿔가며 실험
         self.w_h, self.w_s = hm_cfg["w_height"], hm_cfg["w_support"]
+        self.w_wall = hm_cfg.get("w_wall", 0.0)             # 벽 밀착도 (0 이면 기존 동작)
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
         self.min_sup = hm_cfg["min_support_ratio"]          # 0.7
@@ -58,7 +59,15 @@ class HeightmapPacker:
             #   아래 for 문의 key 동점 처리는 "뽑힌 50개 안에서만" 도는 뒷북이므로,
             #   1차 점수에 미리 위치 벌점을 섞어 정렬 자체가 DBLF 를 따르게 한다.
             ii, jj = np.indices(bz.shape)
-            score = np.where(cand, base_score - self.tie_eps * (ii + jj), -np.inf)
+            # ★ 벽 밀착도 — 박스 둘레 중 팔레트 가장자리에 닿는 비율 (0~1).
+            #   가장자리부터 채우면 가운데에 "큰 박스가 통째로 들어갈 자리"가 남는다.
+            #   자투리 공간이 흩어지는 것을 막는 항이라, 이게 없으면 나중에 오는 5호가
+            #   들어갈 480x380 짜리 연속 영역이 사라진다. (명세서 §7.3 Max-Contact-Area)
+            per = 2 * (wc + dc)
+            wall = ((ii == 0) * dc + (ii + wc == self.W) * dc +
+                    (jj == 0) * wc + (jj + dc == self.D) * wc) / per
+            score = np.where(cand, base_score + self.w_wall * wall
+                             - self.tie_eps * (ii + jj), -np.inf)
             # ③ 지지율: 상위 K개만 정밀 계산 (전 후보는 너무 비쌈 — 명세서 §7.9)
             flat = np.argsort(score, axis=None)[::-1][: self.topk]
             for idx in flat:
@@ -66,7 +75,8 @@ class HeightmapPacker:
                 if not cand[i, j]: continue
                 sup = self._support_ratio(i, j, wc, dc, int(bz[i, j]))
                 if sup < self.min_sup: continue
-                s = self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
+                s = (self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
+                     + self.w_wall * wall[i, j])
                 key = (s, -(i + j))                          # 동점 → 좌하단 우선
                 if best is None or key > best[0]:
                     best = (key, i, j, int(bz[i, j]), yaw, w, d)
