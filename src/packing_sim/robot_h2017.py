@@ -34,6 +34,22 @@ IK 는 Lula 를 쓴다 (`isaacsim.robot_motion.motion_generation`).
 이 처방의 출처는 로봇 트랙이다 — `scripts/verify_cycle.py` (main) 의
 "★ 보간은 태스크 공간이다" 와 `--warm ready`. 여기서 다시 유도하지 않는다.
 
+## IK 해는 **현재 자세에서 가장 가까운 것**을 고른다
+
+태스크 공간으로 쪼개도 그것만으로는 부족했다. `_solve` 가 시드 목록에서
+**처음 풀린 해**를 그냥 돌려주면, 목표가 몇 mm 만 움직여도 다른 가지의 해가
+먼저 풀려 팔이 통째로 돈다. 2026-08-22 실측:
+
+    팔레트 (10600, 650) 1번 박스   정상
+    팔레트 (10600, 1050) 2번 박스  정상
+    팔레트 (11200, 650) 3번 박스   '이송' 시간 초과, 잔여 227.2도
+
+세 목표 모두 도달범위 안이다 (최원 1158mm < 실효 1550mm). 리치가 아니라
+가지 선택 문제다. 지금은 시드를 전부 풀어 보고 **현재 관절각과의 최대 차이가
+가장 작은 해**를 고른다. joint_1/4/5/6 은 가동범위가 ±360도라 같은 자세를
+±2pi 만큼 옮긴 등가해가 있으므로, 그중 현재값에 가까운 쪽으로 풀어 준다
+(joint_2 ±125도 · joint_3 ±160도 는 2pi 여유가 없어 그대로 둔다).
+
 ## 드라이브 게인은 건드리지 않는다
 
 한때 팔이 IK 지령을 못 따라가서 (잔여 46도) 게인을 의심했다. 아니었다.
@@ -219,14 +235,32 @@ def on_pick(box_path, pose):
     drop_top = float(slot[2]) + dims[2] / 2.0     # 놓았을 때의 윗면
 
     a = _s["approach"]
-    safe = max(top, drop_top) + a + 0.20          # 이송 높이
+    # 팔레트 위 이송 높이. 적재 상단에서 approach_offset_mm 만큼 띄운다.
+    # ★ 예전에는 여기에 +0.20 이 더 붙어 있었다. system.yaml 어디에도 없는
+    #   숫자였고 (철칙 3), 사양의 approach_offset_mm 200 을 이중으로 먹어
+    #   이송 높이를 200mm 씩 밀어 올렸다. 그만큼 도달범위를 까먹는다 —
+    #   2026-08-22 실측: 2층 5호 이송이 2080mm 로 올라가 y=1050 열이
+    #   1760mm 를 요구해 IK 가 실패했다 (실효 리치 1550). 사양값만 쓴다.
+    safe = max(top, drop_top) + a
+
+    # ★ 벨트 위에서는 그 높이까지 못 든다. 픽 지점이 로봇에서 1143mm 떨어져
+    #   있어서 z 1960mm 는 도달범위 밖이다 — 2026-08-22 실측:
+    #
+    #       [robot] ★ IK 실패 — '상승' (9757, -0, 1960)
+    #
+    #   목적지 (10600, 650, 1960) 자체는 1449mm 라 닿는다. 순전히 경로 문제라
+    #   벨트 위에서는 박스를 벨트에서 떼는 만큼만 들고, 나머지 높이는 팔레트로
+    #   가는 사선에서 번다. 이송은 태스크 공간 직선이라 중간점도 전부 도달범위
+    #   안이고(최원 1291mm), 팔레트 앞 모서리를 지날 때 박스 밑면이 적재 상단
+    #   보다 150mm 이상 위에 있다.
+    lift = top + a
 
     # (목표 흡착면 z, 동작) 순서로. 흡착면이 박스 윗면에 닿아야 잡힌다.
     _s["wps"] = [
         ("이동",   (pose[0], pose[1], top + a),        None),
         ("하강",   (pose[0], pose[1], top),            None),
         ("흡착",   None,                               ("grip", box_path)),
-        ("상승",   (pose[0], pose[1], safe),           None),
+        ("상승",   (pose[0], pose[1], lift),           None),
         ("이송",   (float(slot[0]), float(slot[1]), safe),     None),
         ("하강",   (float(slot[0]), float(slot[1]), drop_top), None),
         ("놓기",   None,                               ("release", None)),
@@ -237,7 +271,8 @@ def on_pick(box_path, pose):
     _s.setdefault("log", [])
     print(f"[robot] 사이클 시작 — {box_path.split('/')[-1]} "
           f"({pose[0]*1000:.0f}, {pose[1]*1000:.0f}) 윗면 {top*1000:.0f}mm "
-          f"-> 팔레트 ({slot[0]*1000:.0f}, {slot[1]*1000:.0f}) {drop_top*1000:.0f}mm")
+          f"-> 팔레트 ({slot[0]*1000:.0f}, {slot[1]*1000:.0f}) {drop_top*1000:.0f}mm "
+          f"| 벨트 위 상승 {lift*1000:.0f}mm, 이송 {safe*1000:.0f}mm")
 
 
 def is_idle():
@@ -358,13 +393,49 @@ def _tcp_now():
     return np.array([pos[0], pos[1], pos[2] - _s["tool_len"]], dtype=float)
 
 
+def _limits():
+    """관절 가동범위 (lower, upper) [rad]. 솔버에서 읽고, 없으면 URDF 값."""
+    lim = _s.get("limits")
+    if lim is not None:
+        return lim
+    lo = hi = None
+    try:
+        lo, hi = _s["ik"].get_cspace_position_limits()
+        lo, hi = np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+    except Exception:
+        pass
+    if lo is None or hi is None or len(lo) != 6:
+        # h2017.urdf 의 <limit lower/upper>. 솔버가 안 알려줄 때만 쓴다.
+        hi = np.array([6.2832, 2.1817, 2.7925, 6.2832, 6.2832, 6.2832])
+        lo = -hi
+    _s["limits"] = (lo, hi)
+    return _s["limits"]
+
+
+def _unwind(q, cur):
+    """같은 자세의 등가해 중 현재 관절각에 가장 가까운 것.
+
+    joint_1/4/5/6 은 ±360도라 q ± 2pi 도 가동범위 안이다. 그대로 두면
+    "왼쪽으로 133도" 대신 "오른쪽으로 227도" 같은 지령이 나가 팔이 감긴다.
+    """
+    lo, hi = _limits()
+    out = np.array(q, dtype=float)
+    for j in range(len(out)):
+        best = out[j]
+        for k in (-1, 1):
+            cand = out[j] + k * 2.0 * np.pi
+            if lo[j] <= cand <= hi[j] and abs(cand - cur[j]) < abs(best - cur[j]):
+                best = cand
+        out[j] = best
+    return out
+
+
 def _solve(tcp):
     """흡착면을 tcp 에 두는 관절각. 툴 z 축은 아래를 향한다. 못 풀면 None.
 
-    웜스타트를 **고정**한다 (PL_WARM=ready). 직전 해를 이어 쓰면 손목이 한
-    방향으로 감긴다 — main 의 verify_cycle.py 가 실측으로 확인한 사실이다.
-    태스크 공간 보간으로 목표가 매 스텝 몇 mm 씩만 움직이므로, 고정 시드로도
-    해가 튀지 않고 자세가 경로 내내 유지된다.
+    시드를 **전부** 풀어 보고 현재 자세에서 가장 가까운 해를 고른다.
+    처음 풀린 해를 그냥 쓰면 목표가 몇 mm 만 움직여도 가지가 바뀌어 팔이
+    통째로 돈다 (docstring 의 227도 실측 참고).
     """
     # tool0 는 흡착면보다 그리퍼 길이만큼 위에 있다 (툴 z 가 아래를 보므로).
     pos = np.array([tcp[0], tcp[1], tcp[2] + _s["tool_len"]])
@@ -372,24 +443,30 @@ def _solve(tcp):
     quat = np.array([0.0, 1.0, 0.0, 0.0])
     cur = np.asarray(_s["art"].get_joint_positions(), dtype=float)
 
-    def take(q):
-        q = np.array(q, dtype=float)
-        _s["ik_trip"] = float(np.degrees(np.max(np.abs(q - cur))))
-        return q
-
     seeds = [HOME_Q if WARM == "ready" else _s.get("q_cmd", cur)]
     seeds += [x for x in SEEDS]
-    for i, seed in enumerate(seeds):
+    # 직전 지령과 현재 자세도 시드로 넣는다 — 경로 중간에서는 이게 가장 가깝다.
+    if _s.get("q_cmd") is not None:
+        seeds.append(_s["q_cmd"])
+    seeds.append(cur)
+
+    best, best_trip = None, None
+    for seed in seeds:
         q, ok = _s["ik"].compute_inverse_kinematics(
             frame_name=EE_FRAME, target_position=pos,
             target_orientation=quat, warm_start=np.asarray(seed, dtype=float))
-        if ok:
-            if i:
-                _s["ik_reseed"] = _s.get("ik_reseed", 0) + 1
-            return take(q)
+        if not ok:
+            continue
+        q = _unwind(np.asarray(q, dtype=float), cur)
+        trip = float(np.max(np.abs(q - cur)))
+        if best_trip is None or trip < best_trip:
+            best, best_trip = q, trip
 
-    _s["ik_fail"] = _s.get("ik_fail", 0) + 1
-    return None
+    if best is None:
+        _s["ik_fail"] = _s.get("ik_fail", 0) + 1
+        return None
+    _s["ik_trip"] = float(np.degrees(best_trip))
+    return best
 
 
 def _go(q):
