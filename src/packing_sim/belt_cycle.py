@@ -20,6 +20,28 @@
     is_idle()               로봇이 적재를 끝내고 원위치했으면 True.
                             True 가 되는 순간 벨트가 다시 돈다.
 
+벨트를 세우는 레버 (2026-08-22 실측으로 정정)
+    예전에는 `graph:variable:Velocity` 를 0 으로 썼다. **실행 중에는 안 듣는다.**
+    OmniGraph 변수의 런타임 값은 그래프 인스턴스에 있어서 USD 어트리뷰트를
+    고쳐도, og 변수 API 로 set 해도 ConveyorNode 가 다시 안 읽는다. 실측:
+
+        graph:variable:Velocity = 0 적용 후에도 박스가 1.26 m/s 로 계속 갔다.
+
+    그래서 박스가 픽 지점을 지나 벨트 끝(x=10000)에서 바닥으로 떨어졌다.
+    지금은 ConveyorNode 가 데크에 써 놓는 **physxSurfaceVelocity:surfaceVelocity
+    를 직접 0 으로** 만든다 (실측: 1초 안에 선다). 노드가 매 틱 다시 쓰지
+    않으므로 우리가 쓴 값이 유지된다.
+
+    다시 돌릴 때는 속도를 되돌리는 것만으로는 안 된다 — 멈춰 있던 박스가
+    잠들어서(sleep) 표면속도를 다시 안 받는다. surfaceVelocityEnabled 를
+    False -> True 로 토글해 깨운다.
+
+벨트 속도
+    surfaceVelocity 는 **데크 로컬** 값이라 프림 스케일이 곱해진다. 씬에 적힌
+    0.5 가 월드에서는 1.26 m/s 였다 (스케일 2.52). 사양 belt_velocity_mps 가
+    월드에서 그대로 나오도록 start() 에서 환산해 다시 쓴다. STOP_LEAD 40mm 는
+    0.5 m/s 에서 잰 값이라, 속도를 안 맞추면 정지 선행이 통째로 틀린다.
+
 환경 변수
     PL_PICK_X      픽 지점 [mm]. 기본 9760 = stopper_x_mm - 5호 폭/2.
                    도달 검증이 쓰는 값과 같다. 함부로 줄이면 리치를 넘는다.
@@ -44,11 +66,26 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 PICK_X = float(os.environ.get("PL_PICK_X", "9760")) / 1000.0
 STOP_LEAD = float(os.environ.get("PL_STOP_LEAD", "40")) / 1000.0
 CYCLE_S = float(os.environ.get("PL_CYCLE_S", "10.0"))
-BELT_MPS = float(os.environ.get("PL_BELT_MPS", "0.5"))
+def _spec_belt_mps():
+    """사양 conveyor.belt_velocity_mps. 못 읽으면 0.5."""
+    try:
+        import yaml
+        with open(os.path.expanduser(
+                "~/palletris_ws/src/packing_bringup/config/system.yaml")) as fh:
+            return float(yaml.safe_load(fh)["conveyor"]["belt_velocity_mps"])
+    except Exception:
+        return 0.5
+
+
+BELT_MPS = float(os.environ.get("PL_BELT_MPS", _spec_belt_mps()))
 SETTLE_MAX_S = 1.5      # 이 시간이 지나면 안 멎어도 진행한다 (교착 방지)
 
 BOX_ROOT = "/World/Boxes"
 PALLET = "/World/Pallet"
+
+# ConveyorNode 가 데크 프림에 써 놓는 PhysX 표면속도. 이게 진짜 레버다.
+SURF_VEL = "physxSurfaceVelocity:surfaceVelocity"
+SURF_ON = "physxSurfaceVelocity:surfaceVelocityEnabled"
 
 # 벨트 상면. start() 에서 실측값으로 덮어쓴다.
 BELT_TOP_Z = 0.800
@@ -70,23 +107,22 @@ def start():
     if stage is None:
         raise RuntimeError("[cycle] 열린 스테이지가 없다.")
 
-    vels = _find_velocity_attrs(stage)
-    if not vels:
+    if not _find_velocity_attrs(stage):
         raise RuntimeError("[cycle] graph:variable:Velocity 를 못 찾았다. "
                            "컨베이어 그래프가 있는 씬인지 확인해라.")
-    # 씬에 적힌 값이 사양 속도를 내는 로컬 값이다. 재기동할 때 이 값으로 돌린다.
-    run_vals = {a: a.Get() for a in vels}
 
     global BELT_TOP_Z
     top = _belt_top(stage)
     if top is not None:
         BELT_TOP_Z = top
 
+    # 데크의 표면속도는 ConveyorNode 가 **처음 틱을 돌 때** 쓴다. Play 전에는
+    # 어트리뷰트 자체가 없어서 여기서 잡을 수 없다 — 첫 물리 스텝에 잡는다.
     _state.update(
-        stage=stage, vels=vels, run_vals=run_vals,
+        stage=stage, decks=None, run_sv={}, wake=0,
+        deck_try=0, deck_warned=False,
         phase="RUN", timer=0.0, box=None, placed=0,
     )
-    _set_running(True)
 
     _state["physics_sub"] = get_physx_interface().subscribe_physics_step_events(_on_step)
     _state["timeline_sub"] = (
@@ -97,7 +133,8 @@ def start():
 
     mode = "실제 로봇" if _robot["on_pick"] else f"스텁 ({CYCLE_S:.1f}초/사이클)"
     print(f"[cycle] 픽 지점 x={PICK_X * 1000:.0f}mm  "
-          f"정지 선행 {STOP_LEAD * 1000:.0f}mm  벨트면 {BELT_TOP_Z * 1000:.0f}mm")
+          f"정지 선행 {STOP_LEAD * 1000:.0f}mm  벨트면 {BELT_TOP_Z * 1000:.0f}mm  "
+          f"벨트 {BELT_MPS:.2f} m/s")
     print(f"[cycle] 로봇: {mode}. Play 하면 박스가 픽 지점에 서고 벨트가 멈춘다.")
 
 
@@ -106,8 +143,8 @@ def stop():
         _state["physics_sub"] = None
     if _state.get("timeline_sub") is not None:
         _state["timeline_sub"] = None
-    if _state.get("vels"):
-        _set_running(True)      # 씬을 굴러가는 상태로 되돌려 놓고 나간다
+    if _state.get("decks"):
+        _restore_belt()         # 씬을 굴러가는 상태로 되돌려 놓고 나간다
     _state.clear()
 
 
@@ -139,9 +176,97 @@ def _belt_top(stage):
     return max(tops) if tops else None
 
 
+def _ensure_decks(stage):
+    """표면속도가 걸린 데크를 잡고, 사양 속도가 나오도록 다시 쓴다.
+
+    Play 전에는 ConveyorNode 가 아직 아무것도 안 써서 못 잡는다. 첫 물리
+    스텝에 한 번 잡으면 그 뒤로는 우리가 들고 있는다.
+    """
+    if _state.get("decks") is not None:
+        return bool(_state["decks"])
+
+    decks, run_sv = [], {}
+    for prim in stage.Traverse():
+        a = prim.GetAttribute(SURF_VEL)
+        v = a.Get() if a else None
+        if v is None or Gf.Vec3d(v[0], v[1], v[2]).GetLength() < 1e-9:
+            continue
+        local = Gf.Vec3d(v[0], v[1], v[2])
+        # surfaceVelocity 는 데크 로컬이다. 월드 속도로 환산해 사양에 맞춘다.
+        world = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()).TransformDir(local)
+        w = world.GetLength()
+        if w < 1e-9:
+            continue
+        run = local * (BELT_MPS / w)
+        decks.append(prim)
+        run_sv[str(prim.GetPath())] = Gf.Vec3f(run[0], run[1], run[2])
+        print(f"[cycle] 데크 {prim.GetPath()}  "
+              f"로컬 {local[0]:+.3f} -> 월드 {w:.3f} m/s  "
+              f"=> 사양 {BELT_MPS:.3f} m/s 로 재설정")
+
+    if not decks:
+        # ★ 여기서 빈 결과를 캐시하면 안 된다. Play 직후 몇 스텝은 ConveyorNode 가
+        #   아직 표면속도를 안 써서 못 찾는 게 정상이다. 캐시해 버리면 Stop 후
+        #   다시 Play 했을 때 영영 못 잡는다 (2026-08-22 Stop->Play 시험에서 발견).
+        _state["deck_try"] = _state.get("deck_try", 0) + 1
+        if _state["deck_try"] == 180 and not _state.get("deck_warned"):
+            _state["deck_warned"] = True
+            print("[cycle] ★ 3초가 지나도 표면속도가 걸린 데크를 못 찾았다 — "
+                  "벨트를 못 세운다. 컨베이어 그래프가 도는지 확인해라.")
+        return False
+
+    _state["decks"] = decks
+    _state["run_sv"] = run_sv
+    _state["deck_try"] = 0
+    _set_running(True)
+    return True
+
+
 def _set_running(on):
-    for a in _state.get("vels", []):
-        a.Set(_state["run_vals"][a] if on else 0.0)
+    """벨트 on/off. 데크의 PhysX 표면속도를 직접 건드린다 (docstring 참고)."""
+    for prim in _state.get("decks", []):
+        a = prim.GetAttribute(SURF_VEL)
+        if not a:
+            continue
+        a.Set(_state["run_sv"][str(prim.GetPath())] if on else Gf.Vec3f(0, 0, 0))
+        if on:
+            # 멈춰 있던 박스가 잠들어 있으면 속도만 되돌려선 안 깨어난다.
+            # enabled 를 껐다가 다음 스텝에 켜서 접촉을 다시 만든다.
+            e = prim.GetAttribute(SURF_ON)
+            if e:
+                e.Set(False)
+    if on:
+        _state["wake"] = 1
+
+
+def _restore_belt():
+    """벨트를 굴러가는 상태로 되돌려 놓는다 (깨우기 절차 없이 즉시).
+
+    Stop 할 때 반드시 부른다. 우리가 써 놓은 (0,0,0) 을 그대로 두면 다음
+    Play 에서 _ensure_decks 가 "표면속도가 0인 프림"으로 보고 데크를 아예
+    못 찾는다 — ConveyorNode 는 Stop 뒤에 값을 다시 안 쓴다 (실측).
+    """
+    for prim in _state.get("decks", []):
+        a = prim.GetAttribute(SURF_VEL)
+        if a:
+            a.Set(_state["run_sv"][str(prim.GetPath())])
+        e = prim.GetAttribute(SURF_ON)
+        if e:
+            e.Set(True)
+
+
+def _wake_step():
+    """재기동 다음 스텝 — surfaceVelocityEnabled 를 도로 켠다."""
+    if not _state.get("wake"):
+        return
+    _state["wake"] -= 1
+    if _state["wake"] > 0:
+        return
+    for prim in _state.get("decks", []):
+        e = prim.GetAttribute(SURF_ON)
+        if e:
+            e.Set(True)
 
 
 def _boxes(stage):
@@ -177,6 +302,9 @@ def _on_step(dt):
     stage = _state.get("stage")
     if stage is None:
         return
+    if not _ensure_decks(stage):
+        return
+    _wake_step()
     phase = _state["phase"]
     _state["timer"] += dt
 
@@ -229,10 +357,13 @@ def _on_step(dt):
 
 def _on_timeline(event):
     if event.type == int(omni.timeline.TimelineEventType.STOP):
-        _state.update(phase="RUN", timer=0.0, box=None, placed=0)
+        # ★ 순서가 중요하다. 캐시를 비우기 **전에** 표면속도를 되돌려야 한다.
+        _restore_belt()
+        _state.update(phase="RUN", timer=0.0, box=None, placed=0,
+                      decks=None, run_sv={}, wake=0,
+                      deck_try=0, deck_warned=False)
         _state.pop("stub", None)
-        _set_running(True)
-        print("[cycle] Stop — 사이클 리셋, 벨트 재기동")
+        print("[cycle] Stop — 사이클 리셋, 벨트 원상복구")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -261,9 +392,22 @@ def pallet_slot(stage, idx, dims):
 
 
 def _box_dims(prim):
+    """박스 로컬 치수 (w, d, h) [m].
+
+    예전엔 xformOp:scale 만 읽었다. 스폰 박스가 Cube(size=1) + scale 이었기
+    때문인데, 흡착이 스케일 걸린 프림을 못 다뤄서 scale 없는 Mesh 로 바뀌었다
+    (spawn_feeder._make_box). 그래서 **extent 를 먼저 보고 scale 은 있으면 곱한다**
+    — 두 방식 다 받는다. scale 만 읽으면 새 박스가 전부 (0.4, 0.3, 0.3) 로 잡혀
+    팔레트 슬롯이 어긋난다.
+    """
+    ext = UsdGeom.Boundable(prim).GetExtentAttr().Get()
+    d = ([float(ext[1][i] - ext[0][i]) for i in range(3)] if ext
+         else [0.4, 0.3, 0.3])
     a = prim.GetAttribute("xformOp:scale")
     s = a.Get() if a else None
-    return (float(s[0]), float(s[1]), float(s[2])) if s else (0.4, 0.3, 0.3)
+    if s:
+        d = [d[i] * float(s[i]) for i in range(3)]
+    return (d[0], d[1], d[2])
 
 
 def _stub_begin(stage, prim, pose):
