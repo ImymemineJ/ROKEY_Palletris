@@ -1,5 +1,52 @@
 # 시뮬 환경 구성 및 랜덤 스폰
 
+> ## 2026-08-22 현재 — `test1-1.usd` 가 통합 라인이다
+>
+> 아래 본문(1~4장)은 **`test1.usd`(소터 3개 라인)** 기록이다. 그쪽은 분기 레이아웃이
+> 미결이라 멈춰 있고, 통합은 **벨트 1개짜리 `test1-1.usd`** 로 간다.
+>
+> ### 되는 것 — 게이트 3개 통과
+>
+> | 게이트 | 실행 | 결과 |
+> |---|---|---|
+> | 도달범위 G1 | `python3 scripts/verify_reach.py` | 11점 전부 도달 |
+> | 벨트 속도 | `isaac-sim.sh --no-window --exec scripts/verify_belt_speed.py` | main 0.500 · b_pickup 0.501 m/s |
+> | **B4 1사이클** | `isaac-sim.sh --no-window --exec scripts/verify_b4_test1_1.py` | **PLACED, 배치 오차 1.2 mm** (2회 동일) |
+>
+> 씬은 사양과 일치한다 — 팔레트 원점 (10300, 300, 150) · 상면 z=150 · 반출 상판 상면
+> z=0 · 페데스탈 (10900, 0) D400 H700 · 벨트 main 0~7500 / b_pickup 7500~10000 ·
+> 로봇 `~/isaac_assets/h2017_suction.usd`(흡착 그리퍼 포함).
+>
+> 인터페이스는 공통가이드 §3 프로토콜 **15개 cmd 전부** 뜬다:
+> `packing_sim/isaac/{sim_main,sim_server,spawner,conveyor_ctl,mainq}.py` (A) +
+> `robot_motion.py` (B).
+>
+> ### ★ 내일 먼저 정할 것 — 스토퍼를 누가 세우나 (미결)
+>
+> 씬에 스토퍼 벽이 없는데(`layout_to_spec`: "박스는 벨트를 멈춰서 세운다"),
+> `spawner.pickup_check` 는 박스가 **이미 멎어야** present 를 주고 `cycle.py` 는
+> present 를 받은 **뒤에** 벨트를 세운다. **서로를 기다려 아무도 박스를 못 세운다.**
+> 지금은 `verify_b4_test1_1.py` 가 픽 지점에서 대신 끊고 있다. 셋 중 하나로 정해야 한다:
+>
+> 1. 물리 스토퍼 벽을 다시 세운다 (§5.3 원안)
+> 2. `spawner` 가 픽 지점 도달 시 스스로 `b_pickup` 을 끊는다 (`belt_cycle.py` 방식)
+> 3. `pickup_check` 판정에서 속도 조건을 빼고 위치만 본다
+>
+> **이걸 정해야 15개 연속(§stage1 `total_count`)으로 넘어간다.**
+>
+> ### 그 다음
+>
+> `packing_msgs`(msg 5 + srv 15) + `package.xml` → `orchestrator.py`(B) ·
+> `sim_bridge_node.py`(A). 지금은 `src/` 에 ROS 매니페스트가 하나도 없어
+> `colcon build` · `ros2 run` 이 원리적으로 안 된다. 소켓 계층은 그것 없이 돈다.
+>
+> ### 주의 — 런처가 결과를 바꾼다
+>
+> 벨트가 `IsaacConveyor` OmniGraph 노드로 도는데 그 노드는 **렌더 틱**에 물려 있다.
+> 같은 씬인데 `isaac-sim.sh` 0.500 m/s · `python.sh`(render=True) 약 1.5 · `python.sh`
+> (render=False) 약 12.7 로 갈린다. **속도·타이밍 검증은 `isaac-sim.sh` 로만 한다.**
+> 근거는 `isaac/conveyor_ctl.py` docstring.
+
 기준 씬: `project_1/test1.usd`
 
 동작 영상: [`hak_test_1.mp4`](~/Videos/hak_test_1.mp4)
