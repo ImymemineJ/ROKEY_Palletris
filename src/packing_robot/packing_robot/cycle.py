@@ -149,10 +149,25 @@ class Cycle:
         #   집자마자 배치 상공으로 바로 가면 관절공간 직선이 대각선을 그어서, 매달린
         #   박스가 벨트를 뚫고 지나간다. 벨트를 확실히 넘는 높이에서 가로로 옮긴 뒤
         #   내려가야 한다. 매달린 박스는 흡착면보다 h 만큼 아래에 있으므로 그만큼 더 든다.
-        transit = max(pick_top, put_top) + self.approach_m + h / 1000.0
+        #   그리고 **이미 쌓인 것의 최상단**도 넘어야 한다. 계획이 z 를 오르내리면
+        #   목적지가 최상단보다 낮아서 이송 중 적재물을 관통한다. 정본 계산은
+        #   check_place_plan.py:176 `carry_bottom = max(obstacle, top) + safe_mm` 다.
+        #   `stack_top_mm` 은 **선택**이다 — 없으면 예전과 똑같이 동작한다. 있으면
+        #   `/algo/plan_placement` 가 heightmap(=비전 갱신본)에서 읽어 실어 보낸 값이고,
+        #   단위는 팔레트 상면 기준 mm 다 (z_mm 과 같은 기준).
+        stack_top = (float(place.get("stack_top_mm", 0.0)) + self.origin_mm[2]) / 1000.0
+        transit = max(pick_top, put_top, stack_top) + self.approach_m + h / 1000.0
         self._move([pick_c[0], pick_c[1], transit], pick_yaw)
         self._move([cx, cy, transit], put_yaw)
-        self._move([cx, cy, put_top + self.approach_m], put_yaw)
+        # ★ 배치 approach 도 **매달린 박스 밑면** 기준이다 — 여기도 h 를 더한다.
+        #   흡착면 기준으로 잡으면 박스 밑면이 `approach - h` 만큼만 뜬다. 박스가
+        #   approach_offset(200)보다 높으면 밑면이 **같은 층 이웃 상면보다 아래**로 내려가
+        #   슬롯에 들어가기도 전에 이웃에 얹힌다 (3호 −10 · 4호 −80 · 5호 −140 mm).
+        #   2026-08-22 실측: 15박스 4층에서 13번째(양옆이 다 찬 자리)가 여기서 걸려
+        #   도착 잔차 208.9 mm · 이웃을 103.7 mm 밀어냄 · 그 위에 얹혀 Z 오차 +208.8 mm.
+        #   정본은 check_place_plan.py:176 `carry_bottom = max(obstacle, top) + safe_mm`
+        #   즉 h_safe(흡착면) = ... + safe + h 다. 152행 transit 은 이미 그렇게 돼 있었다.
+        self._move([cx, cy, put_top + self.approach_m + h / 1000.0], put_yaw)
         self._move([cx, cy, put_top + GRASP_GAP_MM / 1000.0], put_yaw)
 
         # TCP 정지 대기 · damping 스파이크 · settle 은 robot_motion 안에서 돈다 (§6.5)
