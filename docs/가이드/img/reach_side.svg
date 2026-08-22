@@ -1,45 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 460" font-family="'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
-  <rect width="700" height="460" fill="#ffffff"/>
-  <text x="350" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#111827">도달범위 측면도 — G1이 검증하는 것 (축척 1m = 170px)</text>
-
-  <!-- 실효 reach 반원 (반경 1.55m, 중심 = 베이스) -->
-  <path d="M 51.5 312 A 263.5 263.5 0 0 1 578.5 312" fill="none" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="7,5"/>
-  <text x="315" y="88" text-anchor="middle" font-size="13" fill="#6d28d9" font-weight="bold">실효 reach 1550 = 1700 − 그리퍼 150</text>
-
-  <!-- 바닥 -->
-  <line x1="40" y1="397" x2="660" y2="397" stroke="#374151" stroke-width="2"/>
-  <text x="46" y="392" font-size="11.5" fill="#6b7280">바닥 z=0</text>
-
-  <!-- 벨트 + 박스 + 스토퍼 (왼쪽) -->
-  <rect x="60" y="261" width="102" height="10" fill="#9ca3af" stroke="#4b5563"/>
-  <rect x="80" y="203" width="82" height="58" fill="#fcd34d" stroke="#b45309"/>
-  <rect x="162" y="210" width="8" height="51" fill="#dc2626"/>
-  <text x="110" y="288" text-anchor="middle" font-size="11.5" fill="#6b7280">픽업 벨트 (z=800)</text>
-
-  <!-- 페데스탈 -->
-  <rect x="289.5" y="312" width="51" height="85" fill="#9ca3af" stroke="#4b5563"/>
-  <text x="281" y="362" text-anchor="end" font-size="12" fill="#4b5563">페데스탈 500</text>
-  <circle cx="315" cy="312" r="5" fill="#111827"/>
-  <text x="281" y="318" text-anchor="end" font-size="11.5" fill="#111827">베이스 (10900, 0, 500)</text>
-
-  <!-- 팔레트 + 적재 영역 -->
-  <rect x="366" y="371.5" width="136" height="25.5" fill="#86efac" stroke="#16a34a"/>
-  <rect x="366" y="227.5" width="136" height="144" fill="#fef3c7" stroke="#d97706" stroke-dasharray="4,3"/>
-  <text x="434" y="304" text-anchor="middle" font-size="12" fill="#92400e">최대 적재 850</text>
-  <text x="434" y="418" text-anchor="middle" font-size="11.5" fill="#166534">팔레트 (상면 z=150)</text>
-
-  <!-- 최악점: 먼 코너 최상단 approach (12.0, 1.2) -->
-  <line x1="315" y1="312" x2="502" y2="193" stroke="#dc2626" stroke-width="1.8"/>
-  <circle cx="502" cy="193" r="5.5" fill="#dc2626"/>
-  <text x="512" y="188" font-size="12.5" fill="#b91c1c" font-weight="bold">최악점 (12000, ±600, 1200)</text>
-  <text x="512" y="205" font-size="12.5" fill="#b91c1c">거리 1.435 m → 여유 115mm</text>
-
-  <!-- 픽업점 (9.76, 1.34) -->
-  <line x1="315" y1="312" x2="121" y2="169" stroke="#2563eb" stroke-width="1.8"/>
-  <circle cx="121" cy="169" r="5.5" fill="#2563eb"/>
-  <text x="121" y="150" text-anchor="middle" font-size="12.5" fill="#1d4ed8" font-weight="bold">픽업 approach (9760, 0, 1340)</text>
-  <text x="205" y="238" font-size="12.5" fill="#1d4ed8">1.416 m</text>
-
-  <!-- 각주 -->
-  <text x="350" y="446" text-anchor="middle" font-size="11.5" fill="#6b7280">※ 측면 투영도 — 표기 거리는 Y 성분까지 포함한 3D 값. 바닥 설치(페데스탈 없음)면 최악점 1.735m로 도달 불가.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="766" height="634" viewBox="0 0 766 634" font-family="sans-serif">
+  <rect width="766" height="634" fill="#ffffff"/>
+  <text x="16" y="26" font-size="14" font-weight="bold" fill="#111827">도달범위 측면도 (Y-Z 단면) — G1 이 검증하는 것 · 축척 1m = 170px</text>
+  <text x="16" y="44" font-size="11" fill="#6b7280">scripts/gen_reach_diagram.py 가 system.yaml 에서 생성한다 — 손으로 고치지 말 것</text>
+  <path d="M 119.5 278.0 A 263.5 263.5 0 0 1 646.5 278.0" fill="none" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text x="129.7" y="257.6" text-anchor="start" font-size="11" fill="#2563eb" font-weight="normal">실효 reach 1550 = 1700 − 그리퍼 150</text>
+  <line x1="70.2" y1="541.5" x2="695.8" y2="541.5" stroke="#9ca3af" stroke-width="1.0" stroke-dasharray="4 4"/>
+  <text x="71.9" y="535.5" text-anchor="start" font-size="11" fill="#9ca3af" font-weight="normal">야드 지면 z=-850 (truck.bed_height_mm)</text>
+  <line x1="70.2" y1="397.0" x2="695.8" y2="397.0" stroke="#111827" stroke-width="2.0"/>
+  <text x="71.9" y="390.0" text-anchor="start" font-size="12" fill="#111827" font-weight="bold">★ z=0  도크 바닥 = 트럭 적재함 바닥 = 팔레트 밑면</text>
+  <rect x="349.0" y="278.0" width="68.0" height="119.0" fill="#d1d5db" fill-opacity="1.00" stroke="#374151" stroke-width="1"/>
+  <text x="343.9" y="337.5" text-anchor="end" font-size="12" fill="#374151" font-weight="normal">페데스탈 700</text>
+  <circle cx="383.0" cy="278.0" r="4" fill="#111827"/>
+  <text x="343.9" y="270.0" text-anchor="end" font-size="11" fill="#374151" font-weight="normal">베이스 (10900, 0, 700)</text>
+  <rect x="434.0" y="371.5" width="136.0" height="25.5" fill="#a16207" fill-opacity="0.85" stroke="#374151" stroke-width="1"/>
+  <rect x="434.0" y="150.5" width="136.0" height="221.0" fill="#fcd34d" fill-opacity="0.50" stroke="#374151" stroke-width="1"/>
+  <text x="502.0" y="261.0" text-anchor="middle" font-size="12" fill="#374151" font-weight="normal">최대 적재 1300</text>
+  <text x="576.8" y="384.2" text-anchor="start" font-size="11" fill="#374151" font-weight="normal">팔레트 (상면 z=150)</text>
+  <line x1="70.2" y1="261.0" x2="323.5" y2="261.0" stroke="#6b7280" stroke-width="1.2" stroke-dasharray="5 3"/>
+  <text x="71.9" y="255.0" text-anchor="start" font-size="11" fill="#6b7280" font-weight="normal">픽업 벨트 z=800  (면 밖 — −X 쪽)</text>
+  <line x1="570.0" y1="150.5" x2="570.0" y2="116.5" stroke="#dc2626" stroke-width="1.0" stroke-dasharray="3 3"/>
+  <circle cx="570.0" cy="116.5" r="4.5" fill="#dc2626"/>
+  <line x1="383.0" y1="278.0" x2="570.0" y2="116.5" stroke="#dc2626" stroke-width="1.4"/>
+  <text x="576.8" y="116.5" text-anchor="start" font-size="12" fill="#dc2626" font-weight="bold">최악점 = 먼 코너 상단 + approach 200</text>
+  <text x="576.8" y="132.5" text-anchor="start" font-size="12" fill="#dc2626" font-weight="normal">3D 거리 1572 mm  →  여유 -22 mm</text>
+  <text x="16" y="620" font-size="11" fill="#6b7280">※ 측면 투영도 — 표기 거리는 X 성분까지 포함한 3D 값이다. z=0 을 야드 지면으로 잡으면 같은 요구에 페데스탈 1,580 mm 이상이 필요해진다 (구 사양서 §5-1 이 기각).</text>
 </svg>
