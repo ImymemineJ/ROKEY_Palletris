@@ -133,6 +133,10 @@ robot:
       drive_rot_xy: {stiffness: 100.0, damping: 0.0}
       drive_rot_z: {stiffness: 10000.0, damping: 0.0}
   approach_offset_mm: 200
+  # 관절 속도한계(URDF) 대비 배율. 웨이포인트 보간의 스텝 수를 정한다.
+  #   계단 입력은 금지다 — 팔이 최대 토크로 잡아채며 오버슈트해 박스를 친다
+  #   (흡착_그리퍼_트러블슈팅 문제①). verify_cycle.py --vel 과 같은 값이다.
+  joint_speed_scale: 0.5
   release_speed_threshold_mm_s: 5.0
   release_wait_timeout_s: 3.0
   release_damping: 5.0
