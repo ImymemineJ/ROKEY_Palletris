@@ -42,10 +42,6 @@ import _paths                      # 경로 해결 (scripts/_paths.py)
 import fk as F
 import verify_reach as VR          # solve / load_spheres / pedestal_clearance 재사용
 
-# 그리퍼 실측 (구 저장소 usd/h2017_cell.usd). Ø50 패드 4개, 바깥 210 x 160.
-GRIPPER_R = 0.1225
-GRIPPER_LEN = 0.150
-
 PLACE_ERR_MM = 7.0                 # 실측 배치 오차 6.8 mm
 RMP_SAG_MM = 35.0                  # 지령 대비 처짐. 안전 여유에서 이만큼 빠진다
 TRAVERSE_MIN_MM = 50.0             # 처짐을 빼고도 남아야 하는 이송 여유
@@ -101,6 +97,8 @@ def main():
     base = cfg["zones"]["robot_base_world_mm"][zone]
     ped_mm = cfg["robot"]["pedestal_height_mm"]
     tool = cfg["robot"]["gripper_length_mm"] / 1000.0
+    # 그리퍼 몸통 반경. 하드코딩하지 않는다 (철칙 3) — B0 확정값이 system.yaml 에 있다
+    grip_r_mm = cfg["robot"]["gripper_body_diameter_mm"] / 2.0
     safe_mm = cfg["robot"]["approach_offset_mm"]
     pw, pd = cfg["pallet"]["width_mm"], cfg["pallet"]["depth_mm"]
     max_stack = cfg["pallet"]["max_stack_mm"]
@@ -167,7 +165,7 @@ def main():
             if otop <= top + 1e-6:
                 continue
             grip = min(grip, math.hypot(pl["x_mm"] - ox, pl["y_mm"] - oy)
-                       - max(ohx, ohy) - GRIPPER_R * 1000.0)
+                       - max(ohx, ohy) - grip_r_mm)
         if grip < 1e8 and grip < PLACE_ERR_MM:
             fails.append("#%d: 그리퍼 몸통이 더 높은 이웃과 %.0f mm 뿐" % (n, grip))
 
