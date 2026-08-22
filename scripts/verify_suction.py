@@ -54,7 +54,6 @@ PADS = "/World/h2017/gripper/pads"
 BELT = "/World/TestBelt"
 BOX = "/World/Boxes/box"
 
-GAP_TOL_MM = 2.0            # 이보다 크면 안 붙은 것으로 본다
 LIFT_MM = 300.0             # 잡고 들어 올릴 높이
 
 
@@ -190,18 +189,6 @@ def dump_pads(stage):
                  j.GetJointEnabledAttr().Get()))
 
 
-def status_of(view):
-    s = view.get_surface_gripper_status()[0]
-    return s if isinstance(s, str) else ("Open", "Closing", "Closed")[int(s)]
-
-
-def gripped_of(view):
-    g = view.get_gripped_objects()[0]
-    if isinstance(g, (list, tuple)):
-        return list(g)
-    return [g] if g else []
-
-
 # ─────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
@@ -229,9 +216,7 @@ def main():
     kit = SimulationApp({"headless": not a.gui})
     tee = V.start_log(a.log or _paths.ROOT / "results" / ("verify_suction_%s.txt" % a.geom))
 
-    from isaacsim.core.utils.extensions import enable_extension
-    enable_extension("isaacsim.robot.surface_gripper")
-    from isaacsim.robot.surface_gripper import GripperView
+    import gripper as G                        # _paths 가 packing_robot 을 sys.path 에 넣는다
 
     ok_all = True
     try:
@@ -283,7 +268,16 @@ def main():
         for _ in range(int(0.7 * S.hz)):                 # 벨트 위에서 안정화
             S.world.step(render=S.render)
 
-        view = GripperView(paths=GRIPPER)
+        # ★ 검증이 트랙B 모듈을 **그대로** 쓴다. 여기서만 되는 별도 배선이 있으면
+        #   이 통과가 robot_motion.py 의 통과를 보장하지 못한다.
+        grip = G.Gripper(
+            GRIPPER, articulation=S.art, cfg=cfg,
+            step=lambda: S.world.step(render=S.render),
+            gap_fn=lambda: measure(S, box_rp, half_h)[0],
+            tool_pose_fn=lambda: S.lula.compute_forward_kinematics(
+                S.ee, np.asarray(S.art.get_joint_positions()[:6], dtype=float))[0],
+            on_status=lambda st: print("             /db/set_status <- %s" % st))
+        view = grip.view
         if a.coaxial is not None or a.shear is not None:
             view.set_surface_gripper_properties(
                 coaxial_force_limit=[a.coaxial] if a.coaxial is not None else None,
@@ -291,7 +285,8 @@ def main():
             print("힘 상한 덮어씀  coaxial %s N  shear %s N" % (a.coaxial, a.shear))
         print("SurfaceGripper xformOps  %s   (GripperView 가 붙인 것)"
               % xform_ops(stage, GRIPPER))
-        print("초기 상태  %s" % status_of(view))
+        print("초기 상태  %s   (APPROACH_GAP %.1f mm · GRIP_TOL %.1f mm)"
+              % (grip.status(), G.APPROACH_GAP_MM, G.GRIP_TOL_MM))
 
         gap0, fz0, bz0 = measure(S, box_rp, half_h)
         print("\n[0] 안정화   박스 상면 %.1f mm (벨트 %.0f + 높이 %.0f = %.0f 기대)"
@@ -311,22 +306,14 @@ def main():
               % (gap1, a.approach_gap, fz1, bz1))
 
         # ── 흡착 ───────────────────────────────────────────
-        view.apply_gripper_action([1.0])
-        for _ in range(int(1.5 * S.hz)):
-            S.world.step(render=S.render)
+        print("\n[2] 흡착 ★")
+        grabbed = grip.grasp(BOX)
         gap2, fz2, bz2 = measure(S, box_rp, half_h)
-        st, gr = status_of(view), gripped_of(view)
-        print("\n[2] 흡착 ★  상태 %s   잡은 것 %s" % (st, gr or "없음"))
+        print("             상태 %s   잡은 것 %s" % (grip.status(), grip.gripped() or "없음"))
         print("             간극 %+.2f mm   (Δ %+.2f)   흡착면 z %.1f  박스 상면 z %.1f"
               % (gap2, gap2 - gap1, fz2, bz2))
         dump_pads(stage)
-        grabbed = st == "Closed" and any(BOX in g for g in gr)
-        flush = abs(gap2) <= GAP_TOL_MM
-        if not grabbed:
-            print("             !! 안 잡혔다")
-        elif not flush:
-            print("             !! 잡히긴 했는데 %.1f mm 떠 있다 (허용 %.0f)" % (gap2, GAP_TOL_MM))
-        ok_all &= grabbed and flush
+        ok_all &= grabbed
 
         # ── 들어 올리기 ────────────────────────────────────
         ok, q, err, _, _, _ = V.solve(S, tool + np.array([0.0, 0.0, LIFT_MM / 1000.0]))
@@ -336,9 +323,10 @@ def main():
             rose = bz3 - bz2
             print("\n[3] 상승 %.0f mm   박스 상면 %.1f -> %.1f mm (%+.1f)"
                   % (LIFT_MM, bz2, bz3, rose))
-            print("             간극 %+.2f mm   (Δ %+.2f)   상태 %s"
-                  % (gap3, gap3 - gap2, status_of(view)))
-            held = rose > LIFT_MM * 0.8 and abs(gap3) <= GAP_TOL_MM
+            print("             간극 %+.2f mm   (Δ %+.2f)   상태 %s   is_holding %s"
+                  % (gap3, gap3 - gap2, grip.status(), grip.is_holding()))
+            held = (rose > LIFT_MM * 0.8 and abs(gap3) <= G.GRIP_TOL_MM
+                    and grip.is_holding())
             if not held:
                 print("             !! 딸려 올라오지 않았거나 간극이 벌어졌다")
             ok_all &= held
@@ -347,14 +335,29 @@ def main():
             ok_all = False
 
         # ── 놓기 ───────────────────────────────────────────
-        view.apply_gripper_action([-1.0])
-        for _ in range(int(1.5 * S.hz)):
+        print("\n[4] 놓기 (명세서 6.5 순서)")
+        released = grip.release()
+        for _ in range(int(1.0 * S.hz)):                 # 자유낙하 시간을 준다
             S.world.step(render=S.render)
         _, _, bz4 = measure(S, box_rp, half_h)
         dropped = bz4 < bz3 - 50.0
-        print("\n[4] 놓기     상태 %s   박스 상면 %.1f -> %.1f mm   %s"
-              % (status_of(view), bz3, bz4, "떨어졌다" if dropped else "!! 안 떨어졌다"))
-        ok_all &= dropped
+        print("             박스 상면 %.1f -> %.1f mm   %s"
+              % (bz3, bz4, "떨어졌다" if dropped else "!! 안 떨어졌다"))
+        ok_all &= dropped and released
+
+        # ── 과적 거절 (물리로는 안 걸린다 — 컨트롤러가 막는다) ──
+        print("\n[5] 과적 거절  suction_limit %.0f kgf · box_mass_limit %.0f kg"
+              % (cfg["robot"]["suction"]["controller_limits"]["suction_limit_kgf"],
+                 cfg["robot"]["suction"]["controller_limits"]["box_mass_limit_kg"]))
+        for m in (3.0, 5.0, 9.0, 12.0, 25.0):
+            why = G.payload_reason(m, cfg)
+            print("             %5.1f kg  %s" % (m, why or "통과"))
+        gate = (G.payload_reason(9.0, cfg) is None
+                and G.payload_reason(12.0, cfg) is not None
+                and G.payload_reason(25.0, cfg) is not None)
+        if not gate:
+            print("             !! 3/5/9 는 통과하고 12/25 는 거절해야 한다")
+        ok_all &= gate
 
         print("\nRESULT(%s): %s" % (a.geom, "통과" if ok_all else "실패"))
         if a.hold and a.gui:
