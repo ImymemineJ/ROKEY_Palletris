@@ -277,28 +277,37 @@ print(f"팔레트 모서리 ({porg[0]:.3f}, {porg[1]:.3f})  {pw*1000:.0f}x{pd*10
 # 지금은 상판만 있는 정적 콜라이더다. 롤러/체인 구동은 아직 안 넣었다 —
 # 반출 시퀀스를 만들 때 여기에 physxSurfaceVelocity 를 걸면 된다.
 drop("/World", "PalletOutfeed")
-bed = mm(SPEC["truck"]["bed_height_mm"])
-pw_, pd_ = mm(pal["width_mm"]), mm(pal["depth_mm"])
-if abs((porg[2] - mm(pal["thickness_mm"])) - bed) > 1e-6:
-    print(f"  ※ 팔레트 밑면 {(porg[2]-mm(pal['thickness_mm']))*1000:.0f}mm 와 "
-          f"트럭 바닥 {bed*1000:.0f}mm 가 안 맞는다. "
-          f"system.yaml 의 pallet_origin.z 는 (bed + thickness) 여야 한다.")
-OF_T = 0.15          # 상판 두께
-OF_MARGIN = 0.05     # 팔레트보다 옆으로 내민 양
-OF_RUN = 1.00        # 반출 방향(+X)으로 더 뻗은 길이
-ox0, ox1 = porg[0] - OF_MARGIN, porg[0] + pw_ + OF_RUN
-oy0, oy1 = porg[1] - OF_MARGIN, porg[1] + pd_ + OF_MARGIN
-spec = define(OUTFEED, "Cube", ["PhysicsCollisionAPI", "PhysxCollisionAPI"])
-put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
-put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
-    [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
-put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
-    [Gf.Vec3f(0.30, 0.32, 0.36)])
-put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
-xform(spec, ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0, bed - OF_T / 2.0),
-      (ox1 - ox0, oy1 - oy0, OF_T))
-print(f"반출 컨베이어 x {ox0*1000:.0f}~{ox1*1000:.0f}  y {oy0*1000:.0f}~{oy1*1000:.0f}  "
-      f"상면 z={bed*1000:.0f} (트럭 바닥 높이)")
+truck = SPEC.get("truck")
+if truck is None:
+    # 팔레트를 바닥에 두는 배치다. 반출 상판을 깔 근거가 없으므로 건너뛴다.
+    # (2026-08-22 셀 90도 회전 머지로 truck 섹션이 빠졌다. 트럭 상차 높이를
+    #  다시 쓰려면 system.yaml 에 truck.bed_height_mm 을 넣으면 된다.)
+    print("반출 컨베이어 건너뜀 — system.yaml 에 truck.bed_height_mm 이 없다. "
+          "팔레트는 바닥 기준이다.")
+else:
+    bed = mm(truck["bed_height_mm"])
+    pw_, pd_ = mm(pal["width_mm"]), mm(pal["depth_mm"])
+    if abs((porg[2] - mm(pal["thickness_mm"])) - bed) > 1e-6:
+        print(f"  ※ 팔레트 밑면 {(porg[2]-mm(pal['thickness_mm']))*1000:.0f}mm 와 "
+              f"트럭 바닥 {bed*1000:.0f}mm 가 안 맞는다. "
+              f"system.yaml 의 pallet_origin.z 는 (bed + thickness) 여야 한다.")
+    OF_T = 0.15          # 상판 두께
+    OF_MARGIN = 0.05     # 팔레트보다 옆으로 내민 양
+    OF_RUN = 1.00        # 반출 방향(+X)으로 더 뻗은 길이
+    ox0, ox1 = porg[0] - OF_MARGIN, porg[0] + pw_ + OF_RUN
+    oy0, oy1 = porg[1] - OF_MARGIN, porg[1] + pd_ + OF_MARGIN
+    spec = define(OUTFEED, "Cube", ["PhysicsCollisionAPI", "PhysxCollisionAPI"])
+    put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
+    put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
+        [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+    put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
+        [Gf.Vec3f(0.30, 0.32, 0.36)])
+    put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
+    xform(spec, ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0, bed - OF_T / 2.0),
+          (ox1 - ox0, oy1 - oy0, OF_T))
+    print(f"반출 컨베이어 x {ox0*1000:.0f}~{ox1*1000:.0f}  "
+          f"y {oy0*1000:.0f}~{oy1*1000:.0f}  "
+          f"상면 z={bed*1000:.0f} (트럭 바닥 높이)")
 
 layer.Save()
 print(f"\n저장 완료: {USD_PATH}")

@@ -16,7 +16,8 @@ SPEC_YAML="$HOME/palletris_ws/src/packing_bringup/config/system.yaml"
 export PL_SPEC="$(python3 -c "
 import yaml, json, sys
 c = yaml.safe_load(open('$SPEC_YAML'))
-json.dump({k: c[k] for k in ('zones', 'conveyor', 'pallet', 'robot', 'truck')}, sys.stdout)
+# truck 은 없을 수도 있다 (팔레트를 바닥에 두는 배치). 있으면 넘긴다.
+json.dump({k: c[k] for k in ('zones', 'conveyor', 'pallet', 'robot', 'truck') if k in c}, sys.stdout)
 ")"
 
 USDLIB="$HOME/isaacsim/extscache/omni.usd.libs-1.0.1+69cbf6ad.lx64.r.cp311"
