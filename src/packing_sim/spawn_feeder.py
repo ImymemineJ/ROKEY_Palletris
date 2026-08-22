@@ -17,8 +17,7 @@ Isaac Sim GUI 에서 돌린다.
   · 색은 호수 고정 — 3호 빨강 / 4호 초록 / 5호 파랑.
     test1.usd 에 이미 있는 /World/Looks/BoxNo{3,4,5} 머티리얼을 쓰고,
     없으면 만든다. displayColor 도 같이 넣는다.
-  · 박스는 **scale 없는 Mesh** 다. Cube + xformOp:scale 로 만들면 로봇이
-    흡착할 때 박스가 42.8mm 뜬 채로 붙는다 — _make_box 주석 참고.
+  · 박스는 **scale 없는 Mesh** 다. 치수를 지오메트리에 직접 굽는다 — _make_box 주석 참고.
   · Stop 하면 스폰한 박스를 전부 지우고 카운터를 리셋한다. 다시 Play 하면 처음부터.
 
 흔들림 (PL_JITTER, 기본 1)
@@ -346,20 +345,24 @@ def _spawn_one():
 def _make_box(stage, path, name, dims, pos, yaw_deg):
     """박스 하나. dims = (w, d, h) [m].
 
-    ★ xformOp:scale 을 걸지 않는다. 치수를 지오메트리에 직접 굽는다.
-      SurfaceGripper 의 런타임 구속 앵커 계산이 프림 스케일을 처리하지 못해
-      **흡착하면 박스가 상판에서 42.8mm 떨어진 채 붙는다.**
-      구 저장소에서 단일 변수로 확인된 값이다:
+    치수를 지오메트리에 직접 굽는다. 직육면체가 필요한데 `UsdGeom.Cube` 는 한 변만
+    지정할 수 있어서, 점 8개를 직접 박은 `Mesh` 로 만들고 `xformOp:scale` 은 안 쓴다.
 
-          Cube size=1.0, scale=(0.34, 0.25, 0.21)  ->  +42.8mm
-          Cube size=0.2, scale=(1, 1, 1)           ->   -0.0mm
+    ⚠ **2026-08-22 정정 — 원래 여기 적혀 있던 이유는 틀렸다.**
+      "대상 프림에 scale 이 걸리면 흡착 시 박스가 42.8 mm 떠서 붙는다" 고 적었었다.
+      흡착 그리퍼를 구 저장소 정본(`h2017_cell.usd`)대로 다시 만든 뒤 실측하니
+      **scale 은 흡착에 아무 영향이 없다.** 같은 조건에서 소수점까지 같은 값이 나온다:
 
-      바꾼 건 scale 하나뿐이다 — 원인은 치수가 아니라 스케일 그 자체다.
-      USD 를 뒤져도 안 보인다. SurfaceGripper 는 USD 의 attachment point
-      조인트를 건드리지 않고 PhysX 내부에 따로 구속을 만들기 때문이다.
+          3호  흡착 후 간극 +1.24 mm · 300 mm 상승 시 +299.8 mm   (Mesh = Cube+scale)
+          5호  흡착 후 간극 +1.20 mm · 300 mm 상승 시 +299.0 mm   (Mesh = Cube+scale)
 
-      직육면체가 필요한데 Cube 는 한 변만 지정할 수 있어서, 점을 직접 박은
-      Mesh 로 만든다. translate / orient 는 그대로 써도 된다.
+      42.8 mm 의 진짜 원인은 **그리퍼 쪽 패드 D6 구성**이었다 — `isaac:forwardAxis`
+      미지정(기본이 X 라 옆을 본다)과 6축 하드 잠금(구속이 생긴 자세 그대로 굳는다).
+      **흡착이 이상하면 박스 scale 이 아니라 그리퍼 패드부터 볼 것.**
+      재현: `scripts/verify_suction.py`, 구성: `scripts/build_gripper_usd.py`
+
+    이 코드를 되돌리지는 않는다. 치수를 지오메트리에 굽는 편이 어차피 깔끔하고,
+    실측상 손해도 없다. 고칠 것은 이유뿐이다.
     """
     hx, hy, hz = dims[0] / 2.0, dims[1] / 2.0, dims[2] / 2.0
     mesh = UsdGeom.Mesh.Define(stage, path)
