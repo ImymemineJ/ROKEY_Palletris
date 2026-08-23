@@ -47,10 +47,21 @@ BOX_PRIM_FMT = BOX_ROOT + "/%s"
 LOOKS_ROOT = "/World/Looks"
 PHYS_MAT_PATH = LOOKS_ROOT + "/PhysicsMaterial"          # 씬 빌더가 만든다. 없으면 여기서
 
-BOX_SLUG = {"3호": "No3", "4호": "No4", "5호": "No5"}
-BOX_COLOR = {"3호": (1.0, 0.15, 0.15),
-             "4호": (0.15, 0.9, 0.25),
-             "5호": (0.2, 0.35, 1.0)}
+# ── 박스 색 ────────────────────────────────────────────────
+# ★ stage 1 은 **벨트 한 라인 · 로봇 한 대 · 팔레트 한 대**다. 색으로 나눠 보낼
+#   곳이 없으므로 전부 한 색으로 낸다. 종류(3·4·5호)는 치수와 무게로 이미 구분되고,
+#   `box_type` 속성으로도 씬에서 읽을 수 있다 (§5.5 ground truth).
+#   종류별 색은 stage 2 에서 존 A/B/C 로 갈라 보낼 때 되살릴 것이라 지우지 않는다.
+LINE_COLOR = (1.0, 0.15, 0.15)            # 라인 색 — 빨강
+LINE_MAT = LOOKS_ROOT + "/BoxLine"
+# --- stage 2 (존 분류) 용. 지금은 안 쓴다 ---------------------------------
+# BOX_SLUG = {"3호": "No3", "4호": "No4", "5호": "No5"}
+# BOX_COLOR = {"3호": (1.0, 0.15, 0.15),     # 빨강
+#              "4호": (0.15, 0.9, 0.25),     # 초록
+#              "5호": (0.2, 0.35, 1.0)}      # 파랑
+# 되살릴 때는 _ensure_roots 의 머티리얼 생성 루프와 _make_box 의 displayColor ·
+# 바인딩 세 곳을 같이 되돌린다. 씬에 남아 있는 /World/Looks/BoxNo3·No4·No5 는
+# 예전 판이 만든 것이라 지금은 아무도 안 쓴다.
 # 스토퍼 앞 이 거리 안에 박스 **앞면**이 오고 거의 멎으면 픽업 대기로 본다.
 PICKUP_MARGIN_M = 0.060                   # 트랙A 가이드 §A6~A8 의 60 mm
 PICKUP_VEL_MPS = 0.01                     # |vx| < 1 cm/s
@@ -341,8 +352,8 @@ class Spawner:
             self._log("[spawner] 물리 머티리얼을 새로 만들었다 %s (정지 %.2f · 운동 %.2f)"
                       " — 씬 빌더를 다시 돌리는 편이 낫다"
                       % (PHYS_MAT_PATH, self.mu_s, self.mu_d))
-        for name, rgb in BOX_COLOR.items():
-            mp = "%s/Box%s" % (LOOKS_ROOT, BOX_SLUG[name])
+        # 라인이 하나라 머티리얼도 하나다 (위 BOX_COLOR 주석 참고).
+        for mp, rgb in ((LINE_MAT, LINE_COLOR),):
             if self.stage.GetPrimAtPath(mp):
                 continue
             mat = UsdShade.Material.Define(self.stage, mp)
@@ -361,6 +372,20 @@ class Spawner:
         pos = (x, y, z_bottom + dims[2] / 2.0)          # ★ 밑면 -> 중심 (§5.5)
         path = BOX_PRIM_FMT % box_id
         self._make_box(path, tname, dims, pos, yaw_deg, mass, box_id)
+        # ★ 프림을 지우지 않으므로 같은 경로가 이미 있을 수 있다 — 그 프림은
+        #   `_detach` 로 **콜라이더가 꺼지고 키네마틱에 보이지도 않는** 상태다
+        #   (despawn 또는 park_all 을 거친 것). 그대로 두면 스폰은 됐는데 벨트를
+        #   뚫고 지나가거나 아예 안 보인다. 되살린다.
+        #   stage 2 의 재순환(같은 박스를 다시 라인에 올리는 것)에도 이게 필요하다.
+        _prim = self.stage.GetPrimAtPath(path)
+        if _prim and _prim.IsValid():
+            _c = UsdPhysics.CollisionAPI(_prim)
+            if _c:
+                _c.CreateCollisionEnabledAttr(True)
+            _rb = UsdPhysics.RigidBodyAPI(_prim)
+            if _rb:
+                _rb.CreateKinematicEnabledAttr(False)
+            UsdGeom.Imageable(_prim).MakeVisible()
         self.boxes[box_id] = {"path": path, "dims": dims, "type": tname}
         self.spawned += 1
         self._log("[spawner] %s %s %dx%dx%d mm %.1f kg yaw %+.0f -> %s"
@@ -386,6 +411,38 @@ class Spawner:
         if rb:
             rb.CreateKinematicEnabledAttr(True)
         UsdGeom.Imageable(prim).MakeInvisible()
+
+    def park_all(self):
+        """박스 프림을 **전부** 라인 밖으로 치운다. 타임라인 Stop 뒤 정리용.
+
+        ★ 왜 필요한가 — 이 스포너는 프림을 **지우지 않는다** (시뮬 중에 물리 프림을
+          지우면 PhysX 텐서 뷰가 무효화돼 로봇 아티큘레이션까지 죽는다. `_despawn`
+          docstring 참조). 그래서 15개 프림이 스테이지에 그대로 남는다.
+          그런데 타임라인을 Stop 하면 Isaac 이 시뮬레이션 상태를 버리고 **USD 에
+          적혀 있는 자세**로 되돌린다. 팔레트에 놓인 박스는 PhysX 가 옮긴 것일 뿐
+          USD 에는 스폰 당시 좌표가 적혀 있어서, Stop 하는 순간 전부 스폰 지점으로
+          되돌아가 거기 겹쳐 선다. 그 상태로 Play 를 누르면 벨트(OmniGraph 라
+          드라이버와 무관하게 돈다)가 그것들을 실어 나른다 — "안 나온 박스가
+          갑자기 나와서 움직이는" 것처럼 보인다.
+          그래서 Stop 이 감지되면 여기서 USD 좌표 자체를 라인 밖으로 적어 둔다.
+        """
+        root = self.stage.GetPrimAtPath(BOX_ROOT)
+        n = 0
+        if root and root.IsValid():
+            for prim in root.GetChildren():
+                if not prim.IsValid():
+                    continue
+                self._detach(prim)
+                xf = UsdGeom.Xformable(prim)
+                for op in xf.GetOrderedXformOps():
+                    if op.GetOpName() == "xformOp:translate":
+                        op.Set(Gf.Vec3d(DESPAWN_XYZ_M))
+                        break
+                n += 1
+        self.boxes.clear()
+        self._snap.clear()
+        self._pickup = {"present": False, "box_id": "", "pose": None}
+        return n
 
     def _despawn(self, box_id):
         """박스를 작업 영역에서 치운다.
@@ -449,7 +506,7 @@ class Spawner:
                                           1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7])
         mesh.CreateExtentAttr([Gf.Vec3f(-hx, -hy, -hz), Gf.Vec3f(hx, hy, hz)])
         mesh.CreateSubdivisionSchemeAttr("none")     # 없으면 모서리가 둥글어진다
-        mesh.CreateDisplayColorAttr([Gf.Vec3f(*BOX_COLOR[tname])])
+        mesh.CreateDisplayColorAttr([Gf.Vec3f(*LINE_COLOR)])
 
         xf = UsdGeom.Xformable(prim)
         xf.ClearXformOpOrder()
@@ -475,8 +532,7 @@ class Spawner:
         prim.CreateAttribute("box_id", Sdf.ValueTypeNames.String).Set(box_id)
         prim.CreateAttribute("box_type", Sdf.ValueTypeNames.String).Set(tname)
 
-        mat = UsdShade.Material(
-            self.stage.GetPrimAtPath("%s/Box%s" % (LOOKS_ROOT, BOX_SLUG[tname])))
+        mat = UsdShade.Material(self.stage.GetPrimAtPath(LINE_MAT))
         if mat:
             UsdShade.MaterialBindingAPI.Apply(prim)
             UsdShade.MaterialBindingAPI(prim).Bind(mat)

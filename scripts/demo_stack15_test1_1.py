@@ -264,7 +264,20 @@ def setup():
                         gap_fn=_gap_mm)
     cc = conveyor_ctl.ConveyorCtl(stage, cfg, q)
 
-    server = SS.SimServer(port=PORT)
+    try:
+        server = SS.SimServer(port=PORT)
+    except OSError as e:
+        # ★ 조용히 넘어가면 안 된다. 예전에는 여기서 터져도 리포트가 "0/N" 만 찍고
+        #   끝나서, 진짜 이유(포트 충돌)가 로그 수백 줄 안에 묻혔다.
+        #   실측 2026-08-23: GUI 시연이 돌고 있는데 헤드리스 게이트를 같이 띄웠다.
+        log("\n!! 포트 %d 를 못 잡았다: %s" % (PORT, e))
+        log("   이미 다른 실행이 이 포트를 쓰고 있다. 확인:")
+        log("     ss -ltnp | grep %d" % PORT)
+        log("   둘을 같이 돌리려면 포트를 나눠라:  PL_PORT=8796 ...")
+        log("   ⚠ 다만 Isaac 두 개가 같은 GPU 를 나눠 쓰면 물리 타이밍이 흔들려")
+        log("     게이트 수치가 실행마다 달라진다. 게이트는 하나씩 돌려라.")
+        _kitexit.shutdown(3, log=log)
+        raise SystemExit
     server.register({"ping": lambda r: {"ok": True}})
     server.register(sp.handlers())
     server.register(cc.handlers())
@@ -915,6 +928,51 @@ def on_step(dt):
         _S["phase"] = "done"
         report()
 
+
+# ── Stop 을 누르면 이 드라이버는 못 이어간다 ──────────────────
+# ★ 타임라인을 Stop 하면 Isaac 이 물리 시뮬레이션 뷰를 무효화한다. 이 스크립트는
+#   부팅 때 한 번 잡은 `SingleArticulation` · SurfaceGripper 뷰를 매 스텝 쓰므로,
+#   Play 를 다시 눌러도 그 핸들이 이미 죽어 있다. 그대로 두면 `rm.step()` 이
+#   매 스텝 예외를 뱉어 로그가 에러로 뒤덮이고, 원인이 "Stop 을 눌렀다" 라는 것이
+#   그 안에 묻힌다. 재초기화는 아티큘레이션·그리퍼·스포너 스냅샷·패커 상태를
+#   전부 되감아야 해서 별건이다 — 지금은 **왜 멈췄는지만 분명히 남긴다.**
+try:
+    _STOP_EVT = int(omni.timeline.TimelineEventType.STOP)
+except Exception:                          # API 이름이 바뀌면 감지를 포기한다
+    _STOP_EVT = None                       # (경고를 못 낼 뿐, 동작은 그대로)
+
+
+def _on_timeline(e):
+    if _STOP_EVT is None or e.type != _STOP_EVT:
+        return
+    if _S["phase"] in ("boot", "done") or _S.get("aborted"):
+        return
+    _S["aborted"] = True
+    _S["done"] = True                      # 워커 스레드도 빠져나온다
+    _S["phase"] = "done"                   # on_step 이 죽은 핸들을 안 만진다
+    print("\n" + "!" * 78, flush=True)
+    print("Stop 을 눌렀다 — 이 드라이버는 여기서 끝난다.", flush=True)
+    print("  Play 를 다시 눌러도 안 움직인다. Stop 이 물리 뷰를 무효화해서", flush=True)
+    print("  부팅 때 잡은 로봇·그리퍼 핸들이 죽었기 때문이다 (재초기화 경로 없음).", flush=True)
+    print("  다시 보려면 **창을 닫고** 다시 실행해라:", flush=True)
+    print("      cd ~/palletris_ws && ./scripts/run_demo.sh", flush=True)
+    # ★ Stop 은 박스들을 **스폰 당시 USD 좌표**로 되돌린다 — 팔레트에 쌓인 것까지
+    #   전부 스폰 지점에 겹쳐 선다. 그대로 Play 하면 벨트(OmniGraph 라 이 드라이버와
+    #   무관하게 돈다)가 그것들을 실어 나가서, 안 나왔던 박스가 갑자기 움직이는
+    #   것처럼 보인다. 여기서 좌표 자체를 라인 밖으로 적어 화면을 비운다.
+    sp = _S.get("sp")
+    if sp is not None:
+        try:
+            print("  박스 프림 %d 개를 라인 밖으로 치웠다 (Stop 이 스폰 좌표로 "
+                  "되돌리는 것을 막는다)." % sp.park_all(), flush=True)
+        except Exception as _e:
+            print("  박스 정리 실패: %r" % (_e,), flush=True)
+    print("!" * 78 + "\n", flush=True)
+
+
+_S["timeline_sub"] = (omni.timeline.get_timeline_interface()
+                      .get_timeline_event_stream()
+                      .create_subscription_to_pop(_on_timeline, name="palletris-stop"))
 
 _S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
 log("Play — 부팅 대기...\n")
