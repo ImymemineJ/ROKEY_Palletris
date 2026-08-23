@@ -104,6 +104,14 @@ VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호�
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
 HOLD = os.environ.get("PL_HOLD") not in (None, "", "0")
 PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
+# ★ 팔 속도. **이 실행에서만** 덮어쓴다 — system.yaml 도 B 코드도 안 건드린다.
+#   왜 필요한가: 이송 구간이 177도를 도는데 박스는 흡착 패드에 강성 100 · 감쇠 0
+#   으로 매달려 있어 진자처럼 흔들린다. 감쇠가 0이라 하강하는 2.3 s 동안 안 잦아들고,
+#   놓는 순간이 그 진자의 어느 위상에 걸리느냐로 착지가 갈린다
+#   (`gripper.py` 주석의 "22~76 mm", 실측 2026-08-23 에는 -99.8 mm).
+#   느리게 돌면 진자에 실리는 에너지가 줄어든다. 사이클은 길어진다.
+#   안 주면 사양값 그대로다.
+SPEED = os.environ.get("PL_SPEED")
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -216,6 +224,11 @@ def setup():
     import sim_server as SS
     import isaacsim.robot_motion.motion_generation as mg
     from isaacsim.core.prims import SingleArticulation
+
+    if SPEED:
+        cfg["robot"]["joint_speed_scale"] = float(SPEED)
+        log("★ 팔 속도 %s 로 이 실행에서만 덮어썼다 (사양 %s). 베이스라인 아님."
+            % (SPEED, _paths.system_config()["robot"].get("joint_speed_scale", 0.5)))
 
     art = SingleArticulation(prim_path=ROBOT_PRIM, name="h2017")
     art.initialize()

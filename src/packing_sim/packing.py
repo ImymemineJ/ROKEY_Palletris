@@ -270,8 +270,14 @@ class HeightmapPacker:
             if best_key is None or key < best_key:
                 best_key = key
                 best = Placement(
-                    x=i * self.cell,
-                    y=j * self.cell,
+                    # ★ 격자는 wall_margin 만큼 좁혀 놨지만(__init__ 의 usable),
+                    #   좌표 원점은 안 옮겨져 있었다. 그래서 벽 여유가 **먼 쪽에만**
+                    #   생기고 원점 쪽(x=0 · y=0) 은 여전히 딱 붙었다.
+                    #   로봇 쪽 가장자리가 바로 y=0 이라, 가장 무거운 5호가 팔레트
+                    #   끝에 15 mm 여유로 서는 일이 실제로 났다 (2026-08-23).
+                    #   여기서 원점을 띄워 양쪽에 똑같이 여유를 준다.
+                    x=self.wall_margin + i * self.cell,
+                    y=self.wall_margin + j * self.cell,
                     z=float(base_h[i, j]),
                     w=w,
                     d=d,
@@ -286,8 +292,9 @@ class HeightmapPacker:
 
     def commit(self, placement: Placement) -> None:
         """배치를 확정하고 하이트맵을 갱신한다."""
-        i0 = int(round(placement.x / self.cell))
-        j0 = int(round(placement.y / self.cell))
+        # ★ 위 find_placement 가 wall_margin 을 얹어 돌려주므로 여기서 다시 뺀다.
+        i0 = int(round((placement.x - self.wall_margin) / self.cell))
+        j0 = int(round((placement.y - self.wall_margin) / self.cell))
         i1 = i0 + self._cells(placement.w)
         j1 = j0 + self._cells(placement.d)
 
