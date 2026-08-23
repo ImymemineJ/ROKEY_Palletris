@@ -112,6 +112,16 @@ PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시�
 #   느리게 돌면 진자에 실리는 에너지가 줄어든다. 사이클은 길어진다.
 #   안 주면 사양값 그대로다.
 SPEED = os.environ.get("PL_SPEED")
+# ★ 계량 운전(singulation). 픽업 구간에 이 수보다 많이 못 들어오게 `main` 을 세운다.
+#   왜 필요한가 — 지금 라인은 **누적식**이다. 스토퍼가 선두를 잡고 벨트는 계속
+#   밀어대니 뒤가 전부 붙는다. 물리적으로 맞는 동작이라 속도·간격 튜닝으로는
+#   안 없어진다. 실물에서는 존마다 따로 세워 한 개씩 내려보내는 식으로 푼다
+#   (zero-pressure / singulation). 우리는 구간이 둘이고 `cycle.py` 는 `b_pickup`
+#   만 만지므로 `main` 이 비어 있다 — 거기를 쓴다.
+#   **벨트를 세우면 박스는 그 자리에 선다.** 벽에 눌리는 게 아니라서 간격
+#   (12 s x 0.5 m/s = 6 m)이 그대로 남는다.
+#   0 이면 계량을 안 한다(예전 동작).
+METER_MAX = int(os.environ.get("PL_METER", "1"))
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -372,6 +382,33 @@ class LineServices(D.OnlineServices):
         self.last = None
 
 
+def meter_thread():
+    """`main` 을 여닫아 픽업 구간에 한 대씩만 들여보낸다. **자기 소켓을 쓴다.**
+
+    판단은 `spawn_status.queue` 하나로 한다 — 픽업 구간(7500~10000)에서 벨트
+    높이에 있는 박스 수다. 그리퍼가 박스를 들어 올리는 순간 z 가 바뀌어 이 수가
+    떨어지므로, **집자마자** 다음 박스가 출발한다. 사이클이 끝날 때까지 안 기다린다.
+    """
+    import sim_link as SL
+    link = SL.SimLink(port=PORT)
+    _S["meter_link"] = link
+    running = None                                       # 마지막으로 건 상태
+    try:
+        while not _S["done"]:
+            st = link.call(cmd="spawn_status")
+            want = st.get("queue", 0) < METER_MAX
+            if want != running:
+                r = link.call(cmd="set_velocity", seg="main",
+                              mps=BELT_MPS if want else 0.0)
+                if r.get("ok"):
+                    running = want
+                    log("   [계량] main %s (픽업 구간 %s 개)"
+                        % ("가동" if want else "정지", st.get("queue", "?")))
+            time.sleep(0.2)
+    except Exception as e:
+        log("   [계량] !! %r" % (e,))
+
+
 def spawner_thread(specs, ids):
     """사양 스케줄대로 박스를 라인에 올린다. **자기 소켓을 따로 쓴다** (스레드 안전)."""
     import sim_link as SL
@@ -396,7 +433,11 @@ def spawner_thread(specs, ids):
                 t_wait = time.time()
                 while not _S["done"]:
                     st = link.call(cmd="spawn_status")
-                    if st.get("queue", 0) < BUFFER_CAP:
+                    # ★ 계량 운전에서는 `main` 이 서 있는 동안 앞차가 스폰점 근처에
+                    #   그대로 남는다. 그때 다음 박스를 내면 **겹쳐 스폰된다.**
+                    #   벨트가 계속 돌 때는 12 s 뒤 6 m 밖이라 없던 문제다.
+                    if (st.get("queue", 0) < BUFFER_CAP
+                            and st.get("spawn_clear", True)):
                         break
                     if time.time() - t_wait > 120.0:
                         log("   [투입] 버퍼가 120 s 째 안 빈다 — 그냥 넣는다")
@@ -505,6 +546,8 @@ def worker(specs, ids):
         link.call(cmd="set_velocity", seg="b_pickup", mps=BELT_MPS)
         threading.Thread(target=spawner_thread, args=(specs, ids),
                          daemon=True, name="spawn").start()
+        if METER_MAX > 0:
+            threading.Thread(target=meter_thread, daemon=True, name="meter").start()
 
         def recover():
             """실패한 사이클 뒤처리 — **치우거나 다시 하기 전에 반드시 부른다.**
@@ -852,7 +895,7 @@ def report():
     log("-" * 78)
     log("RESULT: %s" % ("통과" if ok else "실패"))
     log("=" * 78 + "\n")
-    for k in ("link", "spawn_link"):
+    for k in ("link", "spawn_link", "meter_link"):
         try:
             if _S.get(k):
                 _S[k].close()

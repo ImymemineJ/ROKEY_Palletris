@@ -72,6 +72,9 @@ PICKUP_Z_TOL_M = 0.05
 DESPAWN_XYZ_M = (-50.0, -50.0, -10.0)
 # 이 밖으로 나가면 "라인 이탈" 로 본다. despawn 자리(-50)보다 넉넉히 밖이라
 # despawn 한 박스를 이탈로 오인하지 않는다.
+# 스폰 지점 앞뒤로 이만큼 안에 박스가 있으면 "안 비었다" 로 본다.
+# 가장 긴 박스(5호 480) 보다 넉넉해야 겹치지 않는다.
+SPAWN_CLEAR_M = 0.70
 LOST_XY_M = 200.0
 LOST_Z_MIN_M = -50.0
 
@@ -300,9 +303,24 @@ class Spawner:
                 on_belt += 1
                 if x >= self.pickup_x0_m:
                     queue += 1                 # 픽업 구간 = 사양의 버퍼
+        # ★ 스폰 지점이 비었는가. `main` 을 세워 두는 계량(metering) 운전에서는
+        #   앞차가 안 빠진 채 다음 박스를 내면 **같은 자리에 겹쳐 스폰된다.**
+        #   벨트가 돌 때는 12 s 뒤면 6 m 밖이라 문제가 없었지만, 세워 두면 그대로
+        #   남는다. 그래서 인터록을 하나 준다 (실물 인피드도 같은 걸 본다).
+        spawn_clear = True
+        for box_id, e in self._snap.items():
+            rec = self.boxes.get(box_id)
+            if rec is None:
+                continue
+            x, _y, z = e["pos_m"]
+            if abs(z - (self.belt_top_m + rec["dims"][2] / 2.0)) > PICKUP_Z_TOL_M:
+                continue
+            if abs(x - self.spawn_xyz_m[0]) < SPAWN_CLEAR_M:
+                spawn_clear = False
+                break
         return {"spawned": self.spawned, "enabled": bool(self.enabled),
                 "on_belt": on_belt, "queue": queue, "tracked": len(self.boxes),
-                "lost": list(self.lost)}
+                "spawn_clear": spawn_clear, "lost": list(self.lost)}
 
     def h_set_spawn_enabled(self, req):
         self.enabled = bool(req.get("enabled", True))
