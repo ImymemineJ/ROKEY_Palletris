@@ -368,6 +368,25 @@ class Spawner:
                      yaw_deg, path))
         return {"ok": True}
 
+    def _detach(self, prim):
+        """물리에서 떼어낸다. **콜라이더를 먼저 끄고** 키네마틱으로 바꾼다.
+
+        ★ 순서가 중요하다. 콜라이더를 켠 채로 키네마틱 전환 + 순간이동을 하면,
+          그 박스에 눌려 있던 이웃들이 접촉이 갑자기 풀리며 솔버가 폭발한다.
+          실측 2026-08-23 (results/stack15_volume_fail_20260823.log): 픽업 구간에
+          4개가 줄 서 있을 때 선두를 despawn 했더니 뒤 4개가 전부
+          x ≈ -220 m 로 튕겨 나가 라인에서 사라졌다. 콜라이더를 먼저 끄면
+          이웃은 그냥 접촉을 잃을 뿐이라 그 충격이 없다.
+          가시성도 끈다 — 눈으로 봐도 사라진 것과 같아야 한다.
+        """
+        c = UsdPhysics.CollisionAPI(prim)
+        if c:
+            c.CreateCollisionEnabledAttr(False)
+        rb = UsdPhysics.RigidBodyAPI(prim)
+        if rb:
+            rb.CreateKinematicEnabledAttr(True)
+        UsdGeom.Imageable(prim).MakeInvisible()
+
     def _despawn(self, box_id):
         """박스를 작업 영역에서 치운다.
 
@@ -384,8 +403,7 @@ class Spawner:
             return {"ok": False, "error": "없는 box_id %s" % box_id}
         prim = self.stage.GetPrimAtPath(rec["path"])
         if prim and prim.IsValid():
-            # 물리에서 떼어내고(키네마틱) 라인 밖으로 옮긴다.
-            UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
+            self._detach(prim)
             xf = UsdGeom.Xformable(prim)
             for op in xf.GetOrderedXformOps():
                 if op.GetOpName() == "xformOp:translate":

@@ -103,6 +103,7 @@ VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호�
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
 HOLD = os.environ.get("PL_HOLD") not in (None, "", "0")
+PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -479,7 +480,32 @@ def worker(specs, ids):
         threading.Thread(target=spawner_thread, args=(specs, ids),
                          daemon=True, name="spawn").start()
 
+        def recover():
+            """실패한 사이클 뒤처리 — **치우거나 다시 하기 전에 반드시 부른다.**
+
+            ★★ 그리퍼부터 연다. `cycle.py` 의 PICK_FAILED 경로는 `_abort` 를 안 거쳐
+              그리퍼를 안 연다 (B 파일이라 안 고친다). 흡착이 `Closing`/`Closed` 이고
+              물린 목록에 박스가 든 채로 남는데, 그 상태로 despawn 하면
+              `Spawner._despawn` 이 박스를 라인 밖으로 순간이동시키면서
+              **그리퍼가 붙잡은 채로 팔이 같이 끌려간다.** 실측 2026-08-23: 관절
+              하나가 188 rad(10817 deg) 감겨 이후 모든 이동이 예산을 넘겼고, 팔이
+              휘저으며 놓인 박스를 86 mm 밀고 벨트 위 박스를 튕겨냈다.
+              열린 그리퍼에 release 를 걸어도 무해하니 무조건 연다.
+            """
+            rl = link.call_slow(cyc.release_budget_s, cmd="release")
+            if not rl.get("ok"):
+                log("       !! release %r (계속 진행한다)" % rl)
+            q6 = np.asarray(_S["art"].get_joint_positions()[:6], dtype=float)
+            if float(np.max(np.abs(q6))) > 2.0 * math.pi:
+                log("       !! 관절이 감겼다 %s deg — READY 로 되돌린다"
+                    % np.round(np.degrees(q6), 0).tolist())
+                _S["q"].run(lambda: (_S["art"].set_joint_positions(_S["ready_q"]),
+                                     _S["art"].set_joint_velocities(np.zeros(6)),
+                                     {"ok": True})[-1])
+                time.sleep(1.0)                          # 드라이브가 따라올 시간
+
         rest = {}                                        # 놓인 뒤의 기준 자세 (knock 용)
+        pick_retry = {}                                  # box_id -> 흡착 재시도 횟수
         on_pallet = []                                   # 지금 팔레트에 선 기둥 (팔 간섭 진단용)
         swapped_for = set()                              # 이 박스 때문에 이미 교체했다
         pallets = 1
@@ -601,6 +627,25 @@ def worker(specs, ids):
                 rest.clear()                          # 팔레트가 비었으니 knock 기준도 리셋
                 on_pallet.clear()
                 continue                              # i 를 안 올린다 = 같은 박스 재시도
+
+            # ── 흡착 실패는 **다시 해 본다** (사양: 실패는 재시도 대상) ──
+            # ★ 간극 허용치가 얇다. `cycle._descend_to_gap` 은 2.0 mm 를 목표로
+            #   닫고 `gripper.GRIP_TOL_MM` 은 3.0 mm 라 여유가 1.0 mm 뿐이다.
+            #   게다가 두 쪽이 재는 간극이 다르다 — cycle 은 **집기 시작 시점**의
+            #   박스 상면(pick_pose)을 기준으로 수직 거리를, gripper 는 **지금**
+            #   박스 중심에서 툴 +Z 축에 투영한 값을 쓴다. 그 사이 박스가 1 mm 만
+            #   가라앉아도 판정이 갈린다. 실측 2026-08-23: 3.23 mm 로 0.23 mm
+            #   차이에 거절됐다 (results/stack15_volume_fail_20260823.log).
+            #   박스는 아직 스토퍼에 서 있으니 버릴 이유가 없다. 다시 내려간다.
+            if res == "PICK_FAILED" and pick_retry.get(bid, 0) < PICK_RETRY:
+                pick_retry[bid] = pick_retry.get(bid, 0) + 1
+                _S["rows"].pop()                     # 이건 최종 결과가 아니다
+                log("       흡착 실패 — 다시 해 본다 (%d/%d)"
+                    % (pick_retry[bid], PICK_RETRY))
+                recover()
+                # 실패한 흡착이 박스를 접근 높이까지 들었다 놨을 수 있다. 가라앉기를 기다린다.
+                time.sleep(SETTLE_S + 0.5)
+                continue                              # i 를 안 올린다 = 같은 박스 재시도
             i += 1
             # ★ PALLET_FULL 에서 멈추지 않는다. 큰 박스가 못 들어갔다고 작은 박스도
             #   못 들어가는 게 아니다 — seed 42 에서 14번 5호는 자리가 없지만
@@ -620,29 +665,7 @@ def worker(specs, ids):
                     log("       이 팔레트에 자리가 없다 — 우회 처리하고 다음 박스로 간다.")
                 else:
                     log("       !! 실패. 라인에서 빼고 다음 박스로 넘어간다.")
-                # ★★ 치우기 전에 **그리퍼부터 연다.**
-                #   `cycle.py` 의 PICK_FAILED 경로는 `_abort` 를 안 거쳐서 그리퍼를
-                #   안 연다 (B 파일이라 안 고친다). 그래서 흡착이 `Closing` 이고 물린
-                #   프림 목록에 박스가 들어 있는 채로 남는다. 그 상태에서 despawn 하면
-                #   `Spawner._despawn` 이 박스를 kinematic 으로 바꿔 (-50,-50,-10) 로
-                #   순간이동시키는데, **그리퍼가 붙잡은 채로 팔이 같이 끌려간다.**
-                #   실측 2026-08-23: 그 뒤 관절 하나가 188 rad(10817 deg) 감겨 이후
-                #   모든 이동이 120 s 예산을 넘겼고, 팔이 휘저으며 이미 놓인 박스를
-                #   86 mm 밀었으며, 벨트 위 다른 박스가 [-201,-55,21] 로 튕겨 나갔다.
-                #   열려 있는 그리퍼에 release 를 걸어도 무해하다 — 무조건 연다.
-                rl = link.call_slow(cyc.release_budget_s, cmd="release")
-                if not rl.get("ok"):
-                    log("       !! release %r (계속 진행한다)" % rl)
-
-                # 감겼으면 되돌린다. 안 되돌리면 남은 사이클이 전부 죽는다.
-                _q = np.asarray(_S["art"].get_joint_positions()[:6], dtype=float)
-                if float(np.max(np.abs(_q))) > 2.0 * math.pi:
-                    log("       !! 관절이 감겼다 %s deg — READY 로 되돌린다"
-                        % np.round(np.degrees(_q), 0).tolist())
-                    _S["q"].run(lambda: (_S["art"].set_joint_positions(_S["ready_q"]),
-                                         _S["art"].set_joint_velocities(np.zeros(6)),
-                                         {"ok": True})[-1])
-                    time.sleep(1.0)                       # 드라이브가 따라올 시간
+                recover()                            # 그리퍼를 열고, 감겼으면 되돌린다
 
                 # 스토퍼를 막고 있으면 다음 박스가 못 온다. 반드시 치운다.
                 # ★ 단, 이탈 경로(`cycle._abort`)는 매달린 박스를 **그 자리에서** 놓는다.
