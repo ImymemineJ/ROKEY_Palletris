@@ -100,6 +100,9 @@ CYCLE_WALL_S = 120.0
 SETTLE_S = float(os.environ.get("PL_SETTLE", "0.7"))     # 놓은 뒤 재기 전 정착 (B5 는 0.5)
 WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
+# ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
+#   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
+HOLD = os.environ.get("PL_HOLD") not in (None, "", "0")
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -816,6 +819,11 @@ def report():
     #   근거와 실측은 scripts/_kitexit.py docstring.
     if _S.get("tee"):
         _S["tee"].close()                                # post_quit 전에 flush 해야 한다
+    if HOLD:
+        # 물리는 계속 돈다 (`on_step` 은 phase=="done" 이라 즉시 빠진다). 창을
+        # 직접 닫으면 끝난다.
+        print("\nPL_HOLD — 창을 닫지 않는다. 다 보고 창을 직접 닫아라.\n", flush=True)
+        return
     _kitexit.shutdown(0 if ok else 1, physx_sub=_S.get("physx_sub"), log=log)
 
 
