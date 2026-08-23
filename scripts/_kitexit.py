@@ -38,7 +38,12 @@ import time
 import omni.kit.app
 import omni.timeline
 
-HARD_S = float(os.environ.get("PL_HARD_EXIT_S", "20"))   # 3겹째가 끊는 시각
+# ★ 실측 2026-08-23: `--exec` 모드에서는 2겹째(다음 앱 업데이트에서 post_quit)도
+#   **안 통한다.** 15박스판과 B4판 둘 다 3겹째가 끊었다. 즉 실제로 종료시키는 것은
+#   os._exit 이고 앞의 두 겹은 보험이다. 20 s 를 기다릴 이유가 없어 5 s 로 줄인다.
+#   (앞 두 겹을 지우지는 않는다 — Isaac 판이 바뀌어 post_quit 이 통하면 그쪽이
+#    깨끗하고, 그때는 이 줄이 안 찍힌다. 찍히는지 여부가 곧 그 판별이다.)
+HARD_S = float(os.environ.get("PL_HARD_EXIT_S", "5"))
 
 
 def shutdown(code=0, physx_sub=None, log=print):
