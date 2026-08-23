@@ -54,6 +54,38 @@ H2017_DESC = str(M0609_DIR / "descriptor_h2017/h2017_description.yaml")
 
 
 # ─────────────────────────────────────────────────────────────
+# system.yaml 에서 끌어오는 값
+# ─────────────────────────────────────────────────────────────
+# ★ 철칙 3 — 숫자의 단일 출처는 `src/packing_bringup/config/system.yaml` 이다.
+#   여기에 상수를 복사해 두면 반드시 갈라진다. 실제로 2026-08-22 페데스탈을
+#   700 -> 900 으로 올릴 때 system.yaml 과 이 파일을 따로 고쳐야 했고, 한쪽만
+#   고치면 `run_line.py` · `scene.py` 가 씬(`test1-1.usd`)과 다른 높이로 돈다.
+SPEC_YAML = Path(os.environ.get(
+    "PL_SPEC_YAML",
+    THIS_DIR.parent.parent / "src/packing_bringup/config/system.yaml"))
+
+
+def _spec(*keys, default=None):
+    """`system.yaml` 에서 값 하나. 못 읽으면 default 로 떨어지고 한 번 경고한다."""
+    cache = _spec.__dict__.setdefault("_cache", {})
+    if "doc" not in cache:
+        cache["doc"] = None
+        try:
+            import yaml
+            with open(SPEC_YAML, encoding="utf-8") as f:
+                cache["doc"] = yaml.safe_load(f)
+        except Exception as e:                      # yaml 없음 · 파일 없음 · 파싱 실패
+            print("[config] !! %s 를 못 읽었다 (%r) — 내장 기본값으로 간다. "
+                  "씬과 어긋날 수 있다." % (SPEC_YAML, e))
+    node = cache["doc"]
+    for k in keys:
+        if not isinstance(node, dict) or k not in node:
+            return default
+        node = node[k]
+    return node
+
+
+# ─────────────────────────────────────────────────────────────
 # 로봇
 # ─────────────────────────────────────────────────────────────
 ROBOT_PRIM_PATH = "/World/robot"
@@ -189,7 +221,10 @@ else:  # h2017  — 확정 사양 (2026-08-20 사양서)
     #   로봇 베이스   (600, -300, 700)  장변 중앙 · 이격 300 · 받침대 700
     # 이 좌표계를 그대로 쓴다 (로봇을 원점에 두지 않는다).
     ROBOT_BASE_XY = np.array([0.600, -0.300])
-    PEDESTAL_H = 0.900   # ★ system.yaml robot.pedestal_height_mm 와 같아야 한다 (2026-08-22 700->900, issues/18)
+    # ★ 단일 출처는 system.yaml 이다 (위 _spec 주석). 여기 숫자는 그 파일을
+    #   못 읽었을 때의 마지막 확인값이지 사양이 아니다.
+    #   2026-08-22 700 -> 900 (다층 적재 간섭 + 도달 여유, PR #9 / issues/18).
+    PEDESTAL_H = _spec("robot", "pedestal_height_mm", default=900.0) / 1000.0
 
     # ── 파렛트 (Isaac pallet.usd = EUR1 1213x802) ─────────
     PALLET_ASSET = _os.environ.get("PL_PALLET", "std")
