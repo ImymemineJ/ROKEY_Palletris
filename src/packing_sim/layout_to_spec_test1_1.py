@@ -82,6 +82,8 @@ STOPPER = "/World/Stopper"
 PEDESTAL = "/World/Pedestal"
 OUTFEED = "/World/PalletOutfeed"
 ROBOT = "/World/robot"
+CAM_PICK = "/World/CamPick"               # 픽업 하향 카메라 (하우징)
+CAM_PRIM = CAM_PICK + "/Camera"           # 실제 Camera 프림
 # H2017 **흡착 그리퍼가 붙은 판** — 로봇 트랙(B)이 만든 정본이다.
 #   ~/isaac_assets/h2017_suction.usd
 #     /h2017/SurfaceGripper  [IsaacSurfaceGripper]  coaxial 1e6 · maxGripDistance 20mm
@@ -173,8 +175,18 @@ def define(path, type_name, api=None):
 
 
 def put(spec, name, tn, value, uniform=False):
-    var = Sdf.VariabilityUniform if uniform else Sdf.VariabilityVarying
-    a = Sdf.AttributeSpec(spec, name, tn, var)
+    """속성을 쓴다. **이미 있으면 값만 바꾼다.**
+
+    ★ 예전 판은 무조건 `Sdf.AttributeSpec(...)` 을 만들어서, 같은 프림을 두 번
+      건드리면 "already exists" 로 죽었다. `drop()` 으로 지웠다 다시 만드는
+      프림(스토퍼·팔레트 등)은 괜찮았지만, 물리 머티리얼처럼 지우지 않는 것에서
+      **빌더를 두 번 돌리면 터졌다** (2026-08-23 실측). 씬 빌더는 몇 번을 돌려도
+      같은 결과가 나와야 한다.
+    """
+    a = spec.attributes.get(name)
+    if a is None:
+        var = Sdf.VariabilityUniform if uniform else Sdf.VariabilityVarying
+        a = Sdf.AttributeSpec(spec, name, tn, var)
     a.default = value
     return a
 
@@ -501,6 +513,63 @@ xform(spec, (porg[0] + pw / 2.0, porg[1] + pd / 2.0, porg[2] - pt / 2.0),
 bind_phys(PALLET)
 print(f"팔레트 모서리 ({porg[0]:.3f}, {porg[1]:.3f})  {pw*1000:.0f}x{pd*1000:.0f}x{pt*1000:.0f}  "
       f"상면 z={porg[2]:.3f}")
+
+# ── 4b) 픽업 하향 카메라 (RealSense D455 상정) ────────────────
+# ★ 에셋 라이브러리가 원격이라 이 PC 에서는 rsd455.usd 를 못 받아온다
+#   (컨베이어 참조도 같은 이유로 못 푼다). 그래서 **같은 외형 치수의 하우징**을
+#   그리고 그 안에 Camera 프림을 넣는다. 광학값(해상도·화각)은 system.yaml 이
+#   정본이라 겉모습만 대역이고 계측은 진짜다.
+# ⚠ 하우징에는 콜라이더를 안 건다. 팔이 바로 아래를 지나간다 — 물리적으로
+#   부딪히면 안 된다. 높이는 팔의 최대 도달(TCP 1.75 + 그리퍼 0.15 = 1.90)보다
+#   위여야 하고, system.yaml 이 2.30 으로 잡아 뒀다 (여유 400 mm).
+_rec = SPEC.get("recognition", {})
+_pc = _rec.get("pick_cam", {})
+if _pc.get("enabled"):
+    # 박스 **앞면**이 스토퍼에 닿아 서므로 중심은 종류마다 다르다
+    # (5호 10000-240=9760 ~ 3호 10000-170=9830). 그 가운데를 본다.
+    cam_x = belt_x1 - (_w_max + _w_min) / 4.0
+    cam_y = mm(_pc.get("y_mm", 0))
+    cam_z = mm(_pc.get("z_mm", 2300))
+    if cam_z <= base[2] + 1.0:
+        raise SystemExit(
+            f"카메라 z {cam_z*1000:.0f} 가 팔이 지나는 높이에 걸린다 "
+            f"(로봇 베이스 {base[2]*1000:.0f} + 이송 여유 1000).")
+    hw, hd, hh = (v / 1000.0 for v in _pc.get("housing_mm", [124, 26, 29]))
+
+    drop("/World", "CamPick")
+    spec = define(CAM_PICK, "Xform")
+    xform(spec, (cam_x, cam_y, cam_z), (1.0, 1.0, 1.0))
+
+    # 하우징 — 보이기만 한다. 콜라이더 없음.
+    spec = define(CAM_PICK + "/Body", "Cube")
+    put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
+    put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
+        [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+    put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
+        [Gf.Vec3f(0.10, 0.10, 0.12)])
+    xform(spec, (0.0, 0.0, 0.0), (hw, hd, hh))
+
+    # Camera — 회전을 안 주면 USD 규약상 **-Z 를 본다** = 똑바로 아래.
+    #   광학 원점을 하우징 아래면에 둔다.
+    spec = define(CAM_PRIM, "Camera")
+    res = _rec.get("resolution", [1280, 720])
+    hfov = float(_rec.get("hfov_deg", 60))
+    # 수평 화각 -> 초점거리. 센서 가로를 USD 기본 36 mm 로 두고 환산한다.
+    ap_h = 36.0
+    focal = ap_h / (2.0 * math.tan(math.radians(hfov) / 2.0))
+    put(spec, "focalLength", Sdf.ValueTypeNames.Float, focal)
+    put(spec, "horizontalAperture", Sdf.ValueTypeNames.Float, ap_h)
+    put(spec, "verticalAperture", Sdf.ValueTypeNames.Float,
+        ap_h * float(res[1]) / float(res[0]))
+    put(spec, "clippingRange", Sdf.ValueTypeNames.Float2, Gf.Vec2f(0.05, 10.0))
+    xform(spec, (0.0, 0.0, -hh / 2.0), (1.0, 1.0, 1.0))
+
+    _cover = 2.0 * (cam_z - belt_top) * math.tan(math.radians(hfov) / 2.0)
+    print(f"픽업 카메라 ({cam_x:.3f}, {cam_y:.3f}, {cam_z:.3f})  {_pc.get('model')} "
+          f"{res[0]}x{res[1]} hfov {hfov:.0f} deg  f={focal:.1f}mm")
+    print(f"      벨트면까지 {(cam_z-belt_top)*1000:.0f} mm · 가로 시야 "
+          f"{_cover*1000:.0f} mm (가장 긴 박스 {_w_max*1000:.0f} 보다 넓다)"
+          f"  콜라이더 없음")
 
 # ── 5) 팔레트 반출 컨베이어 상판 ─────────────────────────────
 # 적재한 팔레트를 **들지 않고 그대로 밀어** 트럭에 넣는다. 그래서 팔레트 밑면과

@@ -76,7 +76,36 @@ SETTLE_STEPS = 90                                        # READY 수렴 (1.5 s)
 #   튜플을 통째로 갈아끼운다 — 키 두 개를 따로 쓰면 새 박스 id 에 옛 높이가
 #   붙는 순간이 생긴다.
 _CUR = {"box": None}                                     # (box_id, 반높이 m) | None
-N_BOXES = int(os.environ.get("PL_N", "0")) or None        # 0/미지정이면 사양값
+# ── 운전 모드 ──────────────────────────────────────────────
+# ★ 이 파일 하나로 두 가지를 돌린다. 예전에는 시연 설정을 환경변수 넷으로 손수
+#   붙여야 했는데, 발표 중에 하나만 빠뜨려도 다른 게 돌아간다 — PL_N 을 빼면
+#   15개가 돌아 팔레트가 중간에 갈리고, PL_SPEED 를 빼면 첫 5호가 미끄러질
+#   확률이 생긴다. 그래서 모드로 묶었다.
+#
+#   demo (기본) — 사람이 보는 실행. 창을 띄우고 11개를 팔레트 한 판에 쌓고,
+#                 끝나도 창을 안 닫는다. 팔 속도는 0.7 (사양 0.5 가 아니다).
+#   gate        — 수치를 재는 실행. **전부 사양값**이라 베이스라인이 된다.
+#
+#   개별 PL_* 를 주면 모드 기본값을 덮어쓴다. 둘 중 뭘로 돌았는지는 시작할 때
+#   한 줄로 찍는다 — 나중에 로그만 보고도 알 수 있어야 한다.
+MODE = os.environ.get("PL_MODE", "demo").lower()
+if MODE not in ("demo", "gate"):
+    raise SystemExit("PL_MODE 는 demo | gate: %r" % MODE)
+_DEFAULTS = {
+    # 이름        demo    gate            뜻
+    "PL_N":     ("11",   "0"),        # 0 = 사양값(15)
+    "PL_SPEED": ("0.7",  ""),         # "" = 사양값(joint_speed_scale)
+    "PL_HOLD":  ("1",    "0"),        # 끝나고 창을 열어 두나
+}
+
+
+def _env(name):
+    """PL_* 를 읽되, 없으면 **모드 기본값**으로 떨어진다."""
+    v = os.environ.get(name)
+    return _DEFAULTS[name][0 if MODE == "demo" else 1] if v is None else v
+
+
+N_BOXES = int(_env("PL_N") or "0") or None                # 0/미지정이면 사양값
 # ★ 상자 조합을 이 실행에서만 바꾼다. `system.yaml` 의 random_seed 42 는
 #   "고정 — 베이스라인 비교 필수" 라 파일을 고치지 않는다.
 #   seed 42 는 5호가 4개 뽑힌 빡센 패라(사양 분포로는 3개) 도착 순서로는 14/15 가 상한이다.
@@ -102,7 +131,7 @@ WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
-HOLD = os.environ.get("PL_HOLD") not in (None, "", "0")
+HOLD = _env("PL_HOLD") not in ("", "0", "false", "no")
 PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
 # ★ 팔 속도. **이 실행에서만** 덮어쓴다 — system.yaml 도 B 코드도 안 건드린다.
 #   왜 필요한가: 이송 구간이 177도를 도는데 박스는 흡착 패드에 강성 100 · 감쇠 0
@@ -111,7 +140,7 @@ PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시�
 #   (`gripper.py` 주석의 "22~76 mm", 실측 2026-08-23 에는 -99.8 mm).
 #   느리게 돌면 진자에 실리는 에너지가 줄어든다. 사이클은 길어진다.
 #   안 주면 사양값 그대로다.
-SPEED = os.environ.get("PL_SPEED")
+SPEED = _env("PL_SPEED") or None
 # ★ 계량 운전(singulation). 픽업 구간에 이 수보다 많이 못 들어오게 `main` 을 세운다.
 #   왜 필요한가 — 지금 라인은 **누적식**이다. 스토퍼가 선두를 잡고 벨트는 계속
 #   밀어대니 뒤가 전부 붙는다. 물리적으로 맞는 동작이라 속도·간격 튜닝으로는
@@ -122,6 +151,15 @@ SPEED = os.environ.get("PL_SPEED")
 #   (12 s x 0.5 m/s = 6 m)이 그대로 남는다.
 #   0 이면 계량을 안 한다(예전 동작).
 METER_MAX = int(os.environ.get("PL_METER", "1"))
+# ★ 픽업 하향 카메라. **기본은 끔** — 씬에는 들어가 있지만(/World/CamPick,
+#   씬 빌더가 만든다) 좌표 인식이 아직 안 끝났다. `PL_CAM=1` 로 켜면 박스마다
+#   카메라가 본 것을 ground truth 와 나란히 찍는다. 판단에는 안 쓴다.
+#   막힌 곳: `Camera.get_pointcloud(world_frame=True)` 가 Isaac 내부에서
+#   NameError("name 'LOADER_DIR' is not defined") 를 낸다 (우리 코드에는 그 이름이
+#   없다 — 포인트클라우드 annotator 경로 문제다). 우회로는 이미 있다:
+#   `perception.CameraPerception._pointcloud_world` 가 depth + intrinsics 로
+#   직접 투영한다. 그쪽으로 갈아끼우면 된다.
+CAM = os.environ.get("PL_CAM", "0") not in ("0", "false", "no")
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -207,6 +245,12 @@ stage = omni.usd.get_context().get_stage()
 log("\n" + "=" * 78)
 log("15박스 연속 적재 — 실제 라인 (스폰 %.0f s 간격 · %d 개 · 존 %s)" % (SPAWN_DT, N, ZONE))
 log("=" * 78)
+log("모드      %s%s"
+    % (MODE, "  (창을 띄우고 보여주는 실행 — 사양값이 아니다)" if MODE == "demo"
+       else "  (전부 사양값 — 베이스라인)"))
+log("설정      박스 %d · 순서 %s · 팔속도 %s · 계량 %s · 카메라 %s · 창유지 %s"
+    % (N, ORDER, SPEED or "사양", METER_MAX or "끔", "켬" if CAM else "끔",
+       "켬" if HOLD else "끔"))
 log("씬        %s" % STAGE)
 log("팔레트    원점 %s mm   최대 적재 %s mm" % (ORIGIN_MM, cfg["pallet"]["max_stack_mm"]))
 log("라인      스폰 %s -> 스토퍼 %.3f m   벨트 %.2f m/s"
@@ -287,6 +331,11 @@ def setup():
                         gap_fn=_gap_mm)
     cc = conveyor_ctl.ConveyorCtl(stage, cfg, q)
 
+    if CAM:
+        import camera_pick
+        cam = camera_pick.PickCamera(stage, cfg, q)
+        _S["cam"] = cam
+
     try:
         server = SS.SimServer(port=PORT)
     except OSError as e:
@@ -305,6 +354,8 @@ def setup():
     server.register(sp.handlers())
     server.register(cc.handlers())
     server.register(rm.handlers())
+    if _S.get("cam"):
+        server.register(_S["cam"].handlers())
     log("소켓      127.0.0.1:%d   cmd %d 개" % (PORT, len(server.cmds())))
 
     # ★ READY 로 순간이동. 안 하면 첫 이동이 179 deg 라 구간 예산(20 s)을 넘겨
@@ -317,6 +368,11 @@ def setup():
     _S["ready_action"] = ArticulationAction(joint_positions=ready)
     _S["ready_q"] = ready                                # 감긴 팔을 되돌릴 때 쓴다
     log("자세      READY 로 순간이동 %s deg" % np.round(np.degrees(ready), 1).tolist())
+
+    # ★ Camera.initialize() 는 **타임라인이 돌기 시작한 뒤**여야 한다. setup() 은
+    #   부팅 20스텝 뒤라 이미 Play 상태다.
+    if _S.get("cam") and not _S["cam"].start():
+        _S["cam"] = None
 
     _S.update(rm=rm, sp=sp, cc=cc, q=q, server=server, art=art)
     cc.stop_all()
@@ -611,6 +667,26 @@ def worker(specs, ids):
                    [t["w_mm"], t["d_mm"], t["h_mm"]], t["mass_g"] / 1000.0, wait_s,
                    pick["pose"]["pos_m"][0] + t["w_mm"] / 2000.0))
 
+            # ── 카메라가 같은 것을 본다 ────────────────────
+            # ★ `pickup_check` 는 씬 프림에서 자세를 그대로 읽는다 (ground truth).
+            #   실물에는 그런 게 없다. 카메라가 같은 질문에 답하게 하고 **나란히**
+            #   찍어 인식 오차를 남긴다. 지금은 판단에 쓰지 않는다 — 계측만 한다.
+            if CAM:
+                cm = link.call(cmd="camera_detect")
+                if cm.get("present"):
+                    gt = pick["pose"]["pos_m"]
+                    dx = cm["top_center_mm"][0] - gt[0] * 1000.0
+                    dy = cm["top_center_mm"][1] - gt[1] * 1000.0
+                    dz = cm["top_center_mm"][2] - (gt[2] * 1000.0 + t["h_mm"] / 2.0)
+                    log("        [카메라] %s %s mm yaw %+.1f  점 %d  채움 %.0f%%"
+                        "   실제와 차이 [%+.1f %+.1f %+.1f] mm"
+                        % (cm["type"], cm["size_mm"], cm["yaw_deg"],
+                           cm["n_pts"], cm["fill"] * 100, dx, dy, dz))
+                    _S.setdefault("cam_err", []).append(
+                        (bid, t["name"], cm["type"], dx, dy, dz, cm["size_mm"]))
+                else:
+                    log("        [카메라] 못 봤다 — %s" % cm.get("error"))
+
             # ── 사이클 한 바퀴 — 실물 cycle.py 그대로 ───────
             tc = time.time()
             _S["cyc_t0"], _S["cyc_id"] = tc, bid     # 메인 스레드가 감시한다 (on_step)
@@ -847,6 +923,14 @@ def report():
         log("사이클        평균 %.1f s · 최대 %.1f s   (목표 %.0f s · 스폰 간격 %.0f s)"
             % (sum(cyc_s) / len(cyc_s), max(cyc_s),
                cfg["robot"]["cycle_time_target_s"], SPAWN_DT))
+        ce = _S.get("cam_err") or []
+        if ce:
+            exy = [max(abs(e[3]), abs(e[4])) for e in ce]
+            ez = [abs(e[5]) for e in ce]
+            hit = sum(1 for e in ce if e[1] == e[2])
+            log("카메라        %d 회 인식 · 종류 맞춤 %d/%d · 중심 오차 XY 최대 "
+                "%.1f mm · 윗면 z 최대 %.1f mm"
+                % (len(ce), hit, len(ce), max(exy), max(ez)))
         log("팔레트        %d 판" % r.get("pallets", 1))
         log("벽시계        %.0f s" % r.get("wall", 0.0))
 
