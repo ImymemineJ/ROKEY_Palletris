@@ -361,8 +361,7 @@ def report():
         log("최대 knock    %.1f mm  (경고선 %.0f)" % (kn, D.KNOCK_WARN_MM))
         log("사이클        평균 %.1f s · 최대 %.1f s   (목표 %.0f s · 스폰 간격 %.0f s)"
             % (sum(cyc_s) / len(cyc_s), max(cyc_s),
-               cfg["timing"]["cycle_time_target_s"] if "timing" in cfg
-               else cfg.get("cycle_time_target_s", 0), SPAWN_DT))
+               cfg["robot"]["cycle_time_target_s"], SPAWN_DT))
         log("벽시계        %.0f s" % r.get("wall", 0.0))
         ok = (len(placed) == N
               and max(exy) < D.PLACE_TOL_XY_MM and max(ez) < D.PLACE_TOL_Z_MM

@@ -21,8 +21,13 @@ seg -> 그래프 경로는 `layout_to_spec_test1_1.py` 의 TRACKS/SEG_KEYS 와 �
 ## 왜 `Velocity` 변수 **하나만** 쓰나
 
 `IsaacConveyor` 노드가 이 그래프 변수를 읽어 `physxSurfaceVelocity` 를 authoring 한다.
-변수를 0 으로 두면 노드가 표면속도를 **아예 안 쓰므로** 벨트가 선다 —
-스토퍼 벽 없이 박스를 세우는 방식이 이것이다 (`belt_cycle.py` 와 같은 원리).
+변수를 0 으로 두면 노드가 표면속도를 **아예 안 쓰므로** 벨트가 선다.
+
+⚠ 이 정지는 **박스를 세우는 수단이 아니다.** 박스는 씬의 스토퍼 벽이 세운다
+(`layout_to_spec_test1_1.py`, 설계결정서 §4.4). 정지는 흡착 직전 떨림을 없애는
+용도다 — `cycle.py:_run` 이 present 를 받은 뒤 b_pickup 을 끊는다. 한때 벽 없이
+정지만으로 세우려던 판이 있었는데, `pickup_check` 는 박스가 *이미 멎어야* present 를
+주고 `cycle.py` 는 present 를 받아야 벨트를 세우므로 서로를 기다려 아무도 못 세웠다.
 
 **표면속도를 여기서 직접 쓰지 않는다.** 한때 "그래프가 안 도는 헤드리스 대비" 로
 `physxSurfaceVelocity` 를 같이 써넣었는데, 진리원이 둘이 되기만 하고 이득이 없었다.
