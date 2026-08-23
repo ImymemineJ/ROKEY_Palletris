@@ -121,6 +121,16 @@ def main():
         open_stage(a.stage)
         world = World(stage_units_in_meters=1.0,
                       physics_dt=1.0 / hz, rendering_dt=1.0 / hz)
+        # ★ World() 를 sim_params 없이 부르면 PhysicsContext 가 기존 /physicsScene 에
+        #   **자기 기본값을 덮어쓴다** (stabilization off · CPU 파이프라인이면 ccd on).
+        #   씬 USD 에 뭘 써 넣든 매 기동마다 되살아나므로 여기서 사양값으로 되돌린다.
+        #   enable_ccd 는 sim_params 키로 못 준다 — 명시 호출이어야 한다.
+        _ps = cfg["physics"]["scene"]
+        _pc = world.get_physics_context()
+        _pc.enable_stablization(bool(_ps["enable_stabilization"]))   # 메서드명 오타는 Isaac 쪽
+        _pc.enable_ccd(bool(_ps["enable_ccd"]))
+        print("[sim_main] 물리 안정화 %s · CCD %s · %.0f Hz"
+              % (_ps["enable_stabilization"], _ps["enable_ccd"], hz))
         stage = world.stage
         print("[sim_main] 씬 %s" % a.stage)
 
@@ -130,7 +140,7 @@ def main():
         import sim_server as SS
 
         # 소켓 스레드가 USD 를 직접 못 건드리게 한다 (mainq.py docstring).
-        q = MQ.MainQueue()
+        q = MQ.MainQueue(timeout_s=float(cfg["service"]["timeout_s"]) * 0.8)
 
         server = SS.SimServer(port=a.port)
         server.register({"ping": lambda req: {"ok": True}})

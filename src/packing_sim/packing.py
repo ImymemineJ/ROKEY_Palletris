@@ -186,7 +186,8 @@ class HeightmapPacker:
 
         return base_h, flatness, support, valid
 
-    def find_placement(self, box_size, box_mass: float = 0.0) -> Placement | None:
+    def find_placement(self, box_size, box_mass: float = 0.0,
+                       reject=None, reject_scan_max: int = 20000) -> Placement | None:
         """
         박스 하나(w, d, h)의 최적 배치를 찾는다. 실패하면 None.
 
@@ -194,6 +195,18 @@ class HeightmapPacker:
           1) 배치 후 최고 높이가 낮을수록 좋다        <- 하이트맵 최소화
           2) 지지면이 평평할수록 좋다                 <- 안정성
           3) 팔레트 모서리에 가까울수록 좋다          <- 파편화 억제
+
+        `reject(cx, cy, z, w, d, h, yaw_deg) -> bool` 을 주면 **점수 순으로** 훑어
+        거부되지 않는 첫 후보를 고른다. 좌표는 전부 팔레트 로컬 [m], `cx·cy` 는
+        모서리가 아니라 **중심**이다 (`Placement.center_local` 과 같은 규약).
+
+        이 훅이 필요한 이유: 이 클래스는 기하만 안다. "이 자리에 놓으러 가면
+        로봇 아래팔이 이미 서 있는 기둥 위를 쓸고 지나간다" 같은 것은 패킹 문제가
+        아니라 **팔의 문제**라, 여기에 로봇을 알게 만들면 안 된다. 대신 아는 쪽이
+        술어로 넘긴다. 안 주면 예전과 완전히 같이 동작한다.
+
+        `reject_scan_max` 는 술어를 부를 후보 수의 상한이다. 여기까지 다 거부되면
+        그 yaw 는 포기한다 (조용히 오래 도는 것보다 낫다).
         """
         w0, d0, h = (float(v) for v in box_size)
 
@@ -234,10 +247,23 @@ class HeightmapPacker:
 
             # 사전식 최소값을 하나의 정렬 키로 압축
             order = np.lexsort((score_c.ravel(), score_f.ravel(), score_h.ravel()))
-            idx = order[0]
-            i, j = np.unravel_index(idx, score_h.shape)
+            # ★ 무효 후보는 점수가 inf 라 정렬 뒤쪽에 몰린다 — 하나 만나면 그 뒤는
+            #   전부 무효다. 그래서 훑다가 무효를 만나면 바로 끊는다.
+            i = j = None
+            for k, idx in enumerate(order):
+                ii, jj = np.unravel_index(idx, score_h.shape)
+                if not valid[ii, jj]:
+                    break
+                if reject is not None:
+                    if k >= reject_scan_max:
+                        break
+                    if reject(ii * self.cell + w / 2.0, jj * self.cell + d / 2.0,
+                              float(base_h[ii, jj]), w, d, h, yaw):
+                        continue
+                i, j = ii, jj
+                break
 
-            if not valid[i, j]:
+            if i is None:
                 continue
 
             key = (float(score_h[i, j]), float(score_f[i, j]), float(score_c[i, j]))

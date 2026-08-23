@@ -99,6 +99,8 @@ ROBOT = "/World/robot"
 ROBOT_USD = os.environ.get(
     "PL_ROBOT_USD", os.path.expanduser("~/isaac_assets/h2017_suction.usd"))
 PALLET = "/World/Pallet"
+LOOKS = "/World/Looks"
+PHYS_MAT = LOOKS + "/PhysicsMaterial"
 
 # Isaac Sim 헤드리스 실측 (2026-08-22), A05 로 교체하고 scale=(4.180, 0.8019, 1.0399)
 # 일 때의 /World/ConveyorTrack/Rollers 월드 bbox. 스케일당 길이를 뽑는 데 쓴다.
@@ -185,6 +187,45 @@ def xform(spec, pos, scale, quat=(1, 0, 0, 0)):
         ["xformOp:translate", "xformOp:orient", "xformOp:scale"], uniform=True)
 
 
+def bind_phys(path):
+    """`path` 프림에 물리 머티리얼을 건다 (purpose=physics).
+
+    ★ 씬에 PhysicsMaterial 프림이 **하나도 없었다.** /World/Looks 아래 있던 셋은
+      전부 UsdPreviewSurface 시각 머티리얼이라 마찰과 무관하다. 즉 박스·팔레트·
+      스토퍼·벨트가 전부 PhysX 기본 마찰로 돌고 있었고, system.yaml 의
+      static 0.6 / dynamic 0.5 를 읽는 코드가 저장소에 없었다.
+      그런데 위 스토퍼 전도 한계 검사(h > w/(2mu))는 그 mu 를 전제로 벽 높이
+      100 mm 를 정당화한다 — 전제가 씬에서 성립하지 않고 있었다.
+    """
+    ps = layer.GetPrimAtPath(Sdf.Path(path))
+    if ps is None:
+        print(f"  물리 머티리얼 건너뜀 — {path} 가 이 레이어에 없다")
+        return
+    # ★ apiSchemas 는 **리스트옵**이다. 원래 형태를 반드시 지켜야 한다.
+    #   /World/ConveyorTrack/Rollers 는 참조 에셋 위의 `over` 이고, 루트 레이어에는
+    #   `prepended = [PhysxSurfaceVelocityAPI]` 만 들어 있다. 여기에 explicit 리스트를
+    #   써 넣으면 **약한 레이어(참조 에셋)의 apiSchemas 를 통째로 막는다** — 롤러의
+    #   RigidBody/Collision 이 사라져 벨트가 콜라이더를 잃는다.
+    #   실측 2026-08-23: CreateExplicit 로 썼더니 OmniGraph 가
+    #   "Selected Prim is not a Rigid Body" 를 내고 박스가 벨트를 뚫고 바닥(z 0.14)에
+    #   떨어졌다. 그래서 explicit 이면 explicit 에, 아니면 prepended 에 덧붙인다.
+    op = ps.GetInfo("apiSchemas") if ps.HasInfo("apiSchemas") else Sdf.TokenListOp()
+    if "MaterialBindingAPI" not in op.GetAddedOrExplicitItems():
+        if op.isExplicit:
+            ps.SetInfo("apiSchemas", Sdf.TokenListOp.CreateExplicit(
+                list(op.explicitItems) + ["MaterialBindingAPI"]))
+        else:
+            new_op = Sdf.TokenListOp()
+            new_op.prependedItems = list(op.prependedItems) + ["MaterialBindingAPI"]
+            new_op.appendedItems = list(op.appendedItems)
+            new_op.deletedItems = list(op.deletedItems)
+            ps.SetInfo("apiSchemas", new_op)
+    rel = ps.relationships.get("material:binding:physics")
+    if rel is None:
+        rel = Sdf.RelationshipSpec(ps, "material:binding:physics", False)
+    rel.targetPathList.explicitItems = [Sdf.Path(PHYS_MAT)]
+
+
 def drop(parent_path, name):
     parent = layer.GetPrimAtPath(Sdf.Path(parent_path))
     if parent is not None and name in parent.nameChildren:
@@ -213,6 +254,8 @@ if len(tracks) != len(SEG_KEYS):
 belt_sy = float(Gf.Vec3d(layer.GetAttributeAtPath(
     Sdf.Path(tracks[0]).AppendProperty("xformOp:scale")).default)[1])
 belt_w = ROLLER_W_PER_SCALE * belt_sy
+for _t in TRACKS:
+    bind_phys(_t + "/Rollers")           # 박스가 실제로 닿는 면
 print(f"조각 {len(tracks)}개 · 폭 {belt_w*1000:.0f}mm "
       f"(scale.y {belt_sy:.4f}, 사용자 값 유지)\n")
 
@@ -327,7 +370,18 @@ belt_top = mm(_conv["belt_top_z_mm"])
 _bt = SPEC["boxes"]["types"]
 _h_max, _d_max, _w_max = (max(t[k] for t in _bt) / 1000.0 for k in ("h_mm", "d_mm", "w_mm"))
 _w_min = min(t["w_mm"] for t in _bt) / 1000.0
-_mu = float(SPEC.get("physics", {}).get("material", {}).get("dynamic_friction", 0.5))
+# ★ 기본값으로 조용히 떨어지면 안 된다. 셸이 `physics` 키를 안 넘기던 동안
+#   이 검사는 system.yaml 이 아니라 리터럴 0.5 로 판정하고 있었다 — 마찰을
+#   0.3 으로 낮춰도 스토퍼 전도 한계는 340 mm 그대로 나온다. 조용히 틀린 답을
+#   내는 게이트는 없는 게이트보다 나쁘다 (철칙 3).
+try:
+    _mat = SPEC["physics"]["material"]
+    _mu = float(_mat["dynamic_friction"])
+    _mu_s = float(_mat["static_friction"])
+except KeyError as _e:
+    raise SystemExit(
+        f"PL_SPEC 에 physics.material 이 없다 ({_e}) — "
+        "run_layout_to_spec.sh 의 키 튜플을 확인하라.")
 # 1) 너무 높으면 벨트 마찰이 박스를 벽 위로 **전도**시킨다 (벽 상단 모서리가 축).
 _tip_h = _w_min / (2.0 * _mu)
 if STOP_H >= _tip_h:
@@ -345,6 +399,43 @@ if STOP_W < max(_d_max, _w_max):
     raise SystemExit(
         f"스토퍼 폭 {STOP_W*1000:.0f} 가 가장 큰 박스 최대 변"
         f"({max(_d_max, _w_max)*1000:.0f}) 보다 좁다.")
+# ── 물리 씬 플래그 ──────────────────────────────────────────
+# ★ 씬을 pxr 로 읽어 보니 사양과 **정반대**였다: enableStabilization=False
+#   (사양 true) · enableCCD=True (사양 false). 그리고 이 두 속성을 쓰는 코드가
+#   저장소에 한 줄도 없었다 — system.yaml 의 physics.scene 을 아무도 안 읽었다.
+#   stabilization 을 켜라는 이유가 §5.4 상 정지 스택 붕괴 방지이고, G2 합격선이
+#   "4단 30초 방치 후 위치변화 < 3 mm" 다. 그 조건이 이 씬에서 성립한 적이 없다.
+#   라인 드라이버(demo_stack15_test1_1.py)는 World() 를 안 만들고 타임라인만
+#   돌리므로, **여기 씬에 쓴 값이 곧 실행 값**이다.
+_ps = SPEC["physics"]["scene"]
+_pscene = layer.GetPrimAtPath(Sdf.Path("/physicsScene"))
+if _pscene is None:
+    _pscene = define("/physicsScene", "PhysicsScene",
+                     ["PhysxSceneAPI"])
+for _n, _v in (("physxScene:enableStabilization", bool(_ps["enable_stabilization"])),
+               ("physxScene:enableCCD", bool(_ps["enable_ccd"]))):
+    _a = _pscene.attributes.get(_n)
+    if _a is None:
+        _a = Sdf.AttributeSpec(_pscene, _n, Sdf.ValueTypeNames.Bool,
+                               Sdf.VariabilityVarying)
+    _old = _a.default
+    _a.default = _v
+    print(f"물리 씬 {_n.split(':')[-1]} {_old} -> {_v}")
+_a = _pscene.attributes.get("physxScene:timeStepsPerSecond")
+if _a is None:
+    _a = Sdf.AttributeSpec(_pscene, "physxScene:timeStepsPerSecond",
+                           Sdf.ValueTypeNames.UInt, Sdf.VariabilityVarying)
+_a.default = int(_ps["time_steps_per_second"])
+print(f"물리 씬 timeStepsPerSecond {_a.default}")
+
+if layer.GetPrimAtPath(Sdf.Path(LOOKS)) is None:
+    define(LOOKS, "Scope")
+_pm = define(PHYS_MAT, "Material", ["PhysicsMaterialAPI"])
+put(_pm, "physics:staticFriction", Sdf.ValueTypeNames.Float, _mu_s)
+put(_pm, "physics:dynamicFriction", Sdf.ValueTypeNames.Float, _mu)
+put(_pm, "physics:restitution", Sdf.ValueTypeNames.Float, 0.0)
+print(f"물리 머티리얼 {PHYS_MAT}  정지 {_mu_s} · 운동 {_mu} · 반발 0.0")
+
 spec = define(STOPPER, "Cube", ["PhysicsCollisionAPI", "PhysxCollisionAPI"])
 put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
 put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
@@ -357,6 +448,7 @@ put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
 #   밑면은 벨트 상면에 얹는다.
 xform(spec, (belt_x1 + STOP_T / 2.0, 0.0, belt_top + STOP_H / 2.0),
       (STOP_T, STOP_W, STOP_H))
+bind_phys(STOPPER)
 print(f"스토퍼 벽 x {belt_x1*1000:.0f}~{(belt_x1+STOP_T)*1000:.0f}  "
       f"y +-{STOP_W/2*1000:.0f}  z {belt_top*1000:.0f}~{(belt_top+STOP_H)*1000:.0f}  "
       f"(콜라이더만 · RigidBody 없음)")
@@ -377,6 +469,7 @@ put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
 put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
 # 바닥(0)부터 베이스 높이까지. 중심 z = 높이/2.
 xform(spec, (base[0], base[1], ped_h / 2.0), (1.0, 1.0, 1.0))
+bind_phys(PEDESTAL)
 print(f"페데스탈 ({base[0]:.3f}, {base[1]:.3f})  D{PED_DIAM*1000:.0f} x H{ped_h*1000:.0f}  "
       f"상면 z={ped_h:.3f} (로봇 베이스)")
 
@@ -405,6 +498,7 @@ pw, pd, pt = mm(pal["width_mm"]), mm(pal["depth_mm"]), mm(pal["thickness_mm"])
 # porg 는 모서리이고 z 는 상면이다. 중심으로 환산한다.
 xform(spec, (porg[0] + pw / 2.0, porg[1] + pd / 2.0, porg[2] - pt / 2.0),
       (pw, pd, pt))
+bind_phys(PALLET)
 print(f"팔레트 모서리 ({porg[0]:.3f}, {porg[1]:.3f})  {pw*1000:.0f}x{pd*1000:.0f}x{pt*1000:.0f}  "
       f"상면 z={porg[2]:.3f}")
 
@@ -446,6 +540,7 @@ put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
 # 상면이 DOCK_Z 이므로 중심은 그보다 두께의 반만큼 아래다.
 xform(spec, ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0, DOCK_Z - OF_T / 2.0),
       (ox1 - ox0, oy1 - oy0, OF_T))
+bind_phys(OUTFEED)
 print(f"반출 컨베이어 x {ox0*1000:.0f}~{ox1*1000:.0f}  "
       f"y {oy0*1000:.0f}~{oy1*1000:.0f}  "
       f"상면 z={DOCK_Z*1000:.0f} (도크 바닥 = 트럭 적재함 바닥)")

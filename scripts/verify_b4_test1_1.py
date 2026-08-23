@@ -56,6 +56,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "src/packing_sim/isaac"))
 sys.path.insert(0, str(ROOT / "src/packing_robot/packing_robot"))
 
+import _kitexit                                          # noqa: E402
 import _paths                                            # noqa: E402
 import import_h2017_usd as IMP                           # noqa: E402
 
@@ -101,7 +102,7 @@ for p in (ROBOT_PRIM, GRIPPER_PRIM):
     log("  %-28s %s" % (p, "있음" if ok else "!! 없음"))
     if not ok:
         log("  -> run_layout_to_spec.sh 를 먼저 돌려라.")
-        omni.kit.app.get_app().post_quit()
+        _kitexit.shutdown(2, log=log)
         raise SystemExit
 log("-" * 70)
 
@@ -132,9 +133,24 @@ def setup():
     log("로봇      베이스 %s mm  EE %s"
         % ([round(float(v) * 1000) for v in pos], EE_FRAME))
 
-    q = MQ.MainQueue()
-    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM)
+    q = MQ.MainQueue(timeout_s=float(cfg["service"]["timeout_s"]) * 0.8)
     sp = SP.Spawner(stage, cfg, q, zone=ZONE)
+
+    def _gap_mm():
+        """흡착면~박스 윗면 간극 [mm]. 안 주면 grasp 판정이 실측을 안 본다.
+        근거는 scripts/demo_stack15_test1_1.py 의 같은 함수 주석."""
+        e = sp._snap.get(BOX_ID)
+        if e is None:
+            return None
+        q6 = np.asarray(art.get_joint_positions()[:6], dtype=float)
+        fk_p, fk_R = lula.compute_forward_kinematics(EE_FRAME, q6)
+        zax = np.asarray(fk_R)[:, 2]
+        face = np.asarray(fk_p, dtype=float) + zax * rm.grip_len
+        c = np.asarray(e["pos_m"], dtype=float)
+        return (float(np.dot(c - face, zax)) - T4["h_mm"] / 2000.0) * 1000.0
+
+    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM,
+                        gap_fn=_gap_mm)
     cc = conveyor_ctl.ConveyorCtl(stage, cfg, q)
 
     server = SS.SimServer(port=PORT)
@@ -264,8 +280,10 @@ def report():
             _S["server"].close()
     except Exception:
         pass
-    omni.timeline.get_timeline_interface().stop()
-    omni.kit.app.get_app().post_quit()
+    # ★ 여기서 timeline.stop() + post_quit() 만 부르면 **프로세스가 안 죽는다.**
+    #   물리 스텝 콜백 안이라 kit 이 그 틱을 못 끝내 종료 이벤트를 못 뽑는다.
+    #   근거와 실측은 scripts/_kitexit.py docstring.
+    _kitexit.shutdown(0 if ok else 1, physx_sub=_S.get("physx_sub"), log=log)
 
 
 def on_step(dt):
@@ -289,6 +307,14 @@ def on_step(dt):
     if _S["phase"] == "settle":
         # 드라이브 목표를 계속 걸어 줘야 READY 에 머문다 (안 걸면 옛 목표로 튄다).
         _S["n"] += 1
+        # ★ setup() 이 이미 listen 을 시작했다. 이 1.5 s 창에 들어온 소켓 요청이
+        #   죽지 않게 여기서도 매 스텝 돌린다 — 안 돌리면 grasp 가 '늦는' 게 아니라
+        #   '시작조차 안 되고' 예산을 통째로 날린 뒤 timeout 만 돌아온다.
+        #   rm 은 IDLE 이라 아래 apply_action 과 안 싸운다. 순서 주의: rm.step() 을
+        #   먼저 돌리고 ready_action 을 마지막에 걸어 그쪽이 이기게 한다.
+        _S["q"].pump()
+        _S["rm"].step()
+        _S["sp"].step()
         _S["art"].apply_action(_S["ready_action"])
         if _S["n"] >= SETTLE_STEPS:
             q = _S["art"].get_joint_positions()
@@ -306,5 +332,5 @@ def on_step(dt):
         report()
 
 
-_sub = get_physx_interface().subscribe_physics_step_events(on_step)
+_S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
 log("Play — 부팅 대기...\n")

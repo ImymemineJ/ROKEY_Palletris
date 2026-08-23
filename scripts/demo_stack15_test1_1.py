@@ -58,6 +58,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "src/packing_sim/isaac"))
 sys.path.insert(0, str(ROOT / "src/packing_robot/packing_robot"))
 
+import _kitexit                                          # noqa: E402
 import _paths                                            # noqa: E402
 import import_h2017_usd as IMP                           # noqa: E402
 import demo_stack15 as D                                 # B5 산출물 그대로  # noqa: E402
@@ -71,6 +72,10 @@ ZONE = "B"
 BOX_ID_FMT = "BOX%05d"
 BOOT_STEPS = 20
 SETTLE_STEPS = 90                                        # READY 수렴 (1.5 s)
+# ★ 지금 집으려는 박스. 워커 스레드가 쓰고 **메인 스레드**(gap_fn)가 읽는다.
+#   튜플을 통째로 갈아끼운다 — 키 두 개를 따로 쓰면 새 박스 id 에 옛 높이가
+#   붙는 순간이 생긴다.
+_CUR = {"box": None}                                     # (box_id, 반높이 m) | None
 N_BOXES = int(os.environ.get("PL_N", "0")) or None        # 0/미지정이면 사양값
 # ★ 상자 조합을 이 실행에서만 바꾼다. `system.yaml` 의 random_seed 42 는
 #   "고정 — 베이스라인 비교 필수" 라 파일을 고치지 않는다.
@@ -94,6 +99,7 @@ ARRIVE_TIMEOUT_S = 180.0                                 # 다음 박스가 스�
 CYCLE_WALL_S = 120.0
 SETTLE_S = float(os.environ.get("PL_SETTLE", "0.7"))     # 놓은 뒤 재기 전 정착 (B5 는 0.5)
 WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
+VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -103,6 +109,56 @@ S1 = cfg["boxes"]["stage1"]
 BUFFER_CAP = int(cfg["zones"]["buffer_capacity"])        # 픽업 구간에 세울 수 있는 최대
 N = N_BOXES or int(S1["total_count"])
 SPAWN_DT = float(S1["spawn_interval_s"])
+BASE_MM = cfg["zones"]["robot_base_world_mm"][ZONE]
+PALLET_X = (ORIGIN_MM[0] / 1000.0, (ORIGIN_MM[0] + cfg["pallet"]["width_mm"]) / 1000.0)
+PALLET_Y = (ORIGIN_MM[1] / 1000.0, (ORIGIN_MM[1] + cfg["pallet"]["depth_mm"]) / 1000.0)
+PALLET_TOP_M = ORIGIN_MM[2] / 1000.0
+BOX_H_MM = {t["name"]: float(t["h_mm"]) for t in cfg["boxes"]["types"]}
+
+# ── 팔 간섭 제약 ────────────────────────────────────────────
+# ★ knock 의 원인은 물리 튜닝이 아니라 **자리를 어디로 잡느냐**다.
+#   B5 견본이 knock 을 115 mm -> 0.2 mm 로 떨어뜨린 것은 패커가 아니라
+#   `build_plan` 안의 순서 규칙이었다: "로봇 쪽에 이미 기둥이 서 있으면 그 너머
+#   먼 자리로 갈 때 아래팔(link_2)이 그 위를 쓸고 지나간다" (demo_stack15.print_plan
+#   과 results/issues/18). 한계는 대략 페데스탈 상면 − 150 mm.
+#   실측 2026-08-23 (results/stack15_swap_20260823.log): 12번째가 근거리
+#   P(695,205) z680 5호 -> 상단 1020 mm, 13번째가 그 너머 far P(590,620) z840.
+#   그 사이클에서 knock 67.3 mm 가 났고 피해자가 바로 그 근거리 기둥(BOX00011)이다.
+#   한계 900−150=750 을 270 mm 넘겼다.
+#   라인은 **도착 순서**를 못 고른다. 그러나 **자리**는 고를 수 있다 — 그래서
+#   견본의 순서 규칙을 패커의 후보 거부 술어로 옮겨 담는다 (packing.find_placement
+#   의 `reject` 훅). 제약을 만족하는 자리가 없으면 예전처럼 잡되 로그에 남긴다:
+#   자리를 못 잡아 PALLET_FULL 을 내는 것보다 knock 을 감수하는 편이 낫다.
+PED_MM = float(cfg["robot"]["pedestal_height_mm"])
+NEAR_LIM_MM = PED_MM - 150.0          # 이보다 높은 근거리 기둥 위는 못 지나간다
+NEAR_DY_MM = 50.0                     # "로봇 쪽" 으로 칠 최소 y 차 (견본과 동일)
+NEAR_HALF_MM = cfg["pallet"]["depth_mm"] / 2.0   # y < 400 이면 근거리 (견본과 동일)
+SECTOR_DEG = 25.0                     # 방위각이 이 안이면 같은 통로다 (견본과 동일)
+_AG = os.environ.get("PL_ARM_GUARD", "1")
+ARM_GUARD = _AG not in ("0", "false", "no")
+ARM_GUARD_SOFT = _AG == "soft"           # 함정을 만드는 자리도 허용 (비교 실험용)
+
+
+def _az_local(cx_m, cy_m):
+    """팔레트 로컬 [m] -> 로봇 베이스에서 본 방위각 [deg]. 견본 `_az` 와 같은 식."""
+    return math.degrees(math.atan2(cy_m * 1000.0 + ORIGIN_MM[1] - BASE_MM[1],
+                                   cx_m * 1000.0 + ORIGIN_MM[0] - BASE_MM[0]))
+
+
+def _near_worst_mm(cx_m, cy_m, cols):
+    """이 자리로 가려면 넘어야 하는 **근거리 기둥 최고 상단** [mm]. 0 이면 없다.
+
+    `cols` 는 (cx_m, cy_m, top_mm) 목록. 진단과 제약이 같은 식을 쓰게 하나로 둔다.
+    """
+    az = _az_local(cx_m, cy_m)
+    worst = 0.0
+    for qx, qy, top in cols:
+        if qy * 1000.0 >= cy_m * 1000.0 - NEAR_DY_MM:
+            continue                                     # 로봇 쪽이 아니다
+        if abs((_az_local(qx, qy) - az + 180.0) % 360.0 - 180.0) >= SECTOR_DEG:
+            continue                                     # 다른 통로다
+        worst = max(worst, top)
+    return worst
 
 _S = {"phase": "boot", "n": 0, "t0": time.time(), "done": False,
       "rows": [], "result": None}
@@ -110,6 +166,17 @@ _S = {"phase": "boot", "n": 0, "t0": time.time(), "done": False,
 
 def log(*a):
     print(*a, flush=True)
+
+
+# ── 로그 파일 ───────────────────────────────────────────────
+# 헤드리스로 5분 넘게 돌고 cycle/gripper/robot_motion 이 수백 줄을 쏟는다. 터미널
+# 스크롤백은 다음 실행이 밀어낸다 — 실제로 knock 을 사후 분석하려다 로그가 없어
+# 다시 돌린 적이 있다. B5(`demo_stack15.py`)와 같이 Tee 로 파일에 남긴다.
+# `PL_LOG` 로 경로를 바꾼다.
+# ⚠ Tee 는 sys.stdout 을 감싸므로 **파이썬 print 만** 잡는다. carb/Kit 의 C++ 로그까지
+#   필요하면 셸에서 `2>&1 | tee` 를 따로 걸어야 한다.
+_S["tee"] = D.V.start_log(os.environ.get("PL_LOG")
+                          or ROOT / "results" / "demo_stack15_test1_1.txt")
 
 
 # ── 씬 열기 + Play ──────────────────────────────────────────
@@ -127,7 +194,9 @@ for p in (ROBOT_PRIM, GRIPPER_PRIM, "/World/Stopper"):
     log("  %-28s %s" % (p, "있음" if ok else "!! 없음"))
     if not ok:
         log("  -> src/packing_sim/run_layout_to_spec.sh 를 먼저 돌려라.")
-        omni.kit.app.get_app().post_quit()
+        if _S.get("tee"):
+            _S["tee"].close()
+        _kitexit.shutdown(2, log=log)
         raise SystemExit
 log("-" * 78)
 
@@ -158,9 +227,37 @@ def setup():
     log("로봇      베이스 %s mm  EE %s"
         % ([round(float(v) * 1000) for v in pos], EE_FRAME))
 
-    q = MQ.MainQueue()
-    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM)
+    q = MQ.MainQueue(timeout_s=float(cfg["service"]["timeout_s"]) * 0.8)
     sp = SP.Spawner(stage, cfg, q, zone=ZONE)
+
+    def _gap_mm():
+        """흡착면~박스 윗면 간극 [mm]. 못 재면 None.
+
+        ★ 이걸 안 주면 `gripper._grasp_verdict` 의 간극 검사(GRIP_TOL_MM 3 mm)가
+          통째로 건너뛰어진다. 그러면 "is_holding 이 참이고 물린 프림 이름이 맞다"
+          까지만 보고 흡착 성공으로 친다 — 박스가 흡착면에서 몇 mm 떠서 매달려도
+          모른다. `cycle.py` 의 이송·배치 높이는 전부 "딱 붙었다" 를 가정하므로
+          매달린 만큼 밑면이 계산보다 낮게 내려가 이웃 상면을 긁는다.
+          `verify_suction.measure` 와 같은 식: 툴 +Z 축에 투영한다.
+          `rm.suction_pose()` 는 위치만 주고 축을 안 줘서 여기 못 쓴다.
+        rm.step() -> poll_grasp -> _grasp_verdict 경로라 **메인 스레드**다.
+        """
+        cur = _CUR["box"]
+        if cur is None:
+            return None
+        bid, half_h = cur
+        e = sp._snap.get(bid)
+        if e is None:
+            return None
+        q6 = np.asarray(art.get_joint_positions()[:6], dtype=float)
+        fk_p, fk_R = lula.compute_forward_kinematics(EE_FRAME, q6)
+        zax = np.asarray(fk_R)[:, 2]
+        face = np.asarray(fk_p, dtype=float) + zax * rm.grip_len
+        c = np.asarray(e["pos_m"], dtype=float)
+        return (float(np.dot(c - face, zax)) - half_h) * 1000.0
+
+    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM,
+                        gap_fn=_gap_mm)
     cc = conveyor_ctl.ConveyorCtl(stage, cfg, q)
 
     server = SS.SimServer(port=PORT)
@@ -178,6 +275,7 @@ def setup():
     art.set_joint_positions(ready)
     art.set_joint_velocities(np.zeros(6))
     _S["ready_action"] = ArticulationAction(joint_positions=ready)
+    _S["ready_q"] = ready                                # 감긴 팔을 되돌릴 때 쓴다
     log("자세      READY 로 순간이동 %s deg" % np.round(np.degrees(ready), 1).tolist())
 
     _S.update(rm=rm, sp=sp, cc=cc, q=q, server=server, art=art)
@@ -293,6 +391,7 @@ def worker(specs, ids):
     """머리 쪽. 소켓으로만 말한다."""
     import cycle as CY
     import sim_link as SL
+    _S["CY"] = CY                                        # report() 가 좌표 변환에 쓴다
 
     try:
         link = SL.SimLink(port=PORT)
@@ -302,8 +401,61 @@ def worker(specs, ids):
         hm, pal = cfg["heightmap"], cfg["pallet"]
         PKM = D._load_packer_module()
 
+        class ArmAwarePacker(PKM.HeightmapPacker):
+            """기하만 아는 패커에 **팔 사정**을 술어로 얹는다 (위 상수 주석 참고)."""
+
+            def _sweep_risk(self, cx, cy, z, w, d, h, yaw):
+                """이 자리로 **가는 길**에 넘어야 할 기둥이 너무 높은가."""
+                cols = [(q.center_local[0], q.center_local[1], (q.z + q.h) * 1000.0)
+                        for q in self.placements]
+                return _near_worst_mm(cx, cy, cols) > NEAR_LIM_MM
+
+            def _builds_trap(self, cx, cy, z, w, d, h, yaw):
+                """이 자리에 놓으면 **나중에** 그 뒤로 못 가게 되는가.
+
+                ★ 이게 더 중요하다. 함정은 빠진 뒤가 아니라 빠지기 전에 막아야 한다.
+                  실측 2026-08-23 (stack15j): 12번째가 근거리 (695,205) 에 5호를
+                  올려 상단 1020 mm 인 기둥을 세웠다. 그러자 13번째가 갈 수 있는 far
+                  자리가 **하나도 안 남았고**, 제약을 풀고 놓았더니 아래팔이 그 위를
+                  쓸어 far 쪽 4단 탑이 통째로 무너졌다 (knock 1401 mm · 박스 5개가
+                  팔레트 밖으로). 그 한 수를 안 두게 하는 것이 답이다.
+                  근거리 = 팔레트 앞 절반 (견본 `build_plan` 의 `y_mm < 400` 과 동일).
+                """
+                return cy * 1000.0 < NEAR_HALF_MM and (z + h) * 1000.0 > NEAR_LIM_MM
+
+            def find_placement(self, box_size, box_mass=0.0, **kw):
+                if not ARM_GUARD or kw.get("reject") is not None:
+                    return super().find_placement(box_size, box_mass, **kw)
+
+                # 1) 길도 막히지 않고 함정도 안 만드는 자리
+                p = super().find_placement(
+                    box_size, box_mass,
+                    reject=lambda *a: self._sweep_risk(*a) or self._builds_trap(*a))
+                if p is not None:
+                    return p
+                # 2) 함정은 감수하되 지금 길은 열려 있는 자리.
+                #    ★ 기본은 **쓰지 않는다.** 실측 2026-08-23 (stack15k): 이 완화가
+                #      12·13번째를 근거리 z1020(상단 1300) 에 올렸고, 그 깊은 하강에서
+                #      팔꿈치가 옆 기둥을 77.9 mm 밀었다 — 견본이 말한 시나리오 (b) 다.
+                #      팔레트를 한 판 더 쓰는 편이 스택을 흔드는 것보다 싸다.
+                #      비교 실험용으로만 `PL_ARM_GUARD=soft` 로 연다.
+                if ARM_GUARD_SOFT:
+                    p = super().find_placement(box_size, box_mass,
+                                               reject=self._sweep_risk)
+                    if p is not None:
+                        log("            [svc] 근거리 기둥이 %.0f mm 를 넘게 된다 —"
+                            " 다음 박스가 그 뒤로 못 갈 수 있다 (soft)" % NEAR_LIM_MM)
+                        return p
+                # 3) 길이 막혔다. **제약을 풀지 않는다.** 여기서 억지로 놓으면 팔이
+                #    기둥 위를 쓸어 스택이 무너진다 — knock 몇 mm 가 아니라 판이 엎어진다.
+                #    사양이 준 길로 간다: PALLET_FULL -> 팔레트 교체 (설계결정서 §7,
+                #    "버퍼 우회는 정상적인 흐름 제어이지 실패가 아님").
+                log("            [svc] !! 간섭 없이 갈 수 있는 자리가 없다 — 이 팔레트는"
+                    " 여기까지다 (한계 %.0f mm)" % NEAR_LIM_MM)
+                return None
+
         def factory():
-            return PKM.HeightmapPacker(
+            return ArmAwarePacker(
                 size_xy=(pal["width_mm"] / 1000.0, pal["depth_mm"] / 1000.0),
                 max_height=pal["max_stack_mm"] / 1000.0,
                 cell=hm["cell_mm"] / 1000.0,
@@ -315,7 +467,7 @@ def worker(specs, ids):
 
         vision = D.PalletVision(by_id, specs, ORIGIN_MM)
         svc = LineServices(link, specs, factory, vision, D.CLEARANCE_MM,
-                           log=lambda *a: log("           ", *a))
+                           log=lambda *a: log("           ", *a), verbose=VERBOSE)
         cyc = CY.Cycle(link, svc, cfg, zone=ZONE, log=lambda *a: log("   [cycle]", *a))
 
         # 라인을 돌린다. 이후 정지/재가동은 `cycle.py` 가 b_pickup 만 만진다.
@@ -325,6 +477,7 @@ def worker(specs, ids):
                          daemon=True, name="spawn").start()
 
         rest = {}                                        # 놓인 뒤의 기준 자세 (knock 용)
+        on_pallet = []                                   # 지금 팔레트에 선 기둥 (팔 간섭 진단용)
         swapped_for = set()                              # 이 박스 때문에 이미 교체했다
         pallets = 1
         t_all = time.time()
@@ -352,6 +505,7 @@ def worker(specs, ids):
                 break
             bid = pick["box_id"]
             t = specs[bid]
+            _CUR["box"] = (bid, t["h_mm"] / 2000.0)      # gap_fn 이 읽는다
             wait_s = time.time() - t0
 
             log("\n[%2d/%d] %-9s %-3s %s mm %.0f kg   대기 %.1f s   앞면 %.4f m"
@@ -361,8 +515,11 @@ def worker(specs, ids):
 
             # ── 사이클 한 바퀴 — 실물 cycle.py 그대로 ───────
             tc = time.time()
+            _S["cyc_t0"], _S["cyc_id"] = tc, bid     # 메인 스레드가 감시한다 (on_step)
             res = cyc.run(bid, pick["pose"])
             wall = time.time() - tc
+            _S["cyc_t0"] = None
+            _CUR["box"] = None                           # 사이클 밖에서 옛 박스로 재지 않는다
 
             # ── 놓은 뒤 정착 ────────────────────────────────
             # ★ B5 견본(`demo_stack15.main`)은 사이클이 끝난 뒤 SETTLE_S 만큼 물리를
@@ -386,17 +543,34 @@ def worker(specs, ids):
                 want = np.asarray(CY.pallet_place_to_world(place, t["h_mm"], ORIGIN_MM))
                 got = by_id[bid].get_world_pose()[0]
                 err = (got - want) * 1000.0
-            knock, who = 0.0, "-"
+            knock, who, kvec = 0.0, "-", np.zeros(3)
             for pid, ref in rest.items():
-                dmm = float(np.linalg.norm(by_id[pid].get_world_pose()[0] - ref) * 1000.0)
+                dv = (by_id[pid].get_world_pose()[0] - ref) * 1000.0
+                dmm = float(np.linalg.norm(dv))
                 if dmm > knock:
-                    knock, who = dmm, pid
+                    knock, who, kvec = dmm, pid, dv
+
+            # ★ 이 자리로 가려면 로봇 쪽 기둥을 넘어야 했는가. 넘었다면 아래팔이
+            #   그 위를 쓸고 지나갔다는 뜻이고, 그게 knock 의 코드상 원인이다.
+            #   게이트에는 안 넣는다 — 상관을 먼저 실측으로 확인한다.
+            near_mm = 0.0
+            if place is not None:
+                near_mm = _near_worst_mm(
+                    place["x_mm"] / 1000.0, place["y_mm"] / 1000.0,
+                    [(q["x_mm"] / 1000.0, q["y_mm"] / 1000.0,
+                      q["z_mm"] + BOX_H_MM[q["type"]]) for q in on_pallet])
+                if near_mm > NEAR_LIM_MM:
+                    log("       !! 근거리 기둥 %.0f mm > 한계 %.0f (ped %.0f) — "
+                        "아래팔이 그 위를 쓴다" % (near_mm, NEAR_LIM_MM, PED_MM))
+
             if res == "PLACED":
                 rest[bid] = by_id[bid].get_world_pose()[0].copy()
+                if place is not None:
+                    on_pallet.append(dict(place, type=t["name"], id=bid))
 
             _S["rows"].append({"id": bid, "type": t["name"], "res": res, "err": err,
                                "wall": wall, "wait": wait_s, "knock": knock, "who": who,
-                               "place": place})
+                               "kvec": kvec, "near_mm": near_mm, "place": place})
             log("       %-11s 오차 [%+.1f %+.1f %+.1f] mm   %.1f s   knock %.1f mm (%s)"
                 % (res, err[0], err[1], err[2], wall, knock, who))
 
@@ -422,6 +596,7 @@ def worker(specs, ids):
                     log("       팔레트 #%d — 박스 %d 개를 내보냈다. %s 를 다시 집는다."
                         % (pallets, sw.get("removed", 0), bid))
                 rest.clear()                          # 팔레트가 비었으니 knock 기준도 리셋
+                on_pallet.clear()
                 continue                              # i 를 안 올린다 = 같은 박스 재시도
             i += 1
             # ★ PALLET_FULL 에서 멈추지 않는다. 큰 박스가 못 들어갔다고 작은 박스도
@@ -432,14 +607,85 @@ def worker(specs, ids):
             #   실패가 아님" (설계결정서 §7 · bypass_count 를 retry_count 와 분리하는 이유).
             #   stage 2 에서는 Return Line 으로 재순환한다. stage 1 은 그 설비가 없어
             #   여기서 라인 밖으로 뺀다.
-            if res in ("PALLET_FULL", "BLOCKED", "IK_FAIL", "PICK_FAIL"):
+            # ★ 화이트리스트로 쓰면 안 된다. 실제로 `PICK_FAIL` 이라고 적어 뒀는데
+            #   `cycle.py` 가 돌려주는 값은 `PICK_FAILED` 다(cycle.RESULTS). 문자열
+            #   비교라 조용히 안 맞아서, 흡착 실패한 박스가 despawn 안 되고 스토퍼에
+            #   남는다 — 그러면 뒤 박스가 영영 못 오고 pickup_check 는 같은 박스를
+            #   계속 present 로 준다. 성공은 "PLACED" 하나뿐이니 그 반대로 판정한다.
+            if res != "PLACED":
                 if res == "PALLET_FULL":
                     log("       이 팔레트에 자리가 없다 — 우회 처리하고 다음 박스로 간다.")
                 else:
                     log("       !! 실패. 라인에서 빼고 다음 박스로 넘어간다.")
-                # 스토퍼를 막고 있으면 다음 박스가 못 온다. 반드시 치운다.
-                link.call(cmd="despawn_box", box_id=bid)
+                # ★★ 치우기 전에 **그리퍼부터 연다.**
+                #   `cycle.py` 의 PICK_FAILED 경로는 `_abort` 를 안 거쳐서 그리퍼를
+                #   안 연다 (B 파일이라 안 고친다). 그래서 흡착이 `Closing` 이고 물린
+                #   프림 목록에 박스가 들어 있는 채로 남는다. 그 상태에서 despawn 하면
+                #   `Spawner._despawn` 이 박스를 kinematic 으로 바꿔 (-50,-50,-10) 로
+                #   순간이동시키는데, **그리퍼가 붙잡은 채로 팔이 같이 끌려간다.**
+                #   실측 2026-08-23: 그 뒤 관절 하나가 188 rad(10817 deg) 감겨 이후
+                #   모든 이동이 120 s 예산을 넘겼고, 팔이 휘저으며 이미 놓인 박스를
+                #   86 mm 밀었으며, 벨트 위 다른 박스가 [-201,-55,21] 로 튕겨 나갔다.
+                #   열려 있는 그리퍼에 release 를 걸어도 무해하다 — 무조건 연다.
+                rl = link.call_slow(cyc.release_budget_s, cmd="release")
+                if not rl.get("ok"):
+                    log("       !! release %r (계속 진행한다)" % rl)
 
+                # 감겼으면 되돌린다. 안 되돌리면 남은 사이클이 전부 죽는다.
+                _q = np.asarray(_S["art"].get_joint_positions()[:6], dtype=float)
+                if float(np.max(np.abs(_q))) > 2.0 * math.pi:
+                    log("       !! 관절이 감겼다 %s deg — READY 로 되돌린다"
+                        % np.round(np.degrees(_q), 0).tolist())
+                    _S["q"].run(lambda: (_S["art"].set_joint_positions(_S["ready_q"]),
+                                         _S["art"].set_joint_velocities(np.zeros(6)),
+                                         {"ok": True})[-1])
+                    time.sleep(1.0)                       # 드라이브가 따라올 시간
+
+                # 스토퍼를 막고 있으면 다음 박스가 못 온다. 반드시 치운다.
+                # ★ 단, 이탈 경로(`cycle._abort`)는 매달린 박스를 **그 자리에서** 놓는다.
+                #   이송이나 배치 하강 중에 MOTION_TIMEOUT / IK_FAIL 이 나면 박스는
+                #   적재물 위에 떨어져 있고, release 뒤 후퇴 이동이 타임아웃 나면
+                #   **제대로 놓인 박스**가 BLOCKED 로 여기 온다. 그걸 개별 despawn 하면
+                #   `Spawner._despawn` 이 프림을 kinematic 으로 바꿔 (-50,-50,-10) 로
+                #   순간이동시키므로 그 위·옆 박스가 지지를 잃고 무너진다.
+                #   팔레트 위에 있으면 팔레트째 정리한다 (swap_pallet 은 위를 다 치운다).
+                pr = link.call(cmd="get_box_pose", box_id=bid)
+                fell_on_pallet = False
+                if pr.get("ok"):
+                    _bx, _by, _bz = pr["pos_m"]
+                    fell_on_pallet = (PALLET_X[0] <= _bx <= PALLET_X[1]
+                                      and PALLET_Y[0] <= _by <= PALLET_Y[1]
+                                      and _bz >= PALLET_TOP_M - 0.05)
+                if fell_on_pallet:
+                    log("       !! 팔레트 위에 떨어졌다 (%.3f %.3f %.3f) — 개별 despawn "
+                        "대신 팔레트를 갈아낸다" % tuple(pr["pos_m"]))
+                    link.call(cmd="set_spawn_enabled", enabled=False)
+                    sw = link.call(cmd="swap_pallet", zone=ZONE)
+                    svc.reset_pallet()
+                    link.call(cmd="set_spawn_enabled", enabled=True)
+                    if sw.get("ok"):
+                        pallets += 1
+                        log("       팔레트 #%d — 박스 %d 개를 내보냈다."
+                            % (pallets, sw.get("removed", 0)))
+                    else:
+                        log("       !! swap_pallet 실패: %r" % sw)
+                    rest.clear()          # 안 지우면 knock 루프가 없는 박스를 읽는다
+                    on_pallet.clear()
+                else:
+                    link.call(cmd="despawn_box", box_id=bid)
+
+        # ★ 마지막에 **물리에서** 한 번 더 잰다. 리포트의 "최상단" 을 계획값으로
+        #   찍으면 그 게이트는 절대 안 떨어진다 — 계획은 언제나 한계 안이니까.
+        #   내보낸 팔레트의 박스는 없으므로 빠진다(그게 맞다).
+        final = {}
+        for w in _S["rows"]:
+            if w["res"] != "PLACED":
+                continue
+            try:
+                final[w["id"]] = by_id[w["id"]].get_world_pose()[0].copy()
+            except Exception:
+                pass                                     # 내보낸 팔레트에 있던 것
+        _S["final"] = final
         _S["result"] = {"wall": time.time() - t_all, "pallets": pallets}
     except BaseException:
         import traceback
@@ -495,12 +741,45 @@ def report():
         cyc_s = [w["wall"] for w in placed]
         log("배치 오차     XY 최대 %.1f mm · Z 최대 %.1f mm  (허용 %d / %d)"
             % (max(exy), max(ez), D.PLACE_TOL_XY_MM, D.PLACE_TOL_Z_MM))
-        log("최대 knock    %.1f mm  (경고선 %.0f)" % (kn, D.KNOCK_WARN_MM))
+        kw = max(rows, key=lambda w: w["knock"])
+        log("최대 knock    %.1f mm  (경고선 %.0f)   %s 가 %s 를 [%+.0f %+.0f %+.0f] mm"
+            % (kn, D.KNOCK_WARN_MM, kw["id"], kw["who"], *kw["kvec"]))
+        nb = [w for w in rows if w.get("near_mm", 0.0) > NEAR_LIM_MM]
+        log("근거리 기둥   위반 %d 사이클 · 최고 %.0f mm  (한계 %.0f @ ped %.0f)%s"
+            % (len(nb), max([w.get("near_mm", 0.0) for w in rows] or [0.0]),
+               NEAR_LIM_MM, PED_MM,
+               "" if not nb else "  -> " + ", ".join(w["id"] for w in nb)))
         log("사이클        평균 %.1f s · 최대 %.1f s   (목표 %.0f s · 스폰 간격 %.0f s)"
             % (sum(cyc_s) / len(cyc_s), max(cyc_s),
                cfg["robot"]["cycle_time_target_s"], SPAWN_DT))
         log("팔레트        %d 판" % r.get("pallets", 1))
         log("벽시계        %.0f s" % r.get("wall", 0.0))
+
+        # ── 끝난 뒤 **물리에서 잰** 자리 ────────────────────────────
+        # ★ 위의 "단/최상단" 은 계획값이다. 계획은 언제나 한계 안이라 그 게이트는
+        #   절대 안 떨어진다. 실제로 어디에 서 있는지는 여기서만 보인다.
+        fin = _S.get("final") or {}
+        if fin:
+            log("-" * 78)
+            log("끝난 뒤 실측  (내보낸 팔레트의 박스는 빠진다)")
+            log("     박스       종류   계획 P(x,y) z    최종 이동 [mm]   상단 mm")
+            top_meas = 0.0
+            for w in placed:
+                q = fin.get(w["id"])
+                if q is None or not w["place"]:
+                    continue
+                want = np.asarray(_S["CY"].pallet_place_to_world(
+                    w["place"], BOX_H_MM[w["type"]], ORIGIN_MM))
+                dv = (q - want) * 1000.0
+                tmm = q[2] * 1000.0 + BOX_H_MM[w["type"]] / 2.0 - ORIGIN_MM[2]
+                top_meas = max(top_meas, tmm)
+                log("     %-10s %-4s   P(%4d,%4d) %4d   [%+5.0f %+5.0f %+5.0f]   %5.0f"
+                    % (w["id"], w["type"], w["place"]["x_mm"], w["place"]["y_mm"],
+                       w["place"]["z_mm"], dv[0], dv[1], dv[2], tmm))
+            log("     실측 최상단 %.0f mm  (계획 %d · 한계 %d)"
+                % (top_meas, max(tops), cfg["pallet"]["max_stack_mm"]))
+            if top_meas > cfg["pallet"]["max_stack_mm"]:
+                log("     !! 실측이 한계를 넘었다")
         # 합격 기준. ★ "N 개 전부 놓임" 이 아니다 — 자리가 없어 우회한 것은 사양상
         #   실패가 아니고(설계결정서 §7), 도착 순서로 15 개가 다 들어가는지는 **패커의
         #   상한** 문제라 이 게이트가 물을 것이 아니다 (eval_pack_online.py 가 답한다).
@@ -532,8 +811,12 @@ def report():
             _S["server"].close()
     except Exception:
         pass
-    omni.timeline.get_timeline_interface().stop()
-    omni.kit.app.get_app().post_quit()
+    # ★ 여기서 timeline.stop() + post_quit() 만 부르면 **프로세스가 안 죽는다.**
+    #   물리 스텝 콜백 안이라 kit 이 그 틱을 못 끝내 종료 이벤트를 못 뽑는다.
+    #   근거와 실측은 scripts/_kitexit.py docstring.
+    if _S.get("tee"):
+        _S["tee"].close()                                # post_quit 전에 flush 해야 한다
+    _kitexit.shutdown(0 if ok else 1, physx_sub=_S.get("physx_sub"), log=log)
 
 
 def on_step(dt):
@@ -556,6 +839,11 @@ def on_step(dt):
         return
     if _S["phase"] == "settle":
         _S["n"] += 1
+        # ★ setup() 이 이미 listen 중이다 — 이 창에 들어온 소켓 요청도 살려 둔다.
+        #   근거는 verify_b4_test1_1.py 의 같은 자리 주석.
+        _S["q"].pump()
+        _S["rm"].step()
+        _S["sp"].step()
         _S["art"].apply_action(_S["ready_action"])       # 안 걸면 옛 목표로 튄다
         if _S["n"] >= SETTLE_STEPS:
             log("자세      수렴 %s deg"
@@ -583,10 +871,19 @@ def on_step(dt):
     _S["q"].pump()
     _S["rm"].step()                                      # ★ world.step() 앞, 메인 스레드
     _S["sp"].step()
+    # ★ 사이클 하나가 굳으면 워치독(900 s)까지 아무도 안 끊는다. CYCLE_WALL_S 를
+    #   선언만 해 두고 안 쓰고 있었다. 여기서 실제로 쓴다 — 굳은 사이클은 그 자리에서
+    #   끊고 그때까지의 결과라도 남긴다.
+    if _S.get("cyc_t0") and time.time() - _S["cyc_t0"] > CYCLE_WALL_S:
+        log("   !! %s 사이클이 %.0f s 를 넘겼다 — 중단하고 결과를 낸다"
+            % (_S.get("cyc_id"), CYCLE_WALL_S))
+        _S["cyc_t0"] = None
+        _S["stalled"] = True
+        _S["done"] = True
     if _S["done"] or time.time() - _S["t0"] > WATCHDOG_S:
         _S["phase"] = "done"
         report()
 
 
-_sub = get_physx_interface().subscribe_physics_step_events(on_step)
+_S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
 log("Play — 부팅 대기...\n")

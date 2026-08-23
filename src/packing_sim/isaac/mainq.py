@@ -26,7 +26,16 @@
 """
 import threading
 
-DEFAULT_TIMEOUT_S = 5.0
+# ★ **클라이언트보다 반드시 먼저 포기해야 한다.**
+#   `sim_link.SimLink` 의 소켓 타임아웃은 system.yaml `service.timeout_s` = 2.0 s 다.
+#   여기가 5.0 이면 메인 루프가 2~5 s 사이로 밀렸을 때 클라이언트가 **먼저**
+#   socket.timeout 으로 빠져나오는데, 그 사이 sim 은 정상 처리하고 응답 한 줄을
+#   소켓에 그대로 써 넣는다. SimLink 는 write 한 줄 · readline 한 줄로 짝을 맞추므로
+#   버퍼에 남은 그 한 줄 때문에 **그 뒤 모든 호출이 직전 명령의 답을 받는다** —
+#   set_velocity 가 ok=true 를 돌려주는데 실은 그 전 pickup_check 의 답인 식이다.
+#   예외도 로그도 없이 조용히 어긋난다. 그래서 서버 예산을 클라이언트의 80 % 로 둔다.
+#   숫자의 단일 출처는 system.yaml 이다 — `sim_main.py` 가 그 값을 넣어 준다.
+DEFAULT_TIMEOUT_S = 1.6
 
 
 class MainQueue:
@@ -42,7 +51,9 @@ class MainQueue:
         with self._lk:
             self._q.append((fn, evt, out))
         if not evt.wait(self.timeout_s):
-            return {"ok": False, "error": "sim 메인 루프가 응답하지 않는다"}
+            out["abandoned"] = True
+            return {"ok": False,
+                    "error": "sim 메인 루프가 응답하지 않는다 (%.1f s)" % self.timeout_s}
         return out.get("res", {"ok": False, "error": "no result"})
 
     def pump(self):
@@ -55,4 +66,9 @@ class MainQueue:
             except Exception as e:            # 작업 하나가 죽어도 루프는 산다
                 out["res"] = {"ok": False, "error": repr(e)}
                 self._log("[mainq] 작업 예외: %r" % (e,))
+            if out.get("abandoned"):
+                # 부수효과는 이미 났다 — 되돌릴 수 없다. 최소한 "실패라는데 실제로는
+                # 일어난" 상태 불일치를 추적할 수 있게 남긴다.
+                self._log("[mainq] 늦게 끝난 작업 — 호출자는 이미 실패로 처리했다: %r"
+                          % (out.get("res"),))
             evt.set()

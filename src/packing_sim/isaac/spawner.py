@@ -45,6 +45,7 @@ from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
 BOX_ROOT = "/World/boxes"                 # ★ 규칙 5. 소문자다
 BOX_PRIM_FMT = BOX_ROOT + "/%s"
 LOOKS_ROOT = "/World/Looks"
+PHYS_MAT_PATH = LOOKS_ROOT + "/PhysicsMaterial"          # 씬 빌더가 만든다. 없으면 여기서
 
 BOX_SLUG = {"3호": "No3", "4호": "No4", "5호": "No5"}
 BOX_COLOR = {"3호": (1.0, 0.15, 0.15),
@@ -103,6 +104,8 @@ class Spawner:
         self.rb_vel_iter = int(phys["rigid_body"]["solver_velocity_iterations"])
         self.rest_offset_m = phys["collider"]["rest_offset_mm"] / 1000.0
         self.contact_offset_m = phys["collider"]["contact_offset_mm"] / 1000.0
+        self.mu_s = float(phys["material"]["static_friction"])
+        self.mu_d = float(phys["material"]["dynamic_friction"])
 
         self.enabled = True
         self.spawned = 0
@@ -298,8 +301,18 @@ class Spawner:
     def h_pickup_check(self, req=None):
         """스토퍼에 도착해 멎은 박스를 보고한다 (§5.6).
 
-        zone 은 프로토콜 표에 있지만 stage 1 은 B 하나뿐이라 받기만 한다.
+        ★ zone 을 받아만 두고 무시하면 안 된다. 이 스포너는 `sim_main --zone` 으로
+          존 **하나**를 맡는데, 다른 존을 물어도 제 것을 정상 응답으로 돌려주면
+          stage 2 에서 브릿지가 엉뚱한 존의 박스를 집으라고 지시하게 된다. 오류가
+          아니라 정상 응답이라 로그만 봐서는 안 보인다. 존이 다르면 그건 "브릿지가
+          포트를 잘못 잡았다" 는 뜻이고, 그게 보여야 한다.
+          응답 모양은 §3 표대로 세 키를 다 채운다 — 브릿지가 r["box_id"] 를 읽어도
+          KeyError 가 안 나야 한다.
         """
+        zone = (req or {}).get("zone", self.zone)
+        if zone != self.zone:
+            return {"present": False, "box_id": "", "pose": None,
+                    "error": "이 스포너는 존 %s 다 (요청 %s)" % (self.zone, zone)}
         return dict(self._pickup)
 
     def h_get_box_pose(self, req):
@@ -315,6 +328,19 @@ class Spawner:
             UsdGeom.Xform.Define(self.stage, BOX_ROOT)
         if not self.stage.GetPrimAtPath(LOOKS_ROOT):
             UsdGeom.Scope.Define(self.stage, LOOKS_ROOT)
+        # ★ 물리 머티리얼. 정본은 씬 빌더(layout_to_spec_test1_1.py)가 만들지만,
+        #   씬을 아직 다시 안 만든 경우를 위한 보험으로 여기서도 확인한다.
+        #   이게 없으면 박스가 PhysX 기본 마찰로 돌고, system.yaml 의 0.6/0.5 는
+        #   아무데도 안 걸린다 — 스택이 서느냐 미끄러지느냐를 직접 가르는 값이다.
+        if not self.stage.GetPrimAtPath(PHYS_MAT_PATH):
+            _pm = UsdShade.Material.Define(self.stage, PHYS_MAT_PATH)
+            _m = UsdPhysics.MaterialAPI.Apply(_pm.GetPrim())
+            _m.CreateStaticFrictionAttr(self.mu_s)
+            _m.CreateDynamicFrictionAttr(self.mu_d)
+            _m.CreateRestitutionAttr(0.0)
+            self._log("[spawner] 물리 머티리얼을 새로 만들었다 %s (정지 %.2f · 운동 %.2f)"
+                      " — 씬 빌더를 다시 돌리는 편이 낫다"
+                      % (PHYS_MAT_PATH, self.mu_s, self.mu_d))
         for name, rgb in BOX_COLOR.items():
             mp = "%s/Box%s" % (LOOKS_ROOT, BOX_SLUG[name])
             if self.stage.GetPrimAtPath(mp):
@@ -436,3 +462,11 @@ class Spawner:
         if mat:
             UsdShade.MaterialBindingAPI.Apply(prim)
             UsdShade.MaterialBindingAPI(prim).Bind(mat)
+
+        # ★ 물리 바인딩은 시각 머티리얼과 **별개 purpose** 다. `if mat:` 안에 넣으면
+        #   안 된다 — 색이 없어도 마찰은 걸려야 한다.
+        _pmp = self.stage.GetPrimAtPath(PHYS_MAT_PATH)
+        if _pmp:
+            UsdShade.MaterialBindingAPI.Apply(prim)
+            UsdShade.MaterialBindingAPI(prim).Bind(
+                UsdShade.Material(_pmp), UsdShade.Tokens.weakerThanDescendants, "physics")
