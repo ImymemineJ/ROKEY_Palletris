@@ -296,6 +296,23 @@ class Spawner:
 
 `pickup_check` 핸들러 (스토퍼 감지 — 폴링 방식이라 단순하다):
 
+> ### ⚠ 2026-08-23 정정 — 조건이 **둘이 아니라 넷**이다
+>
+> 아래 골격은 "스토퍼 근처 + 거의 정지" 두 조건만 본다. **위쪽 경계가 없어서
+> 팔레트에 놓인 박스가 계속 present 로 잡힌다.** 팔레트는 x 10300~11500 이라
+> 스토퍼(10000)보다 앞이고, 놓인 박스는 당연히 멎어 있다. 그래서 로봇이 방금 놓은
+> 박스를 다시 집는다 — 15박스 연속에서 2번째 사이클부터 같은 박스만 반복해서
+> 집었고(knock 338 mm), 새 박스는 영영 안 집혔다. 정본은
+> `src/packing_sim/isaac/spawner.py:_refresh` 다:
+>
+> 1. **중심이 픽업 구간 안** — `pickup_range[0] ≤ x ≤ stopper_x`. 팔레트를 제외한다.
+> 2. 앞면이 스토퍼 마진 안 — `front > stopper_x − w/2 − 60mm`. 실제로 벽에 닿아 섰다.
+> 3. **밑면이 벨트 상면** — `|z − (belt_top + h/2)| < 50mm`. 집혀서 들린 것과
+>    라인 밖으로 떨어진 것을 제외한다.
+> 4. 거의 정지 — `|vx| < 1 cm/s`.
+>
+> 여럿이 줄 서면 **x 가 가장 큰 것**(= 스토퍼에 제일 가까운 것)이 집힐 차례다.
+
 ```python
 def pickup_check(self, req):
     """스토퍼 근처(x > stopper − w/2 − 60mm)이고 거의 정지(|v|<1cm/s)한 박스를 보고"""
@@ -353,7 +370,8 @@ Isaac Sim 5.1 standalone 파이썬으로 다음 3개 파일을 완성해줘. 골
 1) spawner.py — spawn_box/spawn_status/set_spawn_enabled/despawn_box/get_box_pose 핸들러.
    ★ 반드시: 스폰 z는 밑면+h/2, 박스마다 PhysxRigidBodyAPI로 position iteration 24/velocity 4,
    restOffset 0 / contactOffset 0.002(m), 물리 머티리얼 바인딩, box_id를 커스텀 어트리뷰트로 저장.
-2) pickup_check — 스토퍼 x=10.0 기준, 박스 앞면이 60mm 이내 & |vx|<0.01m/s면 present.
+2) pickup_check — 조건 넷을 **전부** 본다 (위 ⚠ 정정 참조): 중심이 픽업 구간
+   [7500, 10000] 안 · 앞면이 스토퍼 60mm 이내 · 밑면이 벨트 상면 · |vx|<0.01m/s.
    쿼터니언→yaw(도) 변환 포함.
 3) conveyor_ctl.py — OmniGraph 변수로 벨트 속도 설정. 그래프 attribute 이름을 못 찾을 때
    prim의 모든 attribute를 나열하는 debug 함수도 포함.

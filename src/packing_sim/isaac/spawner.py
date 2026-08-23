@@ -53,6 +53,9 @@ BOX_COLOR = {"3호": (1.0, 0.15, 0.15),
 # 스토퍼 앞 이 거리 안에 박스 **앞면**이 오고 거의 멎으면 픽업 대기로 본다.
 PICKUP_MARGIN_M = 0.060                   # 트랙A 가이드 §A6~A8 의 60 mm
 PICKUP_VEL_MPS = 0.01                     # |vx| < 1 cm/s
+# 벨트 상면 기준 높이 허용오차. 흡착으로 들린 박스를 걸러 내는 것이 목적이라
+# 넉넉해도 된다 — 가장 낮은 박스(3호 210)의 절반보다는 작아야 한다.
+PICKUP_Z_TOL_M = 0.05
 # despawn 한 박스를 옮겨 둘 자리. 라인·팔레트·로봇 어디에도 안 걸린다.
 DESPAWN_XYZ_M = (-50.0, -50.0, -10.0)
 
@@ -78,6 +81,10 @@ class Spawner:
         sp = cfg["conveyor"]["spawn_point_mm"]
         self.spawn_xyz_m = [v / 1000.0 for v in sp]
         self.stopper_x_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        # 픽업 판정 구간. **위쪽 경계가 없으면 팔레트에 놓인 박스가 다시 잡힌다** —
+        # 아래 `_refresh` 주석의 실측 참조.
+        self.pickup_x0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
+        self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
 
         phys = cfg["physics"]
@@ -93,8 +100,10 @@ class Spawner:
         self._pickup = {"present": False, "box_id": "", "pose": None}
 
         self._ensure_roots()
-        self._log("[spawner] 스폰점 %s m (밑면) · 스토퍼 x %.3f m · 경로 %s"
-                  % (self.spawn_xyz_m, self.stopper_x_m, BOX_ROOT))
+        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 x %.3f~%.3f · 벨트 상면 %.3f "
+                  "· 경로 %s"
+                  % (self.spawn_xyz_m, self.pickup_x0_m, self.stopper_x_m,
+                     self.belt_top_m, BOX_ROOT))
 
     # ── 등록 ────────────────────────────────────────────────
     def handlers(self):
@@ -154,11 +163,27 @@ class Spawner:
             entry = {"pos_m": pos, "yaw_deg": yaw, "vel_mps": vel}
             snap[box_id] = entry
             # 스토퍼 판정 — 박스 **앞면**이 기준이다 (§5.6)
-            w = rec["dims"][0]
+            #
+            # ★★ 조건이 셋이다. 예전에는 "앞면이 스토퍼 근처보다 앞" + "거의 정지"
+            #    둘뿐이었는데, **위쪽 경계가 없어서 팔레트에 놓인 박스가 계속
+            #    present 로 잡혔다.** 팔레트는 x 10300~11500 이라 스토퍼(10000)보다
+            #    앞이고, 놓인 박스는 당연히 멎어 있다. 그래서 `best` 가 늘 팔레트 위
+            #    박스가 되어 로봇이 **방금 놓은 것을 다시 집었다**
+            #    (2026-08-23 실측: 15박스 연속 중 2번째 사이클부터 BOX00000 을 계속
+            #     재차 집어 knock 338 mm, 새 박스는 영영 안 집혔다).
+            #
+            #    1) 중심이 픽업 구간 [pickup_range[0], stopper_x] 안 — 팔레트를 제외한다
+            #    2) 앞면이 스토퍼 마진 안 — 실제로 벽에 닿아 섰다
+            #    3) 밑면이 벨트 상면 — 집혀서 들린 것과 라인 밖으로 떨어진 것을 제외한다
+            #    여기에 원래의 "거의 정지" 가 더해진다.
+            w, h = rec["dims"][0], rec["dims"][2]
             front = pos[0] + w / 2.0
-            if (front > self.stopper_x_m - w / 2.0 - PICKUP_MARGIN_M
+            in_zone = self.pickup_x0_m <= pos[0] <= self.stopper_x_m
+            at_stopper = front > self.stopper_x_m - w / 2.0 - PICKUP_MARGIN_M
+            on_belt = abs(pos[2] - (self.belt_top_m + h / 2.0)) < PICKUP_Z_TOL_M
+            if (in_zone and at_stopper and on_belt
                     and abs(entry["vel_mps"][0]) < PICKUP_VEL_MPS):
-                # 여러 개가 걸리면 **가장 앞선 것**이 집힐 차례다
+                # 여러 개가 줄 서면 **가장 앞선 것**이 집힐 차례다
                 if best is None or pos[0] > best[1]["pos_m"][0]:
                     best = (box_id, entry)
         self._snap = snap
