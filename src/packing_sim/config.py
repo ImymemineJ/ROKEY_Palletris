@@ -189,7 +189,7 @@ else:  # h2017  — 확정 사양 (2026-08-20 사양서)
     #   로봇 베이스   (600, -300, 700)  장변 중앙 · 이격 300 · 받침대 700
     # 이 좌표계를 그대로 쓴다 (로봇을 원점에 두지 않는다).
     ROBOT_BASE_XY = np.array([0.600, -0.300])
-    PEDESTAL_H = 0.700
+    PEDESTAL_H = 0.900   # ★ system.yaml robot.pedestal_height_mm 와 같아야 한다 (2026-08-22 700->900, issues/18)
 
     # ── 파렛트 (Isaac pallet.usd = EUR1 1213x802) ─────────
     PALLET_ASSET = _os.environ.get("PL_PALLET", "std")

@@ -156,8 +156,18 @@ class RobotMotion:
         self._prev_tool = None
         self._g_evt = None          # grasp 결과 대기
         self._g_res = None
+        self._g_pend = None         # begin_grasp 예약 (메인 스레드가 집행)
         self._r_evt = None          # release 결과 대기
         self._r_res = None
+        self._r_pend = False        # begin_release 예약
+        self._open_pend = False     # 타임아웃 강제 개방 예약
+        # ★ 소켓 스레드가 읽는 값은 전부 **캐시**다. PhysX 는 물리 스텝과 겹치는
+        #   다른 스레드의 읽기/쓰기를 undefined behavior 로 못박는다 — 실제로
+        #   `copyInternalStateToCache() not allowed while simulation is running` 이
+        #   콘솔을 도배했다. 메인 스레드의 step() 이 매 스텝 갱신하고 핸들러는
+        #   이것만 돌려준다 (한 스텝 = 16 ms 지연, 판정에는 무의미).
+        self._face_cache = self.suction_pose()
+        self._holding_cache = False
 
     # ── sim_main 이 부르는 것 ────────────────────────────────
     def handlers(self):
@@ -180,7 +190,18 @@ class RobotMotion:
                 self._start_move(self._req)
                 self._req = None
             self._advance_move()
+            if self._g_pend is not None:            # 소켓 스레드가 예약한 흡착 시작
+                self.grip.begin_grasp(self._g_pend[0])
+                self._g_pend = None
+            if self._r_pend:
+                self.grip.begin_release()
+                self._r_pend = False
+            if self._open_pend:
+                self.grip.open()
+                self._open_pend = False
             self._advance_gripper()
+            self._face_cache = self.suction_pose()
+            self._holding_cache = bool(self.grip.is_holding())
 
     # ── 소켓 핸들러 (소켓 스레드) ────────────────────────────
     def h_move_ee(self, req):
@@ -201,8 +222,8 @@ class RobotMotion:
         """상태 + **지금 흡착면 위치**. face_m 은 프로토콜 표에 없는 추가 필드다 —
         오케스트레이터가 접근을 닫힌 루프로 보정하는 데 쓴다 (B 소유 명령이라 안전)."""
         with self._lk:
-            st = self._state
-        return {"state": st, "face_m": [float(v) for v in self.suction_pose()]}
+            st, face = self._state, self._face_cache
+        return {"state": st, "face_m": [float(v) for v in face]}
 
     def h_grasp(self, req):
         """흡착. 판정이 날 때까지 **이 스레드만** 기다린다 (물리는 계속 돈다)."""
@@ -213,7 +234,7 @@ class RobotMotion:
             if self._g_evt is not None:
                 return {"ok": False, "error": "grasp already in progress"}
             self._g_evt, self._g_res = evt, None
-            self.grip.begin_grasp(path)
+            self._g_pend = (path,)                               # 메인 스레드가 집행
         # 그리퍼가 닫기를 시도하는 총 시간 + 여유. 안 오면 실패로 본다.
         if not evt.wait(self.grip.retry_s + 2.0):
             with self._lk:
@@ -231,21 +252,23 @@ class RobotMotion:
             if self._r_evt is not None:
                 return {"ok": False, "error": "release already in progress"}
             self._r_evt, self._r_res = evt, None
-            self.grip.begin_release()
+            self._r_pend = True                                  # 메인 스레드가 집행
         budget = self.grip.release_timeout_s + self.grip.release_damping_s \
             + self.grip.settle_s + 2.0
         if not evt.wait(budget):
             with self._lk:
                 self._r_evt = None
             self._log("[robot_motion] release 응답 타임아웃 — 강제로 연다")
-            self.grip.open()
+            with self._lk:
+                self._open_pend = True                           # open 도 메인 스레드에서
             return {"ok": False, "error": "timeout"}
         with self._lk:
             res = self._r_res
         return {"ok": bool(res)}
 
     def h_is_holding(self, req=None):
-        return {"holding": bool(self.grip.is_holding())}
+        with self._lk:
+            return {"holding": self._holding_cache}
 
     def h_tcp_speed(self, req=None):
         with self._lk:

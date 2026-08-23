@@ -35,6 +35,14 @@ APPROACH_GAP_MM = 2.0        # 접근 시 남길 간극. transZ 슬롯(5 mm)보�
 #   ★ 2.0 으로 뒀다가 멀쩡한 흡착(2.41 mm)을 실패로 판정했다. 도착 잔차가 얹히기 때문이다.
 GRIP_TOL_MM = 3.0
 
+# 릴리스 전 최소 유지 시간 [s]. TCP 정지 판정은 **툴** 속도라 매달린 박스의 진동을 못 본다.
+#   패드 rotXY 드라이브가 강성 100 · 감쇠 0 (h2017_cell.usd 정본값)이라 5호(9 kg ·
+#   340 mm)는 흔들림이 잘 안 죽는데, 릴리스가 어느 위상에 걸리느냐로 착지가 22~76 mm
+#   갈렸다 (2026-08-22 실측 — 지령·간극이 동일한 두 실행이 0.4 mm 와 27 mm 로 갈림).
+#   바닥 2 mm 위에서 이 시간만큼 머물면 박스가 표면에 얹혀(±3° 순응 안에서) 진동이
+#   접촉 마찰로 죽는다. 정본 패드값은 건드리지 않는다.
+RELEASE_MIN_HOLD_S = 0.5
+
 _STATUS = ("Open", "Closing", "Closed")
 
 
@@ -172,6 +180,7 @@ class Gripper:
         """
         settle = self.settle_s if extra_settle_s is None else extra_settle_s
         self._r = {"phase": "wait", "left": int(self.release_timeout_s / self.dt),
+                   "hold": int(RELEASE_MIN_HOLD_S / self.dt),
                    "spike": int(self.release_damping_s / self.dt),
                    "settle": int(settle / self.dt), "prev": None, "waited": 0.0,
                    "gains": None, "done": None}
@@ -195,6 +204,9 @@ class Gripper:
                     still = float(np.linalg.norm(cur - r["prev"])) / self.dt \
                         < self.release_speed_m_s
                 r["prev"] = cur
+            if r["hold"] > 0:                  # 최소 유지 — 박스 진동은 TCP 로 안 보인다
+                r["hold"] -= 1
+                still = False
             r["left"] -= 1
             r["waited"] += self.dt
             if not still and r["left"] > 0:
