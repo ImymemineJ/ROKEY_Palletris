@@ -58,6 +58,10 @@ PICKUP_VEL_MPS = 0.01                     # |vx| < 1 cm/s
 PICKUP_Z_TOL_M = 0.05
 # despawn 한 박스를 옮겨 둘 자리. 라인·팔레트·로봇 어디에도 안 걸린다.
 DESPAWN_XYZ_M = (-50.0, -50.0, -10.0)
+# 이 밖으로 나가면 "라인 이탈" 로 본다. despawn 자리(-50)보다 넉넉히 밖이라
+# despawn 한 박스를 이탈로 오인하지 않는다.
+LOST_XY_M = 200.0
+LOST_Z_MIN_M = -50.0
 
 
 def _yaw_deg(quat):
@@ -86,6 +90,13 @@ class Spawner:
         self.pickup_x0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
+        # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
+        # 원점은 **모서리**이고 z 는 **상면**이다 (작업명세서 §3.3).
+        _po = cfg["zones"]["pallet_origin_world_mm"][zone]
+        _pal = cfg["pallet"]
+        self.pallet_x = (_po[0] / 1000.0, (_po[0] + _pal["width_mm"]) / 1000.0)
+        self.pallet_y = (_po[1] / 1000.0, (_po[1] + _pal["depth_mm"]) / 1000.0)
+        self.pallet_top_m = _po[2] / 1000.0
 
         phys = cfg["physics"]
         self.rb_pos_iter = int(phys["rigid_body"]["solver_position_iterations"])
@@ -96,6 +107,7 @@ class Spawner:
         self.enabled = True
         self.spawned = 0
         self.boxes = {}                    # box_id -> {"path", "dims", "type"}
+        self.lost = []                     # 라인을 벗어난 박스 (물리 파탄)
         self._snap = {}                    # box_id -> {"pos_m", "yaw_deg", "vel_mps"}
         self._pickup = {"present": False, "box_id": "", "pose": None}
 
@@ -111,6 +123,7 @@ class Spawner:
                 "spawn_status": self.h_spawn_status,
                 "set_spawn_enabled": self.h_set_spawn_enabled,
                 "despawn_box": self.h_despawn_box,
+                "swap_pallet": self.h_swap_pallet,
                 "pickup_check": self.h_pickup_check,
                 "get_box_pose": self.h_get_box_pose}
 
@@ -145,6 +158,7 @@ class Spawner:
         cache = _UG.XformCache()
         snap = {}
         best = None
+        lost = []
         for box_id, rec in list(self.boxes.items()):
             prim = self.stage.GetPrimAtPath(rec["path"])
             if not prim or not prim.IsValid():
@@ -160,6 +174,15 @@ class Spawner:
                 vel = [0.0, 0.0, 0.0]
             else:
                 vel = [(pos[i] - prev["pos_m"][i]) / self.dt for i in range(3)]
+            # ★ 라인 이탈 감지. 물리가 터지면(깊은 관통 -> 거대 임펄스) 박스가 초속
+            #   수 km 로 날아간다. 그러면 `pickup_check` 가 영원히 그 박스를 못 보고,
+            #   부르는 쪽은 "다음 박스가 안 온다" 며 타임아웃까지 헛기다린다.
+            #   실측 2026-08-23: BOX00014 가 (-256577, -119448, 0.16) 에 있었고
+            #   드라이버가 180 s 를 기다리다 중단했다. 조용히 사라지는 대신 알린다.
+            if (abs(pos[0]) > LOST_XY_M or abs(pos[1]) > LOST_XY_M
+                    or pos[2] < LOST_Z_MIN_M):
+                lost.append((box_id, pos))
+                continue
             entry = {"pos_m": pos, "yaw_deg": yaw, "vel_mps": vel}
             snap[box_id] = entry
             # 스토퍼 판정 — 박스 **앞면**이 기준이다 (§5.6)
@@ -186,6 +209,12 @@ class Spawner:
                 # 여러 개가 줄 서면 **가장 앞선 것**이 집힐 차례다
                 if best is None or pos[0] > best[1]["pos_m"][0]:
                     best = (box_id, entry)
+        for box_id, pos in lost:
+            self.boxes.pop(box_id, None)
+            self.lost.append(box_id)
+            self._log("[spawner] !! %s 가 라인을 벗어났다 %s — 추적에서 뺀다. "
+                      "물리가 터진 것이다 (관통 또는 큐 과압축)."
+                      % (box_id, [round(v, 1) for v in pos]))
         self._snap = snap
         if best is None:
             self._pickup = {"present": False, "box_id": "", "pose": None}
@@ -217,9 +246,49 @@ class Spawner:
             return {"ok": False, "error": "없는 box_id %s" % box_id}
         return self.mainq.run(lambda: self._despawn(box_id))
 
+    def h_swap_pallet(self, req=None):
+        """{"cmd":"swap_pallet","zone":"B"} -> {"ok":true,"removed":N}
+
+        **가득 찬 팔레트를 통째로 내보내고 빈 팔레트를 놓는다.** 사양이 정한
+        PALLET_FULL 처리 경로다 (트랙B 가이드 §상태도:
+        "PALLET_FULL: /sim/set_spawn_enabled(false) -> swap_pallet -> /algo/reset -> 재가동").
+
+        여기서 하는 일은 **팔레트 위에 실린 박스를 전부 라인 밖으로 치우는 것**이다.
+        팔레트 프림 자체는 그대로 둔다 — 같은 자리에 빈 팔레트가 새로 온 것과 같다.
+        (실제 셀에서는 반출 컨베이어가 팔레트째 밀어내고 새 팔레트가 들어온다.
+         `/World/PalletOutfeed` 가 그 상판이다. 구동은 아직 안 넣었다.)
+
+        ★ 부르는 쪽이 반드시 같이 해야 하는 것: `/algo/reset` 으로 하이트맵을 비운다.
+          안 비우면 패커가 **없어진 박스 위에** 다음 자리를 잡는다.
+        """
+        zone = (req or {}).get("zone", self.zone)
+        if zone != self.zone:
+            return {"ok": False, "error": "이 스포너는 존 %s 다 (요청 %s)"
+                    % (self.zone, zone), "removed": 0}
+        return self.mainq.run(self._swap_pallet)
+
     def h_spawn_status(self, req=None):
+        """{"spawned":N, "enabled":bool, ...} — 표(공통가이드 §3)의 두 필드 + 진단용.
+
+        ⚠ 예전 `on_belt` 는 `len(self.boxes)` 였는데, 놓인 박스는 despawn 하지 않으므로
+          **팔레트 위 박스까지 세고 있었다.** 백압 판단(`buffer_capacity`)에 그대로 쓰면
+          늘 가득 찬 것으로 보인다. 실제로 벨트에 있는 것만 센다.
+        """
+        on_belt = queue = 0
+        for box_id, e in self._snap.items():
+            x, _y, z = e["pos_m"]
+            rec = self.boxes.get(box_id)
+            if rec is None:
+                continue
+            if abs(z - (self.belt_top_m + rec["dims"][2] / 2.0)) > PICKUP_Z_TOL_M:
+                continue                       # 벨트 위가 아니다 (팔레트·그리퍼·라인 밖)
+            if 0.0 <= x <= self.stopper_x_m:
+                on_belt += 1
+                if x >= self.pickup_x0_m:
+                    queue += 1                 # 픽업 구간 = 사양의 버퍼
         return {"spawned": self.spawned, "enabled": bool(self.enabled),
-                "on_belt": len(self.boxes)}
+                "on_belt": on_belt, "queue": queue, "tracked": len(self.boxes),
+                "lost": list(self.lost)}
 
     def h_set_spawn_enabled(self, req):
         self.enabled = bool(req.get("enabled", True))
@@ -299,6 +368,21 @@ class Spawner:
         self._snap.pop(box_id, None)
         self._log("[spawner] despawn %s (라인 밖으로 이동)" % box_id)
         return {"ok": True}
+
+    def _swap_pallet(self):
+        """**메인 스레드 전용.** 팔레트 영역 안에 있는 박스를 전부 치운다."""
+        on_pallet = []
+        for box_id, e in list(self._snap.items()):
+            x, y, z = e["pos_m"]
+            if (self.pallet_x[0] <= x <= self.pallet_x[1]
+                    and self.pallet_y[0] <= y <= self.pallet_y[1]
+                    and z >= self.pallet_top_m - 0.05):
+                on_pallet.append(box_id)
+        for box_id in on_pallet:
+            self._despawn(box_id)
+        self._log("[spawner] swap_pallet — 박스 %d 개를 팔레트째 내보냈다 %s"
+                  % (len(on_pallet), on_pallet))
+        return {"ok": True, "removed": len(on_pallet)}
 
     def _make_box(self, path, tname, dims, pos, yaw_deg, mass, box_id):
         """치수를 지오메트리에 굽는다 — `xformOp:scale` 을 안 쓴다.

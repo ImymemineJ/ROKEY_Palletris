@@ -72,8 +72,27 @@ BOX_ID_FMT = "BOX%05d"
 BOOT_STEPS = 20
 SETTLE_STEPS = 90                                        # READY 수렴 (1.5 s)
 N_BOXES = int(os.environ.get("PL_N", "0")) or None        # 0/미지정이면 사양값
+# ★ 상자 조합을 이 실행에서만 바꾼다. `system.yaml` 의 random_seed 42 는
+#   "고정 — 베이스라인 비교 필수" 라 파일을 고치지 않는다.
+#   seed 42 는 5호가 4개 뽑힌 빡센 패라(사양 분포로는 3개) 도착 순서로는 14/15 가 상한이다.
+#   시연용으로 전부 들어가는 조합을 쓰려면 PL_SEED 를 준다 — 어떤 seed 가 되는지는
+#   `python3 scripts/eval_pack_online.py --scan-seeds 60` 이 답한다 (60개 중 6개).
+#   ⚠ PL_SEED 를 쓴 실행은 **베이스라인이 아니다.** 결과에 그렇게 찍는다.
+SEED = os.environ.get("PL_SEED")
+# ★ 투입 순서. stage 1 은 **스포너가 곧 투입 순서**라 여기서 정할 수 있다.
+#   arrival = 뽑힌 그대로 (기본). 무엇이 올지 못 고르는 실제 라인의 조건이다.
+#   volume  = 부피 내림차순. **B5 데모(`demo_stack15.py`)와 같은 조건**이다 —
+#             그쪽 docstring: "15개를 도착 순서 그대로 넣으면 패커가 14/15 밖에
+#             못 넣는다. 부피 내림차순으로 정렬하면 15/15 가 들어간다."
+#   seed 42 로 실측(`scripts/eval_pack_online.py --sweep`): arrival 은 clearance ·
+#   halo 를 어떻게 줘도 14/15 가 상한이고, volume 은 어떤 설정에서도 15/15 다.
+#   즉 이 차이는 튜닝이 아니라 **순서**다.
+ORDER = os.environ.get("PL_ORDER", "arrival")
+if ORDER not in ("arrival", "volume"):
+    raise SystemExit("PL_ORDER 는 arrival | volume: %r" % ORDER)
 ARRIVE_TIMEOUT_S = 180.0                                 # 다음 박스가 스토퍼에 설 때까지
 CYCLE_WALL_S = 120.0
+SETTLE_S = float(os.environ.get("PL_SETTLE", "0.7"))     # 놓은 뒤 재기 전 정착 (B5 는 0.5)
 WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
 
 cfg = _paths.system_config()
@@ -81,6 +100,7 @@ STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
 BELT_MPS = float(cfg["conveyor"]["belt_velocity_mps"])
 ORIGIN_MM = cfg["zones"]["pallet_origin_world_mm"][ZONE]
 S1 = cfg["boxes"]["stage1"]
+BUFFER_CAP = int(cfg["zones"]["buffer_capacity"])        # 픽업 구간에 세울 수 있는 최대
 N = N_BOXES or int(S1["total_count"])
 SPAWN_DT = float(S1["spawn_interval_s"])
 
@@ -184,6 +204,19 @@ class LinkPrim:
                 np.array([math.cos(y / 2.0), 0.0, 0.0, math.sin(y / 2.0)]))
 
 
+def _line_state(link, ids):
+    """라인에 남아 있는 박스들의 위치. 타임아웃 진단용."""
+    st = link.call(cmd="spawn_status")
+    out = []
+    for bid in ids:
+        r = link.call(cmd="get_box_pose", box_id=bid)
+        if not r.get("ok"):
+            continue                      # 놓였거나 despawn 된 것
+        x, y, z = r["pos_m"]
+        out.append("%s(%.2f,%.2f,%.2f)" % (bid[-3:], x, y, z))
+    return "라인 %s개 · %s" % (st.get("on_belt", "?"), " ".join(out) if out else "비었다")
+
+
 class LineServices(D.OnlineServices):
     """B5 의 온라인 서비스 그대로 + **벨트만 진짜로 세운다.**
 
@@ -199,6 +232,17 @@ class LineServices(D.OnlineServices):
         self._rec("/conveyor/set_velocity", seg, mps)
         return bool(self.link.call(cmd="set_velocity", seg=seg, mps=mps).get("ok"))
 
+    def reset_pallet(self):
+        """`/algo/reset` 대역 — 하이트맵을 비운다.
+
+        `plan_placement` 이 매번 `vision.scan()` 으로 하이트맵을 다시 세우므로,
+        비전이 본 목록만 비우면 된다. **`swap_pallet` 과 반드시 짝으로** 부른다 —
+        안 비우면 패커가 이미 내보낸 박스 위에 다음 자리를 잡는다.
+        """
+        self._rec("/algo/reset", "B")
+        self.vision.placed.clear()
+        self.last = None
+
 
 def spawner_thread(specs, ids):
     """사양 스케줄대로 박스를 라인에 올린다. **자기 소켓을 따로 쓴다** (스레드 안전)."""
@@ -210,12 +254,30 @@ def spawner_thread(specs, ids):
             if _S["done"]:
                 return
             if i:
-                # 사양 간격. 사이클이 더 느리면 픽업 구간에 줄이 선다 (그게 시험 대상이다).
+                # 사양 간격이 **하한**이다.
                 t_end = time.time() + SPAWN_DT
                 while time.time() < t_end and not _S["done"]:
                     time.sleep(0.05)
                 if _S["done"]:
                     return
+                # ★ 백압 — 버퍼가 차 있으면 넣지 않는다 (설계결정서 §7:
+                #   "목표 구역 버퍼에 여유 있음 -> 통과"). 사이클 14.5 s 인데 간격이
+                #   12 s 라 무조건 넣으면 큐가 계속 길어진다. 그러면 벨트가 뒤에서
+                #   계속 밀어 박스들이 서로 눌리고, 결국 솔버가 터져 박스가 초속
+                #   수 km 로 날아간다 (2026-08-23 BOX00014 실측). 사양대로 막는다.
+                t_wait = time.time()
+                while not _S["done"]:
+                    st = link.call(cmd="spawn_status")
+                    if st.get("queue", 0) < BUFFER_CAP:
+                        break
+                    if time.time() - t_wait > 120.0:
+                        log("   [투입] 버퍼가 120 s 째 안 빈다 — 그냥 넣는다")
+                        break
+                    time.sleep(0.5)
+                held = time.time() - t_wait
+                if held > 1.0:
+                    log("   [투입] 백압 대기 %.0f s (버퍼 %d 대기 중)"
+                        % (held, BUFFER_CAP))
             t = specs[bid]
             r = link.call(cmd="spawn_box", box_id=bid, type=t["name"], yaw_deg=0)
             st = link.call(cmd="spawn_status")
@@ -263,19 +325,30 @@ def worker(specs, ids):
                          daemon=True, name="spawn").start()
 
         rest = {}                                        # 놓인 뒤의 기준 자세 (knock 용)
+        swapped_for = set()                              # 이 박스 때문에 이미 교체했다
+        pallets = 1
         t_all = time.time()
-        for i in range(len(ids)):
+        i = 0
+        while i < len(ids) and not _S["done"]:
             # ── 다음 박스가 스토퍼에 설 때까지 ──────────────
-            pick, t0 = None, time.time()
+            pick, t0, nag = None, time.time(), 0.0
             while time.time() - t0 < ARRIVE_TIMEOUT_S and not _S["done"]:
                 c = link.call(cmd="pickup_check", zone=ZONE)
                 if c.get("present"):
                     pick = c
                     break
+                # 안 오면 어디에 있는지 주기적으로 찍는다. 이게 없으면 타임아웃
+                # 났을 때 "안 왔다" 는 사실만 남고 원인을 못 찾는다
+                # (2026-08-23 15번째가 180 s 동안 안 와서 겪었다).
+                if time.time() - t0 > nag + 15.0:
+                    nag = time.time() - t0
+                    log("   ...대기 %.0f s — %s" % (nag, _line_state(link, ids)))
                 time.sleep(0.05)
             if pick is None:
                 log("   !! %d 번째 박스가 %.0f s 안에 스토퍼에 안 왔다 — 중단"
                     % (i + 1, ARRIVE_TIMEOUT_S))
+                log("      마지막 라인 상태: %s" % _line_state(link, ids))
+                _S["stalled"] = True
                 break
             bid = pick["box_id"]
             t = specs[bid]
@@ -291,8 +364,23 @@ def worker(specs, ids):
             res = cyc.run(bid, pick["pose"])
             wall = time.time() - tc
 
+            # ── 놓은 뒤 정착 ────────────────────────────────
+            # ★ B5 견본(`demo_stack15.main`)은 사이클이 끝난 뒤 SETTLE_S 만큼 물리를
+            #   더 돌린 **다음에** 잰다. 여기서는 그게 빠져 있어서 흔들리는 도중을
+            #   찍고 있었다. 흡착을 떼는 순간 매달린 박스가 진동하는데(패드 rotXY
+            #   드라이브 강성 100 · 감쇠 0), TCP 정지 판정은 **툴** 속도라 그걸 못 본다
+            #   — `gripper.py` 의 RELEASE_MIN_HOLD_S 주석이 같은 얘기다.
+            #   실측 2026-08-23: 3번 5호가 |dq| 177 deg 로 크게 돌아온 뒤 놓였고,
+            #   즉시 재니 y 오차 -76.9 mm 였다. 사양 판정선(30 mm)을 넘는 값이라
+            #   무엇을 재는지가 결과를 가른다. 물리는 메인 스레드가 계속 돌리므로
+            #   여기서는 기다리기만 하면 된다.
+            time.sleep(SETTLE_S)
+
             # ── 결과 · knock ────────────────────────────────
-            place = dict(svc.last) if svc.last else None
+            # ★ `svc.last` 는 **성공한 계획**만 갱신된다. PALLET_FULL 이면 직전 박스의
+            #   계획이 그대로 남아 있어서, 그걸 목표로 쓰면 오차가 -1130 mm 같은
+            #   헛것이 찍힌다 (2026-08-23 첫 실행에서 실제로 그랬다).
+            place = dict(svc.last) if (res == "PLACED" and svc.last) else None
             err = np.array([float("nan")] * 3)
             if place is not None:
                 want = np.asarray(CY.pallet_place_to_world(place, t["h_mm"], ORIGIN_MM))
@@ -311,15 +399,48 @@ def worker(specs, ids):
                                "place": place})
             log("       %-11s 오차 [%+.1f %+.1f %+.1f] mm   %.1f s   knock %.1f mm (%s)"
                 % (res, err[0], err[1], err[2], wall, knock, who))
-            if res == "PALLET_FULL":
-                log("       팔레트가 찼다 — 남은 %d 개는 안 돌린다." % (len(ids) - i - 1))
-                break
-            if res != "PLACED":
-                log("       !! 실패. 다음 박스로 넘어간다.")
-                # 실패한 박스가 스토퍼를 막고 있으면 다음이 못 온다. 치운다.
+
+            # ── PALLET_FULL 은 **팔레트를 갈아서** 푼다 (사양 경로) ──
+            # 트랙B 가이드 상태도: "PALLET_FULL: /sim/set_spawn_enabled(false)
+            #   -> swap_pallet -> /algo/reset -> 재가동".
+            # 이 박스는 아직 라인 위에 그대로 있다(스토퍼가 잡고 있다). 빈 팔레트를
+            # 받은 뒤 **같은 박스를 다시** 집는다. 한 박스당 한 번만 교체한다 —
+            # 빈 팔레트에도 안 들어가면 그건 팔레트 문제가 아니라 박스 문제다.
+            if res == "PALLET_FULL" and bid not in swapped_for:
+                swapped_for.add(bid)
+                _S["rows"].pop()                     # 이건 최종 결과가 아니다
+                log("       팔레트가 찼다 — 사양 경로로 교체한다 "
+                    "(스폰 정지 -> swap_pallet -> algo reset -> 재가동)")
+                link.call(cmd="set_spawn_enabled", enabled=False)
+                sw = link.call(cmd="swap_pallet", zone=ZONE)
+                svc.reset_pallet()
+                link.call(cmd="set_spawn_enabled", enabled=True)
+                if not sw.get("ok"):
+                    log("       !! swap_pallet 실패: %r" % sw)
+                else:
+                    pallets += 1
+                    log("       팔레트 #%d — 박스 %d 개를 내보냈다. %s 를 다시 집는다."
+                        % (pallets, sw.get("removed", 0), bid))
+                rest.clear()                          # 팔레트가 비었으니 knock 기준도 리셋
+                continue                              # i 를 안 올린다 = 같은 박스 재시도
+            i += 1
+            # ★ PALLET_FULL 에서 멈추지 않는다. 큰 박스가 못 들어갔다고 작은 박스도
+            #   못 들어가는 게 아니다 — seed 42 에서 14번 5호는 자리가 없지만
+            #   15번 3호는 들어간다 (scripts/eval_pack_online.py 로 확인). 예전 판은
+            #   여기서 break 해서 멀쩡한 박스를 안 돌렸다.
+            #   사양상으로도 이건 실패가 아니다: "버퍼 우회는 정상적인 흐름 제어이지
+            #   실패가 아님" (설계결정서 §7 · bypass_count 를 retry_count 와 분리하는 이유).
+            #   stage 2 에서는 Return Line 으로 재순환한다. stage 1 은 그 설비가 없어
+            #   여기서 라인 밖으로 뺀다.
+            if res in ("PALLET_FULL", "BLOCKED", "IK_FAIL", "PICK_FAIL"):
+                if res == "PALLET_FULL":
+                    log("       이 팔레트에 자리가 없다 — 우회 처리하고 다음 박스로 간다.")
+                else:
+                    log("       !! 실패. 라인에서 빼고 다음 박스로 넘어간다.")
+                # 스토퍼를 막고 있으면 다음 박스가 못 온다. 반드시 치운다.
                 link.call(cmd="despawn_box", box_id=bid)
 
-        _S["result"] = {"wall": time.time() - t_all}
+        _S["result"] = {"wall": time.time() - t_all, "pallets": pallets}
     except BaseException:
         import traceback
         _S["result"] = {"trace": traceback.format_exc()}
@@ -331,20 +452,36 @@ def report():
     r = _S.get("result") or {}
     rows = _S["rows"]
     log("\n" + "=" * 78)
+    if SEED is not None:
+        log("★ 이 실행은 seed %s 다 — 사양 seed 42 의 베이스라인이 아니다." % SEED)
+    log("투입 순서     %s%s" % (ORDER,
+        "  (부피 내림차순 — B5 데모와 같은 조건)" if ORDER == "volume" else
+        "  (뽑힌 그대로 — 실제 라인 조건)"))
     if "trace" in r:
         log("!! 예외\n" + r["trace"])
-    log("  #  박스       종류  결과        오차 XY / Z [mm]   대기 s  사이클 s  knock mm")
+    log("  #  박스       종류  결과         오차 XY / Z [mm]   대기 s  사이클 s  knock mm")
     log("-" * 78)
     for i, w in enumerate(rows, 1):
-        log("%3d  %-10s %-4s  %-10s %6.1f / %+6.1f   %6.1f   %6.1f   %7.1f"
-            % (i, w["id"], w["type"], w["res"],
-               float(np.linalg.norm(w["err"][:2])), w["err"][2],
+        exy = float(np.linalg.norm(w["err"][:2]))
+        cell = ("%6.1f / %+6.1f" % (exy, w["err"][2])) if np.isfinite(exy) else "     -  /     - "
+        log("%3d  %-10s %-4s  %-11s %s   %6.1f   %6.1f   %7.1f"
+            % (i, w["id"], w["type"], w["res"], cell,
                w["wait"], w["wall"], w["knock"]))
     log("-" * 78)
 
     placed = [w for w in rows if w["res"] == "PLACED"]
+    bypassed = [w for w in rows if w["res"] == "PALLET_FULL"]
+    failed = [w for w in rows if w["res"] not in ("PLACED", "PALLET_FULL")]
     ok = bool(placed)
-    log("놓은 것       %d / %d" % (len(placed), N))
+    log("처리한 것     %d / %d   (놓음 %d · 우회 %d · 실패 %d)"
+        % (len(rows), N, len(placed), len(bypassed), len(failed)))
+    if bypassed:
+        log("우회          %s — 이 팔레트에 자리가 없는 박스다. 설계결정서 §7 상"
+            % ", ".join("%s(%s)" % (w["id"], w["type"]) for w in bypassed))
+        log("              버퍼 우회는 흐름 제어이지 실패가 아니다(bypass_count).")
+    if failed:
+        log("!! 실패       %s"
+            % ", ".join("%s(%s)=%s" % (w["id"], w["type"], w["res"]) for w in failed))
     if placed:
         zs = sorted({int(w["place"]["z_mm"]) for w in placed if w["place"]})
         tops = [w["place"]["z_mm"] + next(t["h_mm"] for t in cfg["boxes"]["types"]
@@ -362,12 +499,19 @@ def report():
         log("사이클        평균 %.1f s · 최대 %.1f s   (목표 %.0f s · 스폰 간격 %.0f s)"
             % (sum(cyc_s) / len(cyc_s), max(cyc_s),
                cfg["robot"]["cycle_time_target_s"], SPAWN_DT))
+        log("팔레트        %d 판" % r.get("pallets", 1))
         log("벽시계        %.0f s" % r.get("wall", 0.0))
-        ok = (len(placed) == N
+        # 합격 기준. ★ "N 개 전부 놓임" 이 아니다 — 자리가 없어 우회한 것은 사양상
+        #   실패가 아니고(설계결정서 §7), 도착 순서로 15 개가 다 들어가는지는 **패커의
+        #   상한** 문제라 이 게이트가 물을 것이 아니다 (eval_pack_online.py 가 답한다).
+        #   여기가 물어야 하는 것은 "라인이 15 개를 끝까지 처리했는가" 다.
+        all_handled = len(rows) == N and not failed
+        ok = (all_handled
               and max(exy) < D.PLACE_TOL_XY_MM and max(ez) < D.PLACE_TOL_Z_MM
               and kn < D.KNOCK_WARN_MM
               and max(tops) <= cfg["pallet"]["max_stack_mm"])
-        for cond, msg in ((len(placed) == N, "%d 개 전부 놓여야 한다" % N),
+        for cond, msg in ((all_handled,
+                           "%d 개를 끝까지 처리해야 한다 (놓거나 우회. BLOCKED 는 실패)" % N),
                           (max(exy) < D.PLACE_TOL_XY_MM, "XY 오차 %d mm 안" % D.PLACE_TOL_XY_MM),
                           (max(ez) < D.PLACE_TOL_Z_MM, "Z 오차 %d mm 안" % D.PLACE_TOL_Z_MM),
                           (kn < D.KNOCK_WARN_MM, "knock %d mm 안" % D.KNOCK_WARN_MM),
@@ -416,7 +560,17 @@ def on_step(dt):
         if _S["n"] >= SETTLE_STEPS:
             log("자세      수렴 %s deg"
                 % np.round(np.degrees(_S["art"].get_joint_positions()[:6]), 1).tolist())
-            fed = D.manifest(cfg, N)
+            if SEED is not None:
+                _c = dict(cfg)
+                _c["boxes"] = dict(cfg["boxes"], random_seed=int(SEED))
+                fed = D.manifest(_c, N)
+                log("★ seed %s 로 덮어썼다 — 사양(42)이 아니다. 베이스라인 아님." % SEED)
+            else:
+                fed = D.manifest(cfg, N)
+            if ORDER == "volume":
+                fed = sorted(fed, key=lambda t: -(t["w_mm"] * t["d_mm"] * t["h_mm"]))
+                log("★ 투입 순서 = 부피 내림차순 (B5 데모와 같은 조건). "
+                    "상자 구성은 사양 seed 그대로다.")
             ids = [BOX_ID_FMT % i for i in range(N)]
             specs = {bid: dict(t) for bid, t in zip(ids, fed)}
             log("박스      %d 개  %s" % (N, [t["name"] for t in fed]))
