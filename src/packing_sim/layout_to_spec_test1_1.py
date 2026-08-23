@@ -9,7 +9,8 @@
   1) 벨트 조각을 **사양이 정한 구간**에 맞춰 x 스케일을 다시 잡는다.
      조각 0 = stage1.main_range_mm (0~7500), 조각 1 = pickup_range_mm (7500~10000).
   2) 벨트를 x=0 에서 시작하도록 옮기고 흐름을 +X 로 돌린다.
-  3) 스토퍼는 세우지 않는다 (있으면 지운다). 박스는 벨트를 멈춰서 세운다.
+  3) 스토퍼 벽을 라인 끝(stopper_x_mm)에 세운다 — 콜라이더만, RigidBody 없음.
+     박스 앞면이 여기 닿아 선다. 벨트 정지는 흡착 직전 떨림을 없애는 용도다.
   4) 페데스탈 D400 x H(pedestal_height) 원기둥을 로봇 베이스 자리에 세운다.
   5) 팔레트를 pallet_origin 에 놓는다 (원점은 모서리, 상면이 origin.z).
   6) 팔레트 반출 컨베이어 상판을 **도크 바닥(z=0)** 과 같은 면에 깐다.
@@ -76,7 +77,8 @@ TRACKS = ["/World/ConveyorTrack", "/World/ConveyorTrack1"]
 SEG_KEYS = ["main", "b_pickup"]
 # GUI 붙여넣기 사고로 /World 밖 루트에 생긴 조각. 지운다.
 STRAY = ["/ConveyorTrack1"]
-ENDSTOP_ROOT = "/World/EndStops"
+ENDSTOP_ROOT = "/World/EndStops"    # 옛 이름. 지우기만 한다.
+STOPPER = "/World/Stopper"
 PEDESTAL = "/World/Pedestal"
 OUTFEED = "/World/PalletOutfeed"
 ROBOT = "/World/robot"
@@ -280,12 +282,60 @@ for i, tp in enumerate(tracks):
             print(f"      흐름 {tuple(old_d)} -> {tuple(d.default)} (월드 +X)")
 print()
 
-# ── 2) 스토퍼는 안 세운다 ────────────────────────────────────
-# 예전에는 사양 stopper_x_mm 자리에 벽을 세워 박스를 막았다. 지금은
-# **벨트를 멈춰서** 세운다 (belt_cycle.py). 박스가 항상 같은 자리에 서므로
-# 로봇이 고정된 픽 자세 하나로 집을 수 있고, 벽에 밀려 쌓이지도 않는다.
-# 그래서 벽을 지운다. stopper_x_mm 는 이제 라인의 끝 좌표로만 쓴다.
-drop("/World", "EndStops")
+# ── 2) 스토퍼 벽 ─────────────────────────────────────────────
+# 설계결정서 §4.4 · 작업명세서 §5.3 · 트랙A §A4 가 모두 "컨베이어 끝에 스토퍼
+# (Cube 에 Collider 만, Rigid Body 없음)" 로 정해 둔 것이다.
+#
+# ⚠ 한때 이 자리에서 벽을 지우고 "벨트를 멈춰서 세운다" 로 갔었다. 두 가지가 틀렸다:
+#
+#   1) **아무도 박스를 못 세운다.** `spawner.pickup_check` 는 박스가 *이미 멎어야*
+#      present 를 주고 `cycle.py:_run` 은 present 를 받은 *뒤에* 벨트를 세운다.
+#      서로를 기다린다 (2026-08-22 실측: 검증 드라이버가 대신 끊어야 사이클이 돌았다).
+#   2) **픽업 위치가 상수가 아니게 된다.** 감속으로 세우면 서는 자리가 감속거리만큼
+#      매번 달라진다. 상수로 만들어 주는 것이 벽이다 (설계결정서 §4.4 표
+#      "픽업 위치가 상수 — IK 목표가 고정값"). 벽을 지운 옛 주석은 이 인과를
+#      거꾸로 적고 있었다.
+#
+# 벨트 정지는 벽을 대신하는 것이 아니라 벽과 **같이** 쓴다 — 벽이 세우고,
+# `cycle.py` 가 흡착 전에 벨트를 꺼서 떨림을 없앤다. 벽은 정지가 늦어도 박스가
+# 라인을 넘지 못하게 하는 안전망이다(설계결정서 §4.4 표).
+drop("/World", "EndStops")          # 옛 이름. 남아 있으면 치운다.
+drop("/World", "Stopper")
+STOP_T, STOP_H = 0.10, 0.30         # 두께 100 · 높이 300 mm (트랙A §A4)
+# 폭은 트랙A §A4 가 700 이라고 적었는데, 그건 그 때 **벨트 폭이 720** 이었기 때문이다
+# (scale.y 0.80). 사용자가 GUI 에서 벨트를 넓힌 뒤로는 700 이 벨트를 다 못 막는다.
+# 원래 의도가 "벨트를 가로지르는 벽" 이므로 벨트 폭을 따라가되 사양값을 하한으로 둔다.
+STOP_W = max(0.70, belt_w)
+belt_top = mm(_conv["belt_top_z_mm"])
+_bt = SPEC["boxes"]["types"]
+_h_max, _d_max, _w_max = (max(t[k] for t in _bt) / 1000.0 for k in ("h_mm", "d_mm", "w_mm"))
+# 벽이 낮으면 박스 무게중심이 벽 위로 올라와 그대로 타고 넘는다.
+if STOP_H <= _h_max / 2.0:
+    raise SystemExit(
+        f"스토퍼 높이 {STOP_H*1000:.0f} 가 가장 큰 박스 높이의 절반"
+        f"({_h_max*1000/2:.0f}) 이하다 — 박스가 벽을 넘는다.")
+# 벽이 좁으면 y 로 치우친 박스가 옆으로 빠져나간다. 90° 돌아간 5호까지 본다.
+if STOP_W < max(_d_max, _w_max):
+    raise SystemExit(
+        f"스토퍼 폭 {STOP_W*1000:.0f} 가 가장 큰 박스 최대 변"
+        f"({max(_d_max, _w_max)*1000:.0f}) 보다 좁다.")
+spec = define(STOPPER, "Cube", ["PhysicsCollisionAPI", "PhysxCollisionAPI"])
+put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
+put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
+    [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
+    [Gf.Vec3f(0.85, 0.25, 0.12)])
+put(spec, "physics:collisionEnabled", Sdf.ValueTypeNames.Bool, True)
+# ★ RigidBodyAPI 를 붙이지 않는다 — 붙이면 박스가 벽을 밀고 나간다 (작업명세서 §5.3).
+#   박스 **앞면**이 닿는 면이 stopper_x 여야 하므로 벽 중심은 두께의 반만큼 뒤다.
+#   밑면은 벨트 상면에 얹는다.
+xform(spec, (belt_x1 + STOP_T / 2.0, 0.0, belt_top + STOP_H / 2.0),
+      (STOP_T, STOP_W, STOP_H))
+print(f"스토퍼 벽 x {belt_x1*1000:.0f}~{(belt_x1+STOP_T)*1000:.0f}  "
+      f"y +-{STOP_W/2*1000:.0f}  z {belt_top*1000:.0f}~{(belt_top+STOP_H)*1000:.0f}  "
+      f"(콜라이더만 · RigidBody 없음)")
+print(f"      박스 앞면이 x={belt_x1*1000:.0f} 에 선다 -> 픽업 중심 = "
+      f"{belt_x1*1000:.0f} - w/2 (5호 {belt_x1*1000 - _w_max*1000/2:.0f})")
 
 # ── 3) 페데스탈 (D400 원기둥) ────────────────────────────────
 drop("/World", "Pedestal")

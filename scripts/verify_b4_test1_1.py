@@ -24,16 +24,16 @@
 `packing_sim/isaac/conveyor_ctl.py` docstring 에 있다. 여기서는 박스가 사양 속도로
 실려 와야 하므로 `isaac-sim.sh` 를 쓴다.
 
-## 스토퍼는 이 스크립트가 대신한다 — **미결 항목이다**
+## 박스는 **씬의 스토퍼 벽**이 세운다 (2026-08-23)
 
-씬에 스토퍼 벽이 없다 (`layout_to_spec_test1_1.py`: "박스는 벨트를 멈춰서 세운다").
-그런데 `spawner.pickup_check` 는 박스가 **이미 멎어 있어야** present 를 보고하고,
-`cycle.py` 는 present 를 받은 **뒤에** 벨트를 세운다. 서로를 기다리는 구조다.
+드라이버가 벨트를 끊지 않는다. 씬(`layout_to_spec_test1_1.py`)이 stopper_x 에
+콜라이더 벽을 세우고, 박스는 거기 닿아 선다. 그래서 여기 흐름이 실제 운용과 같다:
 
-지금은 이 드라이버가 박스 앞면이 `stopper_x` 에 닿을 때 `set_velocity(0)` 을 불러
-끊는다. **진짜로는 A(씬) 쪽이 해야 하는 일이다** — 물리 스토퍼를 세우든,
-`spawner` 가 픽 지점 도달 시 스스로 벨트를 끊든. 팀에서 정할 사항이라 여기서
-임의로 `spawner` 계약을 바꾸지 않았다.
+    spawn_box -> 벨트 on -> (벽이 세운다) -> pickup_check present -> Cycle.run
+
+한때 벽을 지우고 "벨트를 멈춰서 세운다" 로 갔던 판이 있었는데, `pickup_check` 는
+박스가 *이미 멎어야* present 를 주고 `cycle.py` 는 present 를 받은 *뒤에* 벨트를
+세우므로 서로를 기다려 아무도 못 세웠다. 그때는 이 드라이버가 대신 끊었다.
 """
 import json
 import math
@@ -69,6 +69,7 @@ BOX_ID = "BOX00000"
 BOX_TYPE = "4호"                                          # Mock get_box_info 와 같아야 한다
 BOOT_STEPS = 20                                          # 물리가 자리 잡을 때까지
 SETTLE_STEPS = 90                                        # READY 자세로 수렴 대기 (1.5 s)
+TRAVEL_TIMEOUT_S = 90.0                                  # 9.5 m / 0.5 m/s = 19 s + 여유
 WATCHDOG_S = 180.0
 
 cfg = _paths.system_config()
@@ -182,31 +183,25 @@ def worker():
         link.call(cmd="set_velocity", seg="main", mps=BELT_MPS)
         link.call(cmd="set_velocity", seg="b_pickup", mps=BELT_MPS)
 
-        # ── 2) 픽 지점에서 벨트를 끊는다 (스토퍼 대용, docstring 참조) ──
+        # ── 2) 벽이 세울 때까지 기다린다. **벨트는 안 끈다** ──
+        # 9.5 m 를 0.5 m/s 로 오므로 19 s + 정지 판정. 넉넉히 본다.
         half_w = T4["w_mm"] / 2000.0
-        t0 = time.time()
-        while time.time() - t0 < 60.0:
-            p = link.call(cmd="get_box_pose", box_id=BOX_ID)
-            if p.get("ok") and p["pos_m"][0] + half_w >= STOPPER_X - 0.005:
-                break
-            time.sleep(0.02)
-        link.call(cmd="set_velocity", seg="main", mps=0.0)
-        link.call(cmd="set_velocity", seg="b_pickup", mps=0.0)
-        p = link.call(cmd="get_box_pose", box_id=BOX_ID)
-        log("[2] 벨트 정지 — 박스 앞면 %.3f m (스토퍼 %.3f)"
-            % (p["pos_m"][0] + half_w, STOPPER_X))
-
-        # ── 3) 멎을 때까지 기다렸다가 pickup_check ────────────
         pick = None
         t0 = time.time()
-        while time.time() - t0 < 15.0:
+        while time.time() - t0 < TRAVEL_TIMEOUT_S:
             c = link.call(cmd="pickup_check", zone=ZONE)
             if c.get("present"):
                 pick = c
                 break
             time.sleep(0.05)
         if pick is None:
-            raise RuntimeError("pickup_check 가 present 를 안 준다")
+            p = link.call(cmd="get_box_pose", box_id=BOX_ID)
+            raise RuntimeError("pickup_check 가 present 를 안 준다 (박스 %s)"
+                               % (np.round(p.get("pos_m", []), 3).tolist()))
+        travel = time.time() - t0
+        log("[2] 스토퍼 도달 %.1f s — 박스 앞면 %.4f m (스토퍼 %.3f, 오차 %+.1f mm)"
+            % (travel, pick["pose"]["pos_m"][0] + half_w, STOPPER_X,
+               (pick["pose"]["pos_m"][0] + half_w - STOPPER_X) * 1000.0))
         log("[3] pickup_check present  box=%s  pose=%s"
             % (pick["box_id"], {k: (np.round(v, 4).tolist() if isinstance(v, list) else round(v, 2))
                                 for k, v in pick["pose"].items()}))
