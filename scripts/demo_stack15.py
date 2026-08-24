@@ -105,6 +105,7 @@
 import argparse
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -117,6 +118,7 @@ import _paths                                          # noqa: E402
 import verify_lula_ik as V                             # Isaac 배선  # noqa: E402
 import verify_suction as VS                            # 씬 빌더  # noqa: E402
 import verify_b4_cycle as B4                           # StandInServer 대역  # noqa: E402
+import verify_reach as VR                              # 충돌구체 로더  # noqa: E402
 
 PORT = 8798                                            # 8765=A, 8799=verify_b4_cycle
 GRIPPER = "/World/h2017/SurfaceGripper"
@@ -342,6 +344,27 @@ def print_plan(plan, pk=None, dropped=(), ped_mm=700.0):
 
 
 # ─────────────────────────────────────────────────────────────
+def _load_algo_module():
+    """트랙 C 코어(`src/packing_algo/packing_algo/heightmap_core.py`)를 **파일로** 읽는다.
+
+    ★ `import packing_algo...` 를 쓰지 않는 이유 두 가지.
+      1. 그 패키지의 `algo_service_node` 가 `packing_msgs` 를 끌어오는데, Isaac 내장
+         파이썬은 3.11 이고 ROS 2 Jazzy 는 3.12 라 import 가 죽는다 (CLAUDE.md §2).
+      2. `install/` 이 source 돼 있으면 소스본과 설치본 중 어느 사본이 잡히는지가
+         셸 상태에 달린다. 검증에 쓰는 계산기가 실행마다 달라지면 안 된다.
+    `heightmap_core` 의 의존은 math·numpy·scipy 뿐이라 3.11 에서 그대로 돈다.
+    """
+    import importlib.util
+    if "_algo_hm" in sys.modules:
+        return sys.modules["_algo_hm"]
+    path = _paths.ROOT / "src/packing_algo/packing_algo/heightmap_core.py"
+    spec = importlib.util.spec_from_file_location("_algo_hm", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_algo_hm"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class PalletVision:
     """손목 카메라 대역 — 팔레트 위 박스들의 **실제** 자세를 돌려준다.
 
@@ -482,6 +505,83 @@ class OnlineServices:
 
 
 # ─────────────────────────────────────────────────────────────
+class AlgoServices:
+    """**트랙 C(정정인) 코어를 그대로 꽂는다.** 데모의 사본 패커 대신 진짜를 쓴다.
+
+    ★ 왜 따로 있나 — `demo_stack15` 는 지금까지 `packing_sim/packing.py` 의 **사본**
+      패커를 썼다. 통합 검증에서 확인해야 할 것은 그 사본이 아니라 `packing_algo` 다.
+
+    벨트·DB 4개(`set_velocity`·`get_box_info`·`set_status`·`mark_placed`)는 algo 의
+    책임이 아니므로(CLAUDE.md §3) `PlanServices` 와 같은 스텁을 쓴다. algo 가 답하는
+    것은 `plan_placement`·`update_heightmap`·`cancel_plan` 셋뿐이다.
+    """
+
+    def __init__(self, specs, cfg, clearance_mm=0.0, log=print, verbose=False):
+        PKA = _load_algo_module()
+        self.pk = PKA.HeightmapPacker(cfg)          # ★ cfg 통째로 받는다 (사본과 시그니처가 다르다)
+        self.specs = dict(specs)
+        self.c = int(clearance_mm)
+        self.calls, self._log, self._v = [], log, verbose
+        self.last = None                            # 온라인 경로가 실측 대조에 쓴다
+
+    def _rec(self, name, *a):
+        self.calls.append((name,) + a)
+        if self._v:
+            self._log("             [svc] %s%s" % (name, a if a else ""))
+
+    # ── algo 가 답하는 것 ────────────────────────────────────
+    def plan_placement(self, zone, box_id, w, d, h):
+        self._rec("/algo/plan_placement", zone, box_id)
+        # ★ 맨 앞에서 지운다. 안 지우면 계획에 실패한 박스가 **직전 박스의 좌표**를
+        #   물려받아 대조표에 찍힌다 (아래 online 경로가 `svc.last` 를 그대로 읽는다).
+        self.last = None
+        ok, pose, _score, msg = self.pk.plan(box_id, int(w) + self.c,
+                                             int(d) + self.c, int(h))
+        if not ok:
+            self._log("             [algo] %s" % msg)
+            return False, None, msg
+        # ★ np.int64 로 나온다. 지금 경로는 산술뿐이라 안 터지지만 json 을 태우면 죽는다.
+        place = {"x_mm": int(pose["x_mm"]), "y_mm": int(pose["y_mm"]),
+                 "z_mm": int(pose["z_mm"]), "yaw_deg": float(pose["yaw_deg"]),
+                 "stack_top_mm": int(self.pk.hm.max())}
+        self.last = dict(place)
+        return True, place, "OK"
+
+    def update_heightmap(self, zone, box_id, w, d, h, actual):
+        self._rec("/algo/update_heightmap", box_id)
+        # ★ clearance 를 plan 과 **같이** 더해야 한다. 한쪽만 부풀리면
+        #   heightmap_core 의 `i = round((actual.x_mm - w/2)/cell)` 이 셀 단위로 어긋나
+        #   발자국이 실제와 다른 자리에 찍힌다.
+        ok, fill, _n = self.pk.update(box_id, int(w) + self.c, int(d) + self.c,
+                                      int(h), actual)
+        return ok, fill                              # cycle.py 는 2개만 받는다
+
+    def cancel_plan(self, zone, box_id):
+        self._rec("/algo/cancel_plan", box_id)
+        self.pk.cancel(box_id)
+        return True
+
+    # ── algo 책임이 아닌 것 (PlanServices 와 동일한 스텁) ────
+    def set_velocity(self, seg, mps):
+        self._rec("/conveyor/set_velocity", seg, mps)
+        return True
+
+    def get_box_info(self, box_id):
+        self._rec("/db/get_box_info", box_id)
+        s = self.specs.get(box_id)
+        if s is None:
+            return None
+        return {"w_mm": s["w_mm"], "d_mm": s["d_mm"], "h_mm": s["h_mm"], "zone": "B"}
+
+    def set_status(self, box_id, status):
+        self._rec("/db/set_status", box_id, status)
+        return True
+
+    def mark_placed(self, box_id, pose):
+        self._rec("/db/mark_placed", box_id)
+        return True
+
+
 class PlanServices:
     """§2.7 Mock 을 **계획으로 구동**한다. `verify_b4_cycle.MockServices` 의 15개판.
 
@@ -561,7 +661,8 @@ def main():
     ap.add_argument("--zone", default="B", choices=["A", "B", "C"])
     ap.add_argument("--boxes", type=int, default=None,
                     help="기본은 system.yaml boxes.stage1.total_count (=15)")
-    ap.add_argument("--plan-mode", default="offline", choices=["offline", "online"],
+    ap.add_argument("--plan-mode", default="offline",
+                    choices=["offline", "online", "algo"],
                     help="offline = 15개 계획을 미리 만들어 z 오름차순으로 실행한다 (기본, 검증됨). "
                          "online = 박스마다 비전으로 적재 상태를 다시 보고 자리를 정한다 "
                          "— 카메라가 붙었을 때의 구조다. **지금은 오프라인보다 나쁘다**, "
@@ -572,8 +673,13 @@ def main():
                     help="계획만 만들고 끝낸다. Isaac 을 안 띄운다 (python3 로 돈다)")
     ap.add_argument("--clearance", type=float, default=CLEARANCE_MM, metavar="MM")
     ap.add_argument("--halo", type=float, default=DESCENT_HALO_MM, metavar="MM")
-    ap.add_argument("--order", default="volume", choices=["volume", "arrival"],
-                    help="급송 순서. arrival 은 도착순 그대로 (일부 탈락한다)")
+    ap.add_argument("--order", default="volume",
+                    choices=["volume", "small-first", "arrival", "shuffle"],
+                    help="급송 순서. volume=큰 것부터(기본) · small-first=작은 것부터 · "
+                         "arrival=도착순 그대로(일부 탈락한다) · shuffle=무작위(seed 고정). "
+                         "★ 트랙 C 코어에는 **하중 순서 로직이 없다** — 큰 것부터 넣는 것이 "
+                         "무거운 박스를 아래에 두는 유일한 장치다. 바꾸면 9 kg 5호가 "
+                         "3 kg 3호 위에 올라갈 수 있다")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--diag-tcp", action="store_true",
                     help="사이클마다 **하강 바닥에서 지령 대비 실제 흡착면 위치**를 찍는다. "
@@ -588,6 +694,16 @@ def main():
                     help="페데스탈(로봇 베이스) 높이를 덮어쓴다. system.yaml 은 안 건드린다. "
                          "★ 700 이면 적재 상단(월드 1200)이 어깨보다 500 mm 높아 link_2 가 "
                          "이송 중 적재물을 스친다 (results/issues/18). 1000 이면 여유 +49 mm")
+    ap.add_argument("--vel", type=float, default=None, metavar="SCALE",
+                    help="관절 속도 배율(joint_speed_scale)을 덮어쓴다. system.yaml 은 "
+                         "안 건드린다. 기본 0.5. 시연을 빨리 볼 때 0.8~1.0. "
+                         "⚠ 올리면 릴리스 시점 잔여속도가 커져 박스가 놓인 뒤 흐를 수 "
+                         "있다 — 착지 정밀도를 볼 때는 기본값으로 돌릴 것")
+    ap.add_argument("--algo-clearance", type=float, default=0.0, metavar="MM",
+                    help="algo 모드에서 이웃 간격을 박스 치수에 더한다. 0 = 트랙 C 코어 순정. "
+                         "★ 사본 패커는 30 을 쓴다 — 간격 20 으로 줄였을 때 13번째 박스가 "
+                         "이웃 모서리에 걸려 Z 오차 +208 mm 가 났던 값이다. 순정(0)이 "
+                         "그보다 좁으므로 깨지면 30 으로 올려 볼 것")
     ap.add_argument("--standoff", type=float, default=None, metavar="MM",
                     help="로봇을 팔레트 긴 변에서 뒤로 뺀 거리. 기본은 구 사양서 §3-1 의 300. "
                          "600 이면 여유 +126 mm. ※ 둘 다 G1 재검증이 필요하다")
@@ -607,11 +723,22 @@ def main():
 
     # ── 계획 ───────────────────────────────────────────────
     pk = None
-    online = a.plan_mode == "online" and not a.plan and not a.plan_only
+    # "online" 의 실제 뜻은 **미리 만든 계획표가 없다** 이다. algo 모드도 같으므로
+    # 여기 한 줄만 넓히면 아래 급송 순서·대조표 경로가 전부 따라온다.
+    online = a.plan_mode in ("online", "algo") and not a.plan and not a.plan_only
     if online:
         # 온라인은 미리 만드는 계획이 없다. 급송 순서(= 박스 목록)만 정한다.
         fed = manifest(cfg, n)
-        fed.sort(key=lambda b: -(b["w_mm"] * b["d_mm"] * b["h_mm"]))
+        # ★ 여기가 하드코딩이었다 — --order 를 로그에만 찍고 정렬은 항상 부피 내림차순이라
+        #   online/algo 모드에서 --order arrival 이 **조용히 무시**됐다.
+        _vol = lambda b: b["w_mm"] * b["d_mm"] * b["h_mm"]
+        if a.order == "volume":
+            fed.sort(key=lambda b: -_vol(b))
+        elif a.order == "small-first":
+            fed.sort(key=_vol)
+        elif a.order == "shuffle":
+            np.random.default_rng(cfg["boxes"]["random_seed"]).shuffle(fed)
+        # arrival 은 manifest 가 뽑은 순서 그대로 — 정렬하지 않는다
         plan, dropped = [], []
         print("계획  온라인 (비전 -> 하이트맵 -> 다음 자리)  seed %s · 간격 %.0f mm · 급송 %s"
               % (cfg["boxes"]["random_seed"], a.clearance, a.order))
@@ -667,7 +794,7 @@ def main():
     import cycle as CY                                   # packing_robot
     import sim_link as SL
 
-    if a.pedestal is not None or a.standoff is not None:
+    if a.pedestal is not None or a.standoff is not None or a.vel is not None:
         # ★ system.yaml 을 안 고치고 로봇만 옮겨 본다 (철칙 3 — 숫자 변경은 팀 결정이다).
         #   `bring_up` 이 `_paths.system_config()` 로 base 를 읽으므로 그 함수만 감싼다.
         _orig_cfg = _paths.system_config
@@ -682,12 +809,16 @@ def main():
             if a.standoff is not None:
                 # 팔레트 긴 변(y = pallet_origin.y)에서 -Y 로 standoff 만큼 떨어뜨린다
                 b[1] = float(pal[1]) - float(a.standoff)
+            if a.vel is not None:
+                # robot_motion 이 cfg["robot"]["joint_speed_scale"] 로 스텝 수를 정한다
+                c["robot"]["joint_speed_scale"] = float(a.vel)
             return c
 
         _paths.system_config = _patched
-        print("★ 로봇을 옮긴다 (system.yaml 은 그대로): 페데스탈 %s · 이격 %s"
+        print("★ 덮어쓴다 (system.yaml 은 그대로): 페데스탈 %s · 이격 %s · 속도배율 %s"
               % (a.pedestal if a.pedestal is not None else "기본",
-                 a.standoff if a.standoff is not None else "기본"))
+                 a.standoff if a.standoff is not None else "기본",
+                 a.vel if a.vel is not None else "기본"))
 
     ok_all = True
     server = link = None
@@ -755,8 +886,12 @@ def main():
 
         # ── 몸: robot_motion + 소켓 서버 대역 ───────────────
         cur = {"rp": rps[0], "half_h": dims_m[0][2] / 2.0}
+        # ★ 충돌구체와 READY 를 넘긴다 — robot_motion 이 IK **가지**를 고를 때 쓴다.
+        #   안 넘기면 시드 선택이 꺼지고 예전 동작 그대로다 (sim_main 등 다른 호출부).
+        #   descriptor 경로를 robot_motion 이 알 방법이 없어 여기서 읽어 준다.
         rm = RM.RobotMotion(S.art, S.lula, cfg, ee=S.ee, gripper_path=GRIPPER,
-                            gap_fn=lambda: VS.measure(S, cur["rp"], cur["half_h"])[0])
+                            gap_fn=lambda: VS.measure(S, cur["rp"], cur["half_h"])[0],
+                            collision_spheres=VR.load_spheres(), ready_q=S.ready)
         handlers = dict(rm.handlers())
 
         def h_get_box_pose(req):                          # A 소유 명령. 대역이라 여기 둔다
@@ -800,7 +935,14 @@ def main():
 
         # ── 머리 ───────────────────────────────────────────
         link = SL.SimLink(port=a.port)
-        if online:
+        if online and a.plan_mode == "algo":
+            # ★ 트랙 C 코어를 그대로 쓴다. 비전 루프(PalletVision)를 안 태운다 —
+            #   algo 는 자기 heightmap 을 소유하고 실측 pose 로 갱신한다 (CLAUDE.md D3).
+            svc = AlgoServices(specs, cfg, a.algo_clearance, verbose=a.verbose)
+            places = {}
+            print("계획  ★트랙 C 코어 (packing_algo/heightmap_core.py) · 간격 %.0f mm"
+                  % a.algo_clearance)
+        elif online:
             PKM = _load_packer_module()
             hm, pal = cfg["heightmap"], cfg["pallet"]
 
@@ -828,13 +970,50 @@ def main():
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
         j5 = [1e9, -1e9]                                  # 손목 감김 추적 (아래 주석)
 
+        # ★ 물리를 **벽시계에 묶는다** — 재현성의 핵심이다.
+        #
+        #   메인 스레드는 `while th.is_alive(): tick()` 으로 물리를 최대 속도로 돌리는데,
+        #   사이클 스레드(cycle._move)는 `time.sleep(0.02)` **벽시계**로 motion_status 를
+        #   폴링한다. 헤드리스에서는 0.02 초에 물리가 수십~수백 스텝 나가므로 **명령 사이에
+        #   흐르는 스텝 수가 매 실행 다르다.** 흡착 간극·정착 상태가 달라지고, 온라인
+        #   계획이라 한 번 어긋나면 이후 배치가 통째로 갈린다.
+        #
+        #   실측: 같은 명령이 20/20(knock 1071) · 20/20(knock 2146) · 17/20 · 11/20 · 4/20
+        #   으로 흩어졌다. 이 상태로는 **어떤 변경도 데모 통과율로 판정할 수 없다.**
+        #
+        #   여기서 1/hz 만큼 자면 물리 1 스텝 = 벽시계 1/hz 가 되어 폴링 간격(0.02 s)이
+        #   항상 같은 스텝 수(hz*0.02 = 1.2 스텝 @60Hz)에 대응한다. `--gui` 는 렌더가
+        #   이미 비슷한 페이스라 영향이 적고, 헤드리스를 그 조건에 맞추는 셈이다.
+        #
+        #   ★★ 그런데 **효과가 없었다** (2026-08-24 실측). 기본 끔.
+        #     실시간으로 묶고 돌려도 4/20 이 나왔고, 실패는 전부 위치 잔차(297·79·72 mm)
+        #     = 물리적 막힘이지 타이밍이 아니었다. 타임아웃도 안 걸렸다.
+        #
+        #     진짜 원인은 따로 있다: **계획이 5번째 박스부터 갈린다.** 두 실행의 최종
+        #     대조표를 비교하면 앞 4개는 같고 5번째부터 완전히 다르다. 앞 배치의 미세한
+        #     실측 오차가 heightmap 에 기록되고(CLAUDE.md D3 — 실측 pose 로 갱신 =
+        #     자기교정), 그게 다음 계획을 바꾸고, 온라인이라 이후가 통째로 발산한다.
+        #     즉 **자기교정 구조의 대가**이지 페이싱 문제가 아니다.
+        #
+        #     노브는 남긴다 — PL_REALTIME=1 이면 물리를 벽시계에 묶는다. 눈으로 볼 때나
+        #     타이밍 가설을 다시 검증할 때 쓴다. 대신 실행이 8분대로 느려진다.
+        realtime = os.environ.get("PL_REALTIME", "0") != "0"
+        step_dt = 1.0 / S.hz
+
         def tick():
             """물리 한 스텝. 소켓 스레드가 읽을 캐시(현재 박스 pose)도 여기서 갱신한다."""
+            t_step = time.time()
             rm.step()
             pos, quat = cur["rp"].get_world_pose()
             cur["pose"] = ([float(v) for v in pos], _yaw_of(quat))
             S.world.step(render=S.render)
             _j5(S, j5)
+            if realtime:
+                # 남은 시간만 잔다. 이미 늦었으면 안 잔다 (따라잡기를 시도하지 않는다 —
+                # 그러면 다시 스텝 수가 실행마다 달라진다).
+                lag = step_dt - (time.time() - t_step)
+                if lag > 0:
+                    time.sleep(lag)
             if a.diag_tcp:
                 # 현재 흡착면(FK)과 **매달린 박스 중심**을 갱신한다.
                 # 짝짓기는 h_move_diag 가 한다 (소켓 스레드는 이 값을 읽기만 한다).
@@ -922,7 +1101,12 @@ def main():
                     np.asarray(by_id[pid].get_world_pose()[0], dtype=float) - ref) * 1000.0)
                 if dmm > knock:
                     knock, who = dmm, pid
-            rest[bid] = pos.copy()
+            # ★ **놓은 것만** 기준에 등록한다. rest 는 "이미 놓인 박스" 라는 뜻인데,
+            #   결과와 무관하게 넣으면 못 놓은 박스(NO_FEASIBLE_POSE 로 벨트에 남은 것)가
+            #   들어가고, 그 박스가 벨트로 흘러간 거리가 다음 사이클의 knock 으로 찍힌다.
+            #   실측: 거부된 5호가 knock 1925 mm 로 잡혀 표가 통째로 못 읽게 됐다.
+            if res == "PLACED":
+                rest[bid] = pos.copy()
 
             rows.append({"id": bid, "type": spec["name"], "res": res, "err": err,
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
