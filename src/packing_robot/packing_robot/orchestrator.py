@@ -72,12 +72,12 @@ class Orchestrator(Node):
         self.cli_belt = self.create_client(SetVelocity, "/conveyor/set_velocity", callback_group=cb)
         self.pub_status = self.create_publisher(ZoneStatus, f"/zone_{self.zone.lower()}/status", 10)
 
-        self.link = None
+        self.link, self.sim_host, self.sim_port = None, g("sim_host"), int(g("sim_port"))
         if self.mode == "socket":
             try:
-                self.link = SimLink(g("sim_host"), int(g("sim_port")))
-                self.link.call(cmd="ping")
-                self.get_logger().info(f"Isaac 소켓 {g('sim_host')}:{g('sim_port')} 연결됨")
+                self.link = SimLink(self.sim_host, self.sim_port)
+                self.sim(cmd="ping")
+                self.get_logger().info(f"Isaac 소켓 {self.sim_host}:{self.sim_port} 연결됨")
             except OSError as e:
                 self.get_logger().error(
                     f"Isaac 소켓 연결 실패({e}) — sim_main.py 를 먼저 띄우세요. mock 으로 내려갑니다")
@@ -100,6 +100,36 @@ class Orchestrator(Node):
     def now(self):
         return self.get_clock().now().nanoseconds / 1e9
 
+    def sim(self, _slow=None, **req):
+        """소켓 호출은 전부 여기를 지난다.
+
+        ★ Isaac 이 죽거나 창을 닫으면 SimLink 가 예외를 던진다. 그걸 그냥 두면
+          타이머 콜백 밖으로 올라가 **노드가 통째로 죽는다.** 명세서 §1.5 대로
+          state="BLOCKED" 를 발행하고 재연결을 시도해야 한다 (sim_link.py 주석).
+        """
+        if self.link is None:
+            return {}
+        try:
+            return self.link.call_slow(_slow, **req) if _slow else self.link.call(**req)
+        except (OSError, ConnectionError, ValueError) as e:
+            self.get_logger().error(f"Isaac 소켓 끊김({e}) — state=BLOCKED, 재연결 시도")
+            try:
+                self.link.close()
+            except OSError:
+                pass
+            self.link, self.state, self.t_next = None, "BLOCKED", self.now() + 2.0
+            return {}
+
+    def reconnect(self):
+        try:
+            self.link = SimLink(self.sim_host, self.sim_port)
+            self.sim(cmd="ping")
+            self.get_logger().info("Isaac 소켓 재연결 성공 — 사이클 재개")
+            return True
+        except OSError:
+            self.link = None
+            return False
+
     def belt(self, mps):
         """벨트는 ROS 서비스로만 (§3 규칙 4). 서비스가 없으면 경고만 하고 계속 간다."""
         if self.cli_belt.service_is_ready():
@@ -108,7 +138,7 @@ class Orchestrator(Node):
         elif self.link is not None:
             # ★ 임시. §3 규칙 4 는 벨트를 ROS 서비스로 부르라고 한다. sim_bridge_node 가
             #   생기면 위 분기로 자동으로 넘어가므로 이 줄은 그때 지운다.
-            self.link.call(cmd="set_velocity", seg=f"{self.zone.lower()}_pickup", mps=float(mps))
+            self.sim(cmd="set_velocity", seg=f"{self.zone.lower()}_pickup", mps=float(mps))
         elif mps == 0.0:
             self.get_logger().warn("/conveyor/set_velocity 없음 — 벨트 정지를 건너뜁니다", once=True)
 
@@ -136,13 +166,13 @@ class Orchestrator(Node):
     def _move(self, target, yaw):
         """move_ee 는 논블로킹 — 목표를 한 번만 넣고 motion_status 를 폴링한다 (§3 규칙 1)."""
         if not self._sent:
-            r = self.link.call(cmd="move_ee", target_m=list(target), yaw_deg=float(yaw))
+            r = self.sim(cmd="move_ee", target_m=list(target), yaw_deg=float(yaw))
             if not r.get("accepted"):
                 self.abort(f"move_ee 거부: {r}")
                 return False
             self._sent = True
             return False
-        st = self.link.call(cmd="motion_status").get("state")
+        st = self.sim(cmd="motion_status").get("state")
         if st == "REACHED":
             self._sent = False
             return True
@@ -167,7 +197,7 @@ class Orchestrator(Node):
 
     def _grasp(self, box_id):
         # grasp 는 그리퍼 재시도 때문에 오래 걸린다 — 전용 타임아웃 (sim_link.call_slow)
-        if not self.link.call_slow(15.0, cmd="grasp", box_id=box_id).get("ok"):
+        if not self.sim(15.0, cmd="grasp", box_id=box_id).get("ok"):
             self.failed += 1
             self.abort("grasp 실패 (PICK_FAILED)")
             return False
@@ -177,7 +207,7 @@ class Orchestrator(Node):
         """release 는 '도착'이 아니라 '정지' 조건으로 (§6.5). 타임아웃 없으면 무한루프."""
         if self._t0 == 0.0:
             self._t0 = self.now()
-        if self.link.call(cmd="tcp_speed").get("mps", 1.0) < self.stop_speed:
+        if self.sim(cmd="tcp_speed").get("mps", 1.0) < self.stop_speed:
             self._t0 = 0.0
             return True
         if self.now() - self._t0 > self.stop_timeout:
@@ -187,7 +217,7 @@ class Orchestrator(Node):
         return False
 
     def _release(self):
-        self.link.call_slow(15.0, cmd="release")
+        self.sim(15.0, cmd="release")
         self._t0 = self.now()
         return True
 
@@ -198,7 +228,7 @@ class Orchestrator(Node):
         """실측 pose → PlacePose. Isaac 이 없으면 계획값 ±noise 로 흉내낸다."""
         box_id, w, d, h = self.box
         if self.mode == "socket":
-            r = self.link.call(cmd="get_box_pose", box_id=box_id)
+            r = self.sim(cmd="get_box_pose", box_id=box_id)
             if r.get("ok"):
                 pp = world_to_pallet_place(r["pos_m"], float(r.get("yaw_deg", 0.0)), h, self.origin)
                 return PlacePose(x_mm=pp.x_mm, y_mm=pp.y_mm, z_mm=pp.z_mm, yaw_deg=pp.yaw_deg)
@@ -220,6 +250,15 @@ class Orchestrator(Node):
     # ---------- 상태머신 ----------
     def on_tick(self):
         s = self.state
+
+        if s == "BLOCKED":
+            if self.now() < self.t_next:
+                return
+            if self.reconnect():
+                self.state = "IDLE"
+            else:
+                self.t_next = self.now() + 2.0
+            return
         if s == "WAIT_ALGO":
             if self.cli_plan.service_is_ready() and self.cli_upd.service_is_ready():
                 self.get_logger().info("/algo/* 연결됨 — 사이클 시작")
@@ -238,7 +277,7 @@ class Orchestrator(Node):
             if self.real_boxes:
                 # Isaac 에 진짜 박스를 스폰한다. 크기는 우리가 고른 것이라 DB 없이도 안다.
                 # TODO(트랙 B): sim_bridge_node 가 생기면 /zone_b/box_at_pickup 구독으로 바꾼다.
-                r = self.link.call(cmd="spawn_box", box_id=box_id, type=name, yaw_deg=0.0)
+                r = self.sim(cmd="spawn_box", box_id=box_id, type=name, yaw_deg=0.0)
                 if not r.get("ok"):
                     self.get_logger().error(f"spawn_box 실패: {r}")
                     self.state, self.t_next = "IDLE", self.now() + self.interval
@@ -252,7 +291,7 @@ class Orchestrator(Node):
             return                                    # ★ 반드시 여기서 return
 
         if s == "WAIT_PICKUP":
-            r = self.link.call(cmd="pickup_check", zone=self.zone)
+            r = self.sim(cmd="pickup_check", zone=self.zone)
             if r.get("present") and r.get("box_id") == self.box[0]:
                 self.pick_pose = r["pose"]            # 실측 파지 pose (pos_m · yaw_deg)
                 self.belt(0.0)                        # ★ 흡착 전 정지. 안 멈추면 박스가 끌려간다
@@ -283,7 +322,7 @@ class Orchestrator(Node):
                 #   1차에는 Return line 이 없으므로 despawn 이 유일한 처리다 (CLAUDE.md §5).
                 #   TODO(트랙 B): sim_bridge_node 가 생기면 /sim/despawn_box 서비스로 바꾼다.
                 if self.link is not None:
-                    r = self.link.call(cmd="despawn_box", box_id=box_id)
+                    r = self.sim(cmd="despawn_box", box_id=box_id)
                     if not r.get("ok"):
                         self.get_logger().error(f"despawn_box 실패({r}) — 라인이 막힐 수 있습니다")
                 # TODO(트랙 B): /db/set_status(box_id, 'REJECTED')
@@ -353,11 +392,14 @@ class Orchestrator(Node):
 
     def on_status(self):
         busy = self.state in ("PLANNING", "ROBOT", "MOCK_MOVE", "UPDATING", "WAIT_PICKUP")
+        st = ("BLOCKED" if self.state == "BLOCKED" else
+              "BUSY" if busy else
+              "PALLET_FULL" if self.state == "PALLET_FULL" else "IDLE")
         self.pub_status.publish(ZoneStatus(
             zone=self.zone, queue_len=0,          # TODO(트랙 B): /db/zone_queue 중계
             buffer_cap=int(self.cfg["zones"]["buffer_capacity"]),
             est_free_time_s=0.0,
-            state="BUSY" if busy else ("PALLET_FULL" if self.state == "PALLET_FULL" else "IDLE"),
+            state=st,
             fill_rate=float(self.fill_rate)))
 
 
