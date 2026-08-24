@@ -3,6 +3,20 @@
     cd ~/isaacsim && ./isaac-sim.sh --no-window \
         --exec /home/rokey/palletris_ws/scripts/demo_stack15_test1_1.py
 
+## 시작은 사람이 누른다 (창이 있는 실행)
+
+씬이 뜨고 카메라 창까지 준비되면 멈춰 서서 **Play 를 기다린다.** 이 드라이버는
+물리 스텝 콜백으로만 도니까, Play 가 안 눌리면 부팅 카운터부터 안 돈다.
+창이 없는 실행(게이트·검증)은 누를 사람이 없어 자동으로 누른다. `PL_AUTOPLAY` 로
+어느 쪽이든 강제할 수 있다.
+
+  ⚠ **일시정지와 Stop 은 아직 못 이어간다.** 둘 다 그 실행을 거기서 끝낸다 —
+    Stop 은 물리 뷰를 무효화해 로봇·그리퍼 핸들을 죽이고 쌓아 둔 팔레트도 되감고,
+    일시정지는 이 드라이버의 타이머가 전부 **벽시계**라(스폰 간격·도착 180 s·
+    사이클 120 s·워치독 900 s) 물리만 멈춘 사이에 시계가 계속 가서 타임아웃이 터진다.
+    둘 다 고치려면 타이머를 시뮬 시간으로 옮기고(일시정지) 수명주기를 재초기화
+    가능하게(Stop) 만들어야 한다 — 별건이다.
+
 ## 화면 둘 (시연, demo 모드)
 
     view2  Isaac 창 안에 두 번째 뷰포트가 자동으로 뜬다 — **벨트 위 하향 카메라**
@@ -169,6 +183,13 @@ def _has_window():
 #   쓰는 바람에 바로 그 다음 측정이 통째로 틀어졌다 (실측: 사이클 12.3 -> 26.0 s).
 #   재현 안 되는 측정을 만드는 종류라 여기서 막는다.
 HOLD = _env("PL_HOLD") not in ("", "0", "false", "no") and _has_window()
+# ★ 자동 Play. **창이 있으면 안 누른다** — 시연에서는 사람이 직접 누르고 싶다.
+#   이 드라이버는 물리 스텝 콜백(`on_step`)으로만 돌아서, Play 가 안 눌리면
+#   부팅 카운터부터가 안 돈다. 즉 "안 누르면 아무 일도 안 일어난다" 가 그대로 성립한다.
+#   창이 없는 실행(게이트·검증·CI)은 누를 사람이 없으니 자동으로 누른다.
+#   PL_AUTOPLAY=1 / 0 으로 어느 쪽이든 강제할 수 있다.
+_ap = os.environ.get("PL_AUTOPLAY")
+AUTOPLAY = (not _has_window()) if _ap is None else (_ap not in ("0", "false", "no"))
 PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
 # ★ 팔 속도. **이 실행에서만** 덮어쓴다 — system.yaml 도 B 코드도 안 건드린다.
 #   왜 필요한가: 이송 구간이 177도를 도는데 박스는 흡착 패드에 강성 100 · 감쇠 0
@@ -501,7 +522,14 @@ elif WRISTROS:
     log("손목ROS   %s 가 씬에 없다 — src/packing_sim/run_layout_to_spec.sh 를 다시 돌려라"
         % CAM_WRIST_PRIM)
 
-omni.timeline.get_timeline_interface().play()
+if AUTOPLAY:
+    omni.timeline.get_timeline_interface().play()
+else:
+    log("")
+    log("  >>> 준비 끝. **Play 를 눌러라.**  (자동으로 시작하지 않는다)")
+    log("      일시정지와 Stop 은 아직 못 이어간다 — 누르면 그 실행은 거기서 끝이다.")
+    log("      예전처럼 자동으로 시작하려면  PL_AUTOPLAY=1")
+    log("")
 
 
 def setup():
@@ -1417,4 +1445,4 @@ _S["timeline_sub"] = (omni.timeline.get_timeline_interface()
                       .create_subscription_to_pop(_on_timeline, name="palletris-stop"))
 
 _S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
-log("Play — 부팅 대기...\n")
+log("Play 중 — 부팅 대기...\n" if AUTOPLAY else "Play 를 기다린다...\n")
