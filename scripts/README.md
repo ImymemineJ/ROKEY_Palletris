@@ -27,5 +27,6 @@
 | `gen_master_db.py` | 민범진 | **D1 — boxes_master 생성.** 실행 전에 "정답지"를 깐다. 실행 중 흘러간 박스(`boxes_sorted`)와 대조해야 인식률을 잴 수 있다 — 등록된 것만 세면 언제나 100 % 로 나온다 (명세서 §8.6). stage 1 은 zone 전부 `B` (랜덤 금지). `ros2 run packing_db gen_master_db` 와 같다 |
 | `verify_db.py` | 민범진 | **D2 판정 — `/db/*` 6종 + `/diverter/request`.** 박스 하나를 등록→검증→분기→집기→적재까지 태우며 응답을 확인한다. 실패 경로(모르는 status·미등록 박스·남의 QR)도 같이 친다 — 성공 경로만 보면 조용히 잘못 도는 버그를 못 잡는다. `db_service_node` 를 먼저 띄울 것 |
 | `db_peek.py` | 민범진 | **palletris.db 를 사람이 읽는 표로.** SQL 도 sqlite3 CLI 도 필요 없다(이 PC 에 CLI 가 없다 — 가이드 D1 의 `sqlite3 ...` 확인 명령은 안 돈다). 읽기 전용(`mode=ro`)이라 `db_service_node` 와 같이 떠 있어도 안전하다. `--box BOX00003` 은 그 박스의 상태 전이 이력, `--csv` 는 발표용 덤프 |
+| `verify_vision.py` | 민범진 | **D 인식 전 구간 — Isaac 없이.** 씬 USD 가 이 저장소에 없어서(sync_scene.sh 배포) 이 스크립트가 **Isaac 의 대역**을 선다 — 알려진 카메라·박스를 직접 투영해 `<ns>/rgb`·`<ns>/camera_info`·`/tf_static` 을 씬과 같은 규약으로 낸다. cam1 등록 → pick_cam 좌표 → 빈 벨트까지 확인. 실측 x 0.14 mm · yaw 0.05°. `db_service_node` 와 `vision_node` 를 먼저 띄울 것 |
 
 게이팅 검증 스크립트(G1~G7)는 전부 여기에 커밋한다. (작업명세서 §11)

@@ -417,9 +417,11 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 |---|---|
 | `src/packing_common/` | 공용 — `config.py` · `frames.py` · `units.py`. **복사 금지, import** |
 | `src/packing_msgs/` | 공용 인터페이스. 수정 = 팀 전원 재빌드 |
+| `src/packing_db/` | 트랙 D — `db_service_node.py` (palletris.db 유일 writer + 중재자) · `schema.sql` · `gen_master_db.py` |
 | `src/packing_algo/` | 트랙 C — `heightmap_core.py` · `algo_service_node.py` |
-| `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` |
-| `src/packing_vision/` | 트랙 D — `vision_node.py`. ★ **아직 없다** (디렉터리 미생성) |
+| `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` · `cycle.py` |
+| `src/palletris_orchestrator/` | 트랙 B — `orchestrator_node.py` (관제탑. 상태머신 7개) |
+| `src/packing_vision/` | 트랙 D — `vision_node.py` (cam1 등록 · cam2 검증 · pick_cam 좌표). 코어 `detect.py`·`geometry.py` 는 ROS 의존성 0 |
 | `src/packing_sim/isaac/` | 트랙 A — `spawner.py` · `camera_pick.py` · `conveyor_ctl.py` · `robot_motion.py` · `sim_main.py` |
 | `scripts/` | 검증 — `verify_reach.py` · `check_place_plan.py` 등 |
 

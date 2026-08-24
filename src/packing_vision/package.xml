@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>packing_vision</name>
+  <version>0.0.0</version>
+  <description>
+    인식 노드 (트랙 D). 투입부 2대(cam1·cam2)가 등록·검증을, 픽업 하향 1대(pick_cam)가
+    스토퍼 도착과 집을 좌표를 낸다. 코어(detect·geometry)는 ROS 의존성이 0이라
+    Isaac 없이 합성 이미지로 검증된다.
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">민범진</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>packing_msgs</exec_depend>
+  <exec_depend>packing_common</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
