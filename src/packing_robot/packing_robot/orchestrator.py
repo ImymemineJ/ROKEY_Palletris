@@ -1,24 +1,22 @@
-"""orchestrator — pick & place 상태머신 ★ 통합 시연용 초안 (작성: 트랙 C 정정인).
+"""orchestrator — pick & place 상태머신 ★ 초안 (작성: 트랙 C 정정인 · 소유: 트랙 B 김병직).
 
-**소유는 트랙 B(김병직)입니다.** DB(트랙 D)와 Isaac(트랙 A)이 아직 없어도
-`/algo/*` 왕복이 ROS 로 실제로 도는 것을 보여주려고 먼저 만든 것입니다.
+**Isaac Sim 이 떠 있는 PC(김학민님 PC)에서 실행한다.** 공통가이드 §3 구조상
+Isaac 프로세스("몸")와 ROS 프로세스("머리")가 같은 PC 안에 있고, 둘은
+localhost:8765 개행구분 JSON 소켓으로 통신하기 때문이다.
 
-지금 하는 일:
-  박스 생성(내부) → /algo/plan_placement → 좌표 변환 → (로봇 이동 흉내)
-  → /algo/update_heightmap(실측 pose) → /zone_b/status 발행
-
-김병직님이 채울 자리 3곳은 `# TODO(트랙 B)` 로 표시했습니다. 그 자리에 소켓 호출
-(move_ee / grasp / release / get_box_pose)을 넣으면 실제 로봇이 움직입니다.
+두 가지 모드:
+  robot_mode:=socket  ★ 실제 로봇을 움직인다. sim_server.py(:8765) 가 떠 있어야 한다.
+  robot_mode:=mock       로봇 없이 /algo/* 왕복만 확인. 이동을 시간으로 흉내낸다.
 
 철칙:
-- 어떤 콜백에서도 `spin_until_future_complete` 를 쓰지 않는다. 상태머신을 타이머로 돌리고
-  서비스는 `call_async` 후 다음 틱에 `.done()` 을 폴링한다 (작업명세서 §1.5 방법 2).
-- 좌표 변환은 `packing_common.frames` 만 쓴다 — 트랙 C 와 같은 파일이어야 좌표가 맞는다.
-- 모든 이탈 경로에서 `/algo/cancel_plan` 을 부른다.
+- 어떤 콜백에서도 spin_until_future_complete 를 쓰지 않는다. 상태머신을 타이머로 돌리고
+  ROS 서비스는 call_async 후 다음 틱에 .done() 을 폴링한다 (§1.5 방법 2).
+- move_ee 는 논블로킹이다. 목표만 넣고 motion_status 를 폴링한다 (§3 규칙 1).
+- 좌표 변환은 packing_common.frames 만 쓴다 — 트랙 C 와 같은 파일이어야 좌표가 맞는다.
+- 모든 이탈 경로에서 /algo/cancel_plan 을 부른다.
 
 실행:
-    ros2 run packing_robot orchestrator
-    ros2 run packing_robot orchestrator --ros-args -p interval_s:=1.0 -p box_count:=30
+    ros2 run packing_robot orchestrator --ros-args -p robot_mode:=socket
 """
 import random
 
@@ -29,97 +27,192 @@ from rclpy.node import Node
 
 from packing_common.config import load
 from packing_common.frames import PlacePose as PlacePoseData
-from packing_common.frames import pallet_place_to_world
+from packing_common.frames import pallet_place_to_world, world_to_pallet_place
+from packing_common.units import m_to_mm, mm_to_m
 from packing_msgs.msg import PlacePose, ZoneStatus
-from packing_msgs.srv import CancelPlan, PlanPlacement, UpdateHeightmap
+from packing_msgs.srv import CancelPlan, PlanPlacement, SetVelocity, UpdateHeightmap
+from packing_robot.robot_link import RobotLink
 
-TICK_HZ = 20.0        # 상태머신 틱
+TICK_HZ = 20.0
 
 
 class Orchestrator(Node):
     def __init__(self):
         super().__init__("orchestrator")
         self.cfg = load()
-
-        self.declare_parameter("zone", "B")
-        self.declare_parameter("interval_s", 0.0)     # 0 = config 의 spawn_interval_s
-        self.declare_parameter("box_count", 0)        # 0 = config 의 total_count
-        self.declare_parameter("mock_cycle_s", 1.0)   # 로봇 1사이클 흉내 시간
-        self.declare_parameter("place_noise_mm", 3)   # 실측 오차 흉내
-
+        p = self.declare_parameter
+        p("zone", "B"); p("robot_mode", "mock"); p("sim_host", "127.0.0.1"); p("sim_port", 8765)
+        p("interval_s", 0.0); p("box_count", 0); p("mock_cycle_s", 1.0); p("place_noise_mm", 3)
         g = lambda k: self.get_parameter(k).value
-        self.zone = g("zone")
+
+        self.zone, self.mode = g("zone"), g("robot_mode")
         st1 = self.cfg["boxes"]["stage1"]
         self.interval = g("interval_s") or st1["spawn_interval_s"]
         self.total = g("box_count") or st1["total_count"]
-        self.cycle_s = g("mock_cycle_s")
-        self.noise = g("place_noise_mm")
+        self.cycle_s, self.noise = g("mock_cycle_s"), g("place_noise_mm")
 
+        rb_cfg, cv = self.cfg["robot"], self.cfg["conveyor"]
         self.origin = self.cfg["zones"]["pallet_origin_world_mm"][self.zone]
+        self.approach = rb_cfg["approach_offset_mm"]
+        self.stopper_x, self.belt_z = cv["stopper_x_mm"], cv["belt_top_z_mm"]
+        self.belt_v = cv["belt_velocity_mps"]
+        self.stop_speed = rb_cfg["release_speed_threshold_mm_s"] / 1000.0
+        self.stop_timeout = rb_cfg["release_wait_timeout_s"]
+        self.settle = rb_cfg["settle_wait_s"]
+
         self.types = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in self.cfg["boxes"]["types"]]
-        self.rb = random.Random(self.cfg["boxes"]["random_seed"])
-        self.rn = random.Random(7)
+        self.rb, self.rn = random.Random(self.cfg["boxes"]["random_seed"]), random.Random(7)
 
         cb = ReentrantCallbackGroup()
         self.cli_plan = self.create_client(PlanPlacement, "/algo/plan_placement", callback_group=cb)
         self.cli_upd = self.create_client(UpdateHeightmap, "/algo/update_heightmap", callback_group=cb)
         self.cli_cancel = self.create_client(CancelPlan, "/algo/cancel_plan", callback_group=cb)
+        self.cli_belt = self.create_client(SetVelocity, "/conveyor/set_velocity", callback_group=cb)
         self.pub_status = self.create_publisher(ZoneStatus, f"/zone_{self.zone.lower()}/status", 10)
 
-        # 상태
-        self.state = "WAIT_ALGO"       # WAIT_ALGO|IDLE|PLANNING|MOVING|UPDATING|PALLET_FULL|DONE
-        self.fut = None
-        self.box = None                # (box_id, w, d, h)
-        self.pose = None               # 계획 PlacePose (dict)
-        self.t_arrive = 0.0            # 다음 박스가 도착하는 시각
-        self.t_move_end = 0.0
-        self.idx = self.placed = self.dropped = 0
-        self.fill_rate = 0.0
+        self.link = RobotLink(g("sim_host"), int(g("sim_port")))
+        if self.mode == "socket":
+            ok = self.link.connect()
+            self.get_logger().info(f"Isaac 소켓 {g('sim_host')}:{g('sim_port')} — "
+                                   + ("연결됨" if ok else "★ 연결 실패. sim_server.py 를 먼저 띄우세요"))
 
+        self.state, self.fut, self.steps, self.si = "WAIT_ALGO", None, [], 0
+        self.box = self.pose = None
+        self.t_next = self.t_deadline = 0.0
+        self.idx = self.placed = self.dropped = self.failed = 0
+        self.fill_rate = 0.0
         self.create_timer(1.0 / TICK_HZ, self.on_tick, callback_group=cb)
-        self.create_timer(0.5, self.on_status, callback_group=cb)      # 2 Hz
+        self.create_timer(0.5, self.on_status, callback_group=cb)
         self.get_logger().info(
-            f"orchestrator 시작 — zone={self.zone} · 박스 {self.total}개 · "
-            f"투입 간격 {self.interval}s · 사이클 흉내 {self.cycle_s}s · 오차 ±{self.noise}mm")
+            f"orchestrator 시작 — zone={self.zone} · 모드={self.mode} · 박스 {self.total}개")
 
     # ---------- 유틸 ----------
     def now(self):
         return self.get_clock().now().nanoseconds / 1e9
 
-    def next_box(self):
-        """★ 원래는 A 의 /zone_b/box_at_pickup 을 구독한다. 지금은 내부 생성."""
-        if self.idx >= self.total:
-            return None
-        w, d, h = self.rb.choice(self.types)
-        box = (f"BOX{self.idx:05d}", w, d, h)
-        self.idx += 1
-        return box
+    def belt(self, mps):
+        """벨트는 ROS 서비스로만 (§3 규칙 4). 서비스가 없으면 경고만 하고 계속 간다."""
+        if self.cli_belt.service_is_ready():
+            self.cli_belt.call_async(SetVelocity.Request(
+                seg=f"{self.zone.lower()}_pickup", velocity_mps=float(mps)))
+        elif mps == 0.0:
+            self.get_logger().warn("/conveyor/set_velocity 없음 — 벨트 정지를 건너뜁니다", once=True)
 
-    # ---------- 상태머신 (타이머 — 절대 블로킹하지 않는다) ----------
+    def pick_world(self, w, d, h, lifted=False):
+        """스토퍼에 닿은 박스의 파지점(월드 m). 박스 중심 x = 스토퍼 − w/2 (함정 #16)."""
+        z = self.belt_z + h / 2 + (self.approach if lifted else 0)
+        return (mm_to_m(self.stopper_x - w // 2), 0.0, mm_to_m(z))
+
+    def place_world(self, h, lifted=False):
+        x, y, z = pallet_place_to_world(PlacePoseData.from_dict(self.pose), h, self.origin)
+        return (x, y, z + (mm_to_m(self.approach) if lifted else 0.0))
+
+    # ---------- 로봇 스텝 (True 를 돌려주면 다음 스텝으로) ----------
+    def _move(self, target, yaw):
+        """move_ee 는 논블로킹 — 목표를 한 번만 넣고 motion_status 를 폴링한다 (§3 규칙 1)."""
+        if not self._sent:
+            r = self.link.call("move_ee", target_m=list(target), yaw_deg=float(yaw))
+            if not r.get("accepted"):
+                self.abort(f"move_ee 거부: {r}")
+                return False
+            self._sent = True
+            return False
+        st = self.link.call("motion_status").get("state")
+        if st == "REACHED":
+            self._sent = False
+            return True
+        if st == "IK_FAIL":
+            self.abort("IK_FAIL — 도달 불가")
+        return False
+
+    def build_steps(self):
+        box_id, w, d, h = self.box
+        yaw_pick, yaw_place = 0.0, float(self.pose["yaw_deg"])
+        S = []
+        S.append(lambda: self._move(self.pick_world(w, d, h, True), yaw_pick))    # 픽 접근
+        S.append(lambda: self._move(self.pick_world(w, d, h), yaw_pick))          # 하강
+        S.append(lambda: self._grasp(box_id))
+        S.append(lambda: self._move(self.pick_world(w, d, h, True), yaw_pick))    # 상승
+        S.append(lambda: self._move(self.place_world(h, True), yaw_place))        # 배치 접근
+        S.append(lambda: self._move(self.place_world(h), yaw_place))              # 하강
+        S.append(self._wait_stop)                                                 # TCP 정지 대기
+        S.append(self._release)
+        S.append(self._settle)
+        return S
+
+    def _grasp(self, box_id):
+        if not self.link.call("grasp", box_id=box_id).get("ok"):
+            self.failed += 1
+            self.abort("grasp 실패 (PICK_FAILED)")
+            return False
+        return True
+
+    def _wait_stop(self):
+        """release 는 '도착'이 아니라 '정지' 조건으로 (§6.5). 타임아웃 없으면 무한루프."""
+        if self._t0 == 0.0:
+            self._t0 = self.now()
+        if self.link.call("tcp_speed").get("mps", 1.0) < self.stop_speed:
+            self._t0 = 0.0
+            return True
+        if self.now() - self._t0 > self.stop_timeout:
+            self.get_logger().warn("release 정지 대기 타임아웃 — 강제 진행")
+            self._t0 = 0.0
+            return True
+        return False
+
+    def _release(self):
+        self.link.call("release")
+        self._t0 = self.now()
+        return True
+
+    def _settle(self):
+        return self.now() - self._t0 > self.settle
+
+    def measure(self):
+        """실측 pose → PlacePose. Isaac 이 없으면 계획값 ±noise 로 흉내낸다."""
+        box_id, w, d, h = self.box
+        if self.mode == "socket":
+            r = self.link.call("get_box_pose", box_id=box_id)
+            if r.get("ok"):
+                pp = world_to_pallet_place(r["pos_m"], float(r.get("yaw_deg", 0.0)), h, self.origin)
+                return PlacePose(x_mm=pp.x_mm, y_mm=pp.y_mm, z_mm=pp.z_mm, yaw_deg=pp.yaw_deg)
+            self.get_logger().warn(f"get_box_pose 실패({r}) — 계획값으로 갱신합니다")
+        n = self.noise
+        return PlacePose(x_mm=self.pose["x_mm"] + self.rn.randint(-n, n),
+                         y_mm=self.pose["y_mm"] + self.rn.randint(-n, n),
+                         z_mm=self.pose["z_mm"] + self.rn.randint(-n, n),
+                         yaw_deg=float(self.pose["yaw_deg"]))
+
+    def abort(self, why):
+        """모든 이탈 경로 — cancel_plan 을 부르고 벨트를 되살린다."""
+        self.get_logger().error(f"{self.box[0] if self.box else '?'}: {why}")
+        if self.box:
+            self.cli_cancel.call_async(CancelPlan.Request(zone=self.zone, box_id=self.box[0]))
+        self.belt(self.belt_v)
+        self.state, self.t_next = "IDLE", self.now() + self.interval
+
+    # ---------- 상태머신 ----------
     def on_tick(self):
         s = self.state
-
         if s == "WAIT_ALGO":
             if self.cli_plan.service_is_ready() and self.cli_upd.service_is_ready():
                 self.get_logger().info("/algo/* 연결됨 — 사이클 시작")
-                self.state, self.t_arrive = "IDLE", self.now()
+                self.state, self.t_next = "IDLE", self.now()
             return
 
         if s == "IDLE":
-            if self.now() < self.t_arrive:
+            if self.now() < self.t_next:
                 return
-            self.box = self.next_box()
-            if self.box is None:
-                self.finish("박스 소진")
-                return
-            box_id, w, d, h = self.box
-            # TODO(트랙 B): 여기서 /conveyor/set_velocity(b_pickup, 0.0) 을 부르고 ok 를 확인한다.
-            # TODO(트랙 B): DB 가 붙으면 /db/get_box_info(box_id) 로 크기를 받아온다.
-            req = PlanPlacement.Request(zone=self.zone, box_id=box_id,
-                                        size_w_mm=w, size_d_mm=d, size_h_mm=h)
-            self.fut = self.cli_plan.call_async(req)
+            if self.idx >= self.total:
+                return self.finish("박스 소진")
+            w, d, h = self.rb.choice(self.types)      # TODO(트랙 B): /zone_b/box_at_pickup 구독으로 교체
+            self.box = (f"BOX{self.idx:05d}", w, d, h)
+            self.idx += 1
+            self.belt(0.0)                            # 흡착 전 벨트 정지
+            self.fut = self.cli_plan.call_async(PlanPlacement.Request(
+                zone=self.zone, box_id=self.box[0], size_w_mm=w, size_d_mm=d, size_h_mm=h))
             self.state = "PLANNING"
-            return                                         # ★ 반드시 여기서 return
+            return                                    # ★ 반드시 여기서 return
 
         if s == "PLANNING":
             if not (self.fut and self.fut.done()):
@@ -127,48 +220,41 @@ class Orchestrator(Node):
             res, self.fut = self.fut.result(), None
             box_id, w, d, h = self.box
             if not res.ok:
-                if res.message == "PALLET_FULL":
-                    self.cli_cancel.call_async(CancelPlan.Request(zone=self.zone, box_id=box_id))
-                    self.finish("PALLET_FULL")
-                    return
-                # NO_FEASIBLE_POSE = 이 박스만 자리가 없다 → 버리고 계속 (트랙 D 설계변경 A1)
                 self.cli_cancel.call_async(CancelPlan.Request(zone=self.zone, box_id=box_id))
-                self.dropped += 1
+                if res.message == "PALLET_FULL":
+                    return self.finish("PALLET_FULL")
+                self.dropped += 1                     # 이 박스만 버리고 계속 (트랙 D A1)
                 self.get_logger().warn(f"{box_id} {w}x{d}x{h} → {res.message} · 버림 "
                                        f"(누적 {self.dropped})")
-                # TODO(트랙 B): /db/set_status(REJECTED) + /sim/despawn_box(box_id)
-                self.state, self.t_arrive = "IDLE", self.now() + self.interval
+                # TODO(트랙 B): /db/set_status(REJECTED) + /sim/despawn_box
+                self.belt(self.belt_v)
+                self.state, self.t_next = "IDLE", self.now() + self.interval
                 return
-
             self.pose = dict(x_mm=res.pose.x_mm, y_mm=res.pose.y_mm,
                              z_mm=res.pose.z_mm, yaw_deg=res.pose.yaw_deg)
-            # ★ 좌표 변환은 packing_common.frames 만 쓴다 (트랙 C 와 같은 파일)
-            wx, wy, wz = pallet_place_to_world(PlacePoseData.from_dict(self.pose), h, self.origin)
+            wx, wy, wz = self.place_world(h)
             self.get_logger().info(
                 f"{box_id} {w}x{d}x{h} → 팔레트({self.pose['x_mm']},{self.pose['y_mm']},"
-                f"{self.pose['z_mm']}) yaw={self.pose['yaw_deg']:.0f}"
-                f"  ⇒ 월드({wx:.3f}, {wy:.3f}, {wz:.3f})m")
-            # TODO(트랙 B): 여기서 소켓으로 move_ee → 하강 → grasp → 이송 → release.
-            #               지금은 cycle_s 만큼 기다리는 것으로 흉내낸다.
-            self.t_move_end = self.now() + self.cycle_s
-            self.state = "MOVING"
+                f"{self.pose['z_mm']}) yaw={self.pose['yaw_deg']:.0f} ⇒ 월드({wx:.3f},{wy:.3f},{wz:.3f})m")
+            if self.mode == "socket":
+                self._sent, self._t0 = False, 0.0
+                self.steps, self.si = self.build_steps(), 0
+                self.state = "ROBOT"
+            else:
+                self.t_deadline = self.now() + self.cycle_s
+                self.state = "MOCK_MOVE"
             return
 
-        if s == "MOVING":
-            if self.now() < self.t_move_end:
-                return
-            box_id, w, d, h = self.box
-            # TODO(트랙 B): 소켓 get_box_pose(box_id) 로 실제 놓인 위치를 읽는다.
-            #               지금은 계획값에 ±noise mm 를 섞어 흉내낸다.
-            actual = PlacePose(
-                x_mm=self.pose["x_mm"] + self.rn.randint(-self.noise, self.noise),
-                y_mm=self.pose["y_mm"] + self.rn.randint(-self.noise, self.noise),
-                z_mm=self.pose["z_mm"] + self.rn.randint(-self.noise, self.noise),
-                yaw_deg=float(self.pose["yaw_deg"]))
-            self.fut = self.cli_upd.call_async(UpdateHeightmap.Request(
-                zone=self.zone, box_id=box_id, size_w_mm=w, size_d_mm=d, size_h_mm=h,
-                actual_pose=actual))
-            self.state = "UPDATING"
+        if s == "ROBOT":
+            if self.si >= len(self.steps):
+                return self.do_update()
+            if self.steps[self.si]():
+                self.si += 1
+            return
+
+        if s == "MOCK_MOVE":
+            if self.now() >= self.t_deadline:
+                self.do_update()
             return
 
         if s == "UPDATING":
@@ -179,27 +265,32 @@ class Orchestrator(Node):
             self.fill_rate = res.fill_rate
             if not res.ok:
                 self.get_logger().warn("update ok=false — yaw 오차 초과. 로그만 남기고 계속")
-            self.get_logger().info(
-                f"  적재 {res.placed_count}개 · 적재율 {res.fill_rate * 100:.1f}%"
-                f"  (버림 {self.dropped})")
-            # TODO(트랙 B): /db/mark_placed + /conveyor/set_velocity(b_pickup, 0.5)
-            self.state, self.t_arrive = "IDLE", self.now() + self.interval
+            self.get_logger().info(f"  적재 {res.placed_count}개 · 적재율 {res.fill_rate*100:.1f}%"
+                                   f"  (버림 {self.dropped} · 픽실패 {self.failed})")
+            # TODO(트랙 B): /db/mark_placed
+            self.belt(self.belt_v)
+            self.state, self.t_next = "IDLE", self.now() + self.interval
             return
+
+    def do_update(self):
+        box_id, w, d, h = self.box
+        self.fut = self.cli_upd.call_async(UpdateHeightmap.Request(
+            zone=self.zone, box_id=box_id, size_w_mm=w, size_d_mm=d, size_h_mm=h,
+            actual_pose=self.measure()))
+        self.state = "UPDATING"
 
     def finish(self, why):
         self.state = "PALLET_FULL" if why == "PALLET_FULL" else "DONE"
         self.get_logger().info(
             f"═══ 종료 ({why}) — 투입 {self.idx} · 적재 {self.placed} · 버림 {self.dropped} · "
-            f"적재율 {self.fill_rate * 100:.1f}% ═══")
+            f"픽실패 {self.failed} · 적재율 {self.fill_rate*100:.1f}% ═══")
 
-    # ---------- /zone_b/status (2 Hz) ----------
     def on_status(self):
-        busy = self.state in ("PLANNING", "MOVING", "UPDATING")
+        busy = self.state in ("PLANNING", "ROBOT", "MOCK_MOVE", "UPDATING")
         self.pub_status.publish(ZoneStatus(
-            zone=self.zone,
-            queue_len=0,                 # TODO(트랙 B): /db/zone_queue 응답을 중계한다
+            zone=self.zone, queue_len=0,          # TODO(트랙 B): /db/zone_queue 중계
             buffer_cap=int(self.cfg["zones"]["buffer_capacity"]),
-            est_free_time_s=max(0.0, self.t_move_end - self.now()) if busy else 0.0,
+            est_free_time_s=0.0,
             state="BUSY" if busy else ("PALLET_FULL" if self.state == "PALLET_FULL" else "IDLE"),
             fill_rate=float(self.fill_rate)))
 
@@ -208,10 +299,11 @@ def main(args=None):
     rclpy.init(args=args)
     node = Orchestrator()
     try:
-        rclpy.spin(node, executor=MultiThreadedExecutor())      # ★ 철칙 4
+        rclpy.spin(node, executor=MultiThreadedExecutor())
     except KeyboardInterrupt:
         pass
     finally:
+        node.link.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
