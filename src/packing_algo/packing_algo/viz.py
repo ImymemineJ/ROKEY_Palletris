@@ -34,25 +34,41 @@ COLORS = {210: "#4C9AFF", 280: "#FFAB00", 340: "#36B37E"}
 def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7):
     """박스를 하나씩 plan → update 하면서 매 단계 스냅샷을 남긴다.
 
+    ★ NO_FEASIBLE_POSE 는 '이 박스만' 자리가 없다는 뜻이므로 그 박스만 버리고 계속 간다.
+      시나리오를 끝내는 것은 PALLET_FULL 뿐이다 (트랙 D 설계변경 A1).
+      첫 실패에서 멈추면 적재율을 크게 과소평가한다 — 49.8% vs 60.2%.
+
     ★ 난수 스트림을 박스용/노이즈용으로 분리한다. 하나를 공유하면 노이즈를 켜는 순간
-      박스 등장 순서까지 바뀌어서, 노이즈 내성이 아니라 다른 시퀀스를 비교하게 된다.
+      박스 등장 순서까지 바뀐다 (TS-006).
     """
     boxes = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in cfg["boxes"]["types"]]
     pk = HeightmapPacker(cfg)
     rb, rn = random.Random(seed_box), random.Random(seed_noise)
     steps = []
+    placed = skipped = 0
     for k in range(n):
         w, d, h = rb.choice(boxes)
-        ok, pose, _, msg = pk.plan(f"BOX{k:05d}", w, d, h)
+        box_id = f"BOX{k:05d}"
+        ok, pose, _, msg = pk.plan(box_id, w, d, h)
         if not ok:
-            steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(),
-                              fill=pk.fill_rate(), label=f"{k + 1}번째 {w}x{d}x{h} 실패 — {msg}"))
-            break
+            pk.cancel(box_id)                       # ★ 이탈 경로에서는 반드시 계획 폐기
+            if msg == "PALLET_FULL":
+                steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
+                                  n_ok=placed, n_skip=skipped,
+                                  label=f"{k + 1}번째 {w}x{d}x{h} → PALLET_FULL · 종료"))
+                break
+            skipped += 1
+            steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
+                              n_ok=placed, n_skip=skipped,
+                              label=f"{k + 1}번째 {w}x{d}x{h} → 자리 없음, 버리고 계속"))
+            continue
         actual = dict(pose)
         for ax in ("x_mm", "y_mm", "z_mm"):
             actual[ax] += rn.randint(-noise, noise)
-        pk.update(f"BOX{k:05d}", w, d, h, actual)
+        pk.update(box_id, w, d, h, actual)
+        placed += 1
         steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
+                          n_ok=placed, n_skip=skipped,
                           label=f"{k + 1}번째 {w}x{d}x{h} → ({pose['x_mm']}, {pose['y_mm']}) "
                                 f"z={pose['z_mm']} yaw={int(pose['yaw_deg'])}°"))
     return pk, steps
@@ -118,7 +134,8 @@ def render_video(cfg, steps, out_path, fps=2, hold=6):
         draw_boxes3d(ax3d, s["placed"], cfg)
         draw_heightmap(ax_hm, s["hm"], cfg)
         draw_fill_curve(ax_fr, fills, k)
-        title.set_text(f"{s['label']}   |   적재율 {s['fill'] * 100:.1f}%   "
+        title.set_text(f"{s['label']}   |   적재 {s['n_ok']}개 · 버림 {s['n_skip']}개   "
+                       f"|   적재율 {s['fill'] * 100:.1f}%   "
                        f"최고 {int(s['hm'].max())}mm / {cfg['pallet']['max_stack_mm']}mm")
         return []
 
@@ -142,7 +159,9 @@ def main():
     render_video(cfg, steps, args.out, fps=args.fps)
 
     print(f"저장: {args.out}")
-    print(f"박스 {len(pk.placed)}/{n}개 배치 · 적재율 {pk.fill_rate() * 100:.1f}% · "
+    last = steps[-1] if steps else dict(n_ok=0, n_skip=0)
+    print(f"투입 {n}개 → 적재 {last['n_ok']}개 · 버림 {last['n_skip']}개 · "
+          f"적재율 {pk.fill_rate() * 100:.1f}% · "
           f"최고 {int(pk.hm.max())}mm / {cfg['pallet']['max_stack_mm']}mm")
 
 

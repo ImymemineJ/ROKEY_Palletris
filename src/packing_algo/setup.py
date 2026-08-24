@@ -19,8 +19,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # ★ C5(Day 3)에서 algo_service_node.py 를 만든 뒤 주석 해제해야 ros2 run 이 된다.
-            # 'algo_service_node = packing_algo.algo_service_node:main',
+            'algo_service_node = packing_algo.algo_service_node:main',
         ],
     },
 )

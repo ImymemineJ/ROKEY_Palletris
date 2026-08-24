@@ -7,70 +7,124 @@
 import random
 import time
 
+import numpy as np
+
 from packing_algo.heightmap_core import HeightmapPacker
 from packing_common.config import load
 
 CFG = load()          # ★ colcon build + source install/setup.bash 가 선행돼야 한다
-                      #   (packing_common 을 import 하려면 빌드가 먼저다)
 
-BOXES = [(340, 250, 210), (410, 310, 280), (480, 380, 340)]
+BOXES = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in CFG["boxes"]["types"]]
+N = CFG["boxes"]["stage1"]["total_count"]
 
 SEED_BOX = 42         # 박스 등장 순서 — config 의 random_seed 와 동일
 SEED_NOISE = 7        # 실측 오차 전용
 
 
-def run_sequence(pk, n=15, noise_mm=0):
-    """★ 난수 스트림을 박스용 / 노이즈용으로 분리한다.
+def run_sequence(pk, n=N, noise_mm=0):
+    """박스를 하나씩 흘려보내며 배치. → (배치 수, 버린 수, 종료 사유)
 
-    하나를 공유하면 random.randint 가 난수를 더 소비해서, 노이즈를 켜는 순간
-    박스 등장 순서까지 바뀐다. 그러면 이 테스트는 '노이즈 내성'이 아니라
-    '다른 박스 시퀀스'를 재게 되어, 원인을 오판하게 만든다. (트러블슈팅 TS-006)
+    ★ 두 실패 신호의 의미가 다르다 (트랙 D 설계변경 A1):
+      - NO_FEASIBLE_POSE = '이 박스만' 자리가 없다 → 그 박스만 버리고 다음 박스로 계속.
+        실제 시스템도 cancel_plan → set_status(REJECTED) → despawn_box 후 계속 돈다.
+      - PALLET_FULL      = 가장 낮은 박스로도 후보가 없다 → 시나리오 종료.
+      첫 NO_FEASIBLE_POSE 에서 멈추면 적재율을 크게 과소평가한다 (49.8% vs 60.2%).
+
+    ★ 난수 스트림을 박스용 / 노이즈용으로 분리한다. 하나를 공유하면 노이즈를 켜는 순간
+      박스 등장 순서까지 바뀌어 '노이즈 내성'이 아니라 '다른 시퀀스'를 재게 된다. (TS-006)
     """
     rb, rn = random.Random(SEED_BOX), random.Random(SEED_NOISE)
-    placed = 0
+    placed = skipped = 0
     for k in range(n):
         w, d, h = rb.choice(BOXES)
-        ok, pose, _, msg = pk.plan(f"B{k}", w, d, h)
+        box_id = f"B{k}"
+        ok, pose, _, msg = pk.plan(box_id, w, d, h)
         if not ok:
-            return placed, msg
+            if msg == "PALLET_FULL":
+                return placed, skipped, msg
+            pk.cancel(box_id)          # ★ 이탈 경로에서는 반드시 계획 폐기 (stale plan 방지)
+            skipped += 1
+            continue
         actual = dict(pose)                                    # 계획 = 실측 + 노이즈
         actual["x_mm"] += rn.randint(-noise_mm, noise_mm)
         actual["y_mm"] += rn.randint(-noise_mm, noise_mm)
         actual["z_mm"] += rn.randint(-noise_mm, noise_mm)
-        pk.update(f"B{k}", w, d, h, actual)
+        pk.update(box_id, w, d, h, actual)
         placed += 1
-    return placed, "OK"
+    return placed, skipped, "OK"
 
 
 def test_no_noise():
-    """기본 동작 — 15박스 중 12개 이상."""
+    """기본 동작 — 투입 대비 80% 이상 적재."""
     pk = HeightmapPacker(CFG)
-    n, msg = run_sequence(pk)
-    assert n >= 12, f"{n}개에서 {msg} (트러블슈팅 TS-008 참고)"
+    placed, skipped, msg = run_sequence(pk)
+    assert placed >= N * 0.8, f"{N}개 중 {placed}개만 적재 (버림 {skipped}, {msg})"
 
 
 def test_noise_3mm():
-    """★ 수용 기준: ±3mm 오차를 주입해도 12개 이상 (명세서 §7.4)."""
+    """★ 수용 기준: ±3mm 실측 오차를 주입해도 동일 수준 (명세서 §7.4)."""
     pk = HeightmapPacker(CFG)
-    n, msg = run_sequence(pk, noise_mm=3)
-    assert n >= 12, f"{n}개에서 {msg} — support_tol 확인!"
+    placed, skipped, msg = run_sequence(pk, noise_mm=3)
+    assert placed >= N * 0.8, f"{placed}개 적재 (버림 {skipped}, {msg}) — support_tol 확인!"
 
 
 def test_noise_no_regression():
-    """★ 노이즈 '내성' 자체를 재는 테스트 — ±3mm 를 줘도 결과가 나빠지지 않아야 한다.
+    """★ 노이즈 '내성' 자체 — ±3mm 를 줘도 결과가 나빠지지 않아야 한다.
 
-    위 두 테스트는 절대 개수를 보므로 알고리즘 성능(TS-008)에 가려진다.
-    이 테스트는 노이즈만 분리해서 본다. 실패하면 실측 pose 처리(양자화·반올림)가 깨진 것.
+    위 두 테스트는 절대 개수를 보므로 알고리즘 성능에 가려진다. 이건 노이즈만 분리해서 본다.
+    실패하면 실측 pose 처리(양자화·반올림)가 깨진 것이다. (TS-005)
     """
-    clean, _ = run_sequence(HeightmapPacker(CFG), noise_mm=0)
-    noisy, msg = run_sequence(HeightmapPacker(CFG), noise_mm=3)
+    clean, _, _ = run_sequence(HeightmapPacker(CFG), noise_mm=0)
+    noisy, _, msg = run_sequence(HeightmapPacker(CFG), noise_mm=3)
     assert noisy >= clean, f"노이즈로 {clean}개 → {noisy}개로 줄었다 ({msg}) — TS-005 확인!"
+
+
+def stack_depth(pk):
+    """한 자리에 박스가 최대 몇 개나 겹쳐 쌓였는가 = 실제 '층수'.
+
+    hm.max() // 210 으로 세면 안 된다. 높이가 섞여 있어서(210/280/340)
+    1020mm 가 3호 4층일 수도, 5호 3층일 수도 있다. 박스 개수를 직접 세야 한다.
+    """
+    cnt = np.zeros(pk.hm.shape, dtype=int)
+    for pose, w, d, _h in pk.placed:
+        ww, dd = (w, d) if round(pose["yaw_deg"] / 90) % 2 == 0 else (d, w)
+        i = int(round((pose["x_mm"] - ww / 2) / pk.cell))
+        j = int(round((pose["y_mm"] - dd / 2) / pk.cell))
+        i0, i1 = max(i, 0), min(i + ww // pk.cell, pk.W)
+        j0, j1 = max(j, 0), min(j + dd // pk.cell, pk.D)
+        cnt[i0:i1, j0:j1] += 1
+    return int(cnt.max())
+
+
+def test_stacks_5_layers():
+    """★ 수용 기준: ±3mm 오차 상태에서 5층까지 정상 배치 (명세서 §7.4).
+
+    3호 210mm × 5 = 1050 ≤ max_stack 1300 이므로 달성 가능하다.
+    (트랙 D 설계변경 A4 의 '4층으로 낮추자'는 max_stack 850 기준이라 현재 정본과 맞지 않는다.)
+
+    ★ 투입 30개로 돌린다. config 의 15개로는 팔레트 바닥이 다 안 차서 3층까지밖에 안 간다 —
+      알고리즘 문제가 아니라 박스가 모자란 것이다. (트랙 D 설계변경 A2 의 근거)
+    """
+    pk = HeightmapPacker(CFG)
+    placed, skipped, msg = run_sequence(pk, n=30, noise_mm=3)
+    layers = stack_depth(pk)
+    assert layers >= 5, f"{layers}층 (적재 {placed}, 버림 {skipped}, {msg}) — 5층 필요"
+
+
+def test_pallet_full_is_terminal():
+    """★ PALLET_FULL 은 '가장 낮은 박스로도 못 놓을 때'만 나와야 한다 (트랙 D A1)."""
+    pk = HeightmapPacker(CFG)
+    pk.hm[:] = pk.max_stack                       # 팔레트를 꽉 채운 상태로 만든다
+    assert pk.plan("X", 340, 250, 210)[3] == "PALLET_FULL"
+    pk.reset()
+    pk.hm[:] = pk.max_stack - 250                 # 3호(210)는 들어가고 5호(340)는 안 되는 높이
+    assert pk.plan("Y", 480, 380, 340)[3] == "NO_FEASIBLE_POSE"
 
 
 def test_speed():
     """★ 수용 기준: 40% 찬 상태에서 plan() 응답 < 200ms (명세서 §7.9)."""
     pk = HeightmapPacker(CFG)
-    run_sequence(pk, n=8)
+    run_sequence(pk, n=max(1, N // 2))
     t0 = time.time()
     pk.plan("SPD", 480, 380, 340)
     dt = time.time() - t0

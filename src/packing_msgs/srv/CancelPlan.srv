@@ -1,0 +1,4 @@
+string zone
+string box_id
+---
+bool   ok

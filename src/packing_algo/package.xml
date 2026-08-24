@@ -14,9 +14,8 @@
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
-  <!-- ★ C5(ROS 래퍼) 착수 시 아래 두 줄 주석 해제. packing_msgs 는 트랙 D 푸시 후. -->
-  <!-- <exec_depend>rclpy</exec_depend> -->
-  <!-- <exec_depend>packing_msgs</exec_depend> -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>packing_msgs</exec_depend>   <!-- 트랙 D 소유. 아직 비어 있으면 노드 실행만 안 된다 -->
 
   <test_depend>python3-pytest</test_depend>
 

@@ -66,8 +66,17 @@ class HeightmapPacker:
             per = 2 * (wc + dc)
             wall = ((ii == 0) * dc + (ii + wc == self.W) * dc +
                     (jj == 0) * wc + (jj + dc == self.D) * wc) / per
+            # ★ 동점일 때 채우는 순서 — 로봇 기하 때문에 축마다 방향이 다르다 (트랙 B 피드백).
+            #   로봇 베이스 (10900, 0) · 팔레트 원점 (10300, 300) 기준:
+            #     Px 0(월드 X 10300) = 컨베이어 쪽  → 작은 쪽부터. 그대로 둔다.
+            #     Py 0(월드 Y  300)  = 로봇에 가장 가까운 변(300mm) → ★ 큰 쪽부터 채운다.
+            #   가까운 자리를 먼저 채우면, 그 뒤 먼 자리에 놓을 때 팔뚝이 이미 놓인 박스
+            #   위를 넘어가야 한다. 가까운 변을 마지막에 남겨야 팔이 안 걸린다.
+            #   동점 후보 중에서만 고르는 것이라 적재율 손해는 0 이다 (측정: 60.0% 동일,
+            #   팔이 넘어가는 배치가 11.1회 → 9.7회로 감소).
+            order = ii + (bz.shape[1] - 1 - jj)
             score = np.where(cand, base_score + self.w_wall * wall
-                             - self.tie_eps * (ii + jj), -np.inf)
+                             - self.tie_eps * order, -np.inf)
             # ③ 지지율: 상위 K개만 정밀 계산 (전 후보는 너무 비쌈 — 명세서 §7.9)
             flat = np.argsort(score, axis=None)[::-1][: self.topk]
             for idx in flat:
@@ -77,7 +86,7 @@ class HeightmapPacker:
                 if sup < self.min_sup: continue
                 s = (self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
                      + self.w_wall * wall[i, j])
-                key = (s, -(i + j))                          # 동점 → 좌하단 우선
+                key = (s, -order[i, j])                      # 동점 → 위 order 기준
                 if best is None or key > best[0]:
                     best = (key, i, j, int(bz[i, j]), yaw, w, d)
         if best is None:
