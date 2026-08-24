@@ -25,6 +25,7 @@
 
 `move_ee` 의 목표는 **흡착면**이다 (tool0 아님 — `robot_motion.py` 가 그리퍼 길이를 더한다).
 """
+import os
 import time
 
 RESULTS = ("PLACED", "PICK_FAILED", "PALLET_FULL", "BLOCKED", "IK_FAIL")
@@ -35,6 +36,24 @@ GRASP_GAP_MM = 2.0               # 흡착 직전 흡착면을 박스 상면 위 
                                  #   ★ 패드 transZ 슬롯이 5 mm 다. 더 벌리면 떠서 붙는다
                                  #     (packing_robot.gripper.APPROACH_GAP_MM 과 같은 값)
 GAP_FIX_TOL_MM = 0.5             # 실측 간극이 목표에서 이보다 벗어나면 한 번 보정한다
+
+# 가로 이송 구간에 더하는 여유 [mm]. **기본 0** — 지금 기하에서는 필요 없다.
+#
+#   증상(error1.mp4 38~40 s): joint_1 이 픽(-X)에서 배치(+Y)로 90도 넘게 도는 동안
+#   link_2/link_3 이 수평 원호를 그리며 로봇에 가장 가까운 기둥을 쓸어 밀어버린다.
+#   웨이포인트 **끝점은 양쪽 다 깨끗**해서 정지 자세 검사로는 안 잡힌다.
+#
+#   ★ 이 값은 대증요법이었고, 근본 해결은 **로봇 이격 300 -> 400 mm** 다.
+#     실측 (scripts/verify_transit_sweep_isaac.py, 구간 4 최악 여유):
+#       이격 300 · lift   0 -> -100.5      이격 300 · lift 200 -> +4.9 (아슬)
+#       이격 300 · lift 310/330/350 -> -20.6 / -20.5 / -20.3  (고도에 거의 무반응)
+#       **이격 400 · lift 0 -> 5호 3단 +32.9 · 혼합 16박스 +29.7  전 구간 통과**
+#     고도는 200 근처에서만 잠깐 통과하고 300 에서 다시 실패한다 — 팔꿈치 IK 가지가
+#     고도에 따라 튀기 때문이다. "높을수록 안전"이 성립하지 않으니 이 값에 기대지 말 것.
+#
+#   ⚠ 로봇을 **뒤로** 빼는 것(이격을 더 늘리는 것)은 300 -> 450 구간에서 역효과였다
+#     (최악 -100.5 -> -203.5). 400 이 측정된 최선이다.
+TRANSIT_LIFT_MM = float(os.environ.get("PL_TRANSIT_LIFT_MM", "0"))
 
 
 def pallet_place_to_world(place, h_mm, origin_mm):
@@ -54,6 +73,20 @@ def world_to_pallet_place(center_xyz_m, yaw_deg, h_mm, origin_mm):
             "y_mm": int(round(center_xyz_m[1] * 1000)) - origin_mm[1],
             "z_mm": int(round(center_xyz_m[2] * 1000)) - origin_mm[2] - h_mm // 2,
             "yaw_deg": float(yaw_deg)}
+
+
+def place_to_aabb_m(place, w_mm, d_mm, h_mm, origin_mm):
+    """PlacePose -> 월드 AABB (lo, hi) [m]. yaw 0/90 만 (heightmap.allowed_yaw_deg).
+
+    로봇이 피해야 할 덩어리를 그대로 준다. 회전은 축정렬 사각형으로 본다 — 45도 같은
+    중간각은 계약에 없다.
+    """
+    w, d = (w_mm, d_mm) if round(place.get("yaw_deg", 0)) % 180 == 0 else (d_mm, w_mm)
+    cx = place["x_mm"] + origin_mm[0]
+    cy = place["y_mm"] + origin_mm[1]
+    z0 = place["z_mm"] + origin_mm[2]
+    return ([(cx - w / 2.0) / 1000.0, (cy - d / 2.0) / 1000.0, z0 / 1000.0],
+            [(cx + w / 2.0) / 1000.0, (cy + d / 2.0) / 1000.0, (z0 + h_mm) / 1000.0])
 
 
 class MotionError(Exception):
@@ -97,6 +130,10 @@ class Cycle:
         self._log = log
         z = cfg["zones"]
         self.origin_mm = list(z["pallet_origin_world_mm"][zone])
+        # ★ 놓은 박스의 월드 AABB [m]. `move_ee` 에 실어 보내 로봇이 **IK 가지를 고를 때**
+        #   쓴다 (robot_motion 은 씬을 직접 안 읽는다 — 무엇을 피할지는 이쪽 판단이다).
+        #   지금 들고 있는 박스는 여기 없다 — 놓고 난 뒤에 넣는다.
+        self._obstacles = []
         self.approach_m = cfg["robot"]["approach_offset_mm"] / 1000.0
         self.belt_seg = "%s_pickup" % zone.lower()
         self.belt_mps = float(cfg["conveyor"]["belt_velocity_mps"])
@@ -205,7 +242,9 @@ class Cycle:
         #   이송은 언제나 적재물을 넘는다 (1차 구현 합의: 최상단은 최대한으로 본다).
         stack_top = max((float(place.get("stack_top_mm", 0.0)) + self.origin_mm[2]) / 1000.0,
                         self._stack_top_m)
-        transit = max(pick_top, put_top, stack_top) + self.approach_m + h / 1000.0
+        # TRANSIT_LIFT_MM 은 **팔꿈치 간섭용**이다 (위 상수 주석 참조).
+        transit = (max(pick_top, put_top, stack_top) + self.approach_m + h / 1000.0
+                   + TRANSIT_LIFT_MM / 1000.0)
         self._move([pick_c[0], pick_c[1], transit], pick_yaw)
         self._move([cx, cy, transit], put_yaw)
         # ★ 배치 approach 도 **매달린 박스 밑면** 기준이다 — 여기도 h 를 더한다.
@@ -237,6 +276,8 @@ class Cycle:
         if not ok_hm:
             # yaw 오차 초과 경고. 로그만 남기고 계속 간다 (§2.2)
             self._log("[cycle] update_heightmap ok=false — 계속 진행")
+        # ★ 놓은 뒤에 누적한다. 이송 중에는 들고 있으므로 장애물이 아니다.
+        self._obstacles.append(place_to_aabb_m(actual, w, d, h, self.origin_mm))
         self.svc.mark_placed(box_id, actual)
         self._resume_belt()
         self._log("[cycle] %s 완료  %.2f s  적재율 %s" % (box_id, time.time() - t0, fill))
@@ -254,7 +295,7 @@ class Cycle:
     def _move(self, face_m, yaw_deg):
         """흡착면을 face_m 으로 보낸다. 도착까지 기다린다."""
         r = self.link.call(cmd="move_ee", target_m=[float(v) for v in face_m],
-                           yaw_deg=float(yaw_deg))
+                           yaw_deg=float(yaw_deg), obstacles=self._obstacles)
         if not r.get("accepted"):
             raise MotionError(r.get("error", "rejected"))
         t0 = time.time()
