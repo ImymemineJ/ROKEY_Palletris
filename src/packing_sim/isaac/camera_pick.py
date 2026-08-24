@@ -65,7 +65,13 @@ class PickCamera:
 
         conv = cfg["conveyor"]
         self.belt_top_m = conv["belt_top_z_mm"] / 1000.0
-        self.stopper_x_m = conv["stopper_x_mm"] / 1000.0
+        # ★ 픽업 축 — spawner.py 와 같은 규약이다 (2026-08-24). 기본 "x" 라
+        #   이 키가 없는 기존 씬은 동작이 안 바뀐다.
+        _ax = str(conv.get("pickup_axis", "x")).lower()
+        if _ax not in ("x", "y"):
+            raise ValueError("conveyor.pickup_axis 는 x | y 여야 한다: %r" % _ax)
+        self.axis = 0 if _ax == "x" else 1
+        self.stopper_pos_m = conv["stopper_x_mm"] / 1000.0
         bt = cfg["boxes"]["types"]
         self.h_max_m = max(t["h_mm"] for t in bt) / 1000.0
         self.w_max_m = max(t["w_mm"] for t in bt) / 1000.0
@@ -163,9 +169,12 @@ class PickCamera:
         #   높은 점군이 되어 팔을 박스로 인식한다 (perception.py 가 같은 경고를 적어 뒀다).
         z0 = self.belt_top_m + PLANE_TOL_M
         z1 = self.belt_top_m + self.h_max_m + PLANE_TOL_M
-        x0 = self.stopper_x_m - self.w_max_m - 0.05
+        # ★ ROI 의 가로 방향도 픽업 축을 따른다. +X 라인이면 pts[:,0], +Y 지선이면
+        #   pts[:,1] 을 잘라야 한다 — 안 그러면 엉뚱한 축으로 잘라 점군이 0이 된다.
+        a = self.axis
+        p0 = self.stopper_pos_m - self.w_max_m - 0.05
         m = ((pts[:, 2] > z0) & (pts[:, 2] < z1)
-             & (pts[:, 0] > x0) & (pts[:, 0] < self.stopper_x_m + 0.02))
+             & (pts[:, a] > p0) & (pts[:, a] < self.stopper_pos_m + 0.02))
         roi = pts[m]
         if len(roi) < MIN_PTS:
             return {"ok": False, "error": "박스가 안 보인다",

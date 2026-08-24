@@ -99,10 +99,22 @@ class Spawner:
         self.types = {t["name"]: t for t in cfg["boxes"]["types"]}
         sp = cfg["conveyor"]["spawn_point_mm"]
         self.spawn_xyz_m = [v / 1000.0 for v in sp]
-        self.stopper_x_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        # ★ 픽업 축 (2026-08-24 추가). test1-1 은 벨트가 **+X** 로 흘러 스토퍼가
+        #   x=10000 에 있지만, 셀마다 메인 라인에서 **+Y** 로 갈라지는 지선을 쓰는
+        #   배치(test_3)도 있다. 축을 설정으로 받아 아래 판정이 pos[axis] 를 보게 한다.
+        #   기본이 "x" 라 이 키가 없는 기존 씬은 동작이 하나도 안 바뀐다.
+        #   ⚠ 두 축 모두 **진행이 증가 방향**(+X / +Y)이라는 전제다. 감소 방향
+        #     라인이 생기면 부호까지 파라미터로 빼야 한다.
+        _ax = str(cfg["conveyor"].get("pickup_axis", "x")).lower()
+        if _ax not in ("x", "y"):
+            raise ValueError("conveyor.pickup_axis 는 x | y 여야 한다: %r" % _ax)
+        self.axis = 0 if _ax == "x" else 1
+        self.axis_name = _ax
+        # 스토퍼/픽업 구간은 **위 축을 따라** 잰 값이다 (키 이름은 옛 것을 유지한다).
+        self.stopper_pos_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
         # 픽업 판정 구간. **위쪽 경계가 없으면 팔레트에 놓인 박스가 다시 잡힌다** —
         # 아래 `_refresh` 주석의 실측 참조.
-        self.pickup_x0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
+        self.pickup_p0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
@@ -129,10 +141,10 @@ class Spawner:
         self._pickup = {"present": False, "box_id": "", "pose": None}
 
         self._ensure_roots()
-        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 x %.3f~%.3f · 벨트 상면 %.3f "
+        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f · 벨트 상면 %.3f "
                   "· 경로 %s"
-                  % (self.spawn_xyz_m, self.pickup_x0_m, self.stopper_x_m,
-                     self.belt_top_m, BOX_ROOT))
+                  % (self.spawn_xyz_m, self.axis_name, self.pickup_p0_m,
+                     self.stopper_pos_m, self.belt_top_m, BOX_ROOT))
 
     # ── 등록 ────────────────────────────────────────────────
     def handlers(self):
@@ -216,15 +228,19 @@ class Spawner:
             #    2) 앞면이 스토퍼 마진 안 — 실제로 벽에 닿아 섰다
             #    3) 밑면이 벨트 상면 — 집혀서 들린 것과 라인 밖으로 떨어진 것을 제외한다
             #    여기에 원래의 "거의 정지" 가 더해진다.
-            w, h = rec["dims"][0], rec["dims"][2]
-            front = pos[0] + w / 2.0
-            in_zone = self.pickup_x0_m <= pos[0] <= self.stopper_x_m
-            at_stopper = front > self.stopper_x_m - w / 2.0 - PICKUP_MARGIN_M
+            # ★ 진행방향 폭은 축에 따라 다르다. dims = (w, d, h) 이고 스폰 yaw 가 0
+            #   이므로 +X 진행이면 w(=dims[0]), +Y 진행이면 d(=dims[1]) 가 진행방향이다.
+            #   즉 dims[axis] 로 쓰면 두 축 모두 맞는다.
+            a = self.axis
+            w, h = rec["dims"][a], rec["dims"][2]
+            front = pos[a] + w / 2.0
+            in_zone = self.pickup_p0_m <= pos[a] <= self.stopper_pos_m
+            at_stopper = front > self.stopper_pos_m - w / 2.0 - PICKUP_MARGIN_M
             on_belt = abs(pos[2] - (self.belt_top_m + h / 2.0)) < PICKUP_Z_TOL_M
             if (in_zone and at_stopper and on_belt
-                    and abs(entry["vel_mps"][0]) < PICKUP_VEL_MPS):
+                    and abs(entry["vel_mps"][a]) < PICKUP_VEL_MPS):
                 # 여러 개가 줄 서면 **가장 앞선 것**이 집힐 차례다
-                if best is None or pos[0] > best[1]["pos_m"][0]:
+                if best is None or pos[a] > best[1]["pos_m"][a]:
                     best = (box_id, entry)
         for box_id, pos in lost:
             self.boxes.pop(box_id, None)
@@ -293,13 +309,14 @@ class Spawner:
         """
         on_belt = queue = 0
         for box_id, e in self._snap.items():
-            x, _y, z = e["pos_m"]
+            a = self.axis
+            p_axis, z = e["pos_m"][a], e["pos_m"][2]
             rec = self.boxes.get(box_id)
             if rec is None:
                 continue
             if abs(z - (self.belt_top_m + rec["dims"][2] / 2.0)) > PICKUP_Z_TOL_M:
                 continue                       # 벨트 위가 아니다 (팔레트·그리퍼·라인 밖)
-            if 0.0 <= x <= self.stopper_x_m:
+            if 0.0 <= p_axis <= self.stopper_pos_m:
                 on_belt += 1
                 # ★ **뒷면**이 경계를 넘어야 픽업 구간에 든 것으로 센다.
                 #   중심으로 세면 안 된다 — 박스가 경계에 걸친 순간 이미 1로 세어져
@@ -307,7 +324,7 @@ class Spawner:
                 #   위에 있어서 **멈춘 롤러가 붙잡는다.** b_pickup 이 밀어도 안
                 #   움직여 라인이 통째로 굳는다 (2026-08-23 실측: 5호가 x=7.59 에서
                 #   165 s 동안 정지, 처리 2/11).
-                if x - rec["dims"][0] / 2.0 >= self.pickup_x0_m:
+                if p_axis - rec["dims"][a] / 2.0 >= self.pickup_p0_m:
                     queue += 1                 # 픽업 구간 = 사양의 버퍼
         # ★ 스폰 지점이 비었는가. `main` 을 세워 두는 계량(metering) 운전에서는
         #   앞차가 안 빠진 채 다음 박스를 내면 **같은 자리에 겹쳐 스폰된다.**

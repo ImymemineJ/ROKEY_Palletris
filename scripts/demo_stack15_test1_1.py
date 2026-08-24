@@ -103,10 +103,17 @@ import demo_stack15 as D                                 # B5 산출물 그대�
 
 STAGE = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/project_1/test1-1.usd")
 PORT = int(os.environ.get("PL_PORT", "8797"))            # 8765=sim_main · 8798=B5 · 8799=B4
-ROBOT_PRIM = "/World/robot"
+# ★ 로봇 프림을 환경변수로 받는다 (2026-08-24). test1-1 은 로봇이 한 대라
+#   "/World/robot" 하나면 됐지만, 셀이 셋인 씬(test_3)은 robot_A/B/C 다.
+#   이 드라이버는 여전히 **한 번에 한 대**만 돌린다 — 어느 대를 돌릴지만 고른다.
+ROBOT_PRIM = os.environ.get("PL_ROBOT_PRIM", "/World/robot")
+# 스토퍼도 같이 받는다 — 셀이 셋인 씬은 Stopper_A/B/C 로 존마다 따로 있다.
+# 존재 확인에만 쓴다 (판정 좌표는 conveyor.stopper_x_mm 이 준다).
+STOPPER_PRIM = os.environ.get("PL_STOPPER_PRIM", "/World/Stopper")
 GRIPPER_PRIM = ROBOT_PRIM + "/SurfaceGripper"
 EE_FRAME = "tool0"
-ZONE = "B"
+# 존도 같이 받는다 — 팔레트 원점이 존별이라 로봇과 짝이 맞아야 한다.
+ZONE = os.environ.get("PL_ZONE", "B")
 BOX_ID_FMT = "BOX%05d"
 BOOT_STEPS = 20
 SETTLE_STEPS = 90                                        # READY 수렴 (1.5 s)
@@ -273,6 +280,34 @@ _DEFAULTS["PL_WRISTROS"] = ("1", "0")         # demo 만 켠다
 WRISTROS = _env("PL_WRISTROS") not in ("0", "false", "no")
 
 cfg = _paths.system_config()
+
+
+# ★ 좌표 오버레이 (2026-08-24). system.yaml 은 "모든 숫자의 단일 출처"(철칙 3)이고
+#   팀 4명이 공유한다. 그런데 라인 배치가 근본적으로 다른 씬(test_3 은 지선이 +Y)을
+#   돌리려면 좌표가 통째로 달라야 한다. 원본을 고치면 test1-1 기준 게이트·베이스라인이
+#   전부 무효가 되므로, **실행 시에만 얹는 별도 yaml** 로 푼다.
+#     PL_CONFIG_OVERLAY=src/packing_bringup/config/test_3.yaml
+#   ⚠ 오버레이를 쓴 실행은 **베이스라인이 아니다.** 시작 배너에 그렇게 찍는다.
+def _deep_merge(base, over):
+    """over 의 값으로 base 를 덮는다. dict 는 재귀, 그 외는 통째로 교체."""
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+OVERLAY = os.environ.get("PL_CONFIG_OVERLAY")
+if OVERLAY:
+    import yaml
+    _op = Path(OVERLAY)
+    if not _op.is_absolute():
+        _op = ROOT / _op
+    if not _op.exists():
+        raise SystemExit("PL_CONFIG_OVERLAY 파일이 없다: %s" % _op)
+    _ov = yaml.safe_load(_op.read_text()) or {}
+    _deep_merge(cfg, _ov)
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
 BELT_MPS = float(cfg["conveyor"]["belt_velocity_mps"])
 ORIGIN_MM = cfg["zones"]["pallet_origin_world_mm"][ZONE]
@@ -398,7 +433,7 @@ log("씬        %s" % STAGE)
 log("팔레트    원점 %s mm   최대 적재 %s mm" % (ORIGIN_MM, cfg["pallet"]["max_stack_mm"]))
 log("라인      스폰 %s -> 스토퍼 %.3f m   벨트 %.2f m/s"
     % (cfg["conveyor"]["spawn_point_mm"], STOPPER_X, BELT_MPS))
-for p in (ROBOT_PRIM, GRIPPER_PRIM, "/World/Stopper"):
+for p in (ROBOT_PRIM, GRIPPER_PRIM, STOPPER_PRIM):
     ok = stage.GetPrimAtPath(p).IsValid()
     log("  %-28s %s" % (p, "있음" if ok else "!! 없음"))
     if not ok:
@@ -757,6 +792,103 @@ def meter_thread():
         log("   [계량] !! %r" % (e,))
 
 
+# ── 위치변환 레일 (색상 라우팅) ────────────────────────────────────────────
+ROUTE = cfg.get("routing") or {}
+ROUTE_ON = bool(ROUTE) and os.environ.get("PL_ROUTE", "1") not in ("", "0")
+
+
+def router_thread(specs, ids):
+    """색(=크기)으로 목적지 존을 정하고, 그 분기점에서 본선을 +Y 로 꺾는다.
+
+    ★ 왜 벨트 **방향**을 꺾나. 분기점 전용 짧은 전환 벨트를 넣을 수가 없다 —
+      test_3 의 본선 조각은 지선과 프레임 메시(`SM_ConveyorBelt_A23`)를 L 자
+      한 덩어리로 공유해서, 본선 쪽만 떼면 지선의 측면 레일까지 사라진다.
+      대신 본선 조각 하나에 분기점이 **정확히 하나씩** 들어 있어, 그 조각을
+      통째로 꺾는 것이 곧 위치변환 레일이 된다.
+
+    ★ 왜 "그 조각에 목표 박스만 있을 때" 꺾나. 조각 전체가 옆으로 흐르므로
+      뒤따르던 박스도 같이 밀려 프레임에 낀다. 하나일 때까지 기다린다.
+    """
+    import sim_link as SL
+    link = SL.SimLink(port=PORT)
+    by_type = {str(k): str(v) for k, v in (ROUTE.get("by_type") or {}).items()}
+    jx = {k: (v[0] / 1000.0, v[1] / 1000.0)
+          for k, v in (ROUTE.get("junction_x_mm") or {}).items()}
+    mseg = ROUTE.get("main_seg") or {}
+    segx = {k: (min(v) / 1000.0, max(v) / 1000.0)
+            for k, v in (ROUTE.get("main_seg_x_mm") or {}).items()}
+    y_done = float(ROUTE.get("divert_done_y_mm", 1200)) / 1000.0
+    thru = list(ROUTE.get("thru_world", [-1, 0, 0]))
+    div = list(ROUTE.get("divert_world", [0, 1, 0]))
+    state = {}                      # box_id -> "divert" | "done"
+    t_div = {}                      # box_id -> 꺾기 시작한 시각
+    t_log = {}                      # box_id -> 마지막 진행 로그 시각
+    # ★ 꺾은 채로 두면 그 조각 위의 뒤차가 전부 옆으로 밀린다. 실측 2026-08-24:
+    #   복귀를 안 시켰더니 박스 6 개가 분기점에 뭉쳐 라인이 막혔다.
+    DIV_TIMEOUT_S = float(os.environ.get("PL_DIV_TIMEOUT", "45"))
+    log("   [라우팅] 켬 — %s" % ", ".join("%s->%s" % kv for kv in sorted(by_type.items())))
+    try:
+        while not _S["done"]:
+            poses = {}
+            for bid in ids:
+                if state.get(bid) == "done":
+                    continue
+                r = link.call(cmd="get_box_pose", box_id=bid)
+                if r.get("ok"):
+                    poses[bid] = r["pos_m"]
+            for bid, p in list(poses.items()):
+                z = by_type.get(specs[bid]["name"])
+                if z is None or z not in jx or z not in mseg:
+                    continue
+                lo, hi = jx[z]
+                seg = mseg[z]
+                if p[1] >= y_done:                       # 지선에 올라탔다
+                    if state.get(bid) == "divert":
+                        link.call(cmd="set_direction", seg=seg, world=thru)
+                        log("   [라우팅] %s 지선 %s 진입 (Y %.2f m) — 본선 복귀"
+                            % (bid, z, p[1]))
+                    state[bid] = "done"
+                    continue
+                if state.get(bid) == "divert":
+                    # 진행을 1 초마다 남긴다. 어디서 걸리는지 봐야 고칠 수 있다.
+                    now = time.time()
+                    if now - t_log.get(bid, 0.0) >= 1.0:
+                        t_log[bid] = now
+                        log("   [라우팅]   %s 이동 중  X %.2f  Y %.3f  (%.0f s)"
+                            % (bid, p[0], p[1], now - t_div.get(bid, now)))
+                    if now - t_div.get(bid, 0.0) > DIV_TIMEOUT_S:
+                        link.call(cmd="set_direction", seg=seg, world=thru)
+                        state[bid] = "done"
+                        log("   [라우팅] !! %s 가 %.0f s 안에 지선 %s 에 못 올라탔다 "
+                            "(Y %.2f m) — 본선 복귀"
+                            % (bid, DIV_TIMEOUT_S, z, p[1]))
+                    continue
+                # ★ 박스가 지선 폭 안에 **완전히** 들어왔을 때만 꺾는다.
+                #   가장 큰 5호가 480 mm 라 240 을 물린다. 예전엔 분기점 경계에서
+                #   바로 꺾어 몸통 일부가 레일 밑으로 들어가 걸렸다 (실측 X -18.89).
+                if not (lo + 0.25 <= p[0] <= hi - 0.25):
+                    continue
+                # 같은 조각 위에 다른 박스가 있으면 지나갈 때까지 기다린다.
+                # 꺾으면 그 **조각 전체**가 옆으로 흐른다. 조각 위에 다른 박스가
+                # 하나라도 있으면 기다린다 (분기점 주변만 보면 놓친다).
+                slo, shi = segx.get(z, (lo - 3.5, hi + 3.5))
+                busy = [b2 for b2, q in poses.items()
+                        if b2 != bid and q[1] < y_done and slo <= q[0] <= shi]
+                if busy:
+                    continue
+                r = link.call(cmd="set_direction", seg=seg, world=div)
+                if r.get("ok"):
+                    state[bid] = "divert"
+                    t_div[bid] = time.time()
+                    log("   [라우팅] %s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
+                        % (bid, specs[bid]["name"], z, p[0]))
+                else:
+                    log("   [라우팅] !! set_direction %s -> %r" % (seg, r))
+            time.sleep(0.15)
+    except Exception as e:
+        log("   [라우팅] !! %r" % (e,))
+
+
 def spawner_thread(specs, ids):
     """사양 스케줄대로 박스를 라인에 올린다. **자기 소켓을 따로 쓴다** (스레드 안전)."""
     import sim_link as SL
@@ -898,13 +1030,26 @@ def worker(specs, ids):
                            log=lambda *a: log("           ", *a), verbose=VERBOSE)
         cyc = CY.Cycle(link, svc, cfg, zone=ZONE, log=lambda *a: log("   [cycle]", *a))
 
-        # 라인을 돌린다. 이후 정지/재가동은 `cycle.py` 가 b_pickup 만 만진다.
+        # 라인을 돌린다. 이후 정지/재가동은 `cycle.py` 가 <존>_pickup 만 만진다.
+        # ★ 존 이름을 붙인다. 예전엔 "b_pickup" 이 박혀 있어서 PL_ZONE=A 로 돌리면
+        #   `cycle.py` 는 a_pickup 을 끄고 켜는데 여기서 켠 것은 b_pickup 이라
+        #   **지선이 영영 안 돌았다** (실측 2026-08-24: 박스가 스폰 자리에 150 s 정지).
         link.call(cmd="set_velocity", seg="main", mps=BELT_MPS)
-        link.call(cmd="set_velocity", seg="b_pickup", mps=BELT_MPS)
+        if ROUTE_ON:
+            # 라우팅은 박스를 세 지선으로 나눠 보내므로 셋 다 돌아야 한다.
+            for _z in sorted(set((ROUTE.get("by_type") or {}).values())):
+                link.call(cmd="set_velocity", seg="%s_pickup" % _z.lower(),
+                          mps=BELT_MPS)
+        else:
+            link.call(cmd="set_velocity", seg="%s_pickup" % ZONE.lower(),
+                      mps=BELT_MPS)
         threading.Thread(target=spawner_thread, args=(specs, ids),
                          daemon=True, name="spawn").start()
         if METER_MAX > 0:
             threading.Thread(target=meter_thread, daemon=True, name="meter").start()
+        if ROUTE_ON:
+            threading.Thread(target=router_thread, args=(specs, ids),
+                             daemon=True, name="route").start()
 
         def recover():
             """실패한 사이클 뒤처리 — **치우거나 다시 하기 전에 반드시 부른다.**
