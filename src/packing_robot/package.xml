@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>packing_robot</name>
+  <version>0.0.0</version>
+  <description>
+    트랙 B — 로봇 제어 / orchestrator.
+    ★ orchestrator.py 는 트랙 C(정정인)가 Day 3 통합 시연용으로 만든 초안입니다.
+      DB·Isaac 없이 /algo/* 왕복만 검증합니다. 실제 로봇 연결은 김병직님이 채웁니다.
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">정정인 (초안 · 소유: 김병직)</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>packing_msgs</exec_depend>
+  <exec_depend>packing_common</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

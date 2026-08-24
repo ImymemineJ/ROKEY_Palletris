@@ -1,0 +1,9 @@
+string box_id
+int32  size_w_mm
+int32  size_d_mm
+int32  size_h_mm
+---
+bool   ok
+string zone
+int32  db_seq
+string message

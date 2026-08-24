@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>packing_algo</name>
+  <version>0.0.0</version>
+  <description>
+    heightmap 기반 3D 패킹 알고리즘 (트랙 C). 코어(HeightmapPacker)는 ROS 의존성이 0이며,
+    Day 3 의 algo_service_node 가 /algo/* 서비스 4개로 감싼다. (작업명세서 §7)
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">정정인</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>packing_common</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>packing_msgs</exec_depend>   <!-- 트랙 D 소유. 아직 비어 있으면 노드 실행만 안 된다 -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

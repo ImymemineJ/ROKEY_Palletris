@@ -1,0 +1,5 @@
+string box_id
+---
+bool   found
+string zone
+int32  retry_count
