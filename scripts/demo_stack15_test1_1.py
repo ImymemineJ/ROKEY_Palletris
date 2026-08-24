@@ -374,7 +374,10 @@ log("-" * 78)
 if CAMVIEW and stage.GetPrimAtPath(CAM_PICK_PRIM).IsValid():
     try:
         from omni.kit.viewport.utility import create_viewport_window
-        _vw = create_viewport_window("벨트 카메라 (RSD455 하향)",
+        # ★ 제목은 ASCII 만 쓴다. Kit 의 창 제목 폰트에 한글 글리프가 없어서
+        #   "벨트 카메라 (RSD455 하향)" 이 `?? ??? (RSD455 ??)` 로 찍힌다
+        #   (실측 2026-08-24, 시연 화면 녹화). 로그는 한글이어도 된다 — 터미널이다.
+        _vw = create_viewport_window("view2 - Belt Cam (RSD455 top-down)",
                                      width=560, height=340)
         _vw.viewport_api.set_active_camera(CAM_PICK_PRIM)
         _vw.viewport_api.resolution = CAMVIEW_RES   # 렌더 비용을 창 크기에서 떼어낸다
@@ -1366,22 +1369,47 @@ def _on_timeline(e):
     _S["phase"] = "done"                   # on_step 이 죽은 핸들을 안 만진다
     print("\n" + "!" * 78, flush=True)
     print("Stop 을 눌렀다 — 이 드라이버는 여기서 끝난다.", flush=True)
-    print("  Play 를 다시 눌러도 안 움직인다. Stop 이 물리 뷰를 무효화해서", flush=True)
-    print("  부팅 때 잡은 로봇·그리퍼 핸들이 죽었기 때문이다 (재초기화 경로 없음).", flush=True)
+    print("  Play 를 다시 눌러도 **박스가 더 안 나온다.** Stop 이 물리 뷰를", flush=True)
+    print("  무효화해서 부팅 때 잡은 로봇·그리퍼 핸들이 죽었고, 재초기화 경로가", flush=True)
+    print("  없어서 스폰 루프가 다시 안 돈다. 쌓아 둔 팔레트도 Stop 이 되감아서", flush=True)
+    print("  남지 않는다 — 즉 Stop 뒤에 볼 것은 없다.", flush=True)
     print("  다시 보려면 **창을 닫고** 다시 실행해라:", flush=True)
     print("      cd ~/palletris_ws && ./scripts/run_demo.sh", flush=True)
-    # ★ Stop 은 박스들을 **스폰 당시 USD 좌표**로 되돌린다 — 팔레트에 쌓인 것까지
-    #   전부 스폰 지점에 겹쳐 선다. 그대로 Play 하면 벨트(OmniGraph 라 이 드라이버와
-    #   무관하게 돈다)가 그것들을 실어 나가서, 안 나왔던 박스가 갑자기 움직이는
-    #   것처럼 보인다. 여기서 좌표 자체를 라인 밖으로 적어 화면을 비운다.
-    sp = _S.get("sp")
-    if sp is not None:
+    print("!" * 78 + "\n", flush=True)
+    # ★ 박스 정리는 **이 콜백 안에서 하면 안 된다.**
+    #   Stop 은 Play 때 잡아 둔 초기 자세를 USD 에 **되써 넣는다.** 여기서 먼저
+    #   좌표를 옮겨 봐야 그 되쓰기가 덮어버린다 — 실측 2026-08-24: Stop 뒤 화면에
+    #   박스가 스폰 지점에 전부 겹쳐 서 있고, Play 를 누르면 벨트(OmniGraph 라
+    #   이 드라이버와 무관하게 돈다)가 그 더미를 실어 날라 "안 나온 박스가 여러 개
+    #   쏟아지는" 것처럼 보였다.
+    #   그래서 **되쓰기가 끝난 뒤**(다음 앱 업데이트 몇 틱 뒤) 옮긴다.
+    #   한 번으로 안 끝날 수 있어 두 번 친다 — park_all 은 멱등이다.
+    _pk = {"sub": None, "n": 0}
+
+    def _park_later(_ev):
+        _pk["n"] += 1
+        if _pk["n"] not in (3, 12):
+            if _pk["n"] > 12:
+                try:
+                    _pk["sub"].unsubscribe()
+                except Exception:
+                    pass
+            return
+        sp = _S.get("sp")
+        if sp is None:
+            return
         try:
-            print("  박스 프림 %d 개를 라인 밖으로 치웠다 (Stop 이 스폰 좌표로 "
-                  "되돌리는 것을 막는다)." % sp.park_all(), flush=True)
+            n = sp.park_all()
+            if _pk["n"] == 3:
+                print("  박스 프림 %d 개를 라인 밖으로 치웠다 "
+                      "(Stop 의 자세 되쓰기 뒤에)." % n, flush=True)
         except Exception as _e:
             print("  박스 정리 실패: %r" % (_e,), flush=True)
-    print("!" * 78 + "\n", flush=True)
+
+    _pk["sub"] = (omni.kit.app.get_app().get_update_event_stream()
+                  .create_subscription_to_pop(_park_later,
+                                              name="palletris-park-after-stop"))
+    _S["park_sub"] = _pk["sub"]
 
 
 _S["timeline_sub"] = (omni.timeline.get_timeline_interface()
