@@ -116,6 +116,17 @@ class Spawner:
         # 아래 `_refresh` 주석의 실측 참조.
         self.pickup_p0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
+        # ★ 가로축 창 (2026-08-24 추가). 지선이 여러 갈래인 배치(test_3)에서는
+        #   진행축만 봐서는 **어느 지선에 있는 박스인지** 구분이 안 된다.
+        #   실측: 존 A 로 돌렸는데 존 B(X -12.9)·C(X -18.9) 지선에 놓인 박스를
+        #   집으려다 IK_FAIL 3 연발이 났다. 이 창이 없으면 그 일이 다시 난다.
+        #   키가 없으면 제한 없음 — test1-1 은 지선이 하나라 동작이 안 바뀐다.
+        _cross = (cfg["zones"].get("pickup_cross_mm") or {}).get(zone)
+        self.cross_axis = 1 - self.axis
+        if _cross:
+            self.cross_range_m = (min(_cross) / 1000.0, max(_cross) / 1000.0)
+        else:
+            self.cross_range_m = None
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
         # 원점은 **모서리**이고 z 는 **상면**이다 (작업명세서 §3.3).
@@ -141,10 +152,15 @@ class Spawner:
         self._pickup = {"present": False, "box_id": "", "pose": None}
 
         self._ensure_roots()
-        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f · 벨트 상면 %.3f "
-                  "· 경로 %s"
+        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
+                  "· 벨트 상면 %.3f · 경로 %s"
                   % (self.spawn_xyz_m, self.axis_name, self.pickup_p0_m,
-                     self.stopper_pos_m, self.belt_top_m, BOX_ROOT))
+                     self.stopper_pos_m,
+                     ("" if self.cross_range_m is None
+                      else " · %s %.3f~%.3f" % ("xyz"[self.cross_axis],
+                                                self.cross_range_m[0],
+                                                self.cross_range_m[1])),
+                     self.belt_top_m, BOX_ROOT))
 
     # ── 등록 ────────────────────────────────────────────────
     def handlers(self):
@@ -235,6 +251,9 @@ class Spawner:
             w, h = rec["dims"][a], rec["dims"][2]
             front = pos[a] + w / 2.0
             in_zone = self.pickup_p0_m <= pos[a] <= self.stopper_pos_m
+            if in_zone and self.cross_range_m is not None:
+                c = pos[self.cross_axis]
+                in_zone = self.cross_range_m[0] <= c <= self.cross_range_m[1]
             at_stopper = front > self.stopper_pos_m - w / 2.0 - PICKUP_MARGIN_M
             on_belt = abs(pos[2] - (self.belt_top_m + h / 2.0)) < PICKUP_Z_TOL_M
             if (in_zone and at_stopper and on_belt
@@ -317,6 +336,15 @@ class Spawner:
             if abs(z - (self.belt_top_m + rec["dims"][2] / 2.0)) > PICKUP_Z_TOL_M:
                 continue                       # 벨트 위가 아니다 (팔레트·그리퍼·라인 밖)
             if 0.0 <= p_axis <= self.stopper_pos_m:
+                # ★ 픽업 구간 계수도 **자기 지선만** 센다. 지선이 여러 갈래인
+                #   배치에서 남의 지선 박스를 세면 백압이 잘못 걸려, 이 존은
+                #   비어 있는데도 투입이 막힌다.
+                if (self.cross_range_m is not None
+                        and p_axis >= self.pickup_p0_m
+                        and not (self.cross_range_m[0]
+                                 <= e["pos_m"][self.cross_axis]
+                                 <= self.cross_range_m[1])):
+                    continue
                 on_belt += 1
                 # ★ **뒷면**이 경계를 넘어야 픽업 구간에 든 것으로 센다.
                 #   중심으로 세면 안 된다 — 박스가 경계에 걸친 순간 이미 1로 세어져

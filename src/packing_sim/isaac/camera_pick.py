@@ -45,6 +45,9 @@ if _PS not in sys.path:
     sys.path.insert(0, _PS)
 
 CAM_PRIM = "/World/CamPick/Camera"
+# ★ 존별 카메라 (2026-08-24). 지선이 여러 갈래인 배치(test_3)는 픽업 카메라도
+#   존마다 하나씩이다(/World/CamPick_A/Camera ...). `cameras.pick_prim` 에
+#   존->경로 표를 주면 그쪽을 쓴다. 키가 없으면 위 기본값 그대로다.
 PLANE_TOL_M = 0.020        # 벨트 상면에서 이만큼 위부터 "박스"
 TOP_BAND_M = 0.030         # 가장 높은 점에서 이만큼 아래까지를 윗면으로 본다
 MIN_PTS = 200              # 이보다 적으면 못 봤다고 한다
@@ -58,7 +61,12 @@ DEPTH_STRIDE = int(os.environ.get("PL_CAM_STRIDE", "2"))
 
 
 class PickCamera:
-    def __init__(self, stage, cfg, mainq, prim_path=CAM_PRIM, log=print):
+    def __init__(self, stage, cfg, mainq, prim_path=None, zone=None, log=print):
+        if prim_path is None:
+            _tbl = (cfg.get("cameras") or {}).get("pick_prim")
+            prim_path = (_tbl or {}).get(zone) if (_tbl and zone) else None
+            if prim_path is None:
+                prim_path = CAM_PRIM
         self.stage, self.mainq, self._log = stage, mainq, log
         self.path = prim_path
         self.cam = None

@@ -258,8 +258,10 @@ CAM = _env("PL_CAM") not in ("0", "false", "no")
 #   공짜가 아니라 해상도를 낮추고 frameSkipCount 로 발행 주기를 떨군다.
 #   게이트(gate 모드)에서는 둘 다 끈다 — 수치를 재는 실행에 보여주기용 부하를
 #   얹으면 비교가 안 된다.
-CAM_PICK_PRIM = "/World/CamPick/Camera"                    # 벨트 위 하향 (창)
-CAM_WRIST_PRIM = "/World/robot/gripper/CamWrist/Camera"    # 손목 (ROS 토픽)
+# 창(view2)에 띄울 카메라. **실제 값은 설정을 읽은 뒤 아래에서 정해진다** —
+# `cfg` 가 이 줄보다 아래에서 만들어지기 때문이다.
+CAM_PICK_PRIM = "/World/CamPick/Camera"
+CAM_WRIST_PRIM = ROBOT_PRIM + "/gripper/CamWrist/Camera"   # 손목 (ROS 토픽)
 CAMVIEW_RES = (480, 270)          # 창 렌더 해상도. 창 크기와 무관하게 비용을 정한다.
 _DEFAULTS["PL_CAMVIEW"] = ("1", "0")          # demo 만 켠다
 CAMVIEW = _env("PL_CAMVIEW") not in ("0", "false", "no")
@@ -308,6 +310,10 @@ if OVERLAY:
         raise SystemExit("PL_CONFIG_OVERLAY 파일이 없다: %s" % _op)
     _ov = yaml.safe_load(_op.read_text()) or {}
     _deep_merge(cfg, _ov)
+
+# ★ 존별 카메라 (test_3 는 CamPick_A/B/C). 오버레이를 얹은 **뒤에** 정한다.
+CAM_PICK_PRIM = ((cfg.get("cameras") or {}).get("pick_prim") or {}).get(
+    ZONE, CAM_PICK_PRIM)
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
 BELT_MPS = float(cfg["conveyor"]["belt_velocity_mps"])
 ORIGIN_MM = cfg["zones"]["pallet_origin_world_mm"][ZONE]
@@ -660,7 +666,7 @@ def setup():
 
     if CAM:
         import camera_pick
-        cam = camera_pick.PickCamera(stage, cfg, q)
+        cam = camera_pick.PickCamera(stage, cfg, q, zone=ZONE)
         _S["cam"] = cam
 
     try:
@@ -779,7 +785,10 @@ def meter_thread():
     try:
         while not _S["done"]:
             st = link.call(cmd="spawn_status")
-            want = st.get("queue", 0) < METER_MAX
+            # ★ 위치변환 중에는 무조건 돌린다. 꺾기는 그 조각의 **표면속도 방향**만
+            #   바꾸는 것이라, 계량이 main 을 세워 두면 방향만 바뀐 채 박스가 그대로
+            #   선다 (실측 2026-08-24: BOX00003 이 Y -0.11 에서 45 s 정지).
+            want = st.get("queue", 0) < METER_MAX or bool(_S.get("diverting"))
             if want != running:
                 r = link.call(cmd="set_velocity", seg="main",
                               mps=BELT_MPS if want else 0.0)
@@ -818,6 +827,8 @@ def router_thread(specs, ids):
     segx = {k: (min(v) / 1000.0, max(v) / 1000.0)
             for k, v in (ROUTE.get("main_seg_x_mm") or {}).items()}
     y_done = float(ROUTE.get("divert_done_y_mm", 1200)) / 1000.0
+    _mly = ROUTE.get("main_line_y_mm") or [-500, 500]
+    y_lo, y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
     thru = list(ROUTE.get("thru_world", [-1, 0, 0]))
     div = list(ROUTE.get("divert_world", [0, 1, 0]))
     state = {}                      # box_id -> "divert" | "done"
@@ -845,6 +856,7 @@ def router_thread(specs, ids):
                 if p[1] >= y_done:                       # 지선에 올라탔다
                     if state.get(bid) == "divert":
                         link.call(cmd="set_direction", seg=seg, world=thru)
+                        _S["diverting"] = max(0, _S.get("diverting", 1) - 1)
                         log("   [라우팅] %s 지선 %s 진입 (Y %.2f m) — 본선 복귀"
                             % (bid, z, p[1]))
                     state[bid] = "done"
@@ -858,6 +870,7 @@ def router_thread(specs, ids):
                             % (bid, p[0], p[1], now - t_div.get(bid, now)))
                     if now - t_div.get(bid, 0.0) > DIV_TIMEOUT_S:
                         link.call(cmd="set_direction", seg=seg, world=thru)
+                        _S["diverting"] = max(0, _S.get("diverting", 1) - 1)
                         state[bid] = "done"
                         log("   [라우팅] !! %s 가 %.0f s 안에 지선 %s 에 못 올라탔다 "
                             "(Y %.2f m) — 본선 복귀"
@@ -868,18 +881,30 @@ def router_thread(specs, ids):
                 #   바로 꺾어 몸통 일부가 레일 밑으로 들어가 걸렸다 (실측 X -18.89).
                 if not (lo + 0.25 <= p[0] <= hi - 0.25):
                     continue
+                # ★ 본선 위에 있을 때만. 순환 루프(Y -5.1)를 지나는 박스는 X 가
+                #   분기점과 맞아도 그 조각 위에 없다 — 꺾어 봐야 안 움직인다.
+                if not (y_lo <= p[1] <= y_hi):
+                    continue
                 # 같은 조각 위에 다른 박스가 있으면 지나갈 때까지 기다린다.
                 # 꺾으면 그 **조각 전체**가 옆으로 흐른다. 조각 위에 다른 박스가
                 # 하나라도 있으면 기다린다 (분기점 주변만 보면 놓친다).
                 slo, shi = segx.get(z, (lo - 3.5, hi + 3.5))
+                # ★ "같은 조각 위" 도 **본선 띠 안**이어야 한다. 순환 루프(Y -5.1)를
+                #   도는 박스는 X 가 겹쳐도 이 조각에 없다. 띠를 안 보면 루프에 박스가
+                #   하나라도 있는 한 영원히 안 꺾는다 (실측 2026-08-24: BOX00008 ·
+                #   BOX00010 이 180 s 동안 못 들어와 중단).
                 busy = [b2 for b2, q in poses.items()
-                        if b2 != bid and q[1] < y_done and slo <= q[0] <= shi]
+                        if b2 != bid and y_lo <= q[1] <= y_hi
+                        and slo <= q[0] <= shi]
                 if busy:
                     continue
                 r = link.call(cmd="set_direction", seg=seg, world=div)
                 if r.get("ok"):
                     state[bid] = "divert"
                     t_div[bid] = time.time()
+                    _S["diverting"] = _S.get("diverting", 0) + 1
+                    # 계량이 세워 뒀을 수 있으니 이 조각만 직접 돌린다.
+                    link.call(cmd="set_velocity", seg=seg, mps=BELT_MPS)
                     log("   [라우팅] %s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
                         % (bid, specs[bid]["name"], z, p[0]))
                 else:
@@ -1098,7 +1123,8 @@ def worker(specs, ids):
         pallets = 1
         t_all = time.time()
         i = 0
-        while i < len(ids) and not _S["done"]:
+        targets = _S.get("targets") or list(ids)
+        while i < len(targets) and not _S["done"]:
             # ── 다음 박스가 스토퍼에 설 때까지 ──────────────
             pick, t0, nag = None, time.time(), 0.0
             while time.time() - t0 < ARRIVE_TIMEOUT_S and not _S["done"]:
@@ -1114,8 +1140,8 @@ def worker(specs, ids):
                     log("   ...대기 %.0f s — %s" % (nag, _line_state(link, ids)))
                 time.sleep(0.05)
             if pick is None:
-                log("   !! %d 번째 박스가 %.0f s 안에 스토퍼에 안 왔다 — 중단"
-                    % (i + 1, ARRIVE_TIMEOUT_S))
+                log("   !! %d/%d 번째 박스가 %.0f s 안에 스토퍼에 안 왔다 — 중단"
+                    % (i + 1, len(targets), ARRIVE_TIMEOUT_S))
                 log("      마지막 라인 상태: %s" % _line_state(link, ids))
                 _S["stalled"] = True
                 break
@@ -1125,7 +1151,7 @@ def worker(specs, ids):
             wait_s = time.time() - t0
 
             log("\n[%2d/%d] %-9s %-3s %s mm %.0f kg   대기 %.1f s   앞면 %.4f m"
-                % (i + 1, len(ids), bid, t["name"],
+                % (i + 1, len(targets), bid, t["name"],
                    [t["w_mm"], t["d_mm"], t["h_mm"]], t["mass_g"] / 1000.0, wait_s,
                    pick["pose"]["pos_m"][0] + t["w_mm"] / 2000.0))
 
@@ -1357,8 +1383,10 @@ def report():
     bypassed = [w for w in rows if w["res"] == "PALLET_FULL"]
     failed = [w for w in rows if w["res"] not in ("PLACED", "PALLET_FULL")]
     ok = bool(placed)
+    # ★ 분모는 **이 존 몫**이다. 라우팅을 켜면 남의 색 박스는 다른 지선으로 간다.
+    _target_n = len(_S.get("targets") or []) or N
     log("처리한 것     %d / %d   (놓음 %d · 우회 %d · 실패 %d)"
-        % (len(rows), N, len(placed), len(bypassed), len(failed)))
+        % (len(rows), _target_n, len(placed), len(bypassed), len(failed)))
     if bypassed:
         log("우회          %s — 이 팔레트에 자리가 없는 박스다. 설계결정서 §7 상"
             % ", ".join("%s(%s)" % (w["id"], w["type"]) for w in bypassed))
@@ -1436,13 +1464,15 @@ def report():
         #   실패가 아니고(설계결정서 §7), 도착 순서로 15 개가 다 들어가는지는 **패커의
         #   상한** 문제라 이 게이트가 물을 것이 아니다 (eval_pack_online.py 가 답한다).
         #   여기가 물어야 하는 것은 "라인이 15 개를 끝까지 처리했는가" 다.
-        all_handled = len(rows) == N and not failed
+        _tgt = _target_n
+        all_handled = len(rows) == _tgt and not failed
         ok = (all_handled
               and max(exy) < D.PLACE_TOL_XY_MM and max(ez) < D.PLACE_TOL_Z_MM
               and kn < D.KNOCK_WARN_MM
               and max(tops) <= cfg["pallet"]["max_stack_mm"])
         for cond, msg in ((all_handled,
-                           "%d 개를 끝까지 처리해야 한다 (놓거나 우회. BLOCKED 는 실패)" % N),
+                           "%d 개를 끝까지 처리해야 한다 (놓거나 우회. BLOCKED 는 실패)"
+                           % _tgt),
                           (max(exy) < D.PLACE_TOL_XY_MM, "XY 오차 %d mm 안" % D.PLACE_TOL_XY_MM),
                           (max(ez) < D.PLACE_TOL_Z_MM, "Z 오차 %d mm 안" % D.PLACE_TOL_Z_MM),
                           (kn < D.KNOCK_WARN_MM, "knock %d mm 안" % D.KNOCK_WARN_MM),
@@ -1519,6 +1549,21 @@ def on_step(dt):
             ids = [BOX_ID_FMT % i for i in range(N)]
             specs = {bid: dict(t) for bid, t in zip(ids, fed)}
             log("박스      %d 개  %s" % (N, [t["name"] for t in fed]))
+            # ★ 라우팅을 켜면 **이 존 색깔의 박스만** 이 로봇의 몫이다.
+            #   나머지는 다른 지선으로 가서 그 존의 로봇을 기다린다 (1 존만 돌리는
+            #   실행에서는 지선에 그대로 선다). 목표 개수를 N 으로 두면 남의 박스를
+            #   기다리다 늘 실패로 끝난다.
+            _by_t = {str(k): str(v) for k, v in (ROUTE.get("by_type") or {}).items()}
+            if ROUTE_ON and _by_t:
+                _S["targets"] = [b for b in ids
+                                 if _by_t.get(specs[b]["name"]) == ZONE]
+                _other = len(ids) - len(_S["targets"])
+                log("존 %s 몫  %d 개 (%s)  · 다른 존으로 %d 개"
+                    % (ZONE, len(_S["targets"]),
+                       ",".join(k for k, v in sorted(_by_t.items()) if v == ZONE),
+                       _other))
+            else:
+                _S["targets"] = list(ids)
             log("-" * 78)
             _S["phase"] = "run"
             _S["t0"] = time.time()
