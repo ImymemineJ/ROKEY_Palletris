@@ -60,6 +60,7 @@ j5 가 한계의 99% 까지 감긴다. 이송 중 박스 방향은 아무래도 
 정해 나눠 보낸다.
 """
 import math
+import os
 import threading
 
 import numpy as np
@@ -76,6 +77,55 @@ ARC_MIN_R_M = 0.15                        # 반경이 이보다 작으면 각도
 BISECT = 10                               # 속도한계를 넘으면 u 증분을 이만큼까지 반절
 MOVE_LIMIT_S = 20.0                       # 한 구간 상한. 무한루프 방지
 LOG_RESIDUAL_M = 0.005                    # 이보다 큰 잔차만 로그. 1~2 mm 는 정상 처짐이다
+# ★ 잔차가 이보다 크면 **REACHED 로 보고하지 않는다.** 정상 처짐(1~2 mm)이나
+#   RMP 계열 정상상태 오차(check_place_plan 의 RMP_SAG_MM 35)보다 훨씬 큰 값이라
+#   여기 걸리면 '못 갔다'가 맞다. 이게 없어서 343 mm 를 못 간 채 REACHED 를 주고,
+#   cycle 이 그 자리에서 박스를 놓아 팔레트 밖으로 떨어뜨렸다 (0824error1.mp4).
+REACH_ABORT_M = 0.05                      # 50 mm
+
+# ★ IK 가지(branch) 선택 — 팔이 "뻣뻣한" 진짜 이유였다.
+#
+#   6축 팔은 한 점을 최대 8가지 자세(어깨 좌/우 · 팔꿈치 상/하 · 손목 정/역)로 잡는다.
+#   그런데 여기서는 **직전 해를 warm_start 로 물고** 가므로 가지 하나에 갇힌다.
+#   그 가지가 나쁘면 이송 내내 못 빠져나온다.
+#
+#   ⚠ 관절 한계나 자세 공차를 푼다고 해결되지 않는다 — 실측으로 전부 확인했다:
+#     · 관절 한계는 j1/j4/j5/j6 ±360°, j2 ±125°, j3 ±160° 로 이미 넉넉하다
+#     · descriptor 에 cspace_target 같은 인위적 당김이 없다
+#     · orientation_tolerance 를 0.01 -> 3.2 로 열어도 **해가 완전히 동일**하다
+#     · Lula 는 supports_collision_avoidance() = False 다
+#     · 손목 yaw 를 -180~180 돌려도 j1/j2/j3 가 소수점까지 같고 j6 만 돈다
+#       (손목은 팔 끝에 달려 있어 link_2/link_3 위치를 못 바꾼다)
+#   즉 자유도가 묶인 게 아니라 **선택지를 안 쓰고 있었다.**
+#
+#   실측 (scripts/verify_transit_sweep_isaac.py --seeds multi, 이격 400 · 5호 3단):
+#     전체 최악 여유  +32.9 mm -> **+70.2 mm** (2.1배)
+#     #11 이송고도상승 +32.9 -> +365.1 · #11 가로이송 +32.9 -> +115.0
+#   이긴 시드가 박스마다 다르다 (keep/ready/j1flip/wflip 이 골고루) — 하나를 고정할 수 없다.
+#
+#   ★ 가지는 **구간 시작에서 한 번 고르고 끝까지 유지**한다. 중간에 바꾸면 관절이
+#     180도 튄다 (초기 로그에 |dq| 180.0 deg 가 실제로 있었다).
+#
+#   ★★ 기본 keep — **이 구현은 아직 쓰면 안 된다.** (2026-08-24, 0824error1.mp4)
+#     `_advance_move` 는 매 스텝 IK 를 **직전 해**(p["prev"], q0 에서 출발)로 체인한다.
+#     여기서 고른 가지는 `q_end` 에만 들어가고 **경로에는 안 쓰인다** — 오직
+#     steps 계산(dq = |q_end - q0|)에만 반영된다. 즉 가지는 안 바뀌고 페이싱만 어긋난다.
+#     실측 결과: 'wflip' 을 고른 구간에서 도착 잔차 **343 mm**, 그 자리에서 놓아
+#     박스가 팔레트 밖으로 떨어졌다.
+#
+#     측정 도구(verify_transit_sweep_isaac.py --seeds multi)는 **시드에서 체인을
+#     시작**하므로 +32.9 -> +70.2 mm 가 나왔다. 컨트롤러는 q0 에서 시작한다. 이 차이다.
+#
+#     제대로 하려면 고른 가지로 팔을 **실제로 재구성하는 이동**이 먼저 필요하다
+#     (안전 고도에서 관절공간 이동). 그건 별개 작업이라 지금은 끈다.
+IK_SEEDS = os.environ.get("PL_IK_SEEDS", "keep")
+SEED_PROBE_N = 8                          # 시드 점수용 경로 표본 수 (성기게)
+# ★ 현행 가지(keep)가 이만큼 여유로우면 **갈아타지 않는다.**
+#   가지를 바꾸면 관절 이동량이 커져 사이클이 길어진다 — 실측 6박스에서
+#   13~17 s -> 12~32 s 로 거의 2배가 됐다 (IK 계산 비용이 아니라 j1flip 이 팔을
+#   반대편으로 돌리기 때문이다). 여유가 이미 충분하면 그 비용을 낼 이유가 없다.
+#   값은 배치 오차(실측 7 mm)와 RMP 처짐(35 mm)을 합친 것보다 넉넉하게 잡는다.
+SEED_KEEP_OK_M = 0.06                     # 60 mm
 
 
 def _wrap(rad):
@@ -117,7 +167,8 @@ class RobotMotion:
     """
 
     def __init__(self, articulation, lula, cfg, ee="tool0", gripper=None,
-                 gripper_path=None, gap_fn=None, log=print):
+                 gripper_path=None, gap_fn=None, log=print, collision_spheres=None,
+                 ready_q=None):
         self.art = articulation
         self.lula = lula
         self.cfg = cfg
@@ -132,6 +183,13 @@ class RobotMotion:
         self.vlim = np.asarray(self.art.dof_properties["maxVelocity"][:6], dtype=float)
         self.cap = self.vlim * self.speed_scale / self.hz    # 스텝당 허용 관절 변화 [rad]
         self.base_xy = np.asarray(self.art.get_world_pose()[0], dtype=float)[:2]
+        # ★ 충돌구체는 **상위에서 받는다.** 안 주면 시드 선택이 꺼지고 예전 동작 그대로다
+        #   (sim_main 처럼 안 넘기는 호출부가 그대로 살아 있어야 한다).
+        #   descriptor 경로를 여기서 알 방법이 없어서 인자로 받는다 — Lula 는 이미
+        #   그 파일로 만들어져 있으므로 호출부는 알고 있다.
+        self.spheres = collision_spheres or {}
+        self.ready_q = None if ready_q is None else np.asarray(ready_q, dtype=float)
+        self._obst = []                       # move_ee 가 실어 주는 장애물 AABB [m]
 
         from isaacsim.core.utils.types import ArticulationAction
         self._Action = ArticulationAction
@@ -212,7 +270,19 @@ class RobotMotion:
                 raise ValueError
         except Exception:
             return {"accepted": False, "error": "bad target_m"}
+        # ★ 장애물은 **상위(cycle)가 준다.** robot_motion 이 씬을 뒤지지 않는다 —
+        #   무엇을 피할지는 상위 판단이고 여기는 실행기다 (CLAUDE.md §3 · D2).
+        #   형식: [[[lox,loy,loz],[hix,hiy,hiz]], ...] 월드 m. 없으면 시드 선택이 꺼진다.
+        obst = []
+        for ab in (req.get("obstacles") or []):
+            try:
+                lo, hi = np.asarray(ab[0], dtype=float), np.asarray(ab[1], dtype=float)
+                if lo.shape == (3,) and hi.shape == (3,):
+                    obst.append((lo, hi))
+            except Exception:
+                pass                          # 잘못된 항목 하나가 이동을 막으면 안 된다
         with self._lk:
+            self._obst = obst
             self._req = (target, float(req.get("yaw_deg", 0.0)))
             self._state = "MOVING"
             self._path = None
@@ -306,6 +376,93 @@ class RobotMotion:
             warm_start=np.asarray(seed, dtype=float))
         return (np.asarray(q, dtype=float) if ok else None), bool(ok)
 
+    # ── IK 가지 선택 ─────────────────────────────────────────
+    def _seed_bank(self, q):
+        """가지를 갈아탈 후보 시드 `[(이름, q), ...]`.
+
+        실측(results/proxy_test.txt)에서 **실제로 다른 해로 가는 것은 이 넷뿐**이었다.
+        시드를 더 넣어도 같은 해로 수렴한다 — 가지 수는 기구학이 정한다.
+        """
+        q = np.asarray(q, dtype=float)
+        out = [("keep", q)]
+        if IK_SEEDS == "keep" or not self.spheres or not self._obst:
+            return out                        # 점수를 못 매기면 고를 이유가 없다
+        if self.ready_q is not None:
+            out.append(("ready", self.ready_q))
+        f = q.copy()                          # 어깨 반대편 — 같은 점을 반대쪽에서 잡는다
+        f[0] = _wrap(q[0] + math.pi); f[1], f[2] = -q[1], -q[2]
+        out.append(("j1flip", f))
+        w = q.copy()                          # 손목 뒤집기 — 팔은 그대로, 손목만 다른 가지
+        w[3] = _wrap(q[3] + math.pi); w[4] = -q[4]; w[5] = _wrap(q[5] + math.pi)
+        out.append(("wflip", w))
+        return out
+
+    def _arm_clearance(self, q):
+        """자세 q 에서 팔 링크와 **실려 온 장애물** 사이 최소여유 [m]. 없으면 +inf.
+
+        링크 포즈는 Lula FK 로 낸다 — `get_all_frame_names()` 에 link_2~tool0 이 다 있어서
+        별도 FK 모듈이 필요 없다. 상대는 `move_ee` 가 준 AABB 다 (씬을 직접 안 읽는다 —
+        판단 근거는 상위가 준다. CLAUDE.md §3).
+        """
+        worst = float("inf")
+        for link, sph in self.spheres.items():
+            if link in ("base_link", "link_1"):
+                continue                      # 베이스 직상 — 팔레트에 닿을 일이 없다
+            try:
+                pos, rot = self.lula.compute_forward_kinematics(link, q)
+            except Exception:
+                continue                      # Lula 가 모르는 프레임은 건너뛴다
+            pos, rot = np.asarray(pos), np.asarray(rot)
+            for c, r in sph:
+                w = pos + rot @ np.asarray(c, dtype=float)
+                for lo, hi in self._obst:
+                    over = np.maximum(lo - w, w - hi)
+                    d = (float(np.linalg.norm(np.maximum(over, 0.0)))
+                         if np.any(over > 0) else float(np.max(over))) - r
+                    if d < worst:
+                        worst = d
+        return worst
+
+    def _pick_seed(self, face, yaw_to, q0):
+        """끝점과 경로를 함께 보고 가장 여유로운 가지를 고른다. -> (q_end, ok, 이름).
+
+        ★ 구간 **시작에서 한 번** 고르고 끝까지 유지한다. 중간에 바꾸면 관절이 180도 튄다.
+        경로는 성기게(SEED_PROBE_N) 훑는다 — 끝점만 보면 도중에 파고드는 가지를 못 거른다.
+        """
+        best = None
+        f0 = self.suction_pose()
+        bank = self._seed_bank(q0)
+        # ★ 현행 가지가 이미 충분히 여유로우면 그대로 간다 (위 SEED_KEEP_OK_M 주석).
+        if len(bank) > 1:
+            q_keep, ok_keep = self._ik(face, yaw_to, q0)
+            if ok_keep and self._arm_clearance(q_keep) >= SEED_KEEP_OK_M:
+                fk = np.asarray(self.lula.compute_forward_kinematics(self.ee, q_keep)[0])
+                if np.linalg.norm(fk - (np.asarray(face)
+                                        + np.array([0.0, 0.0, self.grip_len]))) <= IK_TOL_M:
+                    return q_keep, True, "keep"
+        for name, sd in bank:
+            q_end, ok = self._ik(face, yaw_to, sd)
+            if not ok:
+                continue
+            fk = np.asarray(self.lula.compute_forward_kinematics(self.ee, q_end)[0])
+            if np.linalg.norm(fk - (np.asarray(face)
+                                    + np.array([0.0, 0.0, self.grip_len]))) > IK_TOL_M:
+                continue
+            score, q = self._arm_clearance(q_end), q_end
+            if self._obst and self.spheres:
+                for k in range(1, SEED_PROBE_N):
+                    u = k / float(SEED_PROBE_N)
+                    qi, oki = self._ik(f0 + (np.asarray(face) - f0) * u, yaw_to, q)
+                    if not oki:
+                        continue
+                    q = qi
+                    score = min(score, self._arm_clearance(qi))
+            if best is None or score > best[0]:
+                best = (score, q_end, name)
+        if best is None:
+            return None, False, ""
+        return best[1], True, best[2]
+
     def _at(self, p, u):
         """호 위의 흡착면 좌표. 반경·높이는 선형, 각도는 짧은 쪽."""
         if not p["arc"]:
@@ -326,13 +483,12 @@ class RobotMotion:
         # 직사각 박스는 yaw 와 yaw+180 이 같은 자리다. 손목을 덜 돌리는 쪽으로 잡는다.
         yaw_to = _near(yaw_req, yaw_from, 180.0)
 
-        q_end, ok = self._ik(face, yaw_to, q0)
-        if ok:
-            fk = np.asarray(self.lula.compute_forward_kinematics(self.ee, q_end)[0],
-                            dtype=float)
-            ik_err = float(np.linalg.norm(
-                fk - (np.asarray(face) + np.array([0.0, 0.0, self.grip_len]))))
-            ok = ik_err <= IK_TOL_M
+        # ★ 가지를 여기서 한 번 고른다 (구간 내내 유지된다). 장애물이나 충돌구체가
+        #   없으면 _seed_bank 가 keep 하나만 주므로 예전과 완전히 같은 경로다.
+        q_end, ok, seed_name = self._pick_seed(face, yaw_to, q0)
+        if ok and seed_name and seed_name != "keep":
+            self._log("[robot_motion] IK 가지 '%s' 선택 (여유 %+.0f mm)"
+                      % (seed_name, self._arm_clearance(q_end) * 1000))
         if not ok:
             # ★ ok 플래그만 믿지 않는다. 해를 FK 로 되돌려 목표와 맞는지까지 본다.
             self._state = "IK_FAIL"
@@ -417,6 +573,14 @@ class RobotMotion:
         if self._settle <= 0:
             if err > LOG_RESIDUAL_M:
                 self._warn_residual(p, err)
+            if err > REACH_ABORT_M:
+                # ★ 여기서 REACHED 를 주면 호출부가 **그 자리에서 놓는다.**
+                #   실패로 알려 cycle 이 이탈 경로(cancel_plan -> 복귀)를 타게 한다.
+                self._log("[robot_motion] 잔차 %.0f mm > 한도 %.0f mm — 실패로 알린다"
+                          % (err * 1000, REACH_ABORT_M * 1000))
+                self._state = "IK_FAIL"
+                self._path = None
+                return
             self._reach_done(err, p)
 
     def _warn_residual(self, p, err):
