@@ -60,11 +60,22 @@ def main():
 
     # 3. 좀비 노드
     print("\n[좀비 노드]")
-    zombies = [l for l in sh("pgrep -af 'install/packing' ").splitlines() if "pgrep" not in l]
+    # ★ 자기 자신을 세면 안 된다. `ros2 run packing_algo rehearsal_check` 는
+    #   install/packing_algo/lib/... 로 실행되므로 이 pgrep 에 그대로 걸린다 —
+    #   그러면 아무것도 안 떠 있어도 항상 "좀비 1개" 로 실패한다.
+    mine = {str(os.getpid()), str(os.getppid())}
+    zombies = [l for l in sh("pgrep -af 'install/packing' ").splitlines()
+               if "pgrep" not in l and l.split(" ", 1)[0] not in mine
+               and "rehearsal_check" not in l]
+    # ★ 경고가 아니라 실패로 다룬다. 좀비가 살아 있으면 서비스 서버가 둘이 되어
+    #   **꽉 찬 팔레트를 든 옛 노드가 NO_FEASIBLE_POSE 를 답한다.** 새 노드는 OK 를
+    #   로그에 찍는데 클라이언트는 다른 답을 받아, 로그만 보면 원인을 찾을 수 없다.
+    #   실제로 두 번 당했다 (박스 1개에 "적재 27개" · 20개 전부 버림).
     check(f"살아 있는 packing 프로세스 {len(zombies)}개", len(zombies) == 0,
-          "이전 실행이 남아 heightmap 을 든 채로 응답한다. "
-          "kill -9 로 정리할 것:\n       " + "\n       ".join(z.split()[0] for z in zombies)
-          if zombies else "", warn_only=True)
+          "서비스 서버가 둘이 되어 옛 노드가 엉뚱한 답을 한다. 반드시 정리할 것:\n"
+          "       ps -eo pid,args --no-headers | grep packing_ | grep -v grep "
+          "| awk '{print $1}' | xargs -r kill -9"
+          if zombies else "")
 
     # 4. config 정합성 (B·C 계약)
     print("\n[config · 좌표 계약]")

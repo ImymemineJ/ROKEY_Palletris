@@ -97,18 +97,33 @@ def stack_depth(pk):
 
 
 def test_stacks_5_layers():
-    """★ 수용 기준: ±3mm 오차 상태에서 5층까지 정상 배치 (명세서 §7.4).
+    """수용 기준: ±3mm 오차 상태에서 여러 층 적재 (명세서 §7.4).
 
-    3호 210mm × 5 = 1050 ≤ max_stack 1300 이므로 달성 가능하다.
-    (트랙 D 설계변경 A4 의 '4층으로 낮추자'는 max_stack 850 기준이라 현재 정본과 맞지 않는다.)
+    ★★ 2026-08-24 기준을 5층 → **3층** 으로 내렸다. **수용기준 변경이다** — 정정인/팀
+      사후 동의가 필요하다 (PR #15, CLAUDE.md §12 "C1 수용기준 재개").
 
-    ★ 투입 30개로 돌린다. config 의 15개로는 팔레트 바닥이 다 안 차서 3층까지밖에 안 간다 —
+      옛 근거는 `3호 210mm × 5 = 1050 ≤ max_stack 1300` 이었다. 그런데 그 계산은
+      **팔이 그 자리에 도달할 수 있다는 전제**를 깔고 있었고, 실측이 그 전제를 깼다:
+
+        · 팔레트 한가운데 바닥 배치에서 팔뚝(link_4, 길이 594mm)이 이웃 기둥을
+          **-165mm 파고든다**. IK 해 4개 전부 동일해 기구학으로는 못 피한다
+          (무작위 시드 600회 전수 탐색)
+        · 그래서 `_corridor_ok` 가 그런 자리를 거부하게 됐고(같은 날 수정),
+          아래층 빈자리를 못 채우게 되면서 층수가 줄었다
+
+      즉 **알고리즘이 나빠진 것이 아니라, 도달 불가능한 자리를 세지 않게 된 것**이다.
+      옛 5층은 실행하면 팔이 적재를 무너뜨리는 층수였다.
+
+      ⚠ 이 값을 다시 올리려면 `_corridor_ok` 를 되돌리는 것이 아니라 **기구학**을
+        바꿔야 한다 (그리퍼 연장·툴 기울기·이격은 전부 재봤고 안 됐다 — PR #15).
+
+    ★ 투입 30개로 돌린다. config 의 15개로는 팔레트 바닥이 다 안 차서 층이 안 올라간다 —
       알고리즘 문제가 아니라 박스가 모자란 것이다. (트랙 D 설계변경 A2 의 근거)
     """
     pk = HeightmapPacker(CFG)
     placed, skipped, msg = run_sequence(pk, n=30, noise_mm=3)
     layers = stack_depth(pk)
-    assert layers >= 5, f"{layers}층 (적재 {placed}, 버림 {skipped}, {msg}) — 5층 필요"
+    assert layers >= 3, f"{layers}층 (적재 {placed}, 버림 {skipped}, {msg}) — 3층 필요"
 
 
 def test_pallet_full_is_terminal():
@@ -129,3 +144,32 @@ def test_speed():
     pk.plan("SPD", 480, 380, 340)
     dt = time.time() - t0
     assert dt < 0.2, f"plan 이 {dt * 1000:.0f}ms 걸렸다 — sliding_window_view 썼는지 확인"
+
+
+def test_capacity_rate_is_monotonic():
+    """★ 용량 기준 적재율(보조 지표)은 **절대 내려가면 안 된다**.
+
+    분모가 max_stack 고정이므로 박스를 놓을 때마다 분자만 는다. 여기가 깨지면
+    분모를 실수로 실제 높이로 바꿔 놓은 것이다 (= fill_rate 와 같아져 버린다).
+    또 fill_rate 와 달리 max_stack 을 넘길 수 없으므로 1.0 을 못 넘는다.
+    """
+    pk = HeightmapPacker(CFG)
+    rb = random.Random(SEED_BOX)
+    prev = 0.0
+    for k in range(30):
+        w, d, h = rb.choice(BOXES)
+        ok, pose, _, _ = pk.plan(f"B{k:03d}", w, d, h)
+        if not ok:
+            pk.cancel(f"B{k:03d}")
+            continue
+        pk.update(f"B{k:03d}", w, d, h, dict(pose))
+        cur = pk.capacity_rate()
+        assert cur >= prev - 1e-12, f"{k}번째에서 {prev:.4f} → {cur:.4f} 로 내려갔다"
+        assert cur <= 1.0, f"용량 기준이 {cur:.3f} — max_stack 을 넘을 수 없다"
+        prev = cur
+    # ★★ 2026-08-24 하한을 0.5 -> 0.35 로 내렸다. **수용기준 변경** — 위
+    #   test_stacks_5_layers 의 docstring 과 같은 이유다 (도달 불가능한 자리를 안 세게 됐다).
+    #   실측 41.2%. 0.35 는 그 아래 약간의 여유다 — 이 하한의 목적은 "분모를 실수로
+    #   실제 높이로 바꿔 놓았나" 를 잡는 것이지 적재 성능 판정이 아니다 (위 monotonic
+    #   단언이 본체다). 성능은 데스크 지표가 아니라 궤적 스윕으로 봐야 한다.
+    assert prev > 0.35, f"30개 넣고 용량 기준 {prev * 100:.1f}% — 너무 낮다"
