@@ -17,6 +17,11 @@ class HeightmapPacker:
         self.w_wall = hm_cfg.get("w_wall", 0.0)             # 벽 밀착도 (0 이면 기존 동작)
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
+        # ★ 하강 통로는 **팔 굵기**로 봐야 한다 — gripper_clearance_mm(30) 이 아니다.
+        #   두 값 다 system.yaml 에 이미 있다. 새 상수를 지어내지 않는다.
+        rb = cfg["robot"]
+        self.arm_r = rb["gripper_body_diameter_mm"] // 2 // self.cell   # 122//10 = 12셀
+        self.arm_gap = rb["gripper_length_mm"]                          # 150 mm
         self.min_sup = hm_cfg["min_support_ratio"]          # 0.7
         self.topk = hm_cfg["topk_support_check"]            # 50
         self.yaw_tol = hm_cfg["yaw_tol_deg"]                # 5.0 — 이만큼 틀어지면 AABB 기록
@@ -48,7 +53,7 @@ class HeightmapPacker:
             wc, dc = w // self.cell, d // self.cell
             bz = self._base_z(wc, dc)                       # ① 경계는 shape가 처리
             ok_h = bz + h_mm <= self.max_stack              # ② 높이
-            corridor = self._corridor_ok(wc, dc, bz)        # ④ 통로 (전 후보, 필터로 싸다)
+            corridor = self._corridor_ok(wc, dc, bz, h_mm)  # ④ 통로 (전 후보, 필터로 싸다)
             cand = ok_h & corridor
             if not cand.any(): continue
             # 지지율 전 1차 점수. 후보가 아닌 칸은 -inf 로 빼서 topk 자리를 낭비하지 않게 한다.
@@ -119,12 +124,29 @@ class HeightmapPacker:
         foot = self.hm[i:i + wc, j:j + dc]
         return float((np.abs(foot - base_z) <= self.tol).mean())   # ★ tol=10 필수
 
-    def _corridor_ok(self, wc, dc, bz):
-        """그리퍼 여유 포함 확장 윈도의 최대가 밑면 이하인가 — 패딩으로 경계 처리"""
-        c = self.clr
+    def _corridor_ok(self, wc, dc, bz, h_mm):
+        """주변 '팔 굵기' 만큼을 보되, 기준은 박스 **윗면 + 그리퍼 길이** 다.
+
+        ★ 2026-08-24 수정. 구 코드는 반경 30mm 링을 박스 **밑면**(bz)과 비교했다.
+          그게 두 가지를 동시에 망쳤다:
+
+          1) **너무 빡빡하다.** 박스는 자기보다 높은 이웃 **옆에 미끄러져 들어가도**
+             아무 문제가 없다. 그런데 밑면 기준은 그걸 금지한다. 그래서
+             `gripper_clearance_mm` 을 올리면 협곡은 그대로인 채 적재율만 떨어졌다
+             (실측 clr 30 -> 60: 협곡 2.55 -> 2.50, 적재율 -4.6%p).
+          2) **정작 부딪히는 걸 못 본다.** 실제로 닿는 것은 박스 윗면 **위**를 지나는
+             팔뚝(link_4, 길이 594mm)인데, 밑면 기준으로는 그 높이가 시야에 없다.
+             실측: 팔레트 한가운데 바닥 배치에서 link_4 가 -165mm 파고들었고,
+             그 자세는 IK 해 4개 전부 동일해 **기구학으로는 못 피한다**.
+
+          박스 윗면부터 `arm_gap`(그리퍼 길이 150mm)까지는 그리퍼 몸통(Ø245)만 지나가고,
+          그 몸통은 **모든 박스 발자국 안에 들어간다** (최소 3호 340x250 의 반폭 125 >
+          몸통 반경 122.5). 그래서 그 구간은 이웃이 높아도 안 닿는다. 팔뚝은 그 위부터다.
+        """
+        c = self.arm_r
         pad = np.pad(self.hm, c, mode="constant", constant_values=0)
         big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + 2 * c, 1)
-        return big <= bz + self.tol
+        return big <= bz + h_mm + self.arm_gap + self.tol
 
     def update(self, box_id, w_mm, d_mm, h_mm, actual):
         """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)"""
