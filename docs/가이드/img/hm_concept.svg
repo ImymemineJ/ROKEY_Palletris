@@ -33,6 +33,6 @@
     <rect x="500" y="225" width="80" height="34" fill="#f9fafb" stroke="#9ca3af"/>
     <text x="540" y="247" fill="#6b7280" font-weight="bold">0</text>
   </g>
-  <text x="60" y="280" font-size="12.5" fill="#374151">hm[80][120] : 셀 하나 = 10mm × 10mm, 값 = 그 자리의 현재 높이(mm)</text>
+  <text x="60" y="280" font-size="12.5" fill="#374151">hm[120][80] : 셀 하나 = 10mm × 10mm, 값 = 그 자리의 현재 높이(mm)</text>
   <text x="60" y="300" font-size="12" fill="#6b7280">박스를 놓으면 → 점유 셀들의 값을 (밑면 + 박스 높이)로 갱신. 배치 결정은 전부 이 배열 위에서.</text>
 </svg>

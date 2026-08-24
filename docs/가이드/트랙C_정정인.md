@@ -266,7 +266,8 @@ class BaselinePacker(HeightmapPacker):
 
 **비교 실험** `scripts/compare_baseline.py`: seed 42의 동일 15박스 시퀀스를 두 패커에 넣고 (각각 `run_sequence` 재사용) fill_rate 곡선 두 개를 한 그래프에. **이 그래프가 발표의 "최적화 증명"이다.**
 
-**Day 2 저녁:** G1 결과가 오면 `max_stack_mm`을 850(또는 확정값)으로 고정하고 테스트 재실행.
+**Day 2 저녁:** G1 은 통과했고 `max_stack_mm` 은 **1300 으로 확정**됐다 (작업명세서 §3.4 · `system.yaml`). 이 값으로 테스트를 재실행한다.
+> 850 은 트럭 내高를 1000 으로 가정하던 옛 값이다 — 구 사양서 §5-1 의 1600 을 채택하며 폐기됐다.
 
 ---
 
