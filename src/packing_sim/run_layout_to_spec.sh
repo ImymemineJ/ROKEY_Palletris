@@ -20,7 +20,7 @@ PL_SPEC="$(python3 -c "
 import yaml, json, sys
 c = yaml.safe_load(open('$SPEC_YAML'))
 # truck 은 씬에 야드 지면을 그릴 때만 쓴다. 높이 계산에는 안 들어간다 (작업명세서 §3.1).
-json.dump({k: c[k] for k in ('zones', 'conveyor', 'pallet', 'robot', 'truck', 'boxes', 'physics', 'recognition') if k in c}, sys.stdout)
+json.dump({k: c[k] for k in ('zones', 'conveyor', 'pallet', 'robot', 'truck', 'boxes', 'physics', 'recognition', 'lighting') if k in c}, sys.stdout)
 ")"
 export PL_SPEC
 

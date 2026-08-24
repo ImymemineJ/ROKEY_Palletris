@@ -84,6 +84,7 @@ OUTFEED = "/World/PalletOutfeed"
 ROBOT = "/World/robot"
 CAM_PICK = "/World/CamPick"               # 픽업 하향 카메라 (하우징)
 CAM_PRIM = CAM_PICK + "/Camera"           # 실제 Camera 프림
+GRIPPER = ROBOT + "/gripper"              # 흡착 그리퍼 몸통 (link_6 에 고정조인트)
 # H2017 **흡착 그리퍼가 붙은 판** — 로봇 트랙(B)이 만든 정본이다.
 #   ~/isaac_assets/h2017_suction.usd
 #     /h2017/SurfaceGripper  [IsaacSurfaceGripper]  coaxial 1e6 · maxGripDistance 20mm
@@ -629,6 +630,95 @@ if os.path.exists(ROBOT_USD):
 else:
     print(f"로봇 건너뜀 — {ROBOT_USD} 가 없다. "
           f"h2017/HANDOFF.md 의 make_h2017_usd.py 로 만들어라.")
+
+# ── 6b) 손목 카메라 (RealSense D455 상정) ────────────────────
+# ★ 반드시 로봇 블록 **뒤**여야 한다 — 위 `drop("/World", "robot")` 이 /World/robot
+#   스펙을 통째로 지우므로, 그 아래에 먼저 써 두면 같이 날아간다.
+# ★ tool0 는 참조 에셋 안에 있는 링크다. 루트 레이어에서 그 아래에 프림을 새로
+#   정의하면 합성 결과에 얹힌다. 물리는 안 붙인다 — 링크에 콜라이더나 질량을
+#   더하면 아티큘레이션 동역학이 바뀐다.
+# ★ 흡착 방향이 tool0 의 **+Z** 다 (`robot_motion` 이 흡착면을 p + R[:,2]*grip_len
+#   으로 잡는다). USD 카메라는 자기 로컬 **-Z** 를 보므로, X 축으로 180도 돌려
+#   카메라의 -Z 가 부모의 +Z 를 향하게 한다. 쿼터니언 (w,x,y,z) = (0,1,0,0).
+_wc = _rec.get("wrist_cam", {})
+if _wc.get("enabled") and os.path.exists(ROBOT_USD):
+    CAM_PARENT = _wc.get("parent", GRIPPER)
+    CAM_WRIST = CAM_PARENT + "/CamWrist"
+    CAM_WRIST_PRIM = CAM_WRIST + "/Camera"
+    wo = [v / 1000.0 for v in _wc.get("offset_mm", [170, 0, 30])]
+    whw, whd, whh = (v / 1000.0 for v in _wc.get("housing_mm", [124, 26, 29]))
+    # ★ 시선 기울기. 툴 +Y 축 둘레로 -tilt 만큼 돌리면 시선이 툴 축 쪽으로 기운다.
+    #   쿼터니언 (w,x,y,z) = (cos(t/2), 0, -sin(t/2), 0).
+    tilt = math.radians(float(_wc.get("tilt_deg", 18)))
+    wq = (math.cos(tilt / 2.0), 0.0, -math.sin(tilt / 2.0), 0.0)
+
+    drop(CAM_PARENT, "CamWrist")
+    spec = define(CAM_WRIST, "Xform")
+    xform(spec, (wo[0], wo[1], wo[2]), (1.0, 1.0, 1.0), quat=wq)
+
+    spec = define(CAM_WRIST + "/Body", "Cube")
+    put(spec, "size", Sdf.ValueTypeNames.Double, 1.0)
+    put(spec, "extent", Sdf.ValueTypeNames.Float3Array,
+        [Gf.Vec3f(-0.5, -0.5, -0.5), Gf.Vec3f(0.5, 0.5, 0.5)])
+    put(spec, "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray,
+        [Gf.Vec3f(0.10, 0.10, 0.12)])
+    # 하우징은 두께 방향이 툴 z (시선) 가 되게 눕힌다.
+    # ★ 긴 변(124)을 **접선 방향**으로 돌린다. 반경 방향으로 두면 ±62 mm 라
+    #   그리퍼 몸통(반경 122.8)을 파고든다 — 카메라 중심을 170 으로 빼도 하우징
+    #   안쪽 끝이 108 이라 여전히 박힌다. 접선으로 눕히면 반경 폭이 ±14.5 다.
+    if _wc.get("housing_tangential", True):
+        xform(spec, (0.0, 0.0, 0.0), (whh, whw, whd))
+    else:
+        xform(spec, (0.0, 0.0, 0.0), (whw, whh, whd))
+
+    spec = define(CAM_WRIST_PRIM, "Camera")
+    res = _rec.get("resolution", [1280, 720])
+    hfov = float(_rec.get("hfov_deg", 60))
+    ap_h = 36.0
+    focal = ap_h / (2.0 * math.tan(math.radians(hfov) / 2.0))
+    put(spec, "focalLength", Sdf.ValueTypeNames.Float, focal)
+    put(spec, "horizontalAperture", Sdf.ValueTypeNames.Float, ap_h)
+    put(spec, "verticalAperture", Sdf.ValueTypeNames.Float,
+        ap_h * float(res[1]) / float(res[0]))
+    put(spec, "clippingRange", Sdf.ValueTypeNames.Float2, Gf.Vec2f(0.02, 6.0))
+    xform(spec, (0.0, 0.0, whd / 2.0), (1.0, 1.0, 1.0), quat=(0.0, 1.0, 0.0, 0.0))
+
+    print(f"손목 카메라 {CAM_WRIST}  부모 로컬 offset "
+          f"({wo[0]*1000:.0f}, {wo[1]*1000:.0f}, {wo[2]*1000:.0f}) mm  "
+          f"기울기 {math.degrees(tilt):.0f} deg  "
+          f"{_wc.get('model')} {res[0]}x{res[1]} hfov {hfov:.0f} deg")
+    print(f"      그리퍼 몸통(반경 122.8 · z 0~150 mm) 바깥에 두고 흡착면 쪽으로 "
+          f"기울였다 · 콜라이더/질량 없음 (동역학 안 건드림)")
+
+# ── 6c) 조명 (돔) ────────────────────────────────────────────
+# ★ 왜 필요한가. 씬에는 /Environment/defaultLight (DistantLight 3000) 하나뿐인데,
+#   **GUI 뷰포트는 그것만으로도 밝게 보인다** — 뷰포트가 자기 조명 리그를 얹기
+#   때문이다. 그런데 오프스크린 렌더(ROS 로 내보내는 카메라, 인식용 render
+#   product)에는 그 리그가 없다. 씬 조명만 받는다.
+#   실측 2026-08-24, 한 실행에서 돔만 켜고 끄며 잰 화소 평균 / 순수 검정 비율:
+#       픽업   180/0.00 -> 196/0.00      손목   94/0.60 -> 233/0.00
+#       persp  220/0.00 -> 235/0.00
+#   손목처럼 배경(하늘)이 많이 잡히는 시야는 돔이 없으면 화면의 60 %가 순수 검정이다.
+#   물리에는 영향이 없다 (콜라이더도 질량도 없다).
+#   ※ 손목 카메라가 아예 새까맣게(전부 0) 나왔던 것은 조명이 아니라 카메라가
+#     그리퍼 몸통 안에 박혀 있었기 때문이다 — 그건 6b 의 offset 으로 고쳤다.
+_lt = SPEC.get("lighting", {}).get("dome", {})
+if _lt.get("enabled", True):
+    drop("/Environment", "DomeLight")
+    spec = define("/Environment/DomeLight", "DomeLight")
+    put(spec, "inputs:intensity", Sdf.ValueTypeNames.Float,
+        float(_lt.get("intensity", 1000)))
+    _c = _lt.get("color", [1.0, 1.0, 1.0])
+    put(spec, "inputs:color", Sdf.ValueTypeNames.Color3f, Gf.Vec3f(*_c))
+    put(spec, "inputs:exposure", Sdf.ValueTypeNames.Float, 0.0)
+    # UsdLux 는 렌더 델리게이트에 이 토큰으로 조명 종류를 알린다.
+    # 기존 defaultLight 도 light:shaderId 를 들고 있다 — 같은 형태로 맞춘다.
+    put(spec, "light:shaderId", Sdf.ValueTypeNames.Token, "DomeLight",
+        uniform=True)
+    xform(spec, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    print(f"돔 조명 /Environment/DomeLight  intensity "
+          f"{_lt.get('intensity', 1000)}  color {_c}")
+    print(f"      오프스크린 렌더(ROS 카메라·인식)가 씬 조명만 받기 때문에 넣는다")
 
 layer.Save()
 print(f"\n저장 완료: {USD_PATH}")

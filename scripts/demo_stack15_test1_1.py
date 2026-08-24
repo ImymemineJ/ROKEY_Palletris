@@ -3,6 +3,30 @@
     cd ~/isaacsim && ./isaac-sim.sh --no-window \
         --exec /home/rokey/palletris_ws/scripts/demo_stack15_test1_1.py
 
+## 화면 둘 (시연, demo 모드)
+
+    view2  Isaac 창 안에 두 번째 뷰포트가 자동으로 뜬다 — **벨트 위 하향 카메라**
+           (/World/CamPick). 박스가 스토퍼에 서는 것을 위에서 본다.
+    rqt    **그리퍼 손목 카메라**(/World/robot/gripper/CamWrist)는 창을 안 만든다.
+           ROS 2 이미지 토픽 `/wrist_cam/rgb` 로 나가고, 다른 프로세스가 그린다.
+
+    창 하나당 렌더 틱이 느려지고 벨트·소켓이 그 틱에 물려 있어 사이클이 밀린다
+    (실측 +35 %, 아래 CAM_PICK_PRIM 근처 주석). 그래서 창은 하나만 쓴다.
+
+    터미널 1                      터미널 2
+    ---------------------------   ------------------------------------------
+    ~/palletris_ws/scripts/run_demo.sh
+                                  ros2 run rqt_image_view rqt_image_view \
+                                      /wrist_cam/rgb
+
+    run_demo.sh 를 안 쓰고 직접 부를 거면 브릿지 .so 경로를 먼저 잡아야 한다
+    (`.bashrc` 의 isaac_ros 함수):
+
+        isaac_ros && cd ~/isaacsim && \
+            ./isaac-sim.sh --exec ~/palletris_ws/scripts/demo_stack15_test1_1.py
+
+    끄려면 PL_CAMVIEW=0 (view2) · PL_WRISTROS=0 (손목 발행). gate 모드는 둘 다 끔.
+
 `scripts/demo_stack15.py`(B5) 는 받침대만 있는 합성 씬에서 박스를 픽 지점으로
 **급송**해 15개를 쌓는다. 이 스크립트는 같은 15개를 **A 가 만든 진짜 라인**으로
 보낸다 — 컨베이어를 타고 와서 스토퍼에 서고, 거기서 집힌다. 새로 만드는 것은
@@ -131,7 +155,20 @@ WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
-HOLD = _env("PL_HOLD") not in ("", "0", "false", "no")
+def _has_window():
+    """이 실행에 창이 있나. `--no-window` 면 False."""
+    try:
+        import carb.settings
+        return bool(carb.settings.get_settings().get("/app/window/enabled"))
+    except Exception:
+        return False
+
+
+# ★ 창이 없으면 HOLD 는 의미가 없다. 그런데 예전 판은 그래도 붙잡아서, 헤드리스로
+#   돌린 검증 실행이 **결과를 다 찍고도 안 죽었다.** 그게 셋씩 쌓여 GPU 를 나눠
+#   쓰는 바람에 바로 그 다음 측정이 통째로 틀어졌다 (실측: 사이클 12.3 -> 26.0 s).
+#   재현 안 되는 측정을 만드는 종류라 여기서 막는다.
+HOLD = _env("PL_HOLD") not in ("", "0", "false", "no") and _has_window()
 PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
 # ★ 팔 속도. **이 실행에서만** 덮어쓴다 — system.yaml 도 B 코드도 안 건드린다.
 #   왜 필요한가: 이송 구간이 177도를 도는데 박스는 흡착 패드에 강성 100 · 감쇠 0
@@ -160,6 +197,41 @@ METER_MAX = int(os.environ.get("PL_METER", "1"))
 #   `perception.CameraPerception._pointcloud_world` 가 depth + intrinsics 로
 #   직접 투영한다. 그쪽으로 갈아끼우면 된다.
 CAM = os.environ.get("PL_CAM", "0") not in ("0", "false", "no")
+# ★ 화면 둘을 **다른 방식으로** 낸다 (2026-08-24).
+#     view2 (Isaac 두 번째 뷰포트)  = 벨트 위 하향 카메라  /World/CamPick
+#     rqt   (별도 프로세스)          = 그리퍼 손목 카메라  /World/robot/gripper/CamWrist
+#
+#   왜 손목만 ROS 로 빼는가. **뷰포트는 공짜가 아니다.** 하나 더 붙으면 렌더 틱이
+#   느려지는데 벨트 IsaacConveyor 노드와 소켓 주기가 그 틱에 물려 있어 사이클 전체가
+#   밀린다. 실측 2026-08-23 (11박스, 창 하나 추가):
+#       없음    사이클 12.3 s · 벽시계 203 s · knock  0.7 mm
+#       창 하나 사이클 16.6 s · 벽시계 268 s · knock 15.7 mm   (+35 %)
+#   knock 경고선이 20 이라 창 둘은 못 띄운다. 그래서 하나(벨트)만 창으로 두고,
+#   손목은 렌더 프로덕트 하나를 ROS 2 이미지 토픽에 실어 **다른 프로세스**(rqt)가
+#   그리게 한다 — 그리는 비용이 Isaac 밖으로 나간다. 그래도 렌더 프로덕트 자체는
+#   공짜가 아니라 해상도를 낮추고 frameSkipCount 로 발행 주기를 떨군다.
+#   게이트(gate 모드)에서는 둘 다 끈다 — 수치를 재는 실행에 보여주기용 부하를
+#   얹으면 비교가 안 된다.
+CAM_PICK_PRIM = "/World/CamPick/Camera"                    # 벨트 위 하향 (창)
+CAM_WRIST_PRIM = "/World/robot/gripper/CamWrist/Camera"    # 손목 (ROS 토픽)
+CAMVIEW_RES = (480, 270)          # 창 렌더 해상도. 창 크기와 무관하게 비용을 정한다.
+_DEFAULTS["PL_CAMVIEW"] = ("1", "0")          # demo 만 켠다
+CAMVIEW = _env("PL_CAMVIEW") not in ("0", "false", "no")
+# ★ 손목 카메라를 ROS 2 이미지로 발행한다.  rqt_image_view 로 본다.
+#     /wrist_cam/rgb   (sensor_msgs/Image)      <- 이걸 rqt 에 물린다
+#     /wrist_cam/camera_info
+#   rclpy 는 안 쓴다 — Isaac 은 3.11, Jazzy 의 rclpy 는 3.12 라 import 하면 죽는다
+#   (docs/가이드/공통가이드_전원필독.md §3). 브릿지가 C++ 로 주는 OmniGraph 노드만 쓴다.
+#   ⚠ 실행 **전에** 브릿지 .so 경로를 잡아야 한다. `.bashrc` 의 `isaac_ros` 함수다:
+#       export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:\
+#           $HOME/isaacsim/exts/isaacsim.ros2.bridge/jazzy/lib
+#     프로세스가 뜬 뒤에 os.environ 을 고쳐도 소용없다 (glibc 가 시작 때 읽는다).
+WRIST_ROS_RES = (424, 240)
+WRIST_ROS_NS = os.environ.get("PL_WRIST_TOPIC", "wrist_cam")
+WRIST_ROS_SKIP = int(os.environ.get("PL_WRIST_SKIP", "3"))   # 3 = 네 틱에 한 장
+WRIST_GRAPH = "/World/ROS2WristCam"
+_DEFAULTS["PL_WRISTROS"] = ("1", "0")         # demo 만 켠다
+WRISTROS = _env("PL_WRISTROS") not in ("0", "false", "no")
 
 cfg = _paths.system_config()
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
@@ -278,8 +350,10 @@ log("=" * 78)
 log("모드      %s%s"
     % (MODE, "  (창을 띄우고 보여주는 실행 — 사양값이 아니다)" if MODE == "demo"
        else "  (전부 사양값 — 베이스라인)"))
-log("설정      박스 %d · 순서 %s · 팔속도 %s · 계량 %s · 카메라 %s · 창유지 %s"
+log("설정      박스 %d · 순서 %s · 팔속도 %s · 계량 %s · 인식 %s"
+    " · view2 %s · 손목ROS %s · 창유지 %s"
     % (N, ORDER, SPEED or "사양", METER_MAX or "끔", "켬" if CAM else "끔",
+       "켬" if CAMVIEW else "끔", "켬" if WRISTROS else "끔",
        "켬" if HOLD else "끔"))
 log("씬        %s" % STAGE)
 log("팔레트    원점 %s mm   최대 적재 %s mm" % (ORIGIN_MM, cfg["pallet"]["max_stack_mm"]))
@@ -295,6 +369,134 @@ for p in (ROBOT_PRIM, GRIPPER_PRIM, "/World/Stopper"):
         _kitexit.shutdown(2, log=log)
         raise SystemExit
 log("-" * 78)
+
+# ── view2 = 벨트 위 하향 카메라 창 ─────────────────────────
+if CAMVIEW and stage.GetPrimAtPath(CAM_PICK_PRIM).IsValid():
+    try:
+        from omni.kit.viewport.utility import create_viewport_window
+        _vw = create_viewport_window("벨트 카메라 (RSD455 하향)",
+                                     width=560, height=340)
+        _vw.viewport_api.set_active_camera(CAM_PICK_PRIM)
+        _vw.viewport_api.resolution = CAMVIEW_RES   # 렌더 비용을 창 크기에서 떼어낸다
+        _S["camview"] = _vw
+        log("뷰포트    view2 = %s  %dx%d" % (CAM_PICK_PRIM, *CAMVIEW_RES))
+    except Exception as _e:
+        # 헤드리스(--no-window)면 여기로 온다. 실패가 정상이므로 조용히 넘어간다.
+        log("뷰포트    두 번째 창 없음 (%s) — 창 없는 실행이면 정상"
+            % type(_e).__name__)
+elif CAMVIEW:
+    log("뷰포트    %s 가 씬에 없다 — run_layout_to_spec.sh 를 다시 돌려라"
+        % CAM_PICK_PRIM)
+
+
+# ── 손목 카메라 -> ROS 2 이미지 (rqt_image_view 로 본다) ────
+def _wrist_cam_to_ros():
+    """손목 카메라를 `/<ns>/rgb` 로 발행하는 액션 그래프를 이 실행에만 만든다.
+
+    ★ 그래프는 **저장하지 않는다.** 이 드라이버는 `save_stage()` 를 한 번도 안
+      부르므로 메모리 스테이지에만 남고 `test1-1.usd` 는 안 변한다. 씬 파일에
+      박아 두지 않는 이유: 게이트 실행(gate 모드)은 이 부하가 없어야 하고,
+      브릿지가 안 켜진 환경에서 씬을 열면 그래프가 매 틱 에러를 낸다.
+
+    ★ 왜 다음 앱 업데이트에서 만드는가. `enable_extension` 직후에는 브릿지가
+      OmniGraph 노드 타입을 아직 등록 중일 수 있다. 여기는 `--exec` 라
+      `simulation_app.update()` 손잡이가 없어서 (`_kitexit` 과 같은 이유)
+      업데이트 이벤트를 한 번 받고 만든다.
+    """
+    from isaacsim.core.utils.extensions import enable_extension
+
+    _lib = os.path.expanduser(
+        "~/isaacsim/exts/isaacsim.ros2.bridge/%s/lib"
+        % os.environ.get("ROS_DISTRO", "jazzy"))
+    if _lib not in os.environ.get("LD_LIBRARY_PATH", ""):
+        log("손목ROS   ⚠ LD_LIBRARY_PATH 에 브릿지 경로가 없다. 그래도 시도한다.")
+        log("          안 되면 실행 전에:  isaac_ros      (.bashrc 함수)")
+
+    enable_extension("isaacsim.core.nodes")
+    if not enable_extension("isaacsim.ros2.bridge"):
+        log("손목ROS   isaacsim.ros2.bridge 를 못 켰다 — 발행 안 한다.")
+        log("          isaac_ros 를 부른 터미널에서 다시 실행해라.")
+        return
+
+    _st = {"sub": None, "n": 0}
+
+    def _build(_e):
+        _st["n"] += 1
+        if _st["n"] < 3:                     # 노드 타입이 등록될 틈을 준다
+            return
+        try:
+            _st["sub"].unsubscribe()
+        except Exception:
+            pass
+        try:
+            import omni.graph.core as og
+            import usdrt.Sdf
+            keys = og.Controller.Keys
+            og.Controller.edit(
+                {"graph_path": WRIST_GRAPH, "evaluator_name": "execution"},
+                {
+                    keys.CREATE_NODES: [
+                        ("Tick", "omni.graph.action.OnPlaybackTick"),
+                        ("Ctx", "isaacsim.ros2.bridge.ROS2Context"),
+                        ("RP", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
+                        ("Rgb", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                        # camera_info 는 CameraHelper 가 안 쏜다. 별도 노드다.
+                        # rqt 에는 필요 없지만 좌표 인식(camera_pick.py)이
+                        # intrinsics 를 여기서 가져가게 같이 낸다. 렌더 프로덕트를
+                        # 공유하므로 추가 렌더 비용은 없다.
+                        ("Info", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
+                    ],
+                    keys.SET_VALUES: [
+                        # 도메인은 씬에 박지 않고 ROS_DOMAIN_ID 를 따른다 (팀 값 116).
+                        ("Ctx.inputs:useDomainIDEnvVar", True),
+                        ("RP.inputs:cameraPrim",
+                         [usdrt.Sdf.Path(CAM_WRIST_PRIM)]),
+                        ("RP.inputs:width", WRIST_ROS_RES[0]),
+                        ("RP.inputs:height", WRIST_ROS_RES[1]),
+                        ("Rgb.inputs:topicName", WRIST_ROS_NS + "/rgb"),
+                        ("Rgb.inputs:type", "rgb"),
+                        ("Rgb.inputs:frameId", "wrist_cam"),
+                        ("Rgb.inputs:frameSkipCount", WRIST_ROS_SKIP),
+                        ("Rgb.inputs:resetSimulationTimeOnStop", True),
+                        ("Info.inputs:topicName", WRIST_ROS_NS + "/camera_info"),
+                        ("Info.inputs:frameId", "wrist_cam"),
+                        ("Info.inputs:frameSkipCount", WRIST_ROS_SKIP),
+                        ("Info.inputs:resetSimulationTimeOnStop", True),
+                    ],
+                    keys.CONNECT: [
+                        ("Tick.outputs:tick", "RP.inputs:execIn"),
+                        ("RP.outputs:execOut", "Rgb.inputs:execIn"),
+                        ("RP.outputs:renderProductPath",
+                         "Rgb.inputs:renderProductPath"),
+                        ("Ctx.outputs:context", "Rgb.inputs:context"),
+                        ("RP.outputs:execOut", "Info.inputs:execIn"),
+                        ("RP.outputs:renderProductPath",
+                         "Info.inputs:renderProductPath"),
+                        ("Ctx.outputs:context", "Info.inputs:context"),
+                    ],
+                },
+            )
+            log("손목ROS   /%s/rgb  %dx%d  frameSkip %d  도메인 %s"
+                % (WRIST_ROS_NS, WRIST_ROS_RES[0], WRIST_ROS_RES[1],
+                   WRIST_ROS_SKIP, os.environ.get("ROS_DOMAIN_ID", "0")))
+            log("          다른 터미널에서:")
+            log("            ros2 run rqt_image_view rqt_image_view /%s/rgb"
+                % WRIST_ROS_NS)
+        except Exception:
+            import traceback
+            # 화면 하나 못 띄운 것뿐이다. 적재는 계속 돌아야 한다.
+            log("손목ROS   그래프 생성 실패 — 발행만 없다, 적재는 계속한다\n"
+                + traceback.format_exc())
+
+    _st["sub"] = omni.kit.app.get_app().get_update_event_stream() \
+        .create_subscription_to_pop(_build, name="palletris-wristcam-ros")
+
+
+if WRISTROS and stage.GetPrimAtPath(CAM_WRIST_PRIM).IsValid():
+    _wrist_cam_to_ros()
+elif WRISTROS:
+    log("손목ROS   %s 가 씬에 없다 — src/packing_sim/run_layout_to_spec.sh 를 다시 돌려라"
+        % CAM_WRIST_PRIM)
 
 omni.timeline.get_timeline_interface().play()
 
