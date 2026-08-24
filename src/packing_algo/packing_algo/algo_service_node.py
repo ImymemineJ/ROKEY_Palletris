@@ -64,7 +64,10 @@ class AlgoService(Node):
     # ---------- 공통 ----------
     def _packer(self, zone):
         """알 수 없는 구역이면 None. 조용히 잘못된 팔레트에 쌓는 것보다 낫다."""
-        pk = self.pk.get(zone)
+        # ★ 대소문자를 흡수한다. 규약은 대문자지만(작업명세서 §2.1) 송신자가
+        #   소문자를 보내면 "빈 팔레트인데 NO_FEASIBLE_POSE" 라는, 원인이 전혀
+        #   안 보이는 증상이 된다. 여기서 받아 주고 로그로만 알린다.
+        pk = self.pk.get(zone) or self.pk.get(str(zone).upper())
         if pk is None:
             self.get_logger().error(f"알 수 없는 zone='{zone}' — config zones.list 를 확인하세요")
         return pk
@@ -105,12 +108,18 @@ class AlgoService(Node):
         pk = self._packer(req.zone)
         if pk is None:
             res.ok, res.fill_rate, res.placed_count = False, 0.0, 0
+            res.max_height_mm = 0
             return res
 
         actual = PlacePoseData.from_msg(req.actual_pose).as_dict()   # ★ 실측 pose 로 갱신
         ok, fill, count = pk.update(req.box_id, req.size_w_mm, req.size_d_mm,
                                     req.size_h_mm, actual)
         res.ok, res.fill_rate, res.placed_count = bool(ok), float(fill), int(count)
+        # ★ 개편으로 생긴 칸이다 (CLAUDE.md §3-3). 안 채우면 0 이 나가고,
+        #   ZoneStatus.max_height_mm 도 0 이 되어 "최고 높이" 지표가 통째로 죽는다.
+        #   값은 이미 아래 로그에서 쓰던 것과 같다 — 계산이 없던 게 아니라
+        #   응답에 싣는 줄이 없었다.
+        res.max_height_mm = int(pk.hm.max())
 
         self.dump(req.zone)
         dt = (time.perf_counter() - t0) * 1000

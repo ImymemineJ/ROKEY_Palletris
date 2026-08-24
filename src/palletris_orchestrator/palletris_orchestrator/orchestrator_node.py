@@ -48,7 +48,13 @@ PLACING  = "PLACING"    # ⑤ 로봇에게 놓기 지시
 UPDATING = "UPDATING"   # ⑥ algo에 heightmap 갱신
 DONE     = "DONE"       # ⑦ 팔레트 만재 → 종료
 
-ZONE = "b"              # 1차는 B구역만
+# 1차는 B구역만. ROS 파라미터 `zone` 으로 덮어쓴다 (launch 가 넘긴다).
+# ★ 모듈 전역인 이유: 토픽 이름·서비스 인자 등 11 군데가 이 값을 읽는데,
+#   전부 노드 메서드 안이라 __init__ 첫머리에서 한 번 정해 두면 안전하다.
+#   stage 2 에서 구역이 셋이 되어도 관제탑 프로세스는 하나다 (CLAUDE.md §8) —
+#   늘어나는 것은 이 값이 아니라 구역별 상태다.
+ZONE = "b"
+ZONE_ID = "B"           # 서비스 인자용 대문자. 토픽 경로에는 ZONE(소문자)을 쓴다
 
 # ── 이 노드가 부르는 서비스 8개: 이름 → 타입 ──
 # 표로 뺀 이유: 기존 호출부가 call_async("/db/get_box_info", {...}, cb) 처럼
@@ -99,6 +105,19 @@ class Orchestrator(Node):
     def __init__(self):
         super().__init__("orchestrator")
 
+        # ★ 구역을 ROS 파라미터로 받는다. 아래 토픽 이름들이 이 값으로 만들어지므로
+        #   **구독·발행을 만들기 전에** 정해야 한다.
+        global ZONE, ZONE_ID
+        self.declare_parameter("zone", ZONE)
+        ZONE = str(self.get_parameter("zone").value).lower()
+        # ★ 대소문자 규약: 서비스 인자의 zone 은 **대문자**, 토픽 경로만 소문자다
+        #   (작업명세서 §2.1 "★ 대문자. 경로에서만 소문자 zone_b").
+        #   소문자로 보내면 algo 의 packer 사전(키가 A·B·C)에서 안 잡혀
+        #   빈 팔레트인데도 NO_FEASIBLE_POSE 가 돌아온다. 실측으로 확인한 버그다 —
+        #   에러 로그는 algo 쪽에만 찍히고 관제탑은 "자리가 없구나" 로 오해한다.
+        ZONE_ID = ZONE.upper()
+        self.zone = ZONE
+
         # ReentrantCallbackGroup: 콜백이 서로를 막지 않게 한다.
         # 이게 없으면 서비스 응답 콜백이 타이머 콜백을 기다리다 멈춘다.
         self.cbg = ReentrantCallbackGroup()
@@ -108,6 +127,11 @@ class Orchestrator(Node):
         # 벨트 서비스가 없으면 call_async 가 reset_to_idle 을 부르고,
         # reset_to_idle 이 다시 벨트를 불러 무한 재귀가 된다. 그걸 막는다.
         self._resetting = False
+        # ★ 방금 버린 박스. 씬이 despawn 을 반영하기 전까지 detector 는 같은 박스를
+        #   계속 present=True 로 알린다. 그대로 두면 버린 박스를 또 집으려 하고,
+        #   또 버리고, 또 집으려 하는 무한 루프가 된다 — 에러 없이 라인만 선다.
+        #   실측으로 확인했다(ROS 그래프 검증). 같은 id 가 다시 오면 무시한다.
+        self._rejected_id = None
         self.box = None          # 지금 처리 중인 박스 {box_id, x_mm, y_mm, yaw_deg, w, d, h}
         self.plan = None         # algo가 준 놓을 자리
         self.t_start = time.time()
@@ -189,6 +213,10 @@ class Orchestrator(Node):
             self.get_logger().warn("box_at_pickup 에 box_id 가 비어 있다 — 무시")
             return
 
+        # ── ②-b 방금 버린 박스면 씬이 치울 때까지 건드리지 않는다 ──
+        if msg.box_id == self._rejected_id:
+            return
+
         # ── ③ m → mm ──
         # ★ BoxAtPickup.pose 는 월드 좌표 m, 박스 "중심" 이다 (작업명세서 §2.1).
         #   orchestrator 내부와 /robot/cmd 는 mm 라서 여기서 한 번만 바꾼다.
@@ -268,7 +296,7 @@ class Orchestrator(Node):
             self.send_robot_cmd(RobotCmd.PICK)
 
         self.call_async("/algo/plan_placement", {
-            "zone": ZONE,
+            "zone": ZONE_ID,
             "box_id": self.box["box_id"],
             "size_w_mm": self.box["w"],
             "size_d_mm": self.box["d"],
@@ -337,7 +365,7 @@ class Orchestrator(Node):
         if not ev.ok:
             self.get_logger().warn(f"로봇 실패({self.state}): {ev.reason}")
             self.call_async("/algo/cancel_plan",
-                            {"zone": ZONE, "box_id": self.box["box_id"]}, None)
+                            {"zone": ZONE_ID, "box_id": self.box["box_id"]}, None)
             self.call_async("/db/set_status",
                             {"box_id": self.box["box_id"], "status": "PICK_FAILED",
                              "reason": ev.reason}, None)
@@ -390,7 +418,7 @@ class Orchestrator(Node):
         self.get_logger().error(
             f"로봇 응답 없음 — {self.state} 에서 {held:.1f}초 (제한 {ROBOT_TIMEOUT_S}초). 계획을 버린다")
         self.t_robot = None
-        self.call_async("/algo/cancel_plan", {"zone": ZONE, "box_id": bid}, None)
+        self.call_async("/algo/cancel_plan", {"zone": ZONE_ID, "box_id": bid}, None)
         self.call_async("/db/set_status",
                         {"box_id": bid, "status": "PICK_FAILED", "reason": "TIMEOUT"}, None)
         self.reset_to_idle()
@@ -412,12 +440,12 @@ class Orchestrator(Node):
                 f" · 최고 {res.max_height_mm}mm")
             # ★ MarkPlaced 는 zone 과 actual_pose 를 받는다. 계획 pose 가 아니다.
             self.call_async("/db/mark_placed",
-                            {"box_id": self.box["box_id"], "zone": ZONE,
+                            {"box_id": self.box["box_id"], "zone": ZONE_ID,
                              "actual_pose": actual_pose}, None)
             self.reset_to_idle()
 
         self.call_async("/algo/update_heightmap", {
-            "zone": ZONE,
+            "zone": ZONE_ID,
             "box_id": self.box["box_id"],
             "size_w_mm": self.box["w"],
             "size_d_mm": self.box["d"],
@@ -437,7 +465,8 @@ class Orchestrator(Node):
         SetStatus 에 reason 필드가 생겨서, 왜 버렸는지를 DB 에 남기려고 받는다."""
         bid = self.box["box_id"]
         self.rejected += 1
-        self.call_async("/algo/cancel_plan", {"zone": ZONE, "box_id": bid}, None)
+        self._rejected_id = bid          # 씬이 치울 때까지 다시 안 잡는다
+        self.call_async("/algo/cancel_plan", {"zone": ZONE_ID, "box_id": bid}, None)
         self.call_async("/db/set_status",
                         {"box_id": bid, "status": "REJECTED", "reason": reason}, None)
         self.call_async("/sim/despawn_box", {"box_id": bid}, None)
@@ -667,7 +696,7 @@ class Orchestrator(Node):
         #   단, 타임아웃 난 게 cancel_plan 자신이면 또 부르지 않는다 (무한 반복).
         if self.box and srv_name != "/algo/cancel_plan":
             self.call_async("/algo/cancel_plan",
-                            {"zone": ZONE, "box_id": self.box["box_id"]}, None)
+                            {"zone": ZONE_ID, "box_id": self.box["box_id"]}, None)
         self.reset_to_idle()
 
 
