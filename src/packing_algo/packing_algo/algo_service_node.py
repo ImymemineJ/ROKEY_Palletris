@@ -16,6 +16,7 @@ ROS 메시지 ↔ 파이썬 자료구조 **번역**과 구역별 패커 인스�
 """
 import json
 import os
+import threading
 import time
 
 import rclpy
@@ -51,6 +52,15 @@ class AlgoService(Node):
 
         # 구역별 패커 1개씩. stage 1 은 B 만 쓰지만, 3구역 확장 때 코드가 안 바뀐다.
         self.pk = {z: HeightmapPacker(self.cfg) for z in self.cfg["zones"]["list"]}
+        # ★ 구역마다 락 하나. 왜 필요한가:
+        #   - `MultiThreadedExecutor` + `ReentrantCallbackGroup` 이라 콜백이 **동시에** 돈다.
+        #   - 관제탑은 1개지만(§8) 로봇 3대를 굴리므로 A·B·C 사이클이 겹쳐 돈다.
+        #   - 게다가 §3-4 가 **재시도 1회**를 규약으로 정했다 — 첫 요청이 처리 중일 때
+        #     같은 구역으로 두 번째가 들어올 수 있다.
+        #   plan 은 hm 을 읽고 update 는 쓴다. 겹치면 반쯤 쓰인 heightmap 위에서 자리를
+        #   고른다 — 에러 없이 박스가 겹쳐 놓인다.
+        #   ※ 구역이 다르면 패커 객체가 달라 서로 안 막는다.
+        self.lock = {z: threading.Lock() for z in self.pk}
 
         self.create_service(PlanPlacement, "/algo/plan_placement", self.on_plan, callback_group=cb)
         self.create_service(UpdateHeightmap, "/algo/update_heightmap", self.on_update, callback_group=cb)
@@ -114,7 +124,10 @@ class AlgoService(Node):
             res.ok, res.score, res.message = False, 0.0, "NO_FEASIBLE_POSE"
             return res
 
-        ok, pose, score, msg = pk.plan(req.box_id, req.size_w_mm, req.size_d_mm, req.size_h_mm)
+        with self.lock[req.zone]:
+            ok, pose, score, msg = pk.plan(req.box_id, req.size_w_mm, req.size_d_mm,
+                                           req.size_h_mm)
+            warn = pk.last_warning
         res.ok, res.score, res.message = bool(ok), float(score), msg
         if ok:
             res.pose = PlacePoseData.from_dict(pose).to_msg(PlacePose)
@@ -132,6 +145,10 @@ class AlgoService(Node):
             self.get_logger().info(line)
         else:
             self.get_logger().warn(line)
+        if warn:
+            # ★ 치수 자체가 잘못된 경우. 그냥 NO_FEASIBLE_POSE 만 보이면 "자리가 없나"
+            #   로 오해하고 계속 박스를 넣는다 — 인식/DB 쪽을 봐야 하는 상황이다.
+            self.get_logger().error(f"plan  [{req.zone}] {req.box_id} — {warn}")
         if dt > 200:      # 명세서 §7.9 요구
             self.get_logger().error(f"plan 이 {dt:.0f}ms — 200ms 요구 초과")
         if msg == "PALLET_FULL":
@@ -149,8 +166,9 @@ class AlgoService(Node):
             return res
 
         actual = PlacePoseData.from_msg(req.actual_pose).as_dict()   # ★ 실측 pose 로 갱신
-        ok, fill, count = pk.update(req.box_id, req.size_w_mm, req.size_d_mm,
-                                    req.size_h_mm, actual)
+        with self.lock[req.zone]:
+            ok, fill, count = pk.update(req.box_id, req.size_w_mm, req.size_d_mm,
+                                        req.size_h_mm, actual)
         res.ok, res.fill_rate, res.placed_count = bool(ok), float(fill), int(count)
         # ★ 관제탑이 ZoneStatus.max_height_mm (§3-2) 를 채우는 유일한 경로다.
         #   여기서 안 주면 관제탑은 실제 더미 높이를 알 방법이 없다.
@@ -208,7 +226,8 @@ class AlgoService(Node):
     def on_cancel(self, req, res):
         pk = self._packer(req.zone)
         if pk is not None:
-            pk.cancel(req.box_id)
+            with self.lock[req.zone]:
+                pk.cancel(req.box_id)
         res.ok = pk is not None
         self.get_logger().info(f"cancel[{req.zone}] {req.box_id}")
         return res
@@ -220,7 +239,8 @@ class AlgoService(Node):
             # ★ 지우기 **전에** 최종 지표를 남긴다. 팔레트를 갈면(PALLET_FULL → SwapPallet)
             #   이 판의 결과가 영영 사라진다 — 평가항목 "검증 및 분석"이 이 숫자다.
             self.get_logger().info(self._summary(req.zone, pk))
-            pk.reset()
+            with self.lock[req.zone]:
+                pk.reset()
             self.t0.pop(req.zone, None)
             self.t_last.pop(req.zone, None)
             self.dump(req.zone)

@@ -193,3 +193,44 @@ def test_reset_clears_applied():
     assert ok2
     _, _, n = pk.update("B001", 340, 250, 210, dict(pose2))
     assert n == 1, f"reset 후에도 '이미 반영됨' 으로 무시됐다 (적재 {n}개)"
+
+
+def test_bad_sizes_never_raise():
+    """★ 치수가 잘못돼도 **예외로 죽으면 안 된다** (§9 입력 검증 · §13 예외 처리).
+
+    rclpy 서비스 콜백에서 예외가 나면 응답이 안 나가고, 관제탑은 2초 뒤 재시도해
+    같은 예외를 또 만난다 — 박스 하나가 라인을 영구히 막는다.
+    실제로 0 이 올 수 있다: 인식 실패 또는 GetBoxInfo found=false 인데 기본값 0 전송.
+    (수정 전에는 scipy 가 RuntimeError: incorrect filter size 로 죽었다.)
+    """
+    pose = dict(x_mm=0, y_mm=0, z_mm=0, yaw_deg=0.0)
+    bad = [(0, 0, 0), (-340, -250, -210), (5, 5, 210), (340, 250, 0),
+           (float("nan"), 250, 210), (340, float("nan"), 210)]
+    for w, d, h in bad:
+        pk = HeightmapPacker(CFG)
+        ok, _, _, msg = pk.plan("BAD", w, d, h)          # 여기서 예외가 나면 실패
+        assert ok is False, f"{(w, d, h)} 가 통과됐다"
+        assert msg == "NO_FEASIBLE_POSE", f"{(w, d, h)} → {msg} (계약은 3가지뿐)"
+        assert pk.last_warning, f"{(w, d, h)} 에 이유가 안 남았다"
+        assert pk.update("BAD", w, d, h, pose)[0] is False
+        assert len(pk.placed) == 0, "잘못된 치수가 적재로 세어졌다"
+
+    # 정상 치수는 그대로 통과해야 한다 (검증이 과하지 않은지)
+    pk = HeightmapPacker(CFG)
+    assert pk.plan("OK1", 340, 250, 210)[0] is True
+
+
+def test_zone_lock_exists():
+    """★ 구역별 락이 있어야 한다 — 관제탑 1개가 A·B·C 를 겹쳐 굴린다 (§8).
+
+    노드를 띄우지 않고 클래스 소스만 본다 (rclpy init 없이 도는 단위 테스트).
+    """
+    import inspect
+
+    from packing_algo import algo_service_node as m
+    src = inspect.getsource(m.AlgoService)
+    assert "self.lock = {" in src, "구역별 락이 없다"
+    for cb in ("def on_plan", "def on_update"):
+        i = src.index(cb)
+        body = src[i:i + 1400]
+        assert "with self.lock[" in body, f"{cb} 이 락 없이 패커를 만진다"
