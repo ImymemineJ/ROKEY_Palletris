@@ -24,6 +24,7 @@
 | `demo_stack15_test1_1.py` | 김학민 | **15박스 연속 — 실제 라인.** `demo_stack15`(B5)를 컨베이어 위로 옮긴 것. 급송이 없고 도착 순서 그대로 집으므로 온라인 패커를 쓴다. 스폰은 사양 스케줄(`boxes.stage1` 12 s x 15). `PL_N` 으로 개수 축소 |
 | `script_editor_lula.py` | 김병직 | **Isaac Sim GUI 의 Script Editor 에 붙여넣는 스니펫.** `POINT` 만 바꿔 11점 중 하나로 팔을 보낸다 |
 | `read_log.py` | 김병직 | Isaac Script Editor 출력을 터미널에서 읽는다 |
-| `gen_master_db.py` | 민범진 | D1 — **직접 추가할 것** |
+| `gen_master_db.py` | 민범진 | **D1 — boxes_master 생성.** 실행 전에 "정답지"를 깐다. 실행 중 흘러간 박스(`boxes_sorted`)와 대조해야 인식률을 잴 수 있다 — 등록된 것만 세면 언제나 100 % 로 나온다 (명세서 §8.6). stage 1 은 zone 전부 `B` (랜덤 금지). `ros2 run packing_db gen_master_db` 와 같다 |
+| `verify_db.py` | 민범진 | **D2 판정 — `/db/*` 6종 + `/diverter/request`.** 박스 하나를 등록→검증→분기→집기→적재까지 태우며 응답을 확인한다. 실패 경로(모르는 status·미등록 박스·남의 QR)도 같이 친다 — 성공 경로만 보면 조용히 잘못 도는 버그를 못 잡는다. `db_service_node` 를 먼저 띄울 것 |
 
 게이팅 검증 스크립트(G1~G7)는 전부 여기에 커밋한다. (작업명세서 §11)
