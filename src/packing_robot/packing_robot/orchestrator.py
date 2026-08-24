@@ -31,7 +31,7 @@ from packing_common.frames import pallet_place_to_world, world_to_pallet_place
 from packing_common.units import m_to_mm, mm_to_m
 from packing_msgs.msg import PlacePose, ZoneStatus
 from packing_msgs.srv import CancelPlan, PlanPlacement, SetVelocity, UpdateHeightmap
-from packing_robot.robot_link import RobotLink
+from packing_robot.sim_link import SimLink   # ★ Lock 있는 김병직님 것을 쓴다
 
 TICK_HZ = 20.0
 
@@ -43,6 +43,8 @@ class Orchestrator(Node):
         p = self.declare_parameter
         p("zone", "B"); p("robot_mode", "mock"); p("sim_host", "127.0.0.1"); p("sim_port", 8765)
         p("interval_s", 0.0); p("box_count", 0); p("mock_cycle_s", 1.0); p("place_noise_mm", 3)
+        p("real_boxes", True)      # socket 모드에서 Isaac 에 진짜 박스를 스폰해 집는다
+        p("pickup_timeout_s", 60.0)
         g = lambda k: self.get_parameter(k).value
 
         self.zone, self.mode = g("zone"), g("robot_mode")
@@ -60,7 +62,7 @@ class Orchestrator(Node):
         self.stop_timeout = rb_cfg["release_wait_timeout_s"]
         self.settle = rb_cfg["settle_wait_s"]
 
-        self.types = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in self.cfg["boxes"]["types"]]
+        self.types = [(b["name"], b["w_mm"], b["d_mm"], b["h_mm"]) for b in self.cfg["boxes"]["types"]]
         self.rb, self.rn = random.Random(self.cfg["boxes"]["random_seed"]), random.Random(7)
 
         cb = ReentrantCallbackGroup()
@@ -70,12 +72,20 @@ class Orchestrator(Node):
         self.cli_belt = self.create_client(SetVelocity, "/conveyor/set_velocity", callback_group=cb)
         self.pub_status = self.create_publisher(ZoneStatus, f"/zone_{self.zone.lower()}/status", 10)
 
-        self.link = RobotLink(g("sim_host"), int(g("sim_port")))
+        self.link = None
         if self.mode == "socket":
-            ok = self.link.connect()
-            self.get_logger().info(f"Isaac 소켓 {g('sim_host')}:{g('sim_port')} — "
-                                   + ("연결됨" if ok else "★ 연결 실패. sim_server.py 를 먼저 띄우세요"))
+            try:
+                self.link = SimLink(g("sim_host"), int(g("sim_port")))
+                self.link.call(cmd="ping")
+                self.get_logger().info(f"Isaac 소켓 {g('sim_host')}:{g('sim_port')} 연결됨")
+            except OSError as e:
+                self.get_logger().error(
+                    f"Isaac 소켓 연결 실패({e}) — sim_main.py 를 먼저 띄우세요. mock 으로 내려갑니다")
+                self.mode = "mock"
 
+        self.real_boxes = bool(g("real_boxes")) and self.mode == "socket"
+        self.pickup_timeout = float(g("pickup_timeout_s"))
+        self.pick_pose = None          # pickup_check 가 준 실측 파지 pose
         self.state, self.fut, self.steps, self.si = "WAIT_ALGO", None, [], 0
         self.box = self.pose = None
         self.t_next = self.t_deadline = 0.0
@@ -95,13 +105,28 @@ class Orchestrator(Node):
         if self.cli_belt.service_is_ready():
             self.cli_belt.call_async(SetVelocity.Request(
                 seg=f"{self.zone.lower()}_pickup", velocity_mps=float(mps)))
+        elif self.link is not None:
+            # ★ 임시. §3 규칙 4 는 벨트를 ROS 서비스로 부르라고 한다. sim_bridge_node 가
+            #   생기면 위 분기로 자동으로 넘어가므로 이 줄은 그때 지운다.
+            self.link.call(cmd="set_velocity", seg=f"{self.zone.lower()}_pickup", mps=float(mps))
         elif mps == 0.0:
             self.get_logger().warn("/conveyor/set_velocity 없음 — 벨트 정지를 건너뜁니다", once=True)
 
     def pick_world(self, w, d, h, lifted=False):
-        """스토퍼에 닿은 박스의 파지점(월드 m). 박스 중심 x = 스토퍼 − w/2 (함정 #16)."""
-        z = self.belt_z + h / 2 + (self.approach if lifted else 0)
-        return (mm_to_m(self.stopper_x - w // 2), 0.0, mm_to_m(z))
+        """파지점(월드 m).
+
+        pickup_check 가 준 실측 pose 가 있으면 그걸 쓴다 — 박스가 스토퍼에 정확히
+        붙지 않거나 살짝 틀어져 있으면 계산값으로는 그리퍼가 모서리를 문다 (D5).
+        없으면 계산값: 박스 중심 x = 스토퍼 − w/2 (함정 #16).
+        """
+        dz = mm_to_m(self.approach) if lifted else 0.0
+        if self.pick_pose:
+            x, y, z = self.pick_pose["pos_m"]
+            return (x, y, z + dz)
+        return (mm_to_m(self.stopper_x - w // 2), 0.0, mm_to_m(self.belt_z + h / 2) + dz)
+
+    def pick_yaw(self):
+        return float(self.pick_pose["yaw_deg"]) if self.pick_pose else 0.0
 
     def place_world(self, h, lifted=False):
         x, y, z = pallet_place_to_world(PlacePoseData.from_dict(self.pose), h, self.origin)
@@ -111,13 +136,13 @@ class Orchestrator(Node):
     def _move(self, target, yaw):
         """move_ee 는 논블로킹 — 목표를 한 번만 넣고 motion_status 를 폴링한다 (§3 규칙 1)."""
         if not self._sent:
-            r = self.link.call("move_ee", target_m=list(target), yaw_deg=float(yaw))
+            r = self.link.call(cmd="move_ee", target_m=list(target), yaw_deg=float(yaw))
             if not r.get("accepted"):
                 self.abort(f"move_ee 거부: {r}")
                 return False
             self._sent = True
             return False
-        st = self.link.call("motion_status").get("state")
+        st = self.link.call(cmd="motion_status").get("state")
         if st == "REACHED":
             self._sent = False
             return True
@@ -127,7 +152,7 @@ class Orchestrator(Node):
 
     def build_steps(self):
         box_id, w, d, h = self.box
-        yaw_pick, yaw_place = 0.0, float(self.pose["yaw_deg"])
+        yaw_pick, yaw_place = self.pick_yaw(), float(self.pose["yaw_deg"])
         S = []
         S.append(lambda: self._move(self.pick_world(w, d, h, True), yaw_pick))    # 픽 접근
         S.append(lambda: self._move(self.pick_world(w, d, h), yaw_pick))          # 하강
@@ -141,7 +166,8 @@ class Orchestrator(Node):
         return S
 
     def _grasp(self, box_id):
-        if not self.link.call("grasp", box_id=box_id).get("ok"):
+        # grasp 는 그리퍼 재시도 때문에 오래 걸린다 — 전용 타임아웃 (sim_link.call_slow)
+        if not self.link.call_slow(15.0, cmd="grasp", box_id=box_id).get("ok"):
             self.failed += 1
             self.abort("grasp 실패 (PICK_FAILED)")
             return False
@@ -151,7 +177,7 @@ class Orchestrator(Node):
         """release 는 '도착'이 아니라 '정지' 조건으로 (§6.5). 타임아웃 없으면 무한루프."""
         if self._t0 == 0.0:
             self._t0 = self.now()
-        if self.link.call("tcp_speed").get("mps", 1.0) < self.stop_speed:
+        if self.link.call(cmd="tcp_speed").get("mps", 1.0) < self.stop_speed:
             self._t0 = 0.0
             return True
         if self.now() - self._t0 > self.stop_timeout:
@@ -161,7 +187,7 @@ class Orchestrator(Node):
         return False
 
     def _release(self):
-        self.link.call("release")
+        self.link.call_slow(15.0, cmd="release")
         self._t0 = self.now()
         return True
 
@@ -172,7 +198,7 @@ class Orchestrator(Node):
         """실측 pose → PlacePose. Isaac 이 없으면 계획값 ±noise 로 흉내낸다."""
         box_id, w, d, h = self.box
         if self.mode == "socket":
-            r = self.link.call("get_box_pose", box_id=box_id)
+            r = self.link.call(cmd="get_box_pose", box_id=box_id)
             if r.get("ok"):
                 pp = world_to_pallet_place(r["pos_m"], float(r.get("yaw_deg", 0.0)), h, self.origin)
                 return PlacePose(x_mm=pp.x_mm, y_mm=pp.y_mm, z_mm=pp.z_mm, yaw_deg=pp.yaw_deg)
@@ -205,14 +231,41 @@ class Orchestrator(Node):
                 return
             if self.idx >= self.total:
                 return self.finish("박스 소진")
-            w, d, h = self.rb.choice(self.types)      # TODO(트랙 B): /zone_b/box_at_pickup 구독으로 교체
-            self.box = (f"BOX{self.idx:05d}", w, d, h)
+            name, w, d, h = self.rb.choice(self.types)
+            box_id = f"BOX{self.idx:05d}"
+            self.box, self.pick_pose = (box_id, w, d, h), None
             self.idx += 1
+            if self.real_boxes:
+                # Isaac 에 진짜 박스를 스폰한다. 크기는 우리가 고른 것이라 DB 없이도 안다.
+                # TODO(트랙 B): sim_bridge_node 가 생기면 /zone_b/box_at_pickup 구독으로 바꾼다.
+                r = self.link.call(cmd="spawn_box", box_id=box_id, type=name, yaw_deg=0.0)
+                if not r.get("ok"):
+                    self.get_logger().error(f"spawn_box 실패: {r}")
+                    self.state, self.t_next = "IDLE", self.now() + self.interval
+                    return
+                self.belt(self.belt_v)                # 벨트를 돌려 스토퍼까지 보낸다
+                self.t_deadline = self.now() + self.pickup_timeout
+                self.state = "WAIT_PICKUP"
+                return
             self.belt(0.0)                            # 흡착 전 벨트 정지
-            self.fut = self.cli_plan.call_async(PlanPlacement.Request(
-                zone=self.zone, box_id=self.box[0], size_w_mm=w, size_d_mm=d, size_h_mm=h))
-            self.state = "PLANNING"
+            self.send_plan()
             return                                    # ★ 반드시 여기서 return
+
+        if s == "WAIT_PICKUP":
+            r = self.link.call(cmd="pickup_check", zone=self.zone)
+            if r.get("present") and r.get("box_id") == self.box[0]:
+                self.pick_pose = r["pose"]            # 실측 파지 pose (pos_m · yaw_deg)
+                self.belt(0.0)                        # ★ 흡착 전 정지. 안 멈추면 박스가 끌려간다
+                x, y, _z = self.pick_pose["pos_m"]
+                self.get_logger().info(f"{self.box[0]} 스토퍼 도착 — 파지 ({x:.3f}, {y:.3f}) "
+                                       f"yaw={self.pick_pose['yaw_deg']:.1f}")
+                self.send_plan()
+                return
+            if self.now() > self.t_deadline:
+                self.get_logger().error(f"{self.box[0]} 스토퍼 도착 타임아웃 "
+                                        f"({self.pickup_timeout:.0f}s) — 다음 박스로")
+                self.state, self.t_next = "IDLE", self.now()
+            return
 
         if s == "PLANNING":
             if not (self.fut and self.fut.done()):
@@ -226,7 +279,14 @@ class Orchestrator(Node):
                 self.dropped += 1                     # 이 박스만 버리고 계속 (트랙 D A1)
                 self.get_logger().warn(f"{box_id} {w}x{d}x{h} → {res.message} · 버림 "
                                        f"(누적 {self.dropped})")
-                # TODO(트랙 B): /db/set_status(REJECTED) + /sim/despawn_box
+                # ★ 스토퍼에 그대로 두면 뒤 박스가 밀려 라인이 통째로 막힌다. 반드시 치운다.
+                #   1차에는 Return line 이 없으므로 despawn 이 유일한 처리다 (CLAUDE.md §5).
+                #   TODO(트랙 B): sim_bridge_node 가 생기면 /sim/despawn_box 서비스로 바꾼다.
+                if self.link is not None:
+                    r = self.link.call(cmd="despawn_box", box_id=box_id)
+                    if not r.get("ok"):
+                        self.get_logger().error(f"despawn_box 실패({r}) — 라인이 막힐 수 있습니다")
+                # TODO(트랙 B): /db/set_status(box_id, 'REJECTED')
                 self.belt(self.belt_v)
                 self.state, self.t_next = "IDLE", self.now() + self.interval
                 return
@@ -272,6 +332,12 @@ class Orchestrator(Node):
             self.state, self.t_next = "IDLE", self.now() + self.interval
             return
 
+    def send_plan(self):
+        _bid, w, d, h = self.box
+        self.fut = self.cli_plan.call_async(PlanPlacement.Request(
+            zone=self.zone, box_id=self.box[0], size_w_mm=w, size_d_mm=d, size_h_mm=h))
+        self.state = "PLANNING"
+
     def do_update(self):
         box_id, w, d, h = self.box
         self.fut = self.cli_upd.call_async(UpdateHeightmap.Request(
@@ -286,7 +352,7 @@ class Orchestrator(Node):
             f"픽실패 {self.failed} · 적재율 {self.fill_rate*100:.1f}% ═══")
 
     def on_status(self):
-        busy = self.state in ("PLANNING", "ROBOT", "MOCK_MOVE", "UPDATING")
+        busy = self.state in ("PLANNING", "ROBOT", "MOCK_MOVE", "UPDATING", "WAIT_PICKUP")
         self.pub_status.publish(ZoneStatus(
             zone=self.zone, queue_len=0,          # TODO(트랙 B): /db/zone_queue 중계
             buffer_cap=int(self.cfg["zones"]["buffer_capacity"]),
@@ -303,7 +369,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.link.close()
+        if node.link:
+            node.link.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
