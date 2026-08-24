@@ -47,13 +47,13 @@
 확인할 수 없다 — 칠 것이 없기 때문이다.** 그래서 사이클마다 이미 놓인 박스가 얼마나
 움직였는지 재고 표에 찍는다.
 
-## 실측 (2026-08-22, 헤드리스, 페데스탈 900) — **RESULT: 통과**
+## 실측 (2026-08-24, 헤드리스, 페데스탈 900) — **RESULT: 통과**
 
     놓은 것 15/15 · 7 단 (밑면 z 0/280/340/560/680/770/840) · 최상단 1050 mm
-    배치 오차 14개가 3.2 mm 안 · Z 오차 전부 0.0
-    **최대 knock 0.2 mm** — 팔이 적재물을 쓸던 문제(26~115 mm)가 순서로 사라졌다
+    배치 오차 **15개 전부 4.4 mm 안** · Z 오차 전부 0.0
+    **최대 knock 0.1 mm** — 팔이 적재물을 쓸던 문제(26~115 mm)가 사라졌다
     joint_5 −90 ~ +23 deg (한계 ±360 — 15회 돌려도 안 감긴다)
-    27 s 벽시계 · 240 s 시뮬 (사이클 평균 16.0 s)
+    32 s 벽시계 · 258 s 시뮬 (사이클 평균 17.2 s)
 
 여기까지 오는 데 밟은 순서 문제 셋 (전부 results/issues/18):
 
@@ -66,10 +66,12 @@
 (issues/18). 700 에서는 팔꿈치가 560 짜리 기둥에도 −65 mm 라 어떤 순서로도 안 나온다.
 다른 높이를 시험할 때만 `--pedestal` 로 덮어쓴다 (system.yaml 은 안 건드린다).
 
-남은 잔결함 하나 — (765,205) z340 5호가 −13/−24 mm 로 앉는다 (허용 30 안, 접촉 없음).
-릴리스 최소 유지(gripper.RELEASE_MIN_HOLD_S) 이전에는 이 계열이 **비결정적**으로
-22~76 mm 까지 튀며 이웃을 밀었다 — 유지 0.5 s 를 넣자 두 실행이 0.3 mm 차이로 재현된다.
-남은 것은 체계적 오프셋이라 별도 조사 대상이다 (파지 오프셋 또는 패드 정적 처짐 후보).
+★ (765,205) z340 5호가 28~33 mm 로 앉던 결함은 **2026-08-24 해결됐다** (results/issues/21).
+원인은 배치→픽 **복귀호에 안전 고도가 없던 것**이다. 호는 z 를 선형 보간하므로 직전 배치가
+1층이면 후퇴가 낮고(0.69), 픽 상공(1.34)으로 오는 중간이 **픽업 대기 박스 상면(1.141)보다
+낮아져** 그리퍼 몸통(Ø245)이 박스를 쓸어 밀었다. 밀린 박스를 그대로 잡아 그대로 놓으니
+배치 오차 = 밀린 양이 됐다. `cycle.py` 가 이제 복귀에도 **먼저 수직 상승**을 넣는다
+(30 mm -> 1.5 mm, knock 22~32 -> 0.1 mm). 대가는 사이클 +1.1 s 다.
 
 ## 계획을 어떻게 만드나
 
@@ -568,6 +570,10 @@ def main():
     ap.add_argument("--order", default="volume", choices=["volume", "arrival"],
                     help="급송 순서. arrival 은 도착순 그대로 (일부 탈락한다)")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--diag-tcp", action="store_true",
+                    help="사이클마다 **하강 바닥에서 지령 대비 실제 흡착면 위치**를 찍는다. "
+                         "박스 착지가 어긋날 때 팔이 못 간 것인지(팔) 박스가 흘러간 것인지"
+                         "(흡착)를 가른다 — 두 값이 같은데 박스만 어긋나면 흡착 쪽이다")
     ap.add_argument("--gui", action="store_true")
     ap.add_argument("--hold", action="store_true", help="--gui 와 같이. 끝나고 창을 열어 둔다")
     ap.add_argument("--cam", type=float, nargs=6, default=None,
@@ -763,6 +769,27 @@ def main():
 
         handlers["get_box_pose"] = h_get_box_pose
         handlers["ping"] = lambda req: {"ok": True}
+
+        # ── 계측: 지령 흡착면 vs 실제 흡착면 ────────────────
+        #   move_ee 목표를 지나가며 받아 적기만 한다 (소켓 스레드 — PhysX 안 만진다).
+        #   실제 위치 비교는 메인 스레드 tick() 에서 한다.
+        #   ★ "사이클 중 최저점" 으로 잡으면 안 된다 — 사이클 시작 시 팔이 직전 사이클의
+        #     후퇴 높이에 남아 있어서 그게 최저점으로 잡힌다 (2026-08-24 실측에서 밟았다).
+        #     대신 **새 move_ee 가 올 때 직전 목표의 도달 결과를 확정**한다. 사이클의
+        #     마지막 항목이 곧 배치 하강 바닥이다 (그 뒤 move 는 놓고 나서의 후퇴다).
+        diag = {"tgt": None, "face": None, "box": None, "log": []}
+        if a.diag_tcp:
+            _h_move = handlers["move_ee"]
+
+            def h_move_diag(req):
+                t = (req or {}).get("target_m")
+                if diag["tgt"] is not None and diag["face"] is not None:
+                    diag["log"].append((diag["tgt"], diag["face"], diag["box"]))
+                if t is not None:
+                    diag["tgt"] = [float(v) for v in t]
+                return _h_move(req)
+
+            handlers["move_ee"] = h_move_diag
         server = B4.StandInServer(handlers, port=a.port)
         print("소켓    127.0.0.1:%d  cmd %s" % (a.port, sorted(handlers)))
 
@@ -803,6 +830,16 @@ def main():
             cur["pose"] = ([float(v) for v in pos], _yaw_of(quat))
             S.world.step(render=S.render)
             _j5(S, j5)
+            if a.diag_tcp:
+                # 현재 흡착면(FK)과 **매달린 박스 중심**을 갱신한다.
+                # 짝짓기는 h_move_diag 가 한다 (소켓 스레드는 이 값을 읽기만 한다).
+                diag["face"] = [float(v) for v in rm.suction_pose()]
+                diag["box"] = list(cur["pose"][0]) if cur.get("pose") else None
+                if diag.get("p0") and diag["box"] and diag.get("hit") is None:
+                    diag["nt"] += 1
+                    d0 = (np.array(diag["box"][:2]) - np.array(diag["p0"][:2])) * 1000.0
+                    if float(np.hypot(*d0)) > 1.0:      # 1 mm 넘게 움직인 첫 순간
+                        diag["hit"] = (diag["nt"], list(diag["face"]), [float(v) for v in d0])
 
         if not a.kit_log:
             # 기동 로그(확장 deprecation 등 ~100줄)를 화면에서 치우고 헤더만 다시 찍는다.
@@ -828,10 +865,18 @@ def main():
             rp.set_angular_velocity(np.zeros(3))
             cur["rp"], cur["half_h"], cur["bid"] = rp, dm[2] / 2.0, bid
             cur["pose"] = None                            # 이번 스텝 tick 이 채운다
+            diag["log"].clear()                           # 사이클마다 초기화 (--diag-tcp)
             for _ in range(int(0.3 * S.hz)):
                 tick()
 
             pick_pose = {"pos_m": [float(v) for v in rp.get_world_pose()[0]], "yaw_deg": 0.0}
+            if a.diag_tcp:
+                # ★ 픽 목표를 읽은 이 순간부터 박스가 **언제 · 팔이 어디 있을 때** 움직이는지
+                #   잡는다. 접근 중에 밀린다면 팔이 스친 것이고, 그 순간의 흡착면 위치가
+                #   범인을 가리킨다.
+                diag["p0"] = list(pick_pose["pos_m"])
+                diag["hit"] = None
+                diag["nt"] = 0
             if online:
                 print("\n[%2d/%d] %s %s  %s mm  %.0f kg"
                       % (i + 1, len(ids), bid, spec["name"],
@@ -878,6 +923,42 @@ def main():
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
             print("       %s  오차 [%+.1f %+.1f %+.1f] mm  %.1f s 시뮬  knock %.1f mm (%s)"
                   % (res, err[0], err[1], err[2], steps0 / S.hz, knock, who))
+            if a.diag_tcp and diag["log"]:
+                tg, fc, bx = diag["log"][-1]
+                tg, fc = np.array(tg, dtype=float), np.array(fc, dtype=float)
+                d = (fc - tg) * 1000.0
+                print("       TCP  지령 %s / 실제 %s  ->  **팔 오차** "
+                      "[%+.1f %+.1f %+.1f] mm  |xy| %.1f"
+                      % (np.round(tg, 3), np.round(fc, 3), d[0], d[1], d[2],
+                         float(np.hypot(d[0], d[1]))))
+                if bx is not None:
+                    # 매달린 박스 중심이 흡착면 중심에서 얼마나 벗어나 있나.
+                    #   팔 오차가 작은데 이게 크면 **박스가 패드 위에서 밀린 것**이다.
+                    o = (np.array(bx, dtype=float)[:2] - fc[:2]) * 1000.0
+                    print("       BOX  놓는 순간 박스중심 − 흡착면 = [%+.1f %+.1f] mm  |xy| %.1f"
+                          % (o[0], o[1], float(np.hypot(*o))))
+                    # ★ 구간별로 편다 — **팔 오차와 박스 오프셋을 같이** 봐야 범인이 갈린다.
+                    #   각 줄은 그 구간이 끝난 시점의 값이다. 첫 줄은 직전 사이클의
+                    #   잔여 위치라 무시한다 (박스를 아직 안 잡았다).
+                    if diag.get("hit"):
+                        n0, f0, d0 = diag["hit"]
+                        print("       ★ 박스가 처음 움직인 순간: 픽목표 읽은 뒤 %d 스텝 (%.2f s)"
+                              % (n0, n0 / S.hz))
+                        print("         그때 흡착면 %s  ·  박스 이동 [%+.1f %+.1f] mm"
+                              % (np.round(np.array(f0), 3), d0[0], d0[1]))
+                    print("       ↳ 구간별   팔오차(실제-지령) | 박스오프셋(박스-흡착면)")
+                    for k, (t2, f2, b2) in enumerate(diag["log"], 1):
+                        if b2 is None:
+                            continue
+                        t2 = np.array(t2, dtype=float)
+                        f2 = np.array(f2, dtype=float)
+                        ae = (f2 - t2) * 1000.0
+                        oo = (np.array(b2, dtype=float)[:2] - f2[:2]) * 1000.0
+                        print("          %d) 지령 %-24s 팔 [%+6.1f %+6.1f] |%5.1f|"
+                              "   박스 [%+7.1f %+7.1f] |%5.1f|"
+                              % (k, str(np.round(t2, 3)), ae[0], ae[1],
+                                 float(np.hypot(ae[0], ae[1])),
+                                 oo[0], oo[1], float(np.hypot(*oo))))
             if res != "PLACED":
                 print("       !! 이 박스는 실패다. 다음으로 넘어간다")
 

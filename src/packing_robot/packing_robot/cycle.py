@@ -128,7 +128,19 @@ class Cycle:
         pick_c = list(pick_pose["pos_m"])
         pick_top = pick_c[2] + h / 2000.0                    # 박스 상면 z [m]
         pick_yaw = float(pick_pose.get("yaw_deg", 0.0))
-        self._move([pick_c[0], pick_c[1], pick_top + self.approach_m], pick_yaw)
+        # ★ 픽 상공으로 **곧장 가지 않는다.** 호 이송은 z 를 선형 보간하므로, 직전 배치의
+        #   후퇴 자리가 낮으면(예: 1층 배치 후 0.69 m) 호 중간이 픽업 대기 박스 윗면
+        #   (1.141 m)보다 낮아지고, 그리퍼 몸통(Ø245)이 박스 모서리를 쓸어 밀어 버린다.
+        #   2026-08-24 실측: 후퇴 0.69 에서 온 사이클만 호 67% 지점(흡착면 z 1.125,
+        #   몸통 가장자리가 박스 모서리 안쪽 7.7 mm)에서 박스를 30 mm 밀었다. 후퇴 0.91
+        #   에서 온 같은 자리 사이클은 멀쩡했다. 밀린 박스를 그대로 잡아 그대로 놓으므로
+        #   배치 오차가 곧 그 30 mm 가 된다 (results/issues/21).
+        #   -> 배치 구간과 같은 규약으로 **먼저 수직 상승**한 뒤 가로로 온다.
+        pick_air = pick_top + self.approach_m
+        cur = self._face_now()
+        if cur is not None and cur[2] < pick_air - 1e-3:
+            self._move([cur[0], cur[1], pick_air], pick_yaw)
+        self._move([pick_c[0], pick_c[1], pick_air], pick_yaw)
         self._descend_to_gap(box_id, [pick_c[0], pick_c[1]], pick_top, pick_yaw)
 
         if not self._grasp(box_id):
@@ -189,6 +201,14 @@ class Cycle:
         return "PLACED"
 
     # ── 조각 ─────────────────────────────────────────────────
+    def _face_now(self):
+        """지금 흡착면 월드 위치 [m]. 못 읽으면 None (호출부가 건너뛴다)."""
+        try:
+            f = self.link.call(cmd="motion_status").get("face_m")
+            return [float(v) for v in f] if f else None
+        except Exception:
+            return None
+
     def _move(self, face_m, yaw_deg):
         """흡착면을 face_m 으로 보낸다. 도착까지 기다린다."""
         r = self.link.call(cmd="move_ee", target_m=[float(v) for v in face_m],
