@@ -143,6 +143,17 @@ class Orchestrator(Node):
             time.sleep(0.2)
         log.info("/algo/* 연결됨 — 사이클 시작")
 
+        # ★ 메인 벨트는 켜 두고 계속 돌린다. 박스는 x=500(메인 구간 0~7500)에 스폰되므로
+        #   이걸 안 켜면 스폰만 되고 영영 안 움직인다. Cycle 이 흡착 전에 멈추는 것은
+        #   b_pickup 구간뿐이고, 앞 구간이 계속 돌아야 뒤 박스가 밀려와 대기열이 생긴다
+        #   (설계결정서 §4.4 — 백압 조율에 필요한 버퍼가 물리적으로 생기는 지점).
+        belt_v = float(self.cfg["conveyor"]["belt_velocity_mps"])
+        if not self.svc.set_velocity("main", belt_v):
+            log.error("메인 벨트 가동 실패 — 박스가 스토퍼까지 못 옵니다. "
+                      "씬에 /World/ConveyorTrack 가 있는지 확인하세요")
+        else:
+            log.info(f"메인 벨트 {belt_v} m/s 가동")
+
         for i in range(self.total):
             if not rclpy.ok():
                 return
@@ -154,8 +165,7 @@ class Orchestrator(Node):
             if not r.get("ok"):
                 log.error(f"spawn_box 실패: {r}")
                 continue
-            self.svc.set_velocity(f"{self.zone.lower()}_pickup",
-                                  self.cfg["conveyor"]["belt_velocity_mps"])
+            self.svc.set_velocity(f"{self.zone.lower()}_pickup", belt_v)
 
             pick = self.wait_pickup(box_id)
             if pick is None:
