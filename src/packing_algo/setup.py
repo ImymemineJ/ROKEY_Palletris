@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'algo_service_node = packing_algo.algo_service_node:main',
+            'rehearsal_check = packing_algo.preflight:main',
         ],
     },
 )
