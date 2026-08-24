@@ -467,6 +467,8 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | tf 프레임 이름 규약 | 김학민 | 씬 prim 이름과 일치해야 함 |
 | `gripper_clearance_mm` 30 → **10** | 김병직 | 충전율 **+7.2%p** |
 | 조각 이음매(7489~7515)에서 박스가 튀는지 | 김학민 | 3호(250)가 걸리면 라인이 막힌다 |
+| **서비스 응답의 float 이 안 실린다** | 김학민 | Isaac ROS2 브리지가 `Unable to write float value (nil)`. `SetVelocity.actual_mps` 만 해당. string·bool·**토픽 float32** 는 정상 (TS-023) |
+| `/sim/*` · `/conveyor/*` 서비스 경로 확정 | 팀 | §3-3 이 srv 타입만 정했다. `ros_graph.SERVICES` 의 잠정값을 쓰는 중 |
 | `msg/SpawnEvent.msg` 존치 여부 | 민범진 | §3 표에 없는데 저장소에 있다. Isaac Action Graph 쪽에서 쓸 수 있어 남겨 뒀다 |
 | `BoxInfo.weight_g` vs yaml `mass_g` | 민범진 | §3-1 은 `weight_g`, `system.yaml` 정본은 `mass_g: 3000`. 이름이 다르다 |
 | `/algo/reset_heightmap` 경로 확정 | 팀 | §3-3 이 srv 타입(`ResetHeightmap`)만 정하고 **서비스 경로를 안 적었다.** srv 이름에 맞춰 잠정 확정 |
