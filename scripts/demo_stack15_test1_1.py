@@ -229,7 +229,13 @@ METER_MAX = int(os.environ.get("PL_METER", "1"))
 #   없다 — 포인트클라우드 annotator 경로 문제다). 우회로는 이미 있다:
 #   `perception.CameraPerception._pointcloud_world` 가 depth + intrinsics 로
 #   직접 투영한다. 그쪽으로 갈아끼우면 된다.
-CAM = os.environ.get("PL_CAM", "0") not in ("0", "false", "no")
+#   ★ 2026-08-24 기본을 **demo 켬 / gate 끔** 으로 바꿨다. 위 막힌 곳(포인트클라우드
+#     API)은 원인이 Isaac 이 아니라 모듈 이름 충돌이었고 (`_cfgload` docstring),
+#     고친 뒤 5/5 인식 · 종류 5/5 · 중심 오차 최대 6.5 mm 로 돈다. 시연에서 제일
+#     설명하기 좋은 자리라 켜 둔다. 게이트는 끈다 — 판단에 안 쓰는 계측이 사이클에
+#     끼면 베이스라인이 흔들린다.
+_DEFAULTS["PL_CAM"] = ("1", "0")
+CAM = _env("PL_CAM") not in ("0", "false", "no")
 # ★ 화면 둘을 **다른 방식으로** 낸다 (2026-08-24).
 #     view2 (Isaac 두 번째 뷰포트)  = 벨트 위 하향 카메라  /World/CamPick
 #     rqt   (별도 프로세스)          = 그리퍼 손목 카메라  /World/robot/gripper/CamWrist
