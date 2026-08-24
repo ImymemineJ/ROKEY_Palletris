@@ -434,10 +434,18 @@ def _wrist_cam_to_ros():
       박아 두지 않는 이유: 게이트 실행(gate 모드)은 이 부하가 없어야 하고,
       브릿지가 안 켜진 환경에서 씬을 열면 그래프가 매 틱 에러를 낸다.
 
-    ★ 왜 다음 앱 업데이트에서 만드는가. `enable_extension` 직후에는 브릿지가
-      OmniGraph 노드 타입을 아직 등록 중일 수 있다. 여기는 `--exec` 라
-      `simulation_app.update()` 손잡이가 없어서 (`_kitexit` 과 같은 이유)
-      업데이트 이벤트를 한 번 받고 만든다.
+    ★ 왜 나중에 만드는가. 이유가 둘이다.
+      (1) `enable_extension` 직후에는 브릿지가 OmniGraph 노드 타입을 아직 등록
+          중일 수 있다. 여기는 `--exec` 라 `simulation_app.update()` 손잡이가
+          없어서 (`_kitexit` 과 같은 이유) 업데이트 이벤트를 받아 처리한다.
+      (2) **부팅 프레임에서 만들면 안 된다.** 뷰포트(view2)를 막 띄운 그 프레임에
+          렌더 프로덕트를 하나 더 붙이면 GPU 커맨드 리스트가 엉켜
+              [Error] [gpu.foundation.plugin] make sure to wait for cmdlist
+              completion ... actualSemaphore: 2 expectedSemaphore: 3
+          가 뜬다. 실측 2026-08-24 A/B — 손목ROS 를 끈 실행에는 이 줄이 없고,
+          켠 실행에는 렌더 프로덕트를 만드는 시각(15,135 ms)에 정확히 뜬다.
+          그래서 **Play 를 누르고 렌더가 안정된 뒤**에 만든다. 손해는 없다 —
+          `OnPlaybackTick` 은 어차피 Play 전에는 안 돈다.
     """
     from isaacsim.core.utils.extensions import enable_extension
 
@@ -457,8 +465,11 @@ def _wrist_cam_to_ros():
     _st = {"sub": None, "n": 0}
 
     def _build(_e):
+        # Play 전에는 세지도 않는다. Play 를 누른 뒤 렌더가 자리를 잡고 나서 만든다.
+        if not omni.timeline.get_timeline_interface().is_playing():
+            return
         _st["n"] += 1
-        if _st["n"] < 3:                     # 노드 타입이 등록될 틈을 준다
+        if _st["n"] < 30:                    # 노드 등록 + 첫 렌더 프레임이 지나갈 틈
             return
         try:
             _st["sub"].unsubscribe()
