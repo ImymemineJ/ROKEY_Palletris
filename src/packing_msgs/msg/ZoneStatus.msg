@@ -1,6 +1,10 @@
-string  zone
-int32   queue_len          # /db/zone_queue 응답 중계 (§6.7)
-int32   buffer_cap
-float32 est_free_time_s    # 사이클 잔여 추정 — 중재자 동점 처리에 사용
-string  state              # "IDLE"|"BUSY"|"BLOCKED"|"PALLET_FULL"
-float32 fill_rate
+# 관제탑 → 중재자·모니터링. 2 Hz (CLAUDE.md §3-2)
+string  zone           # "a"|"b"|"c"
+string  state          # IDLE|FETCHING|PLANNING|PICKING|PLACING|UPDATING|DONE
+int32   queue_len
+int32   placed_count
+int32   rejected_count
+float32 fill_rate      # ★ 분모는 max_stack 이 아니라 실제 최고높이 (함정: 충전율이 낮게 나옴)
+int32   max_height_mm
+bool    accepting      # ★ false = 더 보내지 마라. 중재자는 이 칸만 본다
+builtin_interfaces/Time stamp

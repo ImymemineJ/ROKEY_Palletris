@@ -17,7 +17,27 @@ class HeightmapPacker:
         self.w_wall = hm_cfg.get("w_wall", 0.0)             # 벽 밀착도 (0 이면 기존 동작)
         self.w_far = hm_cfg.get("w_far", 0.0)               # 로봇에서 먼 쪽 우선 (0 이면 기존 동작)
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
+        # ★ 구 등방 halo. 아래 arm_* 로 대체됐고, robot 섹션이 없는 축약 cfg 에서만 쓴다.
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
+        # ★★ 팔이 지나갈 자리 — 코드에 숫자를 박지 않고 robot 섹션에서 유도한다 (철칙 3).
+        #   arm_gap  : 박스 윗면과 팔뚝 밑면 사이 = 그리퍼 몸통 길이. 그 구간은 몸통이
+        #              차지하는데 몸통 Ø245 는 모든 박스 발자국 **안에** 들어가므로
+        #              (가장 짧은 변 250 > 245) 이웃과 무관하다. 즉 이웃이 박스 윗면보다
+        #              이만큼까지 높아도 안 닿는다. 구 코드의 30mm halo 는 어떤 실물
+        #              치수도 아니었다 — 몸통은 애초에 halo 로 막을 대상이 아니었다.
+        #   arm_side : 그 위(팔뚝 높이대)에서 팔이 발자국 밖으로 번지는 양.
+        #              ⚠ **잠정값 60mm.** 실물 치수가 아니라, 위로 갈수록 넓어지는
+        #              팔의 원뿔을 (반경, 높이) 한 쌍으로 선형화한 경험값이다.
+        #              Isaac 스윕으로 교정해야 한다 (CLAUDE.md §15 미결에 추가).
+        #              측정(45박스·seed 0~19): 구 동작 → 이 규칙으로 바꾸면 협곡 배치
+        #              2.55 → 1.30 회이면서 **용량 적재율이 58.1% → 62.3% 로 오른다.**
+        #              높이 기준을 함께 고쳤기 때문에 반경을 넓혀도 손해가 아니다.
+        #              120mm 로 올리면 협곡 0.05 까지 내려가지만 적재율이 55.5% 로
+        #              구 동작보다도 낮아진다 — 그 교환은 Isaac 검증 후에 결정한다.
+        rb = cfg.get("robot")
+        self.arm_aware = rb is not None
+        self.arm_gap  = int(rb["gripper_length_mm"]) if rb else 0
+        self.arm_side = hm_cfg.get("arm_side_margin_mm", 60) // self.cell
         self.min_sup = hm_cfg["min_support_ratio"]          # 0.7
         self.topk = hm_cfg["topk_support_check"]            # 50
         self.yaw_tol = hm_cfg["yaw_tol_deg"]                # 5.0 — 이만큼 틀어지면 AABB 기록
@@ -54,7 +74,8 @@ class HeightmapPacker:
             wc, dc = w // self.cell, d // self.cell
             bz = self._base_z(wc, dc)                       # ① 경계는 shape가 처리
             ok_h = bz + h_mm <= self.max_stack              # ② 높이
-            corridor = self._corridor_ok(wc, dc, bz)        # ④ 통로 (전 후보, 필터로 싸다)
+            # ④ 통로 (전 후보, 필터로 싸다). ★ 높이 기준이 박스 윗면이라 h_mm 이 필요하다.
+            corridor = self._corridor_ok(wc, dc, bz, h_mm)
             cand = ok_h & corridor
             if not cand.any(): continue
             # 지지율 전 1차 점수. 후보가 아닌 칸은 -inf 로 빼서 topk 자리를 낭비하지 않게 한다.
@@ -134,12 +155,35 @@ class HeightmapPacker:
         foot = self.hm[i:i + wc, j:j + dc]
         return float((np.abs(foot - base_z) <= self.tol).mean())   # ★ tol=10 필수
 
-    def _corridor_ok(self, wc, dc, bz):
-        """그리퍼 여유 포함 확장 윈도의 최대가 밑면 이하인가 — 패딩으로 경계 처리"""
-        c = self.clr
+    def _corridor_ok(self, wc, dc, bz, h_mm):
+        """팔이 지나갈 자리가 있는가 — 확장 윈도의 최대가 **박스 윗면** 이하인가.
+
+        ★★ 기준이 밑면이 아니라 **윗면 + 그리퍼 길이** 인 것이 핵심이다.
+          박스는 자기보다 높은 이웃 **옆에 미끄러져 들어가도 된다** — 발자국 안은
+          bz 의 정의상 이미 비어 있다. 막아야 할 것은 그 위를 지나는 **팔뚝**이고,
+          팔뚝은 박스 윗면에서 그리퍼 길이만큼 위에서 시작한다.
+
+          구 코드는 `big <= bz + tol` (밑면 기준) 이었다. 그래서 동시에 두 가지가 틀렸다:
+            · 무해한 배치를 금지해 적재율만 깎았다 — clr 30→60 에서 용량 −4.6%p
+            · 정작 닿는 높이대를 못 봐서 협곡 배치가 안 줄었다 — 2.55 → 2.50 회 (무의미)
+          윗면 기준으로 바꾸면 협곡 2.55 → 1.30 회이면서 적재율이 58.1% → 62.3% 로
+          **오른다.** (seed 0~19 · 45박스 · scripts/eval_arm_corridor.py 로 재현)
+
+        ★ 방향성(로봇 쪽 -Py 통로만 보기)도 얹어 봤지만 **이득이 없다.** 이 기준으로
+          고치고 나면 협곡 1.30 → 1.10 회로 거의 안 줄면서 용량만 62.3% → 60.1% 로
+          떨어진다. 높이 기준이 옳으면 방향 구분이 필요 없다는 뜻이라 넣지 않았다.
+
+        ★ 2.5D 로 충분한 이유: 팔은 위에서 내려온다. 각 셀에서 알아야 하는 것은
+          "이 칸에서 가장 높은 것이 팔 밑면보다 높은가" 뿐이고, 그건 높이맵이 이미
+          가진 정보다. 3D 복셀을 써도 같은 답이 나온다.
+        """
+        if not self.arm_aware:                      # robot 섹션 없는 축약 cfg — 구 동작
+            c, lim = self.clr, bz + self.tol
+        else:
+            c, lim = self.arm_side, bz + h_mm + self.arm_gap + self.tol
         pad = np.pad(self.hm, c, mode="constant", constant_values=0)
         big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + 2 * c, 1)
-        return big <= bz + self.tol
+        return big <= lim
 
     def update(self, box_id, w_mm, d_mm, h_mm, actual):
         """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)

@@ -4,9 +4,11 @@
   <name>packing_msgs</name>
   <version>0.0.0</version>
   <description>
-    ★ 초안 (트랙 C 정정인이 통합 시연을 위해 먼저 작성). 정본 소유는 트랙 D 민범진.
-    필드 이름·타입은 작업명세서 §2.1 / §2.2 를 한 글자도 바꾸지 않고 옮긴 것이며,
-    srv 파일 이름만 제안값이다. 철칙 1 에 따라 반드시 main 에 먼저 머지하고 전원이 pull 한다.
+    ROS 2 공용 인터페이스. 필드 이름·타입은 **CLAUDE.md §3 을 한 글자도 바꾸지 않고**
+    옮긴 것이다. 여기를 고치면 팀 4명 전원이 재빌드해야 한다 (§11·§14).
+    2026-08-24 §3 최종본에 맞춰 정렬 — RobotCmd·RobotEvent 신규, BoxAtPickup 이 Pose 를
+    버리고 mm 정수로, BoxInfo·ZoneStatus 필드 확정, ResetZone -> ResetHeightmap,
+    UpdateHeightmap 응답에 max_height_mm 추가.
   </description>
   <maintainer email="jungji0913@khu.ac.kr">정정인 (초안 · 인수인계 대상: 민범진)</maintainer>
   <license>Apache-2.0</license>
@@ -14,7 +16,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
-  <depend>geometry_msgs</depend>          <!-- BoxAtPickup.msg 의 Pose -->
+  <depend>builtin_interfaces</depend>     <!-- ZoneStatus.msg 의 Time stamp -->
 
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>

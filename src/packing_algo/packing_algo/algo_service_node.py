@@ -29,7 +29,8 @@ from packing_common.frames import PlacePose as PlacePoseData
 
 try:
     from packing_msgs.msg import PlacePose
-    from packing_msgs.srv import CancelPlan, PlanPlacement, ResetZone, UpdateHeightmap
+    from packing_msgs.srv import (CancelPlan, PlanPlacement, ResetHeightmap,
+                                  UpdateHeightmap)
 except ImportError as e:      # 트랙 D 의 packing_msgs 가 아직 빌드되지 않은 경우
     raise SystemExit(
         f"packing_msgs 를 import 하지 못했습니다: {e}\n"
@@ -54,7 +55,10 @@ class AlgoService(Node):
         self.create_service(PlanPlacement, "/algo/plan_placement", self.on_plan, callback_group=cb)
         self.create_service(UpdateHeightmap, "/algo/update_heightmap", self.on_update, callback_group=cb)
         self.create_service(CancelPlan, "/algo/cancel_plan", self.on_cancel, callback_group=cb)
-        self.create_service(ResetZone, "/algo/reset", self.on_reset, callback_group=cb)
+        # ★ 서비스 경로는 srv 이름과 맞춘다 — CLAUDE.md §3-3 이 타입만 정하고
+        #   경로를 안 적어서, 이름이 다르면 클라이언트가 조용히 못 붙는다.
+        self.create_service(ResetHeightmap, "/algo/reset_heightmap", self.on_reset,
+                            callback_group=cb)
 
         # ── 소요시간 (평가항목 "검증 및 분석" — CLAUDE.md §13) ──
         #   첫 plan 이 들어온 순간부터 잰다. 노드를 미리 띄워 두고 기다린 시간은
@@ -141,12 +145,16 @@ class AlgoService(Node):
         pk = self._packer(req.zone)
         if pk is None:
             res.ok, res.fill_rate, res.placed_count = False, 0.0, 0
+            res.max_height_mm = 0
             return res
 
         actual = PlacePoseData.from_msg(req.actual_pose).as_dict()   # ★ 실측 pose 로 갱신
         ok, fill, count = pk.update(req.box_id, req.size_w_mm, req.size_d_mm,
                                     req.size_h_mm, actual)
         res.ok, res.fill_rate, res.placed_count = bool(ok), float(fill), int(count)
+        # ★ 관제탑이 ZoneStatus.max_height_mm (§3-2) 를 채우는 유일한 경로다.
+        #   여기서 안 주면 관제탑은 실제 더미 높이를 알 방법이 없다.
+        res.max_height_mm = int(pk.hm.max())
 
         self.t_last[req.zone] = time.perf_counter()
         self.dump(req.zone)
@@ -205,7 +213,7 @@ class AlgoService(Node):
         self.get_logger().info(f"cancel[{req.zone}] {req.box_id}")
         return res
 
-    # ---------- /algo/reset ----------
+    # ---------- /algo/reset_heightmap ----------
     def on_reset(self, req, res):
         pk = self._packer(req.zone)
         if pk is not None:
