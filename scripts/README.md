@@ -11,6 +11,8 @@
 | `verify_lula_ik.py` | 김병직 | **B1 — Lula 기동.** IK 한 점. Isaac 배선(`bring_up`)이 여기 한 군데에만 있다 |
 | `verify_reach_isaac.py` | 김병직 | **G1 Isaac 판 + G5.** 11점을 Lula 로. 씬 전체 충돌은 A3 대기 |
 | `check_place_plan.py` | 김병직 | 알고리즘 배치 계획 프리플라이트 (`plan.json`) |
+| `verify_link_clearance.py` | 김병직 | **팔 링크 대 적재물 간섭 실측 — 특히 `link_2` (issues/18·25).** `--probe` 는 근거리 기둥 높이를 쓸어 한계를 낸다 (`demo_stack15.py:331` 의 `ped-150` 어림값 대체). `--sweep-dy`/`--sweep-ped` 로 기구학 파라미터 감도. 씬 없이 6초 |
+| `verify_link_clearance_isaac.py` | 김병직 | **위 스크립트의 Isaac/Lula 판.** `~/isaac-sim-5.1.0/python.sh` 로 돌린다. 기하는 책상판에서 import 하므로 같은 기둥을 본다. 여유를 셋(`desk*`/`lula`/`scene`)으로 내서 **가지 선택**과 **FK 모델**을 따로 검증한다. `--gui --spawn --hold` 로 눈으로 확인 |
 | `verify_spheres.py` | 김병직 | Lula 충돌 구체가 메시를 덮는지 |
 | `gen_collision_spheres.py` | 김병직 | 충돌 메시에서 구체 재유도 (`--update`) |
 | `gen_reach_diagram.py` | 김병직 | **`docs/가이드/img/reach_side.svg` 를 system.yaml 에서 생성.** 손으로 그린 축척 도면이라 페데스탈·max_stack 이 바뀔 때마다 조용히 틀려졌다. 값이 바뀌면 다시 돌릴 것 |
