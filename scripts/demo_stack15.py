@@ -148,6 +148,25 @@ STAGE_XY = (14.5, 4.2)
 STAGE_PITCH = 0.75
 STAGE_COLS = 5
 
+# ★ 버림(despawn) 자리 — `Spawner._despawn` 이 하는 일을 이 데모 안에서 한다.
+#   이 데모는 `sim_main` 소켓을 안 거치고 프림을 직접 들고 있으므로 서비스 호출 대신
+#   프림을 라인 밖으로 옮긴다. 벨트(x 9.65 ±0.6)·팔레트(10.3,0.3)·로봇(10.9,-0.1)
+#   어디에도 안 걸리고, 대기 스테이징(+Y 4.2)과도 반대쪽이라 겹치지 않는다.
+PARK_XY = (14.5, -3.0)
+
+
+def _park(rp, dm, idx):
+    """거부·실패한 박스를 라인 밖으로 옮긴다. `Spawner._despawn` 과 같은 역할이다.
+
+    속도를 0 으로 지우지 않으면 옮긴 자리에서 튄다 (급송 코드와 같은 이유).
+    """
+    px = PARK_XY[0] + (idx % STAGE_COLS) * STAGE_PITCH
+    py = PARK_XY[1] - (idx // STAGE_COLS) * STAGE_PITCH
+    rp.set_world_pose(position=np.array([px, py, dm[2] / 2.0 + 0.002]),
+                      orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+    rp.set_linear_velocity(np.zeros(3))
+    rp.set_angular_velocity(np.zeros(3))
+
 
 # ─────────────────────────────────────────────────────────────
 # 배치 계획 — Isaac 없이 돈다
@@ -438,6 +457,7 @@ class OnlineServices:
         self.c = clearance_mm / 1000.0
         self.calls, self._log, self._v = [], log, verbose
         self.last = None                                 # 마지막 계획 (요약표용)
+        self.last_plan_msg = None                        # 직전 plan_placement 의 msg (§5 판정용)
 
     def _rec(self, name, *a):
         self.calls.append((name,) + a)
@@ -473,7 +493,9 @@ class OnlineServices:
         if p is None:
             self._log("             [svc] 자리 없음 (관측 %d개, 최상단 %.0f mm)"
                       % (seen, top * 1000))
+            self.last_plan_msg = "PALLET_FULL"
             return False, None, "PALLET_FULL"
+        self.last_plan_msg = "OK"
         cx, cy, _ = p.center_local
         place = {"x_mm": int(round(cx * 1000.0)), "y_mm": int(round(cy * 1000.0)),
                  "z_mm": int(round(p.z * 1000.0)), "yaw_deg": int(round(p.yaw_deg)),
@@ -523,6 +545,7 @@ class AlgoServices:
         self.c = int(clearance_mm)
         self.calls, self._log, self._v = [], log, verbose
         self.last = None                            # 온라인 경로가 실측 대조에 쓴다
+        self.last_plan_msg = None                   # 직전 plan_placement 의 msg (§5 판정용)
 
     def _rec(self, name, *a):
         self.calls.append((name,) + a)
@@ -535,8 +558,10 @@ class AlgoServices:
         # ★ 맨 앞에서 지운다. 안 지우면 계획에 실패한 박스가 **직전 박스의 좌표**를
         #   물려받아 대조표에 찍힌다 (아래 online 경로가 `svc.last` 를 그대로 읽는다).
         self.last = None
+        self.last_plan_msg = None
         ok, pose, _score, msg = self.pk.plan(box_id, int(w) + self.c,
                                              int(d) + self.c, int(h))
+        self.last_plan_msg = msg
         if not ok:
             self._log("             [algo] %s" % msg)
             return False, None, msg
@@ -592,6 +617,7 @@ class PlanServices:
     def __init__(self, specs, places, log=print, verbose=False):
         self.specs = dict(specs)                    # box_id -> system.yaml 박스 스펙
         self.places = dict(places)                  # box_id -> PlacePose
+        self.last_plan_msg = None                   # 직전 plan_placement 의 msg (§5 판정용)
         self.calls = []
         self._log = log
         self._v = verbose
@@ -616,7 +642,9 @@ class PlanServices:
         self._rec("/algo/plan_placement", zone, box_id)
         p = self.places.get(box_id)
         if p is None:
+            self.last_plan_msg = "PALLET_FULL"
             return False, None, "PALLET_FULL"
+        self.last_plan_msg = "OK"
         return True, dict(p), "OK"
 
     def set_status(self, box_id, status):
@@ -968,6 +996,7 @@ def main():
         cyc = CY.Cycle(link, svc, cfg, zone=a.zone)
 
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
+        parked, rejected = [], set()                      # 라인 밖으로 치운 것 / 그중 §5 거부
         j5 = [1e9, -1e9]                                  # 손목 감김 추적 (아래 주석)
 
         # ★ 물리를 **벽시계에 묶는다** — 재현성의 핵심이다.
@@ -1108,6 +1137,22 @@ def main():
             if res == "PLACED":
                 rest[bid] = pos.copy()
 
+            # ── §5 판정 — `NO_FEASIBLE_POSE` ≠ `PALLET_FULL` ────────────────
+            # ★ `cycle.run` 은 둘 다 뭉뚱그려 돌려준다(`BLOCKED`). 어느 쪽인지는
+            #   svc 가 받은 msg 만 안다 — orchestrator.py:240 과 같은 방식이다.
+            #   여기서 안 치우면 거부된 박스가 **스토퍼에 그대로 서 있고**, 다음
+            #   박스를 같은 자리로 급송하면서 겹친다. 실측: 14번 NO_FEASIBLE_POSE
+            #   직후 15번이 간극 -13.95 mm 로 흡착 실패했다.
+            pmsg = getattr(svc, "last_plan_msg", None)
+            if res != "PLACED" and res != "PALLET_FULL" and pmsg == "NO_FEASIBLE_POSE":
+                res = "REJECTED"                      # 정상 판단이다. 실패로 세지 않는다
+            if res != "PLACED":
+                _park(rp, dm, len(parked))            # 라인 밖으로 — 다음 박스 길을 연다
+                parked.append(bid)
+                if res == "REJECTED":
+                    rejected.add(bid)
+                    places.pop(bid, None)             # 계획이 없다. 대조표에서 빼야 한다
+
             rows.append({"id": bid, "type": spec["name"], "res": res, "err": err,
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
             print("       %s  오차 [%+.1f %+.1f %+.1f] mm  %.1f s 시뮬  knock %.1f mm (%s)"
@@ -1148,7 +1193,13 @@ def main():
                               % (k, str(np.round(t2, 3)), ae[0], ae[1],
                                  float(np.hypot(ae[0], ae[1])),
                                  oo[0], oo[1], float(np.hypot(*oo))))
-            if res != "PLACED":
+            if res == "REJECTED":
+                print("       ·· 이 박스는 자리가 없다 (NO_FEASIBLE_POSE) — "
+                      "버리고 계속한다 (누적 %d)" % len(rejected))
+            elif res == "PALLET_FULL":
+                print("       == PALLET_FULL — 시나리오를 여기서 끝낸다 (CLAUDE.md §5)")
+                break
+            elif res != "PLACED":
                 print("       !! 이 박스는 실패다. 다음으로 넘어간다")
 
         # ── 표 ─────────────────────────────────────────────
@@ -1174,7 +1225,12 @@ def main():
                if r["res"] == "PLACED" and (float(np.linalg.norm(r["err"][:2])) > PLACE_TOL_XY_MM
                                             or abs(r["err"][2]) > PLACE_TOL_Z_MM)]
 
-        print("\n놓은 것       %d / %d" % (len(placed), len(rows)))
+        # ★ 버림은 실패가 아니다 (§5). 뭉뚱그리면 "실패 N건" 이 부풀려 나오고
+        #   발표에서 알고리즘 정상 판단과 진짜 고장을 구분할 수 없다.
+        n_rej = len([r for r in rows if r["res"] == "REJECTED"])
+        n_fail = len(rows) - len(placed) - n_rej
+        print("\n놓은 것       %d / %d   (적재 %d · 버림 %d · 실패 %d)"
+              % (len(placed), len(rows), len(placed), n_rej, n_fail))
         print("%s   %d 단 (밑면 z %s)"
               % ("배치 단수    " if online else "계획 층수    ", len(layers), layers))
         print("실측 최상단   %.0f mm (팔레트 상면 기준) / max_stack %d mm"
@@ -1188,6 +1244,10 @@ def main():
         print("  #  박스      종류  계획 P(x,y) z      실제 어긋남 dx  dy  dz")
         for i, (bid, dm) in enumerate(zip(ids, dims_m), 1):
             pl = places.get(bid)
+            if bid in rejected:
+                print("%3d  %-9s %-4s  (자리 없음 — 버림. 라인 밖으로 치웠다)"
+                      % (i, bid, specs[bid]["name"]))
+                continue
             if pl is None:
                 print("%3d  %-9s %-4s  (계획 없음 — 사이클이 배치 전에 끝났다)"
                       % (i, bid, specs[bid]["name"]))
@@ -1205,7 +1265,8 @@ def main():
                  sum(r["sim_s"] for r in rows) / max(1, len(rows))))
 
         for cond, msg in (
-                (len(placed) == len(rows), "%d 개가 PLACED 가 아니다" % (len(rows) - len(placed))),
+                (len(placed) + n_rej == len(rows),
+                 "%d 개가 PLACED 도 REJECTED 도 아니다 (진짜 실패)" % n_fail),
                 (not off, "배치 오차 초과 %s" % [r["id"] for r in off]),
                 (max_knock <= KNOCK_WARN_MM,
                  "이미 놓인 박스가 %.1f mm 밀렸다 — 이송 높이를 볼 것" % max_knock),
