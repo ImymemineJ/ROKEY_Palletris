@@ -82,6 +82,9 @@ class RosServices:
                                   yaw_deg=float(actual.get("yaw_deg", 0.0))))), "update_heightmap")
         self.n.fill_rate = res.fill_rate
         self.n.placed_count = res.placed_count
+        # ★ 새 ZoneStatus 가 max_height_mm 을 싣는다. 계획값이 아니라 algo 가
+        #   실측 pose 로 갱신한 뒤 돌려준 값이라 그대로 중계하면 된다.
+        self.n.max_height_mm = res.max_height_mm
         return res.ok, f"{res.fill_rate * 100:.1f}%"
 
     def cancel_plan(self, zone, box_id):
@@ -137,6 +140,7 @@ class Orchestrator(Node):
 
         self.state, self.finished = "IDLE", False
         self.fill_rate, self.placed_count = 0.0, 0
+        self.max_height_mm = 0
         self.placed = self.dropped = self.failed = 0
         self.create_timer(0.5, self.on_status, callback_group=cb)
         self.get_logger().info(f"orchestrator 시작 — zone={self.zone} · 박스 {self.total}개 · "
@@ -276,10 +280,20 @@ class Orchestrator(Node):
             f"· 적재율 {self.fill_rate * 100:.1f}% ═══")
 
     def on_status(self):
+        # ★ ZoneStatus 개편 (CLAUDE.md §3-2) 반영.
+        #   buffer_cap · est_free_time_s 는 사라졌다 — 중재자가 그 둘을 보고 계산하던
+        #   것을 이제 accepting 한 칸이 대신한다. "더 보내도 되나"만 알면 되기 때문이다.
         self.pub_status.publish(ZoneStatus(
-            zone=self.zone, queue_len=0,             # TODO(트랙 D): /db/zone_queue 중계
-            buffer_cap=int(self.cfg["zones"]["buffer_capacity"]),
-            est_free_time_s=0.0, state=self.state, fill_rate=float(self.fill_rate)))
+            zone=self.zone,
+            state=self.state,
+            queue_len=0,                              # TODO(트랙 D): /db/zone_queue 중계
+            placed_count=int(self.placed),
+            rejected_count=int(self.dropped),
+            fill_rate=float(self.fill_rate),
+            max_height_mm=int(self.max_height_mm),
+            # 끝났거나 팔레트가 찼으면 더 받지 않는다.
+            accepting=(not self.finished) and self.state != "PALLET_FULL",
+            stamp=self.get_clock().now().to_msg()))
 
 
 def main(args=None):

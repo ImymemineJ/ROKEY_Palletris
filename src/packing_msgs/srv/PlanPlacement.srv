@@ -1,10 +1,15 @@
-string zone
-string box_id
-int32  size_w_mm
-int32  size_d_mm
-int32  size_h_mm
+# orchestrator → algo.  이 박스를 어디에 놓을지 계산한다.
+# ⚠️ 응답 200ms 이내.
+string    zone         # 1차는 항상 "b"
+string    box_id       # ★ 계획을 box_id 로 키잡는다. 없으면 stale plan 이 남는다
+int32     size_w_mm
+int32     size_d_mm
+int32     size_h_mm
 ---
 bool      ok
 PlacePose pose
 float32   score
-string    message      # "OK"|"PALLET_FULL"|"NO_FEASIBLE_POSE"
+string    message      # "OK" | "NO_FEASIBLE_POSE" | "PALLET_FULL"
+                       # ★ 두 실패는 뜻이 다르다.
+                       #   NO_FEASIBLE_POSE = 이 박스만 자리 없음 → 박스만 버리고 계속
+                       #   PALLET_FULL      = 가장 작은 박스도 불가 → 시나리오 종료

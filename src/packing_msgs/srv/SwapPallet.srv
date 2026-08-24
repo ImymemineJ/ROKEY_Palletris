@@ -1,3 +1,4 @@
-string zone
+# 2차 전용.
+string  zone
 ---
-bool   ok
+bool    ok

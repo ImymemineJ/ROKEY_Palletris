@@ -1,4 +1,6 @@
-string box_id
+# 2차 전용.  씬 → 중재자.  분기점 직전에 "이 박스 어디로" 를 묻는다.
+# ⚠️ 응답 제한 0.6초. 초과하면 씬이 기본값으로 통과시킨다.
+string  box_id
 ---
-string target          # "A"|"B"|"C"|"RETURN"
-string reason          # "NORMAL"|"BUFFER_FULL"|"REJECT"
+string  target         # "A"|"B"|"C"|"RETURN"
+string  reason         # "NORMAL"|"BUFFER_FULL"|"REJECT"|"TIMEOUT"

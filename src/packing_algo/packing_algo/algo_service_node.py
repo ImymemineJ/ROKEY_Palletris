@@ -29,7 +29,7 @@ from packing_common.frames import PlacePose as PlacePoseData
 
 try:
     from packing_msgs.msg import PlacePose
-    from packing_msgs.srv import CancelPlan, PlanPlacement, ResetZone, UpdateHeightmap
+    from packing_msgs.srv import CancelPlan, PlanPlacement, ResetHeightmap, UpdateHeightmap
 except ImportError as e:      # 트랙 D 의 packing_msgs 가 아직 빌드되지 않은 경우
     raise SystemExit(
         f"packing_msgs 를 import 하지 못했습니다: {e}\n"
@@ -54,7 +54,7 @@ class AlgoService(Node):
         self.create_service(PlanPlacement, "/algo/plan_placement", self.on_plan, callback_group=cb)
         self.create_service(UpdateHeightmap, "/algo/update_heightmap", self.on_update, callback_group=cb)
         self.create_service(CancelPlan, "/algo/cancel_plan", self.on_cancel, callback_group=cb)
-        self.create_service(ResetZone, "/algo/reset", self.on_reset, callback_group=cb)
+        self.create_service(ResetHeightmap, "/algo/reset", self.on_reset, callback_group=cb)
 
         hm = next(iter(self.pk.values()))
         self.get_logger().info(
