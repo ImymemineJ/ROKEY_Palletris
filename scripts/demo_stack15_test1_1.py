@@ -190,6 +190,18 @@ HOLD = _env("PL_HOLD") not in ("", "0", "false", "no") and _has_window()
 #   PL_AUTOPLAY=1 / 0 으로 어느 쪽이든 강제할 수 있다.
 _ap = os.environ.get("PL_AUTOPLAY")
 AUTOPLAY = (not _has_window()) if _ap is None else (_ap not in ("0", "false", "no"))
+# ★ 창도 없는데 자동 Play 를 끄면 **누를 사람이 없어 영원히 기다린다.**
+#   실측 2026-08-24: 그렇게 띄운 헤드리스 하나가 15분째 살아서 GUI 시연과 GPU 를
+#   나눠 쓰고 있었다 — 어제 knock 이 18 / 67 mm 로 갈렸던 바로 그 원인이다
+#   (`_kitexit` docstring). 조용히 매달려 있느니 여기서 끊는다.
+if not AUTOPLAY and not _has_window():
+    print("\n!! 창이 없는 실행(--no-window)인데 PL_AUTOPLAY=0 이다.", flush=True)
+    print("   Play 를 눌러 줄 사람이 없어서 영원히 기다린다. 그대로 두면 GPU 만 먹는다.",
+          flush=True)
+    print("   창 없이 돌릴 거면 PL_AUTOPLAY 를 빼라 (창 없는 실행은 원래 자동이다).",
+          flush=True)
+    _kitexit.shutdown(3, log=print)
+    raise SystemExit
 PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
 # ★ 팔 속도. **이 실행에서만** 덮어쓴다 — system.yaml 도 B 코드도 안 건드린다.
 #   왜 필요한가: 이송 구간이 177도를 도는데 박스는 흡착 패드에 강성 100 · 감쇠 0
