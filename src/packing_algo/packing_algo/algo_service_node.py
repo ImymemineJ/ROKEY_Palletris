@@ -14,6 +14,8 @@ ROS 메시지 ↔ 파이썬 자료구조 **번역**과 구역별 패커 인스�
 실행:
     ros2 run packing_algo algo_service_node
 """
+import json
+import os
 import time
 
 import rclpy
@@ -40,6 +42,10 @@ class AlgoService(Node):
     def __init__(self):
         super().__init__("algo_service_node")
         self.cfg = load()
+        # 실시간 시각화용 상태 덤프. 빈 문자열이면 끈다 — 인터페이스가 아니라 파일이라
+        # ROS 계약(D2: algo 는 아무것도 발행하지 않는다)을 건드리지 않는다.
+        self.declare_parameter("snapshot_path", "")
+        self.snap = os.path.expanduser(self.get_parameter("snapshot_path").value or "")
         cb = ReentrantCallbackGroup()
 
         # 구역별 패커 1개씩. stage 1 은 B 만 쓰지만, 3구역 확장 때 코드가 안 바뀐다.
@@ -106,15 +112,43 @@ class AlgoService(Node):
                                     req.size_h_mm, actual)
         res.ok, res.fill_rate, res.placed_count = bool(ok), float(fill), int(count)
 
+        self.dump(req.zone)
         dt = (time.perf_counter() - t0) * 1000
         self.get_logger().info(
             f"update[{req.zone}] {req.box_id} → 적재 {count}개 · 적재율 {fill * 100:.1f}% · "
             f"최고 {int(pk.hm.max())}mm  [{dt:.1f}ms]")
         if not ok:
-            # yaw 가 계획에서 벗어났거나 팔레트 밖으로 나갔다. 트랙 B 는 로그만 남기고 계속 진행.
-            self.get_logger().warn(
-                f"update[{req.zone}] {req.box_id} ok=false — 실측 yaw/좌표가 계획을 벗어났습니다")
+            # yaw 가 벗어났거나 팔레트 밖·한계 초과. 트랙 B 는 로그만 남기고 계속 진행.
+            why = pk.last_warning or "실측 yaw/좌표가 계획을 벗어났습니다"
+            self.get_logger().warn(f"update[{req.zone}] {req.box_id} ok=false — {why}")
         return res
+
+    # ---------- 시각화용 스냅샷 ----------
+    def dump(self, zone):
+        """지금 적재 상태를 JSON 으로 떨군다. live_view 가 이 파일을 읽어 그린다.
+
+        원자적으로 쓴다 — 뷰어가 반쯤 쓰인 파일을 읽으면 JSON 파싱이 깨진다.
+        """
+        if not self.snap:
+            return
+        pk = self.pk[zone]
+        boxes = []
+        for pose, w, d, h in pk.placed:
+            ww, dd = (w, d) if round(pose["yaw_deg"] / 90) % 2 == 0 else (d, w)
+            boxes.append([pose["x_mm"] - ww // 2, pose["y_mm"] - dd // 2, pose["z_mm"],
+                          ww, dd, h, pose["yaw_deg"]])
+        state = {"zone": zone, "count": len(pk.placed), "fill": pk.fill_rate(),
+                 "cap": pk.capacity_rate(),          # 용량(max_stack) 기준 보조 지표
+                 "hmax": int(pk.hm.max()), "max_stack": pk.max_stack,
+                 "pallet": [pk.W * pk.cell, pk.D * pk.cell],
+                 "hm": pk.hm.tolist(), "boxes": boxes}
+        try:
+            tmp = self.snap + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, self.snap)
+        except OSError as e:
+            self.get_logger().warn(f"스냅샷 쓰기 실패({e}) — 시각화만 영향", once=True)
 
     # ---------- /algo/cancel_plan ----------
     def on_cancel(self, req, res):
@@ -130,6 +164,7 @@ class AlgoService(Node):
         pk = self._packer(req.zone)
         if pk is not None:
             pk.reset()
+            self.dump(req.zone)
         res.ok = pk is not None
         self.get_logger().info(f"reset [{req.zone}] — heightmap 을 0 으로 초기화")
         return res

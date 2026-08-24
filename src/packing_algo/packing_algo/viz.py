@@ -54,11 +54,13 @@ def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7):
             pk.cancel(box_id)                       # ★ 이탈 경로에서는 반드시 계획 폐기
             if msg == "PALLET_FULL":
                 steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
+                                  cap=pk.capacity_rate(),
                                   n_ok=placed, n_skip=skipped,
                                   label=f"{k + 1}번째 {w}x{d}x{h} → PALLET_FULL · 종료"))
                 break
             skipped += 1
             steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
+                                  cap=pk.capacity_rate(),
                               n_ok=placed, n_skip=skipped,
                               label=f"{k + 1}번째 {w}x{d}x{h} → 자리 없음, 버리고 계속"))
             continue
@@ -68,6 +70,7 @@ def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7):
         pk.update(box_id, w, d, h, actual)
         placed += 1
         steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
+                                  cap=pk.capacity_rate(),
                           n_ok=placed, n_skip=skipped,
                           label=f"{k + 1}번째 {w}x{d}x{h} → ({pose['x_mm']}, {pose['y_mm']}) "
                                 f"z={pose['z_mm']} yaw={int(pose['yaw_deg'])}°"))
@@ -107,19 +110,34 @@ def draw_heightmap(ax, hm, cfg):
     return im
 
 
-def draw_fill_curve(ax, fills, k):
-    """적재율 vs 박스 수. k 번째까지만 그려서 같이 자라게 한다."""
+def draw_fill_curve(ax, fills, caps, k):
+    """적재율 vs 박스 수. k 번째까지만 그려서 같이 자라게 한다.
+
+    두 기준을 같이 그린다 — 실제높이 기준(§7.8)은 층이 올라갈 때 분모가 뛰어
+    내려가고, 용량 기준(max_stack 고정)은 단조 증가한다. 하나만 보이면
+    "왜 적재율이 떨어지냐" 는 질문이 매번 나온다.
+    """
     ax.clear()
-    ax.plot(range(1, len(fills) + 1), fills, color="#DFE1E6", lw=1.5)
-    ax.plot(range(1, k + 2), fills[:k + 1], color="#0052CC", lw=2, marker="o", ms=3)
-    ax.set_xlim(0.5, len(fills) + 0.5); ax.set_ylim(0, max(0.8, max(fills) * 1.15))
-    ax.set_title("적재율 vs 박스 수", fontsize=9)
+    f_pc = [v * 100 for v in fills]                 # 축 단위는 % — 0.65 보다 65% 가 읽기 쉽다
+    c_pc = [v * 100 for v in caps]
+    ax.plot(range(1, len(f_pc) + 1), f_pc, color="#DFE1E6", lw=1.5)
+    ax.plot(range(1, len(c_pc) + 1), c_pc, color="#F5D0BF", lw=1.5)
+    ax.plot(range(1, k + 2), f_pc[:k + 1], color="#2a78d6", lw=2, marker="o", ms=3,
+            label="실제 높이 기준 (§7.8)")
+    ax.plot(range(1, k + 2), c_pc[:k + 1], color="#eb6834", lw=2, marker="o", ms=3,
+            label="용량 기준")
+    ax.axhline(70, color="#52514E", lw=1.2, ls=(0, (5, 4)))
+    ax.text(0.8, 71.5, "목표 70%", color="#52514E", fontsize=8)
+    ax.set_xlim(0.5, len(f_pc) + 0.5); ax.set_ylim(0, 85)
+    ax.set_title("적재율 vs 박스 수 (%)", fontsize=9)
     ax.set_xlabel("박스 수"); ax.grid(alpha=0.3)
+    ax.legend(fontsize=7, loc="lower right", framealpha=0.9)
 
 
 def render_video(cfg, steps, out_path, fps=2, hold=6):
     """매 단계를 프레임으로 찍어 mp4 로 저장. hold = 마지막 화면을 몇 프레임 더 유지할지."""
     fills = [s["fill"] for s in steps]
+    caps = [s["cap"] for s in steps]
     fig = plt.figure(figsize=(12, 6.5))
     gs = fig.add_gridspec(2, 2, width_ratios=[1.5, 1], hspace=0.45, wspace=0.25,
                           left=0.03, right=0.96, top=0.90, bottom=0.09)
@@ -133,9 +151,9 @@ def render_video(cfg, steps, out_path, fps=2, hold=6):
         s = steps[k]
         draw_boxes3d(ax3d, s["placed"], cfg)
         draw_heightmap(ax_hm, s["hm"], cfg)
-        draw_fill_curve(ax_fr, fills, k)
+        draw_fill_curve(ax_fr, fills, caps, k)
         title.set_text(f"{s['label']}   |   적재 {s['n_ok']}개 · 버림 {s['n_skip']}개   "
-                       f"|   적재율 {s['fill'] * 100:.1f}%   "
+                       f"|   적재율 {s['fill'] * 100:.1f}% / {s['cap'] * 100:.1f}%(용량)   "
                        f"최고 {int(s['hm'].max())}mm / {cfg['pallet']['max_stack_mm']}mm")
         return []
 
@@ -161,7 +179,8 @@ def main():
     print(f"저장: {args.out}")
     last = steps[-1] if steps else dict(n_ok=0, n_skip=0)
     print(f"투입 {n}개 → 적재 {last['n_ok']}개 · 버림 {last['n_skip']}개 · "
-          f"적재율 {pk.fill_rate() * 100:.1f}% · "
+          f"적재율 {pk.fill_rate() * 100:.1f}%(실제높이) / "
+          f"{pk.capacity_rate() * 100:.1f}%(용량) · "
           f"최고 {int(pk.hm.max())}mm / {cfg['pallet']['max_stack_mm']}mm")
 
 

@@ -97,6 +97,30 @@ class MotionError(Exception):
         self.state = state
 
 
+def nearest_equiv_yaw(target_deg, ref_deg):
+    """`target_deg` 와 같은 배치가 되는 각 중 `ref_deg` 에서 가장 가까운 것.
+
+    박스도 흡착 패드(210×160 사각)도 **180° 회전 대칭**이다 — yaw 와 yaw±180 은
+    물리적으로 완전히 같은 배치다. 계획값을 그대로 따라가면 픽(≈0°)에서 배치(90°)로
+    갈 때 손목이 먼 쪽으로 최대 180° 돈다.
+
+    ★ 그러면 관절 속도 한계에 걸린다. `robot_motion` 의 도달 판정
+      (`REACH_TOL_M`)은 **흡착면 위치만** 보고 자세는 안 본다 — 위치가 들어오면
+      손목이 덜 돌았어도 `REACHED` 를 낸다. 실측(2026-08-24)에서 구간이
+      `속도초과 1 스텝` 으로 끝나고 다음 이동이 `yaw 112.9` 에서 시작했고,
+      그 박스가 삐딱하게 놓여 넘어졌다.
+
+    등가 각 중 가까운 쪽을 고르면 회전량이 **최대 90°** 로 줄어 이 상황이 안 생긴다.
+    적재 결과는 완전히 동일하다.
+    """
+    best, best_d = float(target_deg), None
+    for cand in (target_deg - 180.0, float(target_deg), target_deg + 180.0):
+        d = abs((cand - ref_deg + 180.0) % 360.0 - 180.0)
+        if best_d is None or d < best_d:
+            best, best_d = float(cand), d
+    return best
+
+
 class Cycle:
     def __init__(self, link, svc, cfg, zone="B", log=print):
         self.link = link
@@ -203,7 +227,8 @@ class Cycle:
         # 5) 놓기 — 팔레트 좌표를 월드로 바꾸고 상공 접근 후 하강
         cx, cy, cz = pallet_place_to_world(place, h, self.origin_mm)
         put_top = cz + h / 2000.0
-        put_yaw = float(place.get("yaw_deg", 0.0))
+        # ★ 손목을 먼 쪽으로 180° 돌리지 않는다 — nearest_equiv_yaw 주석 참조.
+        put_yaw = nearest_equiv_yaw(place.get("yaw_deg", 0.0), pick_yaw)
 
         # ★ 상승 -> **가로 이송** -> 하강. 세 구간이다 (§2.5).
         #   집자마자 배치 상공으로 바로 가면 관절공간 직선이 대각선을 그어서, 매달린
