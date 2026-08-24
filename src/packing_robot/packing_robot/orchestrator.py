@@ -85,7 +85,12 @@ class RosServices:
         return res.ok, f"{res.fill_rate * 100:.1f}%"
 
     def cancel_plan(self, zone, box_id):
-        self.n.cli_cancel.call_async(CancelPlan.Request(zone=zone, box_id=box_id))
+        # ★ future 를 버리면 쌓인다. 워커 스레드이므로 기다려도 데드락이 아니다.
+        try:
+            self._wait(self.n.cli_cancel.call_async(
+                CancelPlan.Request(zone=zone, box_id=box_id)), "cancel_plan")
+        except TimeoutError as e:
+            self._log(f"[svc] {e}")
         return True
 
     # ── 트랙 A (씬) — 브릿지가 생기기 전까지는 소켓으로 내려간다 ──
@@ -95,7 +100,7 @@ class RosServices:
                 SetVelocity.Request(seg=seg, velocity_mps=float(mps))), "set_velocity")
             return res.ok
         # ★ 임시. §3 규칙 4 는 ROS 서비스를 쓰라고 한다. sim_bridge_node 가 생기면 위로 간다.
-        return bool(self.link.call(cmd="set_velocity", seg=seg, mps=float(mps)).get("ok"))
+        return bool(self.n.sim(cmd="set_velocity", seg=seg, mps=float(mps)).get("ok"))
 
 
 class Orchestrator(Node):
@@ -122,22 +127,69 @@ class Orchestrator(Node):
         self.cli_belt = self.create_client(SetVelocity, "/conveyor/set_velocity", callback_group=cb)
         self.pub_status = self.create_publisher(ZoneStatus, f"/zone_{self.zone.lower()}/status", 10)
 
-        self.link = SimLink(g("sim_host"), int(g("sim_port")))       # 실패하면 여기서 예외
+        self.sim_host, self.sim_port = g("sim_host"), int(g("sim_port"))
+        self.link = SimLink(self.sim_host, self.sim_port)            # 실패하면 여기서 예외
         self.link.call(cmd="ping")
-        self.get_logger().info(f"Isaac 소켓 {g('sim_host')}:{g('sim_port')} 연결됨")
+        self.get_logger().info(f"Isaac 소켓 {self.sim_host}:{self.sim_port} 연결됨")
 
         self.svc = RosServices(self, self.link, self.get_logger().info)
         self.cycle = Cycle(self.link, self.svc, self.cfg, self.zone, log=self.get_logger().info)
 
-        self.state = "IDLE"
+        self.state, self.finished = "IDLE", False
         self.fill_rate, self.placed_count = 0.0, 0
         self.placed = self.dropped = self.failed = 0
         self.create_timer(0.5, self.on_status, callback_group=cb)
         self.get_logger().info(f"orchestrator 시작 — zone={self.zone} · 박스 {self.total}개 · "
                                f"투입 간격 {self.interval}s")
 
+    # ── 소켓 호출은 전부 여기를 지난다 ──
+    def sim(self, _slow=None, **req):
+        """★ 끊겨도 죽지 않는다. state="BLOCKED" 로 떨어뜨리고 재연결에 맡긴다.
+
+        Cycle.run() 안쪽은 cycle.py 가 예외를 잡아 주지만, **사이클 밖**(spawn_box ·
+        pickup_check · despawn_box · set_velocity)은 맨몸이었다. 거기서 예외가 나면
+        워커 스레드만 죽고 rclpy.spin 은 메인 스레드에서 계속 돌아, 노드가
+        **죽었는데 state=IDLE 을 계속 광고한다.** 중재자가 그 값으로 배정을 정하므로
+        (§6.7) 크래시보다 나쁘다 — 상대가 알아차릴 방법이 없다.
+        """
+        if self.link is None:
+            return {}
+        try:
+            return self.link.call_slow(_slow, **req) if _slow else self.link.call(**req)
+        except (OSError, ConnectionError, ValueError) as e:
+            self.get_logger().error(f"Isaac 소켓 끊김({e}) — state=BLOCKED, 재연결 시도")
+            try:
+                self.link.close()
+            except OSError:
+                pass
+            self.link, self.state = None, "BLOCKED"
+            return {}
+
+    def ensure_link(self):
+        """끊겼으면 다시 잡을 때까지 기다린다. 워커 스레드에서만 부른다."""
+        while self.link is None and rclpy.ok():
+            try:
+                link = SimLink(self.sim_host, self.sim_port)
+                link.call(cmd="ping")
+            except OSError:
+                time.sleep(2.0)
+                continue
+            # ★ Cycle 을 새로 만들지 않는다. _stack_top_m(누적 적재 최상단, 42690a9)이
+            #   0 으로 돌아가면 재연결 뒤 첫 이송이 적재물 높이를 잊고 기둥을 지나간다.
+            self.link = self.svc.link = self.cycle.link = link
+            self.state = "IDLE"
+            self.get_logger().info("Isaac 소켓 재연결 — 사이클 재개")
+        return self.link is not None
+
     # ── 워커 스레드 — 여기서만 블로킹한다 ──
     def loop(self):
+        try:
+            self._loop()
+        except Exception as e:                       # noqa: BLE001 — 조용히 죽지 않게
+            self.state = "BLOCKED"
+            self.get_logger().error(f"워커 스레드 중단: {e!r} — state=BLOCKED 로 남깁니다")
+
+    def _loop(self):
         log = self.get_logger()
         while not self.cli_plan.service_is_ready() or not self.cli_upd.service_is_ready():
             time.sleep(0.2)
@@ -157,11 +209,13 @@ class Orchestrator(Node):
         for i in range(self.total):
             if not rclpy.ok():
                 return
+            if not self.ensure_link():        # 끊겼으면 다시 잡고 나서 진행
+                return
             name, w, d, h = self.rb.choice(self.types)
             box_id = f"BOX{i:05d}"
             self.svc.sizes[box_id] = (w, d, h)      # DB 대신 크기의 출처
 
-            r = self.link.call(cmd="spawn_box", box_id=box_id, type=name, yaw_deg=0.0)
+            r = self.sim(cmd="spawn_box", box_id=box_id, type=name, yaw_deg=0.0)
             if not r.get("ok"):
                 log.error(f"spawn_box 실패: {r}")
                 continue
@@ -169,7 +223,10 @@ class Orchestrator(Node):
 
             pick = self.wait_pickup(box_id)
             if pick is None:
-                log.error(f"{box_id} 스토퍼 도착 타임아웃 — 다음 박스로")
+                # 벨트에 남겨 두면 다음 박스와 겹친다 — 치우고 간다
+                log.error(f"{box_id} 스토퍼 도착 타임아웃 — despawn 후 다음 박스로")
+                self.sim(cmd="despawn_box", box_id=box_id)
+                self.failed += 1
                 continue
 
             self.state = "BUSY"
@@ -183,12 +240,12 @@ class Orchestrator(Node):
             elif res == "BLOCKED" and self.svc.last_plan_msg == "NO_FEASIBLE_POSE":
                 # 이 박스만 자리가 없다 → 치우고 계속 (트랙 D A1). 스토퍼에 두면 라인이 막힌다.
                 self.dropped += 1
-                self.link.call(cmd="despawn_box", box_id=box_id)
+                self.sim(cmd="despawn_box", box_id=box_id)
                 log.warn(f"{box_id} {w}x{d}x{h} → NO_FEASIBLE_POSE · 버림 (누적 {self.dropped})")
             else:
                 self.failed += 1
                 log.error(f"{box_id} → {res} (누적 실패 {self.failed})")
-                self.link.call(cmd="despawn_box", box_id=box_id)
+                self.sim(cmd="despawn_box", box_id=box_id)
             log.info(f"  적재 {self.placed} · 버림 {self.dropped} · 실패 {self.failed} "
                      f"· 적재율 {self.fill_rate * 100:.1f}%")
             time.sleep(self.interval)
@@ -200,7 +257,7 @@ class Orchestrator(Node):
         while time.time() - t0 < self.pickup_timeout:
             if not rclpy.ok():
                 return None
-            r = self.link.call(cmd="pickup_check", zone=self.zone)
+            r = self.sim(cmd="pickup_check", zone=self.zone)
             if r.get("present") and r.get("box_id") == box_id:
                 x, y, _z = r["pose"]["pos_m"]
                 self.get_logger().info(f"{box_id} 스토퍼 도착 — 파지 ({x:.3f}, {y:.3f}) "
@@ -210,7 +267,10 @@ class Orchestrator(Node):
         return None
 
     def finish(self, why):
-        self.state = "PALLET_FULL" if why == "PALLET_FULL" else "DONE"
+        # ★ ZoneStatus.state 는 "IDLE"|"BUSY"|"BLOCKED"|"PALLET_FULL" 뿐이다.
+        #   "DONE" 은 계약에 없는 값이라 중재자가 해석하지 못한다.
+        self.state = "PALLET_FULL" if why == "PALLET_FULL" else "IDLE"
+        self.finished = True
         self.get_logger().info(
             f"═══ 종료 ({why}) — 적재 {self.placed} · 버림 {self.dropped} · 실패 {self.failed} "
             f"· 적재율 {self.fill_rate * 100:.1f}% ═══")
