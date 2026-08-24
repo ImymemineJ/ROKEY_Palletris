@@ -1467,5 +1467,47 @@ _S["timeline_sub"] = (omni.timeline.get_timeline_interface()
                       .get_timeline_event_stream()
                       .create_subscription_to_pop(_on_timeline, name="palletris-stop"))
 
-_S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
-log("Play 중 — 부팅 대기...\n" if AUTOPLAY else "Play 를 기다린다...\n")
+
+# ── 물리 스텝 구독 ────────────────────────────────────────
+# ★ **Play 뒤에 붙여야 한다.** `subscribe_physics_step_events` 는 그 시점의 물리
+#   시뮬레이션에 붙는데, Play 전에는 그 시뮬레이션이 아직 없다. 그래서 정지 상태에서
+#   구독해 두면 나중에 Play 를 눌러도 콜백이 안 들어온다 — 이 드라이버는 전부
+#   `on_step` 으로 도니까 **아무 일도 안 일어난다.**
+#   실측 2026-08-24: 수동 Play 를 넣으면서 이 순서가 깨졌다. 예전 판은 스크립트가
+#   `timeline.play()` 를 먼저 부르고 여기까지 앱 업데이트 없이 내려와서 우연히
+#   "Play -> 구독" 순서가 지켜지고 있었다. 자동 Play 를 빼자 그 순서가 사라졌다.
+#   증상: 씬은 뜨고 Play 를 눌러도 박스가 안 나오고 소켓 서버도 안 열린다.
+def _sub_physx(_why):
+    if _S.get("physx_sub") is not None:
+        return
+    _S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
+    log("물리      스텝 구독 (%s)" % _why)
+
+
+if AUTOPLAY:
+    _sub_physx("자동 Play")
+    log("Play 중 — 부팅 대기...\n")
+else:
+    # 사람이 Play 를 누르는 순간 붙인다. Stop -> Play 로 다시 눌러도 중복 구독은 안 한다.
+    try:
+        _PLAY_EVT = int(omni.timeline.TimelineEventType.PLAY)
+    except Exception:                      # API 이름이 바뀌면 즉시 구독으로 물러선다
+        _PLAY_EVT = None
+        _sub_physx("PLAY 이벤트를 못 잡아 즉시 구독")
+
+    if _PLAY_EVT is not None:
+        def _on_play(e):
+            if e.type != _PLAY_EVT:
+                return
+            _sub_physx("Play 눌림")
+            try:
+                _S["play_sub"].unsubscribe()   # 한 번이면 된다
+            except Exception:
+                pass
+            _S["play_sub"] = None
+
+        _S["play_sub"] = (omni.timeline.get_timeline_interface()
+                          .get_timeline_event_stream()
+                          .create_subscription_to_pop(_on_play,
+                                                      name="palletris-play"))
+    log("Play 를 기다린다...\n")
