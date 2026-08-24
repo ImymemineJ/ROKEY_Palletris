@@ -34,11 +34,17 @@ from pathlib import Path
 import isaacsim.robot_motion.motion_generation as mg
 from isaacsim.core.prims import SingleArticulation
 
-# packing_robot/packing_robot/ -> packing_robot/{urdf,config}/
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_URDF = BASE_DIR / "../urdf/h2017.urdf"
-DEFAULT_DESCRIPTION = BASE_DIR / "../config/h2017_descriptor.yaml"
-DEFAULT_RMPFLOW = BASE_DIR / "../config/h2017_rmpflow_common.yaml"
+# ★ 로봇 자산의 정본은 `src/packing_robot/` 하나뿐이다 (scripts/_paths.py 와 같은 규약).
+#   여기에 사본을 두면 반드시 갈라진다 — 실제로 갈라졌다: 이 옆의
+#   h2017/config/h2017_rmpflow_common.yaml 은 페데스탈 원통을 -0.500 으로 들고 있었고
+#   정본은 -0.900 이다. 400 mm 차이라, 이 컨트롤러를 쓰는 순간 RMPflow 가 받침대
+#   상부 400 mm 를 '빈 공간' 으로 알고 지나가려 한다. 그래서 사본은 지웠다.
+#   (덧붙여 옛 경로 `../urdf/...` 는 한 단계를 더 올라가 애초에 없는 파일을 가리키고
+#    있었다 — 아무도 이 모듈을 import 하지 않아서 안 드러났을 뿐이다.)
+ROBOT_DIR = Path(__file__).resolve().parents[2] / "packing_robot"   # parents[2] = src/
+DEFAULT_URDF = ROBOT_DIR / "urdf/h2017.urdf"
+DEFAULT_DESCRIPTION = ROBOT_DIR / "config/h2017_descriptor.yaml"
+DEFAULT_RMPFLOW = ROBOT_DIR / "config/h2017_rmpflow_common.yaml"
 
 
 class RMPFlowController(mg.MotionPolicyController):

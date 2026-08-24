@@ -155,7 +155,26 @@ Isaac Sim 5.1 standalone 스크립트에서 아래 에러가 났다. 5.1 기준�
    - **메인 벨트**: X 0 → 7.5m (직선 조각을 이어붙여 7.5m). 완성 후 Stage에서 그래프 이름을 `ConveyorBeltGraph_main`으로 rename
    - **픽업 벨트**: 새 트랙 시작으로 X 7.5 → 10.0m (2.5m). 그래프 이름 `ConveyorBeltGraph_b_pickup`
    - ★ **왜 두 개?** 픽업 구간만 따로 멈춰야 하니까. 트랙을 새로 시작해야 그래프(=속도 변수)가 분리된다
-4. **스토퍼**: `Create > Shape > Cube` → Property에서 Translate **(10.05, 0, 0.95)**, Scale **(0.05, 0.35, 0.15)** (= 100×700×300mm 벽, 벨트 상면 0.8 위) → 우클릭 `Add > Physics > Colliders Preset` (**Rigid Body는 절대 추가하지 않는다** — 움직이지 않는 벽이어야 한다)
+4. **스토퍼**: `Create > Shape > Cube` → Property에서 Translate **(10.05, 0, 0.85)**, Scale **(0.10, 1.55, 0.10)** (= 100×1550×**100**mm 벽, 벨트 상면 0.8 위) → 우클릭 `Add > Physics > Colliders Preset` (**Rigid Body는 절대 추가하지 않는다** — 움직이지 않는 벽이어야 한다)
+
+   > ### ⚠ 2026-08-23 정정 — 높이는 300 이 아니라 **100**, 폭은 벨트 폭
+   >
+   > **높이:** 300 으로 세우면 벽 상단이 z=1100 인데 로봇 베이스는 900 이다.
+   > 로봇은 벽 **너머**(픽 지점 x≈9800)를 집어야 해서 팔이 늘 벽 위를 지난다.
+   > 실측: 첫 박스만 통과하고(READY 에서 수직 하강) 2번째부터 매번 "도착 잔차
+   > 491.8 mm" 로 서서 전부 BLOCKED, 놓아 둔 박스도 79.6 mm 밀렸다.
+   > **막는 데 300 이 필요하지도 않다** — 벨트 마찰이 박스를 벽 위로 넘기려면
+   > `h > w/(2μ)` 여야 하고(벽 상단 모서리 축 전도), μ=0.5·최소폭 340 이면 한계가
+   > 340 mm 다. 즉 **높을수록 위험**하다. 100 이면 벽 상단이 로봇 베이스 평면과
+   > 같아 팔 경로와 안 겹친다.
+   >
+   > **폭:** §A4 의 700 은 그 때 벨트 폭이 720(scale.y 0.80)이라 맞았다. 지금은
+   > 벨트가 1546 이라 700 이면 다 못 막는다. 정본(`layout_to_spec_test1_1.py`)은
+   > `max(700, 벨트 폭)` 으로 잡는다.
+   >
+   > 이 값들은 손으로 넣지 말고 `src/packing_sim/run_layout_to_spec.sh` 로 만든다 —
+   > `system.yaml` 의 `stopper_x_mm` · `belt_top_z_mm` 에서 유도하고 위 두 조건을
+   > 빌드 때 검사한다.
 
    ![스토퍼 측면도](img/pickup_side.svg)
 5. 두 벨트의 그래프 Variables에서 `Velocity` 초기값 = **0.5**
@@ -296,6 +315,23 @@ class Spawner:
 
 `pickup_check` 핸들러 (스토퍼 감지 — 폴링 방식이라 단순하다):
 
+> ### ⚠ 2026-08-23 정정 — 조건이 **둘이 아니라 넷**이다
+>
+> 아래 골격은 "스토퍼 근처 + 거의 정지" 두 조건만 본다. **위쪽 경계가 없어서
+> 팔레트에 놓인 박스가 계속 present 로 잡힌다.** 팔레트는 x 10300~11500 이라
+> 스토퍼(10000)보다 앞이고, 놓인 박스는 당연히 멎어 있다. 그래서 로봇이 방금 놓은
+> 박스를 다시 집는다 — 15박스 연속에서 2번째 사이클부터 같은 박스만 반복해서
+> 집었고(knock 338 mm), 새 박스는 영영 안 집혔다. 정본은
+> `src/packing_sim/isaac/spawner.py:_refresh` 다:
+>
+> 1. **중심이 픽업 구간 안** — `pickup_range[0] ≤ x ≤ stopper_x`. 팔레트를 제외한다.
+> 2. 앞면이 스토퍼 마진 안 — `front > stopper_x − w/2 − 60mm`. 실제로 벽에 닿아 섰다.
+> 3. **밑면이 벨트 상면** — `|z − (belt_top + h/2)| < 50mm`. 집혀서 들린 것과
+>    라인 밖으로 떨어진 것을 제외한다.
+> 4. 거의 정지 — `|vx| < 1 cm/s`.
+>
+> 여럿이 줄 서면 **x 가 가장 큰 것**(= 스토퍼에 제일 가까운 것)이 집힐 차례다.
+
 ```python
 def pickup_check(self, req):
     """스토퍼 근처(x > stopper − w/2 − 60mm)이고 거의 정지(|v|<1cm/s)한 박스를 보고"""
@@ -353,7 +389,8 @@ Isaac Sim 5.1 standalone 파이썬으로 다음 3개 파일을 완성해줘. 골
 1) spawner.py — spawn_box/spawn_status/set_spawn_enabled/despawn_box/get_box_pose 핸들러.
    ★ 반드시: 스폰 z는 밑면+h/2, 박스마다 PhysxRigidBodyAPI로 position iteration 24/velocity 4,
    restOffset 0 / contactOffset 0.002(m), 물리 머티리얼 바인딩, box_id를 커스텀 어트리뷰트로 저장.
-2) pickup_check — 스토퍼 x=10.0 기준, 박스 앞면이 60mm 이내 & |vx|<0.01m/s면 present.
+2) pickup_check — 조건 넷을 **전부** 본다 (위 ⚠ 정정 참조): 중심이 픽업 구간
+   [7500, 10000] 안 · 앞면이 스토퍼 60mm 이내 · 밑면이 벨트 상면 · |vx|<0.01m/s.
    쿼터니언→yaw(도) 변환 포함.
 3) conveyor_ctl.py — OmniGraph 변수로 벨트 속도 설정. 그래프 attribute 이름을 못 찾을 때
    prim의 모든 attribute를 나열하는 debug 함수도 포함.

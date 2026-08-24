@@ -54,6 +54,38 @@ H2017_DESC = str(M0609_DIR / "descriptor_h2017/h2017_description.yaml")
 
 
 # ─────────────────────────────────────────────────────────────
+# system.yaml 에서 끌어오는 값
+# ─────────────────────────────────────────────────────────────
+# ★ 철칙 3 — 숫자의 단일 출처는 `src/packing_bringup/config/system.yaml` 이다.
+#   여기에 상수를 복사해 두면 반드시 갈라진다. 실제로 2026-08-22 페데스탈을
+#   700 -> 900 으로 올릴 때 system.yaml 과 이 파일을 따로 고쳐야 했고, 한쪽만
+#   고치면 `run_line.py` · `scene.py` 가 씬(`test1-1.usd`)과 다른 높이로 돈다.
+SPEC_YAML = Path(os.environ.get(
+    "PL_SPEC_YAML",
+    THIS_DIR.parent.parent / "src/packing_bringup/config/system.yaml"))
+
+
+def _spec(*keys, default=None):
+    """`system.yaml` 에서 값 하나. 못 읽으면 default 로 떨어지고 한 번 경고한다."""
+    cache = _spec.__dict__.setdefault("_cache", {})
+    if "doc" not in cache:
+        cache["doc"] = None
+        try:
+            import yaml
+            with open(SPEC_YAML, encoding="utf-8") as f:
+                cache["doc"] = yaml.safe_load(f)
+        except Exception as e:                      # yaml 없음 · 파일 없음 · 파싱 실패
+            print("[config] !! %s 를 못 읽었다 (%r) — 내장 기본값으로 간다. "
+                  "씬과 어긋날 수 있다." % (SPEC_YAML, e))
+    node = cache["doc"]
+    for k in keys:
+        if not isinstance(node, dict) or k not in node:
+            return default
+        node = node[k]
+    return node
+
+
+# ─────────────────────────────────────────────────────────────
 # 로봇
 # ─────────────────────────────────────────────────────────────
 ROBOT_PRIM_PATH = "/World/robot"
@@ -189,7 +221,10 @@ else:  # h2017  — 확정 사양 (2026-08-20 사양서)
     #   로봇 베이스   (600, -300, 700)  장변 중앙 · 이격 300 · 받침대 700
     # 이 좌표계를 그대로 쓴다 (로봇을 원점에 두지 않는다).
     ROBOT_BASE_XY = np.array([0.600, -0.300])
-    PEDESTAL_H = 0.900   # ★ system.yaml robot.pedestal_height_mm 와 같아야 한다 (2026-08-22 700->900, issues/18)
+    # ★ 단일 출처는 system.yaml 이다 (위 _spec 주석). 여기 숫자는 그 파일을
+    #   못 읽었을 때의 마지막 확인값이지 사양이 아니다.
+    #   2026-08-22 700 -> 900 (다층 적재 간섭 + 도달 여유, PR #9 / issues/18).
+    PEDESTAL_H = _spec("robot", "pedestal_height_mm", default=900.0) / 1000.0
 
     # ── 파렛트 (Isaac pallet.usd = EUR1 1213x802) ─────────
     PALLET_ASSET = _os.environ.get("PL_PALLET", "std")
@@ -205,9 +240,12 @@ else:  # h2017  — 확정 사양 (2026-08-20 사양서)
         PALLET_SIZE = np.array([0.800, 0.600])   # EUR6 하프
         PALLET_CENTER_XY = np.array([0.600, 0.300])
 
-    PALLET_DECK_Z = 0.150                        # 사양: 상면 z = 150
-    PALLET_TOP_Z = 1.450                         # 사양: 적재 상단 z = 1450
-    PALLET_MAX_STACK_H = PALLET_TOP_Z - PALLET_DECK_Z   # = 1300 mm
+    # 숫자의 단일 출처는 system.yaml 이다 (철칙 3). 여기서 손으로 들고 있으면
+    # 사양이 움직일 때 이 프리셋만 조용히 어긋난다.
+    PALLET_DECK_Z = _spec("zones", "pallet_origin_world_mm", "B",
+                          default=[0, 0, 150])[2] / 1000.0
+    PALLET_MAX_STACK_H = _spec("pallet", "max_stack_mm", default=1300.0) / 1000.0
+    PALLET_TOP_Z = PALLET_DECK_Z + PALLET_MAX_STACK_H
 
     # ── 컨베이어 / 픽 존 ──────────────────────────────────
     # 파렛트 옆(-x 쪽)에 나란히 둔다. 실제 팔레타이징 셀의 인피드 배치다.
@@ -216,13 +254,17 @@ else:  # h2017  — 확정 사양 (2026-08-20 사양서)
     # 매 사이클 팔이 150도 넘게 돌아야 하고 그 경로의 방위각 0도 부근에서
     # 흡착이 끊긴다. 옆으로 옮기면 픽 방위각이 155도가 되어 회전각이
     # 128도 이하로 줄고 문제 구간을 아예 지나지 않는다.
-    # 트럭 적재함 바닥 지상고 (1톤 윙바디). 측면 윙바디에 컨베이어를 대고
-    # 직접 싣는 방식이라 컨베이어 토출 높이 = 트럭 바닥 높이여야 한다.
-    # test1.usd 는 이 값으로 라인 전 구간을 평탄화해 뒀다 (flatten_line.py).
-    TRUCK_FLOOR_H = 0.900
-    CONVEYOR_TOP_H = TRUCK_FLOOR_H
+    # ★ 벨트 상면. 단일 출처는 system.yaml conveyor.belt_top_z_mm (= 800).
+    #   옛 판은 `TRUCK_FLOOR_H = 0.900` 을 만들어 `CONVEYOR_TOP_H = TRUCK_FLOOR_H`
+    #   로 이어 놓았는데, 두 값은 뜻이 다르다 — system.yaml 은 bed_height_mm 에 대해
+    #   "월드 z 가 아니다 · 도달범위 계산에 안 들어간다" 고 못박는다. 게다가 위
+    #   PEDESTAL_H 만 사양을 타고 900 이 되면서 **베이스 900 · 벨트 상면 900** 이 되어
+    #   둘이 같은 평면이 됐다. 사양 기하는 벨트가 베이스보다 100 아래다
+    #   (layout_to_spec_test1_1.py 가 belt_top + 스토퍼 100 <= 베이스 z 로 검사한다).
+    #   값이 우연히 같아져 "맞은 것처럼" 보이는 쪽이 더 위험하다. 사슬을 끊는다.
+    CONVEYOR_TOP_H = _spec("conveyor", "belt_top_z_mm", default=800.0) / 1000.0
     # 파렛트(x >= 0)와 300mm 이상 띄운다. 붙여 놓으면 파렛트 근처 자리로
-    # 내려오는 박스가 컨베이어 상면(900mm) 모서리를 스쳐 흡착이 끊긴다.
+    # 내려오는 박스가 컨베이어 상면(800mm) 모서리를 스쳐 흡착이 끊긴다.
     CONVEYOR_CENTER = np.array([-0.600, 0.125, CONVEYOR_TOP_H - 0.04])
     CONVEYOR_SIZE = np.array([0.600, 1.200, 0.04])
     PICK_XY = np.array([-0.600, 0.125])
@@ -349,7 +391,10 @@ RANDOM_SEED = 42
 # 이 30mm 가 필요하다.
 TRUCK_BED = np.array([2.80, 1.60])      # 사양: 2800 x 1600 x 1600
 TRUCK_INNER_H = 1.60
-TRUCK_FLOOR_H = globals().get("TRUCK_FLOOR_H", 0.900)
+# 야드 지면 대비 도크(=트럭 적재함 바닥) 지상고. **월드 z 가 아니다** — system.yaml
+# 이 "도달범위 계산에는 들어가지 않는다" 고 못박은 값이다. 씬에 야드 지면을 그릴
+# 때만 쓴다. 벨트 상면(CONVEYOR_TOP_H)과 헷갈리지 마라: 그건 800 이다.
+TRUCK_FLOOR_H = _spec("truck", "bed_height_mm", default=850.0) / 1000.0
 
 # 적재 장수는 공칭 1200x800 이 아니라 실치수로 따진다. Isaac pallet.usd 는
 # EUR1 1213 x 802 라 802 x 2 = 1604 > 1600 이 되어 폭 방향 2열이 안 들어간다.
@@ -371,8 +416,11 @@ PALLET_LAYOUT = (
 # 우체국 규격은 전부 10mm 단위라 postal 에서는 반올림 오차가 0 이다.
 PACK_CELL = 0.010 if PRESET in ("postal", "h2017") else 0.005
 PACK_YAWS_DEG = (0.0, 90.0)                      # 허용 회전
-PACK_MIN_SUPPORT_RATIO = 0.85                    # 밑면이 이만큼은 받쳐져야 배치 허용
-PACK_SUPPORT_TOL = 0.004                         # 이 오차 안이면 "받쳐진 것"으로 간주
+# ★ 사양(heightmap.min_support_ratio 0.7 · support_tol_mm 10)과 다른 값을 손으로
+#   들고 있었다 (0.85 / 4 mm). 라이브 경로는 system.yaml 을 읽으므로 두 경로가
+#   서로 다른 패킹을 하고 있었다 — 같은 입력에 다른 답이 나오는 셈이다.
+PACK_MIN_SUPPORT_RATIO = float(_spec("heightmap", "min_support_ratio", default=0.7))
+PACK_SUPPORT_TOL = _spec("heightmap", "support_tol_mm", default=10.0) / 1000.0
 PACK_FLATNESS_WEIGHT = 1.0                       # 평탄도 penalty 가중치
 PACK_WALL_MARGIN = 0.000 if PRESET in ("postal", "h2017") else 0.002
 
@@ -394,7 +442,7 @@ PACK_DESCENT_HALO = 0.040 if PRESET == "h2017" else 0.0
 # ─────────────────────────────────────────────────────────────
 # 모션
 # ─────────────────────────────────────────────────────────────
-APPROACH_CLEARANCE = 0.10                        # 픽/플레이스 대상 위 접근 높이
+APPROACH_CLEARANCE = _spec("robot", "approach_offset_mm", default=200.0) / 1000.0
 # 이동 높이는 고정하지 않는다. 매 사이클마다
 #   max(집는 박스 위, 놓을 자리 위, 현재 적재 최고점) + TRANSIT_CLEARANCE
 # 로 계산해 불필요하게 높이 들지 않는다 (리치 여유 확보).

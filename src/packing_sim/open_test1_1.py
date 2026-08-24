@@ -1,3 +1,21 @@
+# ⚠⚠ **구버전이다. 지금 씬과 안 맞는다.** (2026-08-23)
+#
+# 이 경로(`open_test1_1.py` + `spawn_feeder` + `belt_cycle` + `robot_h2017`)는
+# **스토퍼 벽이 생기기 전** 설계다. 지금 씬에는 x 10000~10100 에 실물 벽이 서 있어
+# "벨트를 브레이크로 쓴다" 는 전제가 성립하지 않는다.
+# 통합 경로는 `scripts/demo_stack15_test1_1.py` 하나다 (cycle.py 상태머신 +
+# robot_motion + 소켓 브릿지 + HeightmapPacker). 게이트 수치는 전부 그쪽 것이다.
+#
+# 트랙B 리뷰(2026-08-23)가 이 경로에서 다섯 가지를 지적했고 **전부 확인됐다.**
+# 지금은 아무도 안 부르므로 잠복이지만, 되살리려면 먼저 고쳐야 한다:
+#   1. `robot_h2017.ROBOT_PRIM = "/World/robot/h2017"` 가 씬에 없다. 씬 빌더는
+#      defaultPrim 을 `/World/robot` 에 직접 합성한다 (EE 도 `/World/robot/root_joint/tool0`).
+#   2. 이송 고도에 매달린 박스 높이(+h)가 빠졌다 — 여유가 approach(200) − h 라
+#      3호 −10 / 4호 −80 / 5호 −140 mm 로 전부 음수다. 같은 층을 관통한다.
+#   3. IK/FK 실패 시 웨이포인트를 건너뛰고 다음 액션을 그대로 실행한다 (공중 흡착).
+#   4. HOME 복귀가 보간 없는 계단 입력이다.
+#   5. `belt_cycle.pallet_slot` 이 층 높이를 현재 박스 높이로 전 층에 적용한다.
+#
 # isaac-sim.sh --exec 로 실행되어 test1-1.usd (벨트 1개 라인) 를 열고
 # 피더 + 벨트 간헐 구동까지 붙인다.
 #   cd ~/isaacsim && ./isaac-sim.sh --exec /home/rokey/palletris_ws/src/packing_sim/open_test1_1.py
@@ -10,6 +28,7 @@
 # 끄는 법
 #   PL_NO_FEEDER=1   피더 없이 스테이지만
 #   PL_NO_CYCLE=1    벨트를 계속 돌린다 (예전 동작). 박스는 끝에서 떨어진다.
+#   PL_NO_ROBOT=1    H2017 대신 스텁이 집는다 (박스를 순간이동시킨다).
 #
 # 자주 쓰는 값
 #   PL_N, PL_INTERVAL   투입 개수/간격 (기본 10개, 12초 = 사양 stage1)
@@ -43,6 +62,12 @@ else:
     import spawn_feeder
     spawn_feeder.start()
     print("[open_test1_1] 피더 부착 완료.")
+
+if os.environ.get("PL_NO_ROBOT"):
+    print("[open_test1_1] PL_NO_ROBOT — 스텁이 집는다 (H2017 안 씀).")
+else:
+    import robot_h2017
+    robot_h2017.attach()
 
 if os.environ.get("PL_NO_CYCLE"):
     print("[open_test1_1] PL_NO_CYCLE — 벨트를 계속 돌린다.")

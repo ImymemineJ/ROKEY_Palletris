@@ -15,14 +15,16 @@ USD 가 있고 관절 한계가 URDF 와 정확히 일치하는 것을 확인했
 ### 1. 받은 파일 설치  `src/packing_sim/h2017/`
 
 ```
-urdf/h2017.urdf                  joint_2 effort=1000 (상류 372 는 자리표시자)
-config/h2017_descriptor.yaml     Lula descriptor. default_q [0,0,-1.5708,0,-1.5708,0]
-config/h2017_rmpflow_common.yaml RMPflow 설정 (1차에서는 안 씀 — 보관용)
-rmpflow_controller.py            위와 같음. 보관용
+rmpflow_controller.py            RMPflow 래퍼. 1차에서는 안 쓴다 — 보관용
 tools/fk.py                      URDF 원점만으로 도는 정기구학 (numpy 불필요)
 tools/import_h2017_usd.py        URDF→USD 임포터. **메시가 없어 못 돌린다**
 make_h2017_usd.py                ← 새로 만든 것. 아래 참조
 ```
+
+★ 로봇 자산(urdf · descriptor · rmpflow)의 **정본은 `src/packing_robot/` 하나뿐**이다.
+  여기 있던 사본 3개는 지웠다 — 둘이 갈라져서 rmpflow 설정의 페데스탈 원통이
+  한쪽은 -0.500, 정본은 -0.900 이었다 (400 mm 차). `rmpflow_controller.py` 도
+  정본을 가리키게 고쳤다. 사본을 다시 만들지 마라.
 
 ### 2. `~/isaac_scenes/robot/h2017.usd` 생성 (완료 · 검증됨)
 
@@ -52,29 +54,43 @@ joint_3 ±160.00° = ±2.7925). 사양서 6-3 이 경고한 "m0609 한계가 들
 필요한 것:
 1. `~/isaac_scenes/robot/h2017.usd` 를 `/World/robot` 으로 reference
 2. ~~페데스탈 (원기둥 D400 × 높이 H) 추가~~ ← 끝남 (`/World/Pedestal`)
-3. ~~배치 좌표 결정~~ ← **끝남. (10.9, 0, 0.7). 아래 참조**
+3. ~~배치 좌표 결정~~ ← **끝남. (10.9, 0, 0.9). 아래 참조**
 4. 검증: articulation 로드 · Lula IK 가 벨트 위 픽 지점을 푸는지
 
 ## ★ 좌표계 — 정해졌다 (2026-08-22, 김학민)
 
 **(A) 로 결정. 씬을 `system.yaml` 에 맞췄다.** 아래 "두 개다" 절은 결정 전
-기록이라 참고용으로 남긴다. 현재 `test1-1.usd` 실측값은 이렇다 (존 B).
+기록이라 참고용으로만 남긴다.
 
+**현재 씬 수치를 여기에 적지 않는다.** 정본은 `src/packing_bringup/config/system.yaml`
+하나이고, 씬은 `src/packing_sim/run_layout_to_spec.sh` 가 그걸 읽어 매번 다시 만든다.
+여기에 사본을 적어 두면 반드시 갈라진다 — 실제로 갈라져서, 이 자리에 2026-08-22 까지
+`페데스탈 H700 · 상면 z=700`, `스토퍼 없다`, `팔레트 x 11200~12000`, `픽 지점 x=9700`
+이 "현재 실측값" 이라고 적혀 있었다. 넷 다 지금 씬과 다르다 (페데스탈은 900 이고,
+스토퍼 벽은 실물로 x 10000~10100 에 서 있으며, 팔레트는 x 10300~11500 이고,
+박스 앞면은 x=10000 에 선다). 로봇 베이스 z 를 0.7 로 읽으면 IK 와 도달 판정이
+통째로 200 mm 어긋난다.
+
+지금 값을 보려면:
+
+```bash
+python3 -c "import yaml;c=yaml.safe_load(open('src/packing_bringup/config/system.yaml'));print(c['zones']['robot_base_world_mm'],c['robot']['pedestal_height_mm'],c['conveyor'])"
 ```
-벨트 롤러      x     0 ~ 10000 mm   y -773 ~ 773   상면 z = 800 mm
-  ConveyorTrack     0 ~  5000        ConveyorTrack1   5000 ~ 10000
-스토퍼         없다 — 벨트를 멈춰서 세운다 (아래 참조)
-페데스탈       x 10700 ~ 11100   D400 x H700    상면 z = 700  ← 로봇 베이스
-팔레트         x 11200 ~ 12000   y -600 ~ 600   상면 z = 150
-흐름 +X · 0.501 m/s 실측 · 투입점 x=500mm
-픽 지점        x = 9700 mm (실측 정지 9694~9700, y 1~7) · 로봇 베이스에서 1.2 m
-```
 
-다시 깔려면 `./run_layout_to_spec.sh` (system.yaml 을 읽어 그대로 재현한다).
-따라서 **남은 일 3번(배치 좌표 결정)은 끝났다.** 로봇은 (10.9, 0, 0.7) 에
-놓으면 된다.
+씬을 다시 깔려면 `./src/packing_sim/run_layout_to_spec.sh` (백업을 뜨고 재현한다).
+실측 요약은 `src/packing_sim/STATUS.md` 가 매 작업마다 갱신한다.
 
-## 벨트 간헐 구동 — 스토퍼를 없앴다 (2026-08-22)
+## ~~벨트 간헐 구동 — 스토퍼를 없앴다~~ (2026-08-22) — **폐기된 설계**
+
+> ⚠ **이 절은 결정 전 기록이다. 지금 씬과 반대다.**
+> 2026-08-23 에 스토퍼 벽을 **실물로 세웠다** — `layout_to_spec_test1_1.py` 가
+> x 10000~10100 · z 800~900 에 콜라이더 Cube 를 만든다(RigidBody 는 안 붙인다).
+> 박스는 벨트가 아니라 그 벽이 세운다. 아래의 "막는 벽이 없다" · "실물 벽은 없다" ·
+> `stopper_x_mm` 을 라인 끝 좌표로만 쓴다는 해석은 **전부 무효**다.
+> 현재 수치는 `src/packing_sim/STATUS.md`, 정본은 `system.yaml` 이다.
+> `belt_cycle` 을 브레이크로 쓰는 이 방식은 `open_test1_1.py` 경로에만 남아 있고
+> 통합 경로(`scripts/demo_stack15_test1_1.py`)는 안 쓴다.
+
 
 박스를 벽으로 막지 않는다. **선두 박스가 픽 지점에 오면 벨트를 세우고,
 로봇이 적재를 끝내고 원위치하면 다시 돌린다.** 픽 지점이 항상 같으므로

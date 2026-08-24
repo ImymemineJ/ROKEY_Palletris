@@ -43,8 +43,14 @@ H2017 IK · 흡착 그리퍼 · 오케스트레이터.
 | `docs/흡착_그리퍼_트러블슈팅.md` | SurfaceGripper 삽질 기록 — B3 하기 전에 읽을 것 |
 | `docs/픽앤플레이스_통합_기록.md` | 픽앤플레이스 1사이클을 완성하기까지의 실측 기록 |
 
-**아직 없는 것 (Day 1~2):** `packing_robot/orchestrator.py`(상태머신),
-`packing_sim/isaac/robot_motion.py`(소켓 핸들러 — A 패키지 안이지만 **B 소유**).
+**들어온 것:** `packing_robot/gripper.py`(B3) · `packing_robot/cycle.py`(B4 상태머신) ·
+`packing_robot/sim_link.py`(소켓 클라이언트) · `packing_sim/isaac/robot_motion.py`
+(소켓 핸들러 6개 — A 패키지 안이지만 **B 소유**). 씬 쪽 짝(`sim_main.py`·`sim_server.py`·
+`spawner.py`·`conveyor_ctl.py`)도 들어와 `test1-1.usd` 위에서 프로토콜 15개가 돈다.
+
+**아직 없는 것:** `packing_robot/orchestrator.py`(cycle.py 를 감싸는 rclpy 노드),
+`packing_sim/packing_sim/sim_bridge_node.py`, `packing_msgs`(msg 5 + srv 15),
+그리고 `src/` 전체에 ROS 패키지 매니페스트(`package.xml`)가 아직 하나도 없다.
 
 ## 저장소 루트의 관련 스크립트
 

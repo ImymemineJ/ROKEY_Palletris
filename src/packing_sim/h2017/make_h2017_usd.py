@@ -36,7 +36,9 @@ _app = SimulationApp({"headless": True})
 import yaml  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-URDF = HERE / "urdf/h2017.urdf"
+# 로봇 자산의 정본은 src/packing_robot/ 하나다. 여기 있던 사본은 지웠다 —
+# rmpflow 설정의 페데스탈이 사본 -0.500 / 정본 -0.900 으로 갈라져 있었다.
+URDF = HERE.parents[1] / "packing_robot/urdf/h2017.urdf"   # parents[1] = src/
 SYSTEM_YAML = Path("/home/rokey/palletris_ws/src/packing_bringup/config/system.yaml")
 SRC_USD = Path("/home/rokey/isaac_scenes/project_1/SubUSDs/h2017.usd")
 OUT_USD = Path(os.environ.get(

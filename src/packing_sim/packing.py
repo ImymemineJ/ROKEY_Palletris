@@ -127,9 +127,13 @@ class HeightmapPacker:
     def local_to_world(self, local_xyz, pallet_origin_xy, deck_z: float) -> np.ndarray:
         """팔레트 로컬 -> 월드. wall_margin 만큼 안쪽으로 들어가 있음에 주의."""
         local_xyz = np.asarray(local_xyz, dtype=float)
+        # ★ wall_margin 을 여기서 **또 더하면 안 된다.** `find_placement` 가 돌려주는
+        #   Placement.x/y 에 이미 들어가 있다 (원점을 띄우는 그 보정). 두 번 더하면
+        #   margin>0 인 순간 월드 좌표가 그만큼 밀린다 — 기본 0 이라 지금은 안 터지고,
+        #   그래서 더 나쁘다. 누가 margin 을 켜는 순간 조용히 어긋난다.
         return np.array([
-            pallet_origin_xy[0] + self.wall_margin + local_xyz[0],
-            pallet_origin_xy[1] + self.wall_margin + local_xyz[1],
+            pallet_origin_xy[0] + local_xyz[0],
+            pallet_origin_xy[1] + local_xyz[1],
             deck_z + local_xyz[2],
         ])
 
@@ -186,7 +190,8 @@ class HeightmapPacker:
 
         return base_h, flatness, support, valid
 
-    def find_placement(self, box_size, box_mass: float = 0.0) -> Placement | None:
+    def find_placement(self, box_size, box_mass: float = 0.0,
+                       reject=None, reject_scan_max: int = 20000) -> Placement | None:
         """
         박스 하나(w, d, h)의 최적 배치를 찾는다. 실패하면 None.
 
@@ -194,6 +199,18 @@ class HeightmapPacker:
           1) 배치 후 최고 높이가 낮을수록 좋다        <- 하이트맵 최소화
           2) 지지면이 평평할수록 좋다                 <- 안정성
           3) 팔레트 모서리에 가까울수록 좋다          <- 파편화 억제
+
+        `reject(cx, cy, z, w, d, h, yaw_deg) -> bool` 을 주면 **점수 순으로** 훑어
+        거부되지 않는 첫 후보를 고른다. 좌표는 전부 팔레트 로컬 [m], `cx·cy` 는
+        모서리가 아니라 **중심**이다 (`Placement.center_local` 과 같은 규약).
+
+        이 훅이 필요한 이유: 이 클래스는 기하만 안다. "이 자리에 놓으러 가면
+        로봇 아래팔이 이미 서 있는 기둥 위를 쓸고 지나간다" 같은 것은 패킹 문제가
+        아니라 **팔의 문제**라, 여기에 로봇을 알게 만들면 안 된다. 대신 아는 쪽이
+        술어로 넘긴다. 안 주면 예전과 완전히 같이 동작한다.
+
+        `reject_scan_max` 는 술어를 부를 후보 수의 상한이다. 여기까지 다 거부되면
+        그 yaw 는 포기한다 (조용히 오래 도는 것보다 낫다).
         """
         w0, d0, h = (float(v) for v in box_size)
 
@@ -234,18 +251,37 @@ class HeightmapPacker:
 
             # 사전식 최소값을 하나의 정렬 키로 압축
             order = np.lexsort((score_c.ravel(), score_f.ravel(), score_h.ravel()))
-            idx = order[0]
-            i, j = np.unravel_index(idx, score_h.shape)
+            # ★ 무효 후보는 점수가 inf 라 정렬 뒤쪽에 몰린다 — 하나 만나면 그 뒤는
+            #   전부 무효다. 그래서 훑다가 무효를 만나면 바로 끊는다.
+            i = j = None
+            for k, idx in enumerate(order):
+                ii, jj = np.unravel_index(idx, score_h.shape)
+                if not valid[ii, jj]:
+                    break
+                if reject is not None:
+                    if k >= reject_scan_max:
+                        break
+                    if reject(ii * self.cell + w / 2.0, jj * self.cell + d / 2.0,
+                              float(base_h[ii, jj]), w, d, h, yaw):
+                        continue
+                i, j = ii, jj
+                break
 
-            if not valid[i, j]:
+            if i is None:
                 continue
 
             key = (float(score_h[i, j]), float(score_f[i, j]), float(score_c[i, j]))
             if best_key is None or key < best_key:
                 best_key = key
                 best = Placement(
-                    x=i * self.cell,
-                    y=j * self.cell,
+                    # ★ 격자는 wall_margin 만큼 좁혀 놨지만(__init__ 의 usable),
+                    #   좌표 원점은 안 옮겨져 있었다. 그래서 벽 여유가 **먼 쪽에만**
+                    #   생기고 원점 쪽(x=0 · y=0) 은 여전히 딱 붙었다.
+                    #   로봇 쪽 가장자리가 바로 y=0 이라, 가장 무거운 5호가 팔레트
+                    #   끝에 15 mm 여유로 서는 일이 실제로 났다 (2026-08-23).
+                    #   여기서 원점을 띄워 양쪽에 똑같이 여유를 준다.
+                    x=self.wall_margin + i * self.cell,
+                    y=self.wall_margin + j * self.cell,
                     z=float(base_h[i, j]),
                     w=w,
                     d=d,
@@ -260,8 +296,9 @@ class HeightmapPacker:
 
     def commit(self, placement: Placement) -> None:
         """배치를 확정하고 하이트맵을 갱신한다."""
-        i0 = int(round(placement.x / self.cell))
-        j0 = int(round(placement.y / self.cell))
+        # ★ 위 find_placement 가 wall_margin 을 얹어 돌려주므로 여기서 다시 뺀다.
+        i0 = int(round((placement.x - self.wall_margin) / self.cell))
+        j0 = int(round((placement.y - self.wall_margin) / self.cell))
         i1 = i0 + self._cells(placement.w)
         j1 = j0 + self._cells(placement.d)
 
@@ -284,8 +321,11 @@ class HeightmapPacker:
         self.heightmap[:] = 0.0
         self.massmap[:] = np.inf
         for p in self.placements:
-            i0 = int(round(p.x / self.cell))
-            j0 = int(round(p.y / self.cell))
+            # ★ commit 과 같은 규약이어야 한다 — Placement.x 에는 wall_margin 이
+            #   얹혀 있으므로 격자 인덱스로 되돌릴 때 빼야 한다. 안 빼면 되돌리기
+            #   뒤 하이트맵이 margin 칸수만큼 어긋난다.
+            i0 = int(round((p.x - self.wall_margin) / self.cell))
+            j0 = int(round((p.y - self.wall_margin) / self.cell))
             i1, j1 = i0 + self._cells(p.w), j0 + self._cells(p.d)
             self.heightmap[i0:i1, j0:j1] = p.z + p.h
             self.massmap[i0:i1, j0:j1] = p.mass if p.mass > 0 else np.inf

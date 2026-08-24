@@ -8,8 +8,9 @@ import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# packing_robot/packing_robot/fk.py -> packing_robot/urdf/h2017.urdf
-URDF = (Path(__file__).resolve().parent / "../urdf/h2017.urdf").resolve()
+# 로봇 자산의 정본은 src/packing_robot/ 하나다 (사본은 갈라져서 지웠다).
+# parents[0]=tools · [1]=h2017 · [2]=packing_sim · [3]=src
+URDF = (Path(__file__).resolve().parents[3] / "packing_robot/urdf/h2017.urdf")
 
 CHAIN = [
     ("joint_1", "base_link", "link_1"),

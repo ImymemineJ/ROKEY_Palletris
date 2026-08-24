@@ -13,7 +13,7 @@ Isaac Sim GUI 에서 돌린다.
   · Play 중 물리 스텝에서 시간을 누적해 PL_INTERVAL 초마다 박스 1개 생성.
   · 호수는 3/4/5호 를 50:30:20 비율로 랜덤, 요(yaw)와 가로 위치도 랜덤.
     가로 지터는 회전 후 실제 발자국으로 상한을 계산해 실측한 벨트 폭 밖으로
-    걸치지 않게 한다 (투입 벨트는 1001mm).
+    걸치지 않게 한다 (폭은 씬마다 다르다 — test1.usd 722mm, test1-1.usd 1546mm).
   · 색은 호수 고정 — 3호 빨강 / 4호 초록 / 5호 파랑.
     test1.usd 에 이미 있는 /World/Looks/BoxNo{3,4,5} 머티리얼을 쓰고,
     없으면 만든다. displayColor 도 같이 넣는다.
@@ -92,10 +92,18 @@ BOX_SLUG = {"3호": "No3", "4호": "No4", "5호": "No5"}
 # 높이 계열로 되돌린 뒤로 그 좌표가 벨트면보다 470mm 아래를 가리켰다. 박스가
 # 벨트 안쪽에서 생성돼 튕겨 나가거나 바닥으로 떨어졌다 — 스폰이 안 되던 원인.
 #
-#   이름: (조각 프림, (흐름 축, 부호), 진입단에서 안쪽으로 넣을 거리 [m])
+# 흐름 방향도 씬에서 읽는다. ConveyorNode 의 inputs:direction 을 데크 프림의
+# 월드 회전으로 돌려서 쓴다. 아래 표의 축·부호는 그래프를 못 찾을 때만 쓰는
+# 기본값이다.
+#   test1.usd    /World/ConveyorTrack = 8.4m A06, 상면 1780mm, x=0 에서 -X 로 흐른다
+#   test1-1.usd  /World/ConveyorTrack = 5m A05,   상면  800mm, x=0 에서 +X 로 흐른다
+# 이름이 같은 프림이 씬마다 반대로 흐른다. 부호를 박아 두면 반드시 한쪽이
+# 깨진다 — 실제로 +1 로 박아 두는 바람에 test1.usd 에서 박스가 투입구가 아니라
+# 8m 떨어진 토출단(커브 앞)에 떨어졌다. 그게 "스폰이 안 된다" 의 정체였다.
+#
+#   이름: (조각 프림, (흐름 축, 부호 기본값), 진입단에서 안쪽으로 넣을 거리 [m])
 SPAWN_POINTS = {
-    # 공장 투입구. system.yaml 좌표계에서 라인은 x=0 에서 +X 로 흐르고,
-    # 진입단에서 0.50m 안쪽 = x=500mm 가 사양의 spawn_point_mm 다.
+    # 공장 투입구. 진입단에서 0.50m 안쪽 = 사양의 spawn_point_mm 다.
     "cube":   ("/World/ConveyorTrack",    ("x", +1), 0.50),
     # 로봇까지 이어지는 본선 시작점. ConveyorTrack_03 은 +Y 로 흐른다.
     "feeder": ("/World/ConveyorTrack_03", ("y", +1), 0.40),
@@ -105,16 +113,14 @@ SPAWN_POINTS = {
 # A05/A02/A43 (770mm 계열) 은 Rollers, A06/A03 (1780mm 계열) 은 Belt.
 DECK_NAMES = ("Rollers", "Belt")
 
-# 실측이 안 될 때만 쓰는 값 (2026-08-21 헤드리스 실측 기록).
-FALLBACK = {
-    "cube":   {"top": 0.8000, "center": (0.500, 0.000), "half": 0.7730},
-    "feeder": {"top": 1.7805, "center": (-9.496, 1.896), "half": 0.4500},
-}
-
-BELT_TOP_Z = FALLBACK["cube"]["top"]    # start() 에서 실측값으로 덮어쓴다
+# 벨트 실측값. start() -> _measure() 가 채운다.
+# 예전에는 실측이 실패하면 기록해 둔 상수로 넘어갔는데, 그 상수가 다른 씬의
+# 것이면 박스를 허공이나 벨트 밑에 만들어 놓고 조용히 지나간다. 씬을 바꿀
+# 때마다 이걸로 깨졌다. 이제는 못 재면 끊는다.
+BELT_TOP_Z = 0.0
 # 게이팅 판정용 벨트 흐름축 범위 [m]. _measure() 가 실측값으로 채운다.
 BELT_FLOW_RANGE = None
-BELT_HALF_W = FALLBACK["cube"]["half"]
+BELT_HALF_W = 0.0
 EDGE_MARGIN = 0.08       # 벨트 가장자리 여유 [m]
 YAW_JITTER_DEG = 15.0
 
@@ -243,6 +249,47 @@ def _clear():
 
 
 # ─────────────────────────────────────────────────────────────
+def _flow_dir(stage, track_path, deck, default_axis, default_sign):
+    """벨트가 실제로 어느 쪽으로 흐르는지 (축, 부호) 를 씬에서 읽는다.
+
+    ConveyorNode 의 inputs:direction 은 conveyorPrim 의 로컬 프레임 기준이다.
+    조각을 Z 180도 돌려 놓은 씬이 흔해서 같은 (1,0,0) 이 씬에 따라 +X 도 되고
+    -X 도 된다. test1.usd 와 test1-1.usd 가 정확히 그 관계다.
+    """
+    node, local = None, None
+    track = stage.GetPrimAtPath(track_path)
+    for graph in track.GetChildren():
+        if "ConveyorBeltGraph" not in graph.GetName():
+            continue
+        for child in graph.GetChildren():
+            attr = child.GetAttribute("inputs:direction")
+            v = attr.Get() if attr else None
+            if v is not None and Gf.Vec3d(v[0], v[1], v[2]).GetLength() > 1e-9:
+                node, local = child, Gf.Vec3d(v[0], v[1], v[2])
+                break
+        if node is not None:
+            break
+
+    if node is None:
+        print(f"[feeder] {track_path} 에서 ConveyorNode 를 못 찾았다 — "
+              f"기본 흐름 {default_axis}{'+' if default_sign > 0 else '-'} 를 쓴다")
+        return default_axis, default_sign
+
+    frame = deck if UsdGeom.Xformable(deck) else track
+    world = UsdGeom.Xformable(frame).ComputeLocalToWorldTransform(
+        Usd.TimeCode.Default()).TransformDir(local)
+
+    axis = "x" if abs(world[0]) >= abs(world[1]) else "y"
+    sign = 1 if world[0 if axis == "x" else 1] >= 0 else -1
+    arrow = f"{axis}{'+' if sign > 0 else '-'}"
+    print(f"[feeder] 흐름 실측 {node.GetPath()}  "
+          f"로컬 ({local[0]:+.0f},{local[1]:+.0f},{local[2]:+.0f}) -> 월드 {arrow}")
+    if (axis, sign) != (default_axis, default_sign):
+        print(f"[feeder]   표의 기본값 "
+              f"{default_axis}{'+' if default_sign > 0 else '-'} 와 다르다 — 씬을 따른다")
+    return axis, sign
+
+
 def _measure(stage):
     """투입 벨트 메시를 재서 (중심 xy, 폭 방향 축) 을 돌려준다.
 
@@ -255,11 +302,9 @@ def _measure(stage):
         raise ValueError(f"PL_SPAWN 은 {' | '.join(SPAWN_POINTS)}: {SPAWN!r}")
 
     track_path, (flow_axis, flow_sign), inset = SPAWN_POINTS[SPAWN]
-    cross_axis = "y" if flow_axis == "x" else "x"
-    fb = FALLBACK[SPAWN]
 
-    # 벨트 자체가 없으면 FALLBACK 좌표는 허공을 가리킨다. 조용히 넘어가면
-    # 박스가 바닥으로 떨어지므로 여기서 끊는다.
+    # 벨트가 없으면 좌표를 찍을 근거가 없다. 조용히 넘어가면 박스가 바닥으로
+    # 떨어지므로 여기서 끊는다.
     if not stage.GetPrimAtPath(track_path):
         raise RuntimeError(
             f"[feeder] 투입 벨트 {track_path} 가 이 스테이지에 없다 "
@@ -267,31 +312,38 @@ def _measure(stage):
             f"이 스테이지에 있는 투입구를 PL_SPAWN 으로 고르거나 "
             f"벨트가 있는 USD 를 PL_STAGE 로 열어라.")
 
-    prim, prim_path = None, f"{track_path}/<{'|'.join(DECK_NAMES)}>"
+    prim, prim_path = None, None
     for deck in DECK_NAMES:
         p = stage.GetPrimAtPath(f"{track_path}/{deck}")
         if p and p.IsValid():
             prim, prim_path = p, f"{track_path}/{deck}"
             break
+    if prim is None:
+        raise RuntimeError(
+            f"[feeder] {track_path} 밑에 {' 도 '.join(DECK_NAMES)} 도 없다 — "
+            f"박스가 닿을 면을 못 찾는다. 에셋 계열이 바뀌었으면 "
+            f"DECK_NAMES 에 이름을 추가해라.")
 
-    rng = None
-    if prim is not None:
-        try:
-            cache = UsdGeom.BBoxCache(
-                Usd.TimeCode.Default(),
-                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render,
-                 UsdGeom.Tokens.proxy, UsdGeom.Tokens.guide])
-            r = cache.ComputeWorldBound(prim).ComputeAlignedRange()
-            if not r.IsEmpty():
-                rng = (r.GetMin(), r.GetMax())
-        except Exception as exc:
-            print(f"[feeder] 벨트 측정 실패 ({exc})")
-    if rng is None:
-        print(f"[feeder] {prim_path} 를 못 쟀다 — 기록해 둔 실측값을 쓴다")
-        BELT_TOP_Z, BELT_HALF_W = fb["top"], fb["half"]
-        return fb["center"], cross_axis
+    try:
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render,
+             UsdGeom.Tokens.proxy, UsdGeom.Tokens.guide])
+        r = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+    except Exception as exc:
+        raise RuntimeError(f"[feeder] {prim_path} 측정 실패 ({exc})") from exc
+    if r.IsEmpty():
+        # 예전엔 여기서 기록해 둔 상수로 넘어갔다. 그 상수가 다른 씬 것이면
+        # 박스가 벨트 밑이나 허공에 생겨 조용히 사라진다. 끊는 게 낫다.
+        raise RuntimeError(
+            f"[feeder] {prim_path} 의 bbox 가 비었다 — 벨트 에셋(레퍼런스)이 "
+            f"로드되지 않았을 가능성이 크다. 스테이지={STAGE_PATH}")
 
-    mn, mx = rng
+    # 흐름 방향은 씬에서 읽는다 (표의 부호는 못 읽을 때만 쓴다).
+    flow_axis, flow_sign = _flow_dir(stage, track_path, prim, flow_axis, flow_sign)
+    cross_axis = "y" if flow_axis == "x" else "x"
+
+    mn, mx = r.GetMin(), r.GetMax()
     i_flow = 0 if flow_axis == "x" else 1
     i_cross = 1 - i_flow
     # 진입단 = 흐름의 반대쪽 끝. 거기서 inset 만큼 안쪽에 떨어뜨린다.
@@ -305,8 +357,10 @@ def _measure(stage):
     center = (along, cross_c) if flow_axis == "x" else (cross_c, along)
 
     print(f"[feeder] 벨트 실측 {prim_path}")
-    print(f"[feeder]   상면 {BELT_TOP_Z * 1000:.0f}mm  폭 {BELT_HALF_W * 2 * 1000:.0f}mm  "
-          f"중심 ({center[0]:.3f}, {center[1]:.3f})")
+    print(f"[feeder]   {flow_axis} {mn[i_flow]:.3f}~{mx[i_flow]:.3f}m  "
+          f"진입단 {entry:.3f}  상면 {BELT_TOP_Z * 1000:.0f}mm  "
+          f"폭 {BELT_HALF_W * 2 * 1000:.0f}mm")
+    print(f"[feeder]   투입 중심 ({center[0]:.3f}, {center[1]:.3f})")
     return center, cross_axis
 
 

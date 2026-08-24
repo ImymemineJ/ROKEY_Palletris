@@ -19,6 +19,9 @@
 | `verify_cycle.py` | 김병직 | **시뮬레이션 A — 사이클 예행.** 픽→이송→플레이스를 계획대로 돌리며 사이클타임·툴 기울기·박스↔팔 간섭·이송 여유를 잰다. `--gui` 면 팔레트/벨트/박스를 **시각 전용**으로 띄운다 (물리 없음, 측정 무영향). `--transit line --yaw fixed` 로 옛 방식 재현 |
 | `verify_b4_cycle.py` | 김병직 | **B4 — 단일 사이클 판정.** 소켓 프로토콜 위에서 픽→플레이스 1개 완주. 내장 StandInServer 가 A `sim_server` 의 대역이라 **명령 프로토콜의 참조 구현**을 겸한다 |
 | `demo_stack15.py` | 김병직 | **B5 예행 — 15박스 다층(7단) 적재 데모.** HeightmapPacker 계획 + 로봇 기하를 아는 끼워넣기 순서. 촬영은 `--gui --hold`, `--kit-log` 로 런타임 로그 억제, `--plan-mode online` 은 비전 모의(현재 오프라인보다 낮음) |
+| `verify_belt_speed.py` | 김학민 | **벨트 이송속도 게이트.** `isaac-sim.sh --no-window --exec` **전용** — `IsaacConveyor` 가 렌더 틱에 물려 있어 `python.sh` 로는 값이 틀린다. main·b_pickup 을 따로 잰다 (scale.x 가 3 배 달라 한쪽만 맞을 수 있다) |
+| `verify_b4_test1_1.py` | 김학민 | **B4 를 실제 씬 `test1-1.usd` 에서.** `verify_b4_cycle` 은 합성 씬이고 이건 진짜 라인이다 — 박스가 벨트를 타고 와 스토퍼에 서고, A 의 `sim_server`/`spawner`/`conveyor_ctl` 과 B 의 `robot_motion` 이 같은 소켓에 붙는다 |
+| `demo_stack15_test1_1.py` | 김학민 | **15박스 연속 — 실제 라인.** `demo_stack15`(B5)를 컨베이어 위로 옮긴 것. 급송이 없고 도착 순서 그대로 집으므로 온라인 패커를 쓴다. 스폰은 사양 스케줄(`boxes.stage1` 12 s x 15). `PL_N` 으로 개수 축소 |
 | `script_editor_lula.py` | 김병직 | **Isaac Sim GUI 의 Script Editor 에 붙여넣는 스니펫.** `POINT` 만 바꿔 11점 중 하나로 팔을 보낸다 |
 | `read_log.py` | 김병직 | Isaac Script Editor 출력을 터미널에서 읽는다 |
 | `gen_master_db.py` | 민범진 | D1 — **직접 추가할 것** |
