@@ -133,7 +133,12 @@ class HeightmapPacker:
         yaw = float(actual["yaw_deg"])
 
         # ① yaw 가 계획에서 yaw_tol_deg 이상 벗어났나
-        if planned is not None and abs(yaw - planned[0]["yaw_deg"]) > self.yaw_tol:
+        # ★ 180° 주기로 비교한다. 박스는 회전 대칭이라 yaw 와 yaw±180 은 같은 배치다.
+        #   로봇이 손목 회전량을 줄이려고 등가 각을 골라 오는데(cycle.nearest_equiv_yaw),
+        #   단순 차이로 재면 그때마다 "yaw 오차 초과" 로 오판해 footprint 를 AABB 로
+        #   부풀린다 — 멀쩡한 배치에서 적재율이 떨어진다.
+        dyaw = abs((yaw - planned[0]["yaw_deg"] + 90.0) % 180.0 - 90.0) if planned else 0.0
+        if planned is not None and dyaw > self.yaw_tol:
             # 비스듬히 놓였다 = 축정렬 격자에 그대로 못 넣는다. 외접 사각형으로 부풀려
             # "여기는 뭔가 있다"고 안전하게 기록하고, 실패를 호출자(트랙 B)에게 알린다.
             w, d = self._aabb(w_mm, d_mm, yaw)
@@ -168,6 +173,15 @@ class HeightmapPacker:
     def reset(self): self.hm[:] = 0; self.plans.clear(); self.placed.clear()
 
     def fill_rate(self):
-        vol = sum(w * d * h for _, w, d, h in self.placed) / 1e9      # m³
-        hmax = max(1, int(self.hm.max()))                              # ★ 실제 최고 높이!
-        return vol / (0.8 * 1.2 * hmax / 1000.0)
+        """적재율 = 박스 부피 합 / (팔레트 바닥 넓이 × **실제 최고 높이**)  — 명세서 §7.8
+
+        ★ 분모를 max_stack 으로 고정하지 말 것 (함정 #19). 절반만 찼는데 1300 으로
+          나누면 부당하게 낮다. 대신 **층이 새로 올라가는 순간 분모가 계단처럼 뛰어**
+          적재율이 일시적으로 떨어져 보인다 — 정의상 정상이다.
+        ★ 바닥 넓이도 config 에서 온다. 0.8*1.2 로 박아 두면 팔레트 치수가 바뀔 때
+          (2026-08-22 90° 회전 같은 일) 조용히 틀린 값이 나온다 (철칙 3).
+        """
+        vol = sum(w * d * h for _, w, d, h in self.placed) / 1e9       # m³
+        hmax = max(1, int(self.hm.max()))                              # ★ 실제 최고 높이
+        area_m2 = (self.W * self.cell) * (self.D * self.cell) / 1e6    # 1200×800 → 0.96
+        return vol / (area_m2 * hmax / 1000.0)
