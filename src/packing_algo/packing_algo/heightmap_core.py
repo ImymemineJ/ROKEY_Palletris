@@ -101,8 +101,11 @@ class HeightmapPacker:
             # ③ 이 박스만 못 놓은 건지(NO_FEASIBLE_POSE), 팔레트가 정말 끝난 건지(PALLET_FULL) 구분
             return False, None, 0.0, "PALLET_FULL" if self._is_pallet_full() else "NO_FEASIBLE_POSE"
         _, i, j, z, yaw, w, d = best
-        pose = dict(x_mm=i * self.cell + w // 2, y_mm=j * self.cell + d // 2,
-                    z_mm=z, yaw_deg=float(yaw))              # ★ x,y=중심 / z=밑면
+        # ★ int()/float() 로 감싸는 이유: i,j,z 는 numpy 배열에서 나온 int64 다.
+        #   그대로 내보내면 json.dump 가 "int64 is not JSON serializable" 로 죽고
+        #   (스냅샷 저장이 통째로 실패한다), ROS 메시지 대입에서도 타입 경고가 난다.
+        pose = dict(x_mm=int(i * self.cell + w // 2), y_mm=int(j * self.cell + d // 2),
+                    z_mm=int(z), yaw_deg=float(yaw))         # ★ x,y=중심 / z=밑면
         self.plans[box_id] = (pose, w_mm, d_mm, h_mm)
         return True, pose, float(best[0][0]), "OK"
 
@@ -202,3 +205,16 @@ class HeightmapPacker:
         hmax = max(1, int(self.hm.max()))                              # ★ 실제 최고 높이
         area_m2 = (self.W * self.cell) * (self.D * self.cell) / 1e6    # 1200×800 → 0.96
         return vol / (area_m2 * hmax / 1000.0)
+
+    def capacity_rate(self):
+        """용량 대비 적재율 = 박스 부피 합 / (팔레트 바닥 넓이 × **max_stack**)
+
+        ★ 이건 §7.8 의 `fill_rate` 를 대체하는 게 아니라 **보조 지표**다.
+          - `fill_rate` : "쌓은 만큼의 공간을 얼마나 알차게 썼나" (정본, 함정 #19)
+          - `capacity_rate` : "트럭 한 칸(1200×800×1300)을 얼마나 채웠나"
+          층이 올라갈 때 분모가 안 뛰므로 **단조 증가**한다. 발표 곡선용.
+          포화까지 채우면 실제 최고 높이가 max_stack 에 붙어 두 값이 1%p 안쪽으로 만난다.
+        """
+        vol = sum(w * d * h for _, w, d, h in self.placed) / 1e9       # m³
+        area_m2 = (self.W * self.cell) * (self.D * self.cell) / 1e6
+        return vol / (area_m2 * self.max_stack / 1000.0)

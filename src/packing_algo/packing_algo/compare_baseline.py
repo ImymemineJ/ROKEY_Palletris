@@ -72,7 +72,8 @@ def run_once(packer_cls, cfg, n, seed_box, seed_noise, noise_mm, cap=200, dry_li
         pk.update(box_id, w, d, h, actual)
         placed += 1
         curve.append(pk.fill_rate())
-    return fed, placed, skipped, pk.fill_rate(), int(pk.hm.max()), curve
+    return (fed, placed, skipped, pk.fill_rate(), int(pk.hm.max()), curve,
+            pk.capacity_rate())
 
 
 PACKERS = (("제안 (heightmap)", HeightmapPacker), ("베이스라인 (순차)", BaselinePacker))
@@ -91,13 +92,14 @@ def markdown_table(sat, by_n, counts, seeds, noise_mm, TARGET):
     L = ["# C4 비교 실험 — 제안 vs 베이스라인", "",
          f"시드 {len(seeds)}개(1~{max(seeds)}) · 실측 오차 ±{noise_mm}mm · 두 패커에 동일 시퀀스 투입", "",
          "## 주 지표 — 팔레트를 포화시킬 때까지 (= 최대로 쌓기)", "",
-         "| 알고리즘 | 적재 개수 | 적재율 | 최소~최대 | 최고 높이 | 투입 | 버림 |",
-         "|---|---|---|---|---|---|---|"]
+         "| 알고리즘 | 적재 개수 | 적재율(실제높이) | 최소~최대 | 적재율(용량) | 최고 높이 | 투입 | 버림 |",
+         "|---|---|---|---|---|---|---|---|"]
     for lb in sat:
         rs = sat[lb]
-        pl = [r[1] for r in rs]; fr = [r[3] * 100 for r in rs]
+        pl = [r[1] for r in rs]; fr = [r[3] * 100 for r in rs]; cp = [r[6] * 100 for r in rs]
         L.append(f"| {lb} | {st.mean(pl):.1f} ± {st.pstdev(pl):.1f} | "
                  f"**{st.mean(fr):.1f}% ± {st.pstdev(fr):.1f}** | {min(fr):.1f}~{max(fr):.1f}% | "
+                 f"{st.mean(cp):.1f}% | "
                  f"{st.mean([r[4] for r in rs]):.0f}mm | {st.mean([r[0] for r in rs]):.1f} | "
                  f"{st.mean([r[2] for r in rs]):.1f} |")
     a, b = list(sat)

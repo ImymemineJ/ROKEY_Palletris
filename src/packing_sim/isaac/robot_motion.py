@@ -70,7 +70,15 @@ BOX_PRIM_FMT = "/World/boxes/%s"          # 공통가이드 §3 규칙 5
 #   흡착 접근 간극 2 mm 를 판정할 수 없다 (실측으로 2.14 mm 떠서 붙어 실패했다).
 IK_TOL_M = 0.005                          # Lula 해를 FK 로 되돌렸을 때 허용 오차
 REACH_TOL_M = 0.001                       # 흡착면이 목표에서 이 안이면 REACHED
-SETTLE_MAX_S = 1.0                        # 궤적을 다 보낸 뒤 수렴을 기다리는 한도
+# ★ 도착 판정에 **자세**도 넣는다 (2026-08-24, TS-015).
+#   위치만 보면 손목이 도는 중에 REACHED 가 나가고, 그 상태로 흡착을 놓아
+#   박스가 삐딱하게 떨어져 넘어졌다. 실측에서 다음 구간이 yaw 112.9 에서 시작했다.
+YAW_TOL_DEG = 2.0                         # 툴 yaw 가 이 안이어야 REACHED
+# ★ 1.0 → 2.5 로 늘렸다. 정상 이동은 SETTLE_HOLD 몇 틱이면 빠져나가므로 이 값이
+#   길어도 손해가 없다. 이 한도가 실제로 쓰이는 건 "뭔가 안 맞을 때" 뿐이고,
+#   바로 그때 더 기다려야 한다. 단 **무한대는 안 된다** — 정상상태 오차가 남는
+#   제어기에서는 임계값에 영영 못 들어간다 (구 저장소 RMPflow 교훈).
+SETTLE_MAX_S = 2.5                        # 궤적을 다 보낸 뒤 수렴을 기다리는 한도
 SETTLE_HOLD = 3                           # 연속 이만큼 만족해야 REACHED
 ARC_MIN_R_M = 0.15                        # 반경이 이보다 작으면 각도가 무의미 — 직선
 BISECT = 10                               # 속도한계를 넘으면 u 증분을 이만큼까지 반절
@@ -150,6 +158,7 @@ class RobotMotion:
         self._req = None            # move_ee 요청 (아직 IK 안 푼 것)
         self._path = None           # 진행 중인 호 경로
         self._goal_face = None      # 이번 이동의 흡착면 목표 (작업공간 판정용)
+        self._goal_yaw = 0.0        # 같은 이동의 툴 yaw 목표 (자세 판정용)
         self._hold = 0
         self._settle = 0
         self._tcp_mps = 0.0
@@ -280,11 +289,19 @@ class RobotMotion:
         q = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
         return np.asarray(self.lula.compute_forward_kinematics(self.ee, q)[0], dtype=float)
 
-    def suction_pose(self):
-        """흡착면 월드 위치 (3,) [m]. 툴 +Z 로 그리퍼 길이만큼 나간 점."""
+    def suction_face(self):
+        """흡착면 월드 위치 (3,) [m] 와 툴 yaw [deg] 를 **FK 한 번**으로 같이 낸다.
+
+        settle 은 매 틱 돌기 때문에 위치와 yaw 를 따로 구하면 FK 가 두 배가 된다.
+        """
         q = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
         p, R = self.lula.compute_forward_kinematics(self.ee, q)
-        return np.asarray(p, dtype=float) + np.asarray(R)[:, 2] * self.grip_len
+        R = np.asarray(R)
+        return np.asarray(p, dtype=float) + R[:, 2] * self.grip_len, _tool_yaw_deg(R)
+
+    def suction_pose(self):
+        """흡착면 월드 위치 (3,) [m]. 툴 +Z 로 그리퍼 길이만큼 나간 점."""
+        return self.suction_face()[0]
 
     def _update_tcp_speed(self):
         cur = self.tool_pose()
@@ -355,6 +372,7 @@ class RobotMotion:
                       "u": 0.0, "du": 1.0 / steps, "prev": q0, "k": 0,
                       "miss": 0, "over": 0}
         self._goal_face = np.asarray(face, dtype=float)
+        self._goal_yaw = float(yaw_to)              # ★ 도착 판정에 쓸 목표 자세
         self._hold = 0
         self._settle = int(SETTLE_MAX_S * self.hz)
         self._state = "MOVING"
@@ -404,10 +422,14 @@ class RobotMotion:
                       % (MOVE_LIMIT_S, p["u"], p["miss"]))
 
     def _settle_move(self, p):
-        """끝점 지령을 유지하며 흡착면이 실제로 목표에 들어오는지 본다."""
+        """끝점 지령을 유지하며 흡착면이 실제로 목표 **위치와 자세**에 들어오는지 본다."""
         self.art.apply_action(self._Action(joint_positions=p["prev"]))
-        err = float(np.linalg.norm(self.suction_pose() - self._goal_face))
-        if err < REACH_TOL_M:
+        face, yaw = self.suction_face()
+        err = float(np.linalg.norm(face - self._goal_face))
+        # ★ yaw 와 yaw±180 은 물리적으로 같은 자세다 — 180° 주기로 비교한다.
+        #   안 그러면 등가 각으로 수렴했는데 178° 틀렸다고 오판해 매번 한도까지 기다린다.
+        dyaw = abs(yaw - _near(self._goal_yaw, yaw, 180.0))
+        if err < REACH_TOL_M and dyaw < YAW_TOL_DEG:
             self._hold += 1
             if self._hold >= SETTLE_HOLD:
                 self._reach_done(err, p)
@@ -415,17 +437,19 @@ class RobotMotion:
         self._hold = 0
         self._settle -= 1
         if self._settle <= 0:
-            if err > LOG_RESIDUAL_M:
-                self._warn_residual(p, err)
+            if err > LOG_RESIDUAL_M or dyaw > YAW_TOL_DEG:
+                self._warn_residual(p, err, dyaw)
             self._reach_done(err, p)
 
-    def _warn_residual(self, p, err):
+    def _warn_residual(self, p, err, dyaw=0.0):
         # ⚠ 여기서 영원히 기다리면 안 된다 — 정상상태 오차가 남는 제어기에서는
         #   임계값에 영영 못 들어간다 (구 저장소 RMPflow 교훈). 한도를 두고
         #   잔차를 로그로 남긴 뒤 넘어간다.
-        self._log("[robot_motion] 도착 잔차 %.2f mm (허용 %.1f) — 한도 초과, 진행\n"
+        self._log("[robot_motion] 도착 잔차 %.2f mm (허용 %.1f) · yaw %.1f deg (허용 %.1f)"
+                  " — 한도 초과, 진행\n"
                   "               흡착면 %s -> 목표 %s  (IK 실패 %d · 속도초과 %d)"
-                  % (err * 1000, REACH_TOL_M * 1000, np.round(self.suction_pose(), 4),
+                  % (err * 1000, REACH_TOL_M * 1000, dyaw, YAW_TOL_DEG,
+                     np.round(self.suction_pose(), 4),
                      np.round(self._goal_face, 4), p["miss"], p["over"]))
 
     def _reach_done(self, err, p=None):

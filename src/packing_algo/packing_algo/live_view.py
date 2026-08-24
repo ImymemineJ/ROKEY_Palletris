@@ -61,18 +61,27 @@ def draw(fig, axes, st, fills):
     ax_hm.set_title("heightmap (mm)", fontsize=9)
     ax_hm.set_xlabel("Px"); ax_hm.set_ylabel("Py")
 
+    # 적재율 두 가지를 같이 그린다 — 기준이 다르면 곡선 모양이 아주 다르다.
+    #   실제높이 기준(정본 §7.8): 층이 올라가는 순간 분모가 뛰어 **뚝 떨어진다**
+    #   용량 기준(보조)         : 분모가 max_stack 고정이라 **단조 증가**
+    # 하나만 보면 "왜 적재율이 내려가지?" 를 계속 설명해야 한다.
     ax_fr.clear()
-    ax_fr.plot(range(1, len(fills) + 1), [f * 100 for f in fills],
-               color="#0052CC", lw=2, marker="o", ms=3)
+    xs = range(1, len(fills) + 1)
+    ax_fr.plot(xs, [f * 100 for f, _ in fills],
+               color="#2a78d6", lw=2, marker="o", ms=3, label="실제 높이 기준 (§7.8)")
+    ax_fr.plot(xs, [c * 100 for _, c in fills],
+               color="#eb6834", lw=2, marker="o", ms=3, label=f"용량 기준 ({ms}mm)")
     ax_fr.axhline(70, color="#52514E", lw=1.2, ls=(0, (5, 4)))
     ax_fr.text(0.6, 71, "목표 70%", color="#52514E", fontsize=8)
     ax_fr.set_xlim(0.5, max(2, len(fills) + 0.5)); ax_fr.set_ylim(0, 85)
     ax_fr.set_title("적재율 vs 박스 수", fontsize=9)
     ax_fr.set_xlabel("적재된 박스 수"); ax_fr.grid(alpha=0.3)
+    ax_fr.legend(fontsize=7, loc="lower right", framealpha=0.9)
 
     fig.suptitle(f"zone {st['zone']}  ·  적재 {st['count']}개  ·  "
-                 f"적재율 {st['fill'] * 100:.1f}%  ·  최고 {st['hmax']}mm / {ms}mm",
-                 fontsize=13)
+                 f"적재율 {st['fill'] * 100:.1f}% (실제높이) / "
+                 f"{st.get('cap', 0.0) * 100:.1f}% (용량)  ·  "
+                 f"최고 {st['hmax']}mm / {ms}mm", fontsize=13)
 
 
 def main():
@@ -110,10 +119,12 @@ def main():
                     last_mtime = mtime
                     if st["count"] < last_count:      # reset 됐다 — 곡선도 새로
                         fills = []
+                    # 옛 스냅샷(cap 없음)도 읽히게 — 없으면 fill 로 대신한다
+                    pair = (st["fill"], st.get("cap", st["fill"]))
                     if st["count"] != last_count:
-                        fills.append(st["fill"])
+                        fills.append(pair)
                         last_count = st["count"]
-                    draw(fig, axes, st, fills or [st["fill"]])
+                    draw(fig, axes, st, fills or [pair])
                     if args.save:
                         shot += 1
                         fig.savefig(os.path.join(args.save, f"{shot:04d}.png"), dpi=110)
