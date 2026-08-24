@@ -29,6 +29,10 @@ class HeightmapPacker:
         self.last_warning = ""                              # 마지막 update 경고 (래퍼가 로그로 올린다)
         self.plans = {}                                      # (zone,box_id) -> PlacePose
         self.placed = []                                     # [(x,y,z,w,d,h,yaw), ...]
+        # ★ 이미 반영한 박스. box_id -> 그때의 ok.
+        #   CLAUDE.md §3-4 는 서비스 타임아웃 2.0초 · **재시도 1회** 를 규약으로 못 박았다.
+        #   재시도가 오면 update 가 두 번 불린다 — 멱등이 아니면 값이 샌다 (아래 update 주석).
+        self.applied = {}
 
     # ---------- 핵심 유틸 ----------
     @staticmethod
@@ -138,7 +142,26 @@ class HeightmapPacker:
         return big <= bz + self.tol
 
     def update(self, box_id, w_mm, d_mm, h_mm, actual):
-        """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)"""
+        """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)
+
+        ★★ **멱등이어야 한다.** CLAUDE.md §3-4 가 서비스 재시도 1회를 규약으로 정했으므로
+        같은 box_id 로 두 번 들어오는 일이 정상 동작 중에 생긴다. 멱등이 아니면:
+
+          · `self.placed` 에 두 번 쌓여 **적재 개수와 부피가 늘고 적재율이 부풀려진다**
+          · `self.plans.pop` 이 두 번째엔 None 을 줘서 **yaw 검사가 통째로 건너뛰어진다**
+            (planned 가 없으면 dyaw=0 이라 아무리 틀어져 있어도 통과한다)
+
+        `self.hm` 만은 `np.maximum` 이라 원래 멱등이었다 — 그래서 heightmap 은 멀쩡한데
+        숫자만 새는, 로그로 알아채기 어려운 형태로 나타난다.
+        """
+        prev = self.applied.get(box_id)
+        if prev is not None:
+            # 재시도로 본다. 계획은 이미 회수됐고 hm 도 이미 반영됐다.
+            # ok 는 **처음 판정을 그대로** 돌려주고, 개수·적재율만 현재 값으로 준다
+            # (그 사이 다른 박스가 들어왔을 수 있다).
+            self.last_warning = f"{box_id}: 이미 반영된 박스다 — 재시도로 보고 무시했다"
+            return prev, self.fill_rate(), len(self.placed)
+
         planned = self.plans.pop(box_id, None)               # ★ box_id 로 계획을 회수 (없으면 None)
         ok = True
         self.last_warning = ""
@@ -181,16 +204,26 @@ class HeightmapPacker:
         i0, i1 = max(i, 0), min(i + wc, self.W)
         j0, j1 = max(j, 0), min(j + dc, self.D)
         if i0 >= i1 or j0 >= j1:                             # 통째로 팔레트 밖 — 기록할 것이 없다
+            # ★ 여기도 이 박스에 대한 **최종 판정**이다. applied 에 남겨야 재시도가
+            #   같은 답을 받는다 (안 남기면 재시도 때 아래 경로로 새로 들어간다).
+            self.applied[box_id] = False
             return False, self.fill_rate(), len(self.placed)
         if (i0, i1, j0, j1) != (i, i + wc, j, j + dc):       # 일부만 걸쳐 있다 = 이미 이상 상황
             ok = False
 
         self.hm[i0:i1, j0:j1] = np.maximum(self.hm[i0:i1, j0:j1], top_q)
         self.placed.append((actual, w_mm, d_mm, h_mm))
+        self.applied[box_id] = ok
         return ok, self.fill_rate(), len(self.placed)
 
     def cancel(self, box_id): self.plans.pop(box_id, None)
-    def reset(self): self.hm[:] = 0; self.plans.clear(); self.placed.clear()
+    def reset(self):
+        # ★ applied 도 같이 비운다. 안 비우면 팔레트를 갈고 나서 같은 box_id 가
+        #   다시 와도 "이미 반영됨" 으로 무시된다.
+        self.hm[:] = 0
+        self.plans.clear()
+        self.placed.clear()
+        self.applied.clear()
 
     def fill_rate(self):
         """적재율 = 박스 부피 합 / (팔레트 바닥 넓이 × **실제 최고 높이**)  — 명세서 §7.8

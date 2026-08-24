@@ -153,3 +153,43 @@ def test_capacity_rate_is_monotonic():
         assert cur <= 1.0, f"용량 기준이 {cur:.3f} — max_stack 을 넘을 수 없다"
         prev = cur
     assert prev > 0.5, f"30개 넣고 용량 기준 {prev * 100:.1f}% — 너무 낮다"
+
+
+def test_update_is_idempotent():
+    """★ 서비스 재시도로 같은 박스가 두 번 와도 값이 새면 안 된다 (CLAUDE.md §3-4).
+
+    타임아웃 2.0초 · 재시도 1회가 규약이므로 이 상황은 **정상 동작 중에 생긴다.**
+    멱등이 아니면 적재 개수·적재율이 부풀려지고, 두 번째 호출에서는 계획이 이미
+    회수돼 있어 yaw 검사까지 건너뛴다.
+    """
+    pk = HeightmapPacker(CFG)
+    ok, pose, _, _ = pk.plan("B001", 340, 250, 210)
+    assert ok
+
+    ok1, fill1, n1 = pk.update("B001", 340, 250, 210, dict(pose))
+    hm1 = pk.hm.copy()
+    ok2, fill2, n2 = pk.update("B001", 340, 250, 210, dict(pose))     # 재시도
+
+    assert (ok2, n2) == (ok1, n1), f"재시도로 {n1} → {n2} 개가 됐다"
+    assert fill2 == fill1, f"재시도로 적재율이 {fill1:.4f} → {fill2:.4f} 로 변했다"
+    assert np.array_equal(pk.hm, hm1), "재시도가 heightmap 을 바꿨다"
+
+    # 다른 박스는 정상적으로 들어가야 한다 (전부 막아버린 게 아님을 확인)
+    ok3, pose3, _, _ = pk.plan("B002", 340, 250, 210)
+    assert ok3
+    _, _, n3 = pk.update("B002", 340, 250, 210, dict(pose3))
+    assert n3 == n1 + 1, "멱등 처리가 다른 박스까지 막았다"
+
+
+def test_reset_clears_applied():
+    """★ 팔레트를 갈면(PALLET_FULL → SwapPallet) 같은 box_id 가 다시 들어갈 수 있어야 한다."""
+    pk = HeightmapPacker(CFG)
+    ok, pose, _, _ = pk.plan("B001", 340, 250, 210)
+    assert ok
+    pk.update("B001", 340, 250, 210, dict(pose))
+    pk.reset()
+
+    ok2, pose2, _, _ = pk.plan("B001", 340, 250, 210)
+    assert ok2
+    _, _, n = pk.update("B001", 340, 250, 210, dict(pose2))
+    assert n == 1, f"reset 후에도 '이미 반영됨' 으로 무시됐다 (적재 {n}개)"
