@@ -22,8 +22,10 @@
   · 카메라 프림은 씬 빌더(`layout_to_spec_test1_1.py`)가 만든다. 여기서는 붙기만 한다.
   · `Camera.initialize()` 는 **타임라인이 돌기 시작한 뒤**에 불러야 한다.
     부팅 직후(setup)에서 부른다.
-  · `get_pointcloud` 는 렌더 결과라 **렌더 틱**이 필요하다. `isaac-sim.sh` 로
-    띄워야 한다 — `python.sh` standalone 은 벨트와 같은 이유로 안 맞는다.
+  · 깊이는 렌더 결과라 **렌더 틱**이 필요하다. `isaac-sim.sh` 로 띄워야 한다 —
+    `python.sh` standalone 은 벨트와 같은 이유로 안 맞는다.
+  · `Camera.get_pointcloud` 는 안 쓴다 (Isaac 안에서 NameError 로 죽는다).
+    `_pointcloud_world()` 가 깊이 + 내부 파라미터로 직접 투영한다.
   · 소켓 스레드에서 부르면 안 된다. 다른 핸들러와 같이 `MainQueue` 를 거친다.
 
 ## 안 하는 것
@@ -32,6 +34,7 @@ RGB 로 종류를 분류하지 않는다. stage 1 은 라인이 하나라 분류
 박스는 전부 같은 색이다 (`spawner.LINE_COLOR` 주석 참고). 치수는 depth 로
 재므로 3·4·5호 구분은 그 치수로 붙는다.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -45,6 +48,13 @@ CAM_PRIM = "/World/CamPick/Camera"
 PLANE_TOL_M = 0.020        # 벨트 상면에서 이만큼 위부터 "박스"
 TOP_BAND_M = 0.030         # 가장 높은 점에서 이만큼 아래까지를 윗면으로 본다
 MIN_PTS = 200              # 이보다 적으면 못 봤다고 한다
+# ★ 깊이 영상을 이 간격으로 솎아 쓴다. 1280x720 을 전부 투영하면 92만 점이고,
+#   실측 2026-08-24 로 한 번에 10.7만 점(ROI 통과분)이 나왔다 — 필요량(MIN_PTS 200)의
+#   500배다. 그 계산이 **물리 스텝 안에서** 도는 탓에 MainQueue 예산(1.6 s)을 넘겨
+#   3개 중 1개가 "메인 루프가 응답하지 않는다" 로 떨어졌다.
+#   2 로 솎으면 점이 1/4 이 되고 정밀도는 그대로다 — 상자 윗면은 평면이라 점 밀도가
+#   최소면적 사각형 피팅에 거의 영향을 안 준다.
+DEPTH_STRIDE = int(os.environ.get("PL_CAM_STRIDE", "2"))
 
 
 class PickCamera:
@@ -90,11 +100,62 @@ class PickCamera:
             return {"ok": False, "error": "카메라가 없다"}
         return self.mainq.run(self.detect)
 
+    # ── 깊이 -> 월드 점군. **메인 스레드 전용** ─────────────
+    def _pointcloud_world(self):
+        """깊이 영상과 내부 파라미터로 월드 점군을 직접 만든다. 못 만들면 None.
+
+        ★ `Camera.get_pointcloud(world_frame=True)` 를 **쓰지 않는다.** Isaac 안에서
+              NameError: name 'LOADER_DIR' is not defined
+          로 죽는다 — 우리 코드에는 그 이름이 없다. 포인트클라우드 annotator 쪽
+          경로 문제라 우리가 고칠 수 있는 자리가 아니다. 그래서 같은 계산을 여기서
+          직접 한다 (`perception.CameraPerception._pointcloud_world` 와 같은 식).
+          쓰는 API 는 전부 이미 돌고 있는 것들이다 — `start()` 가
+          `add_distance_to_image_plane_to_frame()` 을 이미 불러 두어 깊이는 나온다.
+
+        축 규약이 두 번 꺾인다. depth 로 만든 점은 **광학 규약**(+X 오른쪽 ·
+        +Y 아래 · +Z 전방)인데 USD 카메라는 **-Z 를 보고 +Y 가 위**다. 그래서
+        광학 -> USD 로 한 번 맞추고, 카메라 월드 자세로 한 번 더 돌린다.
+        """
+        depth = self.cam.get_depth()
+        if depth is None:
+            return None
+        depth = np.asarray(depth, dtype=np.float64)
+        if depth.ndim != 2 or not np.isfinite(depth).any():
+            return None
+
+        K = np.asarray(self.cam.get_intrinsics_matrix(), dtype=np.float64)
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        if DEPTH_STRIDE > 1:
+            depth = depth[::DEPTH_STRIDE, ::DEPTH_STRIDE]
+        h, w = depth.shape
+        # 솎아도 화소 좌표는 **원본 격자** 위에 있어야 내부 파라미터(cx, cy, fx, fy)와
+        # 맞는다. 그래서 인덱스에 stride 를 곱해 되돌린다.
+        uu, vv = np.meshgrid(np.arange(w) * DEPTH_STRIDE,
+                             np.arange(h) * DEPTH_STRIDE)
+        # 배경(무한대)·0·이상치를 뺀다. 하향 카메라라 바닥까지 4.5 m 쯤이다.
+        valid = np.isfinite(depth) & (depth > 1e-3) & (depth < 1e3)
+        if not valid.any():
+            return None
+
+        z = depth[valid]
+        x = (uu[valid] - cx) / fx * z
+        y = (vv[valid] - cy) / fy * z
+        pts_cam = np.stack([x, y, z], axis=1)
+
+        from perception import _quat_to_matrix
+        cam_pos, cam_quat = self.cam.get_world_pose(camera_axes="usd")
+        R = _quat_to_matrix(np.asarray(cam_quat, dtype=float))
+        optical_to_usd = np.array([[1.0, 0.0, 0.0],
+                                   [0.0, -1.0, 0.0],
+                                   [0.0, 0.0, -1.0]])
+        return pts_cam @ optical_to_usd.T @ R.T + np.asarray(cam_pos, dtype=float)
+
     # ── 본체. **메인 스레드 전용** ──────────────────────────
     def detect(self):
-        pts = self.cam.get_pointcloud(world_frame=True)
+        pts = self._pointcloud_world()
         if pts is None or len(pts) == 0:
-            return {"ok": False, "error": "포인트클라우드가 비었다", "n_pts": 0}
+            return {"ok": False, "error": "깊이 영상에서 점을 못 만들었다", "n_pts": 0}
         pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
 
         # ── ROI ────────────────────────────────────────────
