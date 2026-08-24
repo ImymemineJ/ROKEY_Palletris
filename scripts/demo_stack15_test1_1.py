@@ -173,6 +173,8 @@ ARRIVE_TIMEOUT_S = 180.0                                 # 다음 박스가 스�
 CYCLE_WALL_S = 120.0
 SETTLE_S = float(os.environ.get("PL_SETTLE", "0.7"))     # 놓은 뒤 재기 전 정착 (B5 는 0.5)
 WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
+# 픽업 구간에 박스가 있는데 이 시간이 지나도 못 집으면 지운다 (아래 `_stuck_box`).
+STUCK_S = float(os.environ.get("PL_STUCK", "75"))
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
@@ -744,6 +746,41 @@ def _line_state(link, ids):
     return "라인 %s개 · %s" % (st.get("on_belt", "?"), " ".join(out) if out else "비었다")
 
 
+# ★ 픽업 구간 판정 (아래 "낀 박스" 탈출로가 쓴다). `spawner` 의 판정과 같은 기준이다.
+_PU_AX = 0 if str(cfg["conveyor"].get("pickup_axis", "x")).lower() == "x" else 1
+_PU_P0 = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
+_PU_P1 = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+_PU_CROSS = (cfg["zones"].get("pickup_cross_mm") or {}).get(ZONE)
+_PU_CROSS = (None if not _PU_CROSS
+             else (min(_PU_CROSS) / 1000.0, max(_PU_CROSS) / 1000.0))
+
+
+def _stuck_box(link, ids):
+    """픽업 구간에 들어와 있는데 `pickup_check` 가 못 잡는 박스 중 **가장 앞선 것**.
+
+    ★ 왜 필요한가. 흡착이 실패하면 박스가 살짝 기운 채 남는다. 그러면 `spawner` 의
+      "벨트 위인가"(z 허용오차) 판정을 못 넘어 영영 `present` 가 안 되고, 사이클은
+      집으러 오지 않는데 뒤차는 계속 밀려온다 — 라인이 통째로 굳는다
+      (실측 2026-08-24: BOX00005 가 132 s 동안 스토퍼 앞을 막았다).
+      CLAUDE.md §5 의 `NO_FEASIBLE_POSE` 와 같은 결로, **지우고 계속** 간다.
+    """
+    best = None
+    for bid in ids:
+        r = link.call(cmd="get_box_pose", box_id=bid)
+        if not r.get("ok"):
+            continue
+        pos = r["pos_m"]
+        if not (_PU_P0 <= pos[_PU_AX] <= _PU_P1):
+            continue
+        if _PU_CROSS is not None:
+            c = pos[1 - _PU_AX]
+            if not (_PU_CROSS[0] <= c <= _PU_CROSS[1]):
+                continue
+        if best is None or pos[_PU_AX] > best[1][_PU_AX]:
+            best = (bid, pos)
+    return best
+
+
 class LineServices(D.OnlineServices):
     """B5 의 온라인 서비스 그대로 + **벨트만 진짜로 세운다.**
 
@@ -1127,11 +1164,36 @@ def worker(specs, ids):
         while i < len(targets) and not _S["done"]:
             # ── 다음 박스가 스토퍼에 설 때까지 ──────────────
             pick, t0, nag = None, time.time(), 0.0
+            stuck_done = skipped = False
             while time.time() - t0 < ARRIVE_TIMEOUT_S and not _S["done"]:
                 c = link.call(cmd="pickup_check", zone=ZONE)
                 if c.get("present"):
                     pick = c
                     break
+                # ★ 낀 박스 탈출로. 픽업 구간에 박스가 **있는데** present 가 안 되면
+                #   그 박스는 기울었거나 물리가 틀어진 것이다. 지우고 계속 간다.
+                #   안 지우면 뒤차가 계속 밀려 라인이 통째로 굳는다.
+                if not stuck_done and time.time() - t0 > STUCK_S:
+                    stuck_done = True
+                    sb = _stuck_box(link, ids)
+                    if sb is not None:
+                        sid, spos = sb
+                        rr = link.call(cmd="despawn_box", box_id=sid)
+                        log("   !! %s 가 픽업 구간(%s %.2f m)에 %.0f s 째 끼어 있는데 "
+                            "집을 수 없다 — 지우고 계속한다 (%s)"
+                            % (sid, "xyz"[_PU_AX], spos[_PU_AX], STUCK_S,
+                               "ok" if rr.get("ok") else rr))
+                        _S["rows"].append(
+                            {"id": sid, "type": specs.get(sid, {}).get("name", "?"),
+                             "res": "STUCK", "err": (float("nan"),) * 3,
+                             "wall": time.time() - t0, "wait": time.time() - t0,
+                             "knock": 0.0, "who": "-", "kvec": (0.0, 0.0, 0.0),
+                             "near_mm": 0.0, "far_mm": 0.0, "place": None})
+                        if sid in targets:
+                            # 이 박스는 이 존 몫이었다. 처리한 것으로 세고 넘어간다.
+                            i += 1
+                            skipped = True
+                            break
                 # 안 오면 어디에 있는지 주기적으로 찍는다. 이게 없으면 타임아웃
                 # 났을 때 "안 왔다" 는 사실만 남고 원인을 못 찾는다
                 # (2026-08-23 15번째가 180 s 동안 안 와서 겪었다).
@@ -1139,6 +1201,8 @@ def worker(specs, ids):
                     nag = time.time() - t0
                     log("   ...대기 %.0f s — %s" % (nag, _line_state(link, ids)))
                 time.sleep(0.05)
+            if skipped:
+                continue
             if pick is None:
                 log("   !! %d/%d 번째 박스가 %.0f s 안에 스토퍼에 안 왔다 — 중단"
                     % (i + 1, len(targets), ARRIVE_TIMEOUT_S))

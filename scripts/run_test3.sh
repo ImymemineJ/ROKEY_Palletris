@@ -18,7 +18,7 @@ export PL_STOPPER_PRIM="${PL_STOPPER_PRIM:-/World/Stopper_$PL_ZONE}"
 export PL_MODE="${PL_MODE:-demo}"
 export PL_N="${PL_N:-6}"
 export PL_ROUTE="${PL_ROUTE:-1}"
-export PL_CAM="${PL_CAM:-0}"          # 인식은 아직 test_3 좌표에 안 맞춰 놨다
+export PL_CAM="${PL_CAM:-1}"          # 픽업 카메라 인식 — test_3 에서 5/5 · 오차 1.5 mm 확인
 export PL_CAMVIEW="${PL_CAMVIEW:-0}"
 export PL_WRISTROS="${PL_WRISTROS:-0}"
 exec "$HERE/run_demo.sh" "$@"
