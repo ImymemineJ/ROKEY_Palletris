@@ -80,6 +80,17 @@ class Cycle:
         r = cfg["robot"]
         self.release_budget_s = (r["release_wait_timeout_s"] + r["release_damping_duration_s"]
                                  + r["settle_wait_s"] + 3.0)
+        # ★ 적재 최상단을 **로봇이 직접 최대치로 들고 간다** (1차 구현 합의, 2026-08-24).
+        #   `stack_top_mm` 을 C 가 채워 주길 기다리지 않는다 — 지금까지 이 사이클이
+        #   실제로 놓은 것들의 최고 상면을 누적해 그중 **최대**를 쓴다. 계획이 z 를
+        #   오르내려도(온라인/비전 경로가 그렇다) 이송이 항상 적재물을 넘는다.
+        #   메시지에 `stack_top_mm` 이 실려 오면 그것과도 max 를 취하므로 둘 다 산다.
+        #   ⚠ 팔레트를 갈면 리셋해야 한다 -> `reset_stack()`
+        self._stack_top_m = 0.0
+
+    def reset_stack(self):
+        """팔레트를 갈았다 — 누적해 온 적재 최상단을 버린다."""
+        self._stack_top_m = 0.0
 
     # ── 한 사이클 ────────────────────────────────────────────
     def run(self, box_id, pick_pose):
@@ -164,10 +175,11 @@ class Cycle:
         #   그리고 **이미 쌓인 것의 최상단**도 넘어야 한다. 계획이 z 를 오르내리면
         #   목적지가 최상단보다 낮아서 이송 중 적재물을 관통한다. 정본 계산은
         #   check_place_plan.py:176 `carry_bottom = max(obstacle, top) + safe_mm` 다.
-        #   `stack_top_mm` 은 **선택**이다 — 없으면 예전과 똑같이 동작한다. 있으면
-        #   `/algo/plan_placement` 가 heightmap(=비전 갱신본)에서 읽어 실어 보낸 값이고,
-        #   단위는 팔레트 상면 기준 mm 다 (z_mm 과 같은 기준).
-        stack_top = (float(place.get("stack_top_mm", 0.0)) + self.origin_mm[2]) / 1000.0
+        #   `stack_top_mm` 은 **선택**이다 — 실려 오면 쓰고(=/algo 가 heightmap 에서 읽은
+        #   값, 단위는 팔레트 상면 기준 mm), 없어도 **우리가 누적한 최대치**가 있으므로
+        #   이송은 언제나 적재물을 넘는다 (1차 구현 합의: 최상단은 최대한으로 본다).
+        stack_top = max((float(place.get("stack_top_mm", 0.0)) + self.origin_mm[2]) / 1000.0,
+                        self._stack_top_m)
         transit = max(pick_top, put_top, stack_top) + self.approach_m + h / 1000.0
         self._move([pick_c[0], pick_c[1], transit], pick_yaw)
         self._move([cx, cy, transit], put_yaw)
@@ -191,6 +203,11 @@ class Cycle:
 
         # 6) **실제** pose 로 갱신한다 — 계획값이 아니라 (§7.6)
         actual = self._actual_place(box_id, h) or place
+        # ★ 적재 최상단 누적. **실제 상면**으로 올린다 — 계획대로 안 앉았으면
+        #   그만큼 더 높을 수 있고, 이송은 그 실물을 넘어야 한다.
+        act_top = (float(actual.get("z_mm", place.get("z_mm", 0.0))) + h
+                   + self.origin_mm[2]) / 1000.0
+        self._stack_top_m = max(self._stack_top_m, act_top)
         ok_hm, fill = self.svc.update_heightmap(self.zone, box_id, w, d, h, actual)
         if not ok_hm:
             # yaw 오차 초과 경고. 로그만 남기고 계속 간다 (§2.2)
