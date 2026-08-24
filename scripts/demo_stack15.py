@@ -1063,7 +1063,12 @@ def main():
                     np.asarray(by_id[pid].get_world_pose()[0], dtype=float) - ref) * 1000.0)
                 if dmm > knock:
                     knock, who = dmm, pid
-            rest[bid] = pos.copy()
+            # ★ **놓은 것만** 기준에 등록한다. rest 는 "이미 놓인 박스" 라는 뜻인데,
+            #   결과와 무관하게 넣으면 못 놓은 박스(NO_FEASIBLE_POSE 로 벨트에 남은 것)가
+            #   들어가고, 그 박스가 벨트로 흘러간 거리가 다음 사이클의 knock 으로 찍힌다.
+            #   실측: 거부된 5호가 knock 1925 mm 로 잡혀 표가 통째로 못 읽게 됐다.
+            if res == "PLACED":
+                rest[bid] = pos.copy()
 
             rows.append({"id": bid, "type": spec["name"], "res": res, "err": err,
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
