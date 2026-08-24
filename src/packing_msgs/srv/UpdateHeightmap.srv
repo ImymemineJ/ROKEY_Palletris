@@ -1,0 +1,10 @@
+string    zone
+string    box_id
+int32     size_w_mm
+int32     size_d_mm
+int32     size_h_mm
+PlacePose actual_pose
+---
+bool      ok           # false = yaw 오차 초과 경고. B 는 로그만 남기고 계속 진행
+float32   fill_rate
+int32     placed_count

@@ -1,0 +1,10 @@
+string zone
+string box_id
+int32  size_w_mm
+int32  size_d_mm
+int32  size_h_mm
+---
+bool      ok
+PlacePose pose
+float32   score
+string    message      # "OK"|"PALLET_FULL"|"NO_FEASIBLE_POSE"

@@ -1,0 +1,5 @@
+string  seg             # "main"|"a_pickup"|"b_pickup"|"c_pickup"|"return"
+float32 velocity_mps
+---
+bool    ok
+float32 actual_mps

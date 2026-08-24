@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>packing_common</name>
+  <version>0.0.0</version>
+  <description>
+    전원이 공유하는 단위 변환(units) · 팔레트 좌표계 변환(frames) · config 로더.
+    ROS 의존성이 없어 Isaac 쪽 프로세스에서도 그대로 import 할 수 있다. (작업명세서 §1.3, §3.3)
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">정정인</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
