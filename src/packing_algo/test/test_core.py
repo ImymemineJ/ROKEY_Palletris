@@ -129,3 +129,27 @@ def test_speed():
     pk.plan("SPD", 480, 380, 340)
     dt = time.time() - t0
     assert dt < 0.2, f"plan 이 {dt * 1000:.0f}ms 걸렸다 — sliding_window_view 썼는지 확인"
+
+
+def test_capacity_rate_is_monotonic():
+    """★ 용량 기준 적재율(보조 지표)은 **절대 내려가면 안 된다**.
+
+    분모가 max_stack 고정이므로 박스를 놓을 때마다 분자만 는다. 여기가 깨지면
+    분모를 실수로 실제 높이로 바꿔 놓은 것이다 (= fill_rate 와 같아져 버린다).
+    또 fill_rate 와 달리 max_stack 을 넘길 수 없으므로 1.0 을 못 넘는다.
+    """
+    pk = HeightmapPacker(CFG)
+    rb = random.Random(SEED_BOX)
+    prev = 0.0
+    for k in range(30):
+        w, d, h = rb.choice(BOXES)
+        ok, pose, _, _ = pk.plan(f"B{k:03d}", w, d, h)
+        if not ok:
+            pk.cancel(f"B{k:03d}")
+            continue
+        pk.update(f"B{k:03d}", w, d, h, dict(pose))
+        cur = pk.capacity_rate()
+        assert cur >= prev - 1e-12, f"{k}번째에서 {prev:.4f} → {cur:.4f} 로 내려갔다"
+        assert cur <= 1.0, f"용량 기준이 {cur:.3f} — max_stack 을 넘을 수 없다"
+        prev = cur
+    assert prev > 0.5, f"30개 넣고 용량 기준 {prev * 100:.1f}% — 너무 낮다"

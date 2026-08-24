@@ -138,6 +138,7 @@ class AlgoService(Node):
             boxes.append([pose["x_mm"] - ww // 2, pose["y_mm"] - dd // 2, pose["z_mm"],
                           ww, dd, h, pose["yaw_deg"]])
         state = {"zone": zone, "count": len(pk.placed), "fill": pk.fill_rate(),
+                 "cap": pk.capacity_rate(),          # 용량(max_stack) 기준 보조 지표
                  "hmax": int(pk.hm.max()), "max_stack": pk.max_stack,
                  "pallet": [pk.W * pk.cell, pk.D * pk.cell],
                  "hm": pk.hm.tolist(), "boxes": boxes}
