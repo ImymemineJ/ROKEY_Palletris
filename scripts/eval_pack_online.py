@@ -63,7 +63,12 @@ def manifest(cfg, n, seed=None):
 
 
 def make_packer(PK, cfg, clearance_mm, halo_mm):
-    """`demo_stack15_test1_1.factory()` 와 같은 인자여야 한다."""
+    """인자는 `demo_stack15_test1_1.factory()` 와 같다. **클래스는 다르다.**
+
+    ★ 그쪽은 팔 간섭 술어를 얹은 `ArmAwarePacker` 라 여기보다 자리를 **더 거부한다**.
+      즉 여기 결과는 상한(낙관치)이다 — 파일 머리말대로 "여기서 떨어지면 실물도
+      떨어진다" 쪽으로만 쓰고, 그 반대로는 쓰지 마라.
+    """
     hm, pal = cfg["heightmap"], cfg["pallet"]
     return PK.HeightmapPacker(
         size_xy=(pal["width_mm"] / 1000.0, pal["depth_mm"] / 1000.0),
@@ -88,6 +93,8 @@ def run(cfg, PK, n, clearance_mm, halo_mm, order="arrival", verbose=False, seed=
     c = clearance_mm / 1000.0
     pk = make_packer(PK, cfg, clearance_mm, halo_mm)
     rows, dropped = [], []
+    pal = cfg["pallet"]
+    packed_m3 = 0.0                      # ★ clearance 를 뺀 **실제** 박스 부피
     for i, t in enumerate(boxes):
         size = (t["w_mm"] / 1000.0 + c, t["d_mm"] / 1000.0 + c, t["h_mm"] / 1000.0)
         p = pk.find_placement(size, t["mass_g"] / 1000.0)
@@ -99,6 +106,7 @@ def run(cfg, PK, n, clearance_mm, halo_mm, order="arrival", verbose=False, seed=
                       % (i + 1, t["name"], pk.current_height * 1000))
             continue
         pk.commit(p)
+        packed_m3 += t["w_mm"] * t["d_mm"] * t["h_mm"] / 1e9
         cx, cy, _ = p.center_local
         rows.append({"i": i + 1, "name": t["name"], "ok": True,
                      "x": cx * 1000, "y": cy * 1000, "z": p.z * 1000,
@@ -111,7 +119,14 @@ def run(cfg, PK, n, clearance_mm, halo_mm, order="arrival", verbose=False, seed=
     return {"placed": sum(1 for r in rows if r["ok"]), "n": len(boxes),
             "dropped": dropped, "layers": len(zs), "z_list": zs,
             "top_mm": pk.current_height * 1000,
-            "util": pk.volume_utilization(), "rows": rows}
+            # ★ `pk.volume_utilization()` 을 쓰면 안 된다. 그 함수는 Placement.w/d 를
+            #   적분하는데, 여기서는 clearance 30 mm 를 더한 치수로 배치를 잡으므로
+            #   **부풀린 부피**가 들어간다 (실측 17~18 % 상대 과대: n=11 은 33.5 vs
+            #   실제 28.5 %, n=15 는 44.3 vs 37.7 %). 적재율은 협의 안건 숫자라
+            #   부풀면 곧장 결론이 틀어진다. 원 치수로 따로 적산한다.
+            "util": packed_m3 / (pal["width_mm"] * pal["depth_mm"]
+                                 * pal["max_stack_mm"] / 1e9),
+            "rows": rows}
 
 
 def main():
@@ -184,7 +199,8 @@ def main():
           % (r["placed"], r["n"], [f"{i}번 {t}" for i, t in r["dropped"]] or "없음"))
     print("단       %d 단  밑면 z %s mm" % (r["layers"], r["z_list"]))
     print("최상단   %.0f mm  (한계 %d)" % (r["top_mm"], pal["max_stack_mm"]))
-    print("적재율   %.1f %%" % (r["util"] * 100))
+    print("적재율   %.1f %%  (clearance 제외한 순 박스 부피 / 팔레트 가용 부피)"
+          % (r["util"] * 100))
     print("=" * 72)
     return 0 if r["placed"] == r["n"] else 1
 

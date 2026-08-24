@@ -80,7 +80,17 @@ python3 -c "import yaml;c=yaml.safe_load(open('src/packing_bringup/config/system
 씬을 다시 깔려면 `./src/packing_sim/run_layout_to_spec.sh` (백업을 뜨고 재현한다).
 실측 요약은 `src/packing_sim/STATUS.md` 가 매 작업마다 갱신한다.
 
-## 벨트 간헐 구동 — 스토퍼를 없앴다 (2026-08-22)
+## ~~벨트 간헐 구동 — 스토퍼를 없앴다~~ (2026-08-22) — **폐기된 설계**
+
+> ⚠ **이 절은 결정 전 기록이다. 지금 씬과 반대다.**
+> 2026-08-23 에 스토퍼 벽을 **실물로 세웠다** — `layout_to_spec_test1_1.py` 가
+> x 10000~10100 · z 800~900 에 콜라이더 Cube 를 만든다(RigidBody 는 안 붙인다).
+> 박스는 벨트가 아니라 그 벽이 세운다. 아래의 "막는 벽이 없다" · "실물 벽은 없다" ·
+> `stopper_x_mm` 을 라인 끝 좌표로만 쓴다는 해석은 **전부 무효**다.
+> 현재 수치는 `src/packing_sim/STATUS.md`, 정본은 `system.yaml` 이다.
+> `belt_cycle` 을 브레이크로 쓰는 이 방식은 `open_test1_1.py` 경로에만 남아 있고
+> 통합 경로(`scripts/demo_stack15_test1_1.py`)는 안 쓴다.
+
 
 박스를 벽으로 막지 않는다. **선두 박스가 픽 지점에 오면 벨트를 세우고,
 로봇이 적재를 끝내고 원위치하면 다시 돌린다.** 픽 지점이 항상 같으므로

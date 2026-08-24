@@ -463,8 +463,15 @@ class Spawner:
                         op.Set(Gf.Vec3d(DESPAWN_XYZ_M))
                         break
                 n += 1
-        self.boxes.clear()
-        self._snap.clear()
+        # ★ 제자리에서 비우면 안 된다. `h_spawn_status` 는 **소켓 스레드**에서
+        #   `self._snap.items()` 를 순회한다. 그 dict 를 메인 스레드가 줄이면
+        #   RuntimeError: dictionary changed size during iteration 이 나고,
+        #   `sim_server` 가 그걸 error 응답으로 삼켜 호출자는 기본값으로 떨어진다 —
+        #   계량은 queue=0 으로 읽어 이미 한 대 있는데 main 을 다시 돌리고, 스폰은
+        #   백압을 건너뛰어 겹쳐 스폰한다. `_refresh` 처럼 **통째로 교체**한다
+        #   (그래서 읽기에 락이 없어도 되는 것이다).
+        self.boxes = {}
+        self._snap = {}
         self._pickup = {"present": False, "box_id": "", "pose": None}
         return n
 
@@ -490,7 +497,8 @@ class Spawner:
                 if op.GetOpName() == "xformOp:translate":
                     op.Set(Gf.Vec3d(DESPAWN_XYZ_M))
                     break
-        self._snap.pop(box_id, None)
+        # 제자리 삭제가 아니라 교체다 — 이유는 park_all 주석 참고.
+        self._snap = {k: v for k, v in self._snap.items() if k != box_id}
         self._log("[spawner] despawn %s (라인 밖으로 이동)" % box_id)
         return {"ok": True}
 

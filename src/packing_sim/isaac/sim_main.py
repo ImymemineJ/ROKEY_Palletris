@@ -69,6 +69,7 @@ DEFAULT_STAGE = os.environ.get(
 ROBOT_PRIM = "/World/robot"
 GRIPPER_PRIM = ROBOT_PRIM + "/SurfaceGripper"
 EE_FRAME = "tool0"
+SETTLE_STEPS = 90                  # READY 수렴 (60 Hz 에서 1.5 s). 게이트 판과 같다
 
 
 def main():
@@ -152,14 +153,48 @@ def main():
         server.register(cc.handlers())
 
         # ── 로봇 (B 소유 핸들러) ─────────────────────────────
+        # ★ 지금 집으려는 박스. 워커가 없는 정본 서버에서는 `grasp` 요청이 곧
+        #   그 신호다. B 코드를 고치지 않고 **등록할 때 감싸서** 채운다.
+        cur = {"box": None}
         if not a.no_robot:
-            rm = _bring_up_robot(world, stage, cfg, a.zone)
+            rm = _bring_up_robot(world, stage, cfg, a.zone, spawner=sp, cur=cur)
             if rm is not None:
-                server.register(rm.handlers())
+                _h = dict(rm.handlers())
+                _grasp = _h["grasp"]
+
+                def h_grasp(req, _f=_grasp):
+                    bid = (req or {}).get("box_id")
+                    rec = sp.boxes.get(bid)
+                    cur["box"] = (bid, rec["dims"][2] / 2.0) if rec else None
+                    try:
+                        return _f(req)
+                    finally:
+                        cur["box"] = None   # 사이클 밖에서 옛 박스로 재지 않는다
+
+                _h["grasp"] = h_grasp
+                server.register(_h)
 
         world.reset()
         if rm is not None:
             rm.art.initialize()
+            # ★ READY 로 순간이동한 뒤 **정착시킨다.** 이게 없으면 씬의 로봇이
+            #   zero pose(팔이 수직으로 선 자세)로 남아, 첫 이동이 179 도를 돌아야
+            #   해서 구간 예산(20 s)을 넘겨 MOTION_TIMEOUT 이 난다
+            #   (`verify_b4_test1_1.py` 의 실측). 게이트 스크립트에는 있는데
+            #   정본 서버에만 빠져 있었다.
+            import numpy as np
+            import yaml
+            from isaacsim.core.utils.types import ArticulationAction
+            _ready = np.array(
+                yaml.safe_load(_paths.DESCRIPTOR.read_text())["default_q"], dtype=float)
+            rm.art.set_joint_positions(_ready)
+            rm.art.set_joint_velocities(np.zeros(6))
+            _act = ArticulationAction(joint_positions=_ready)
+            for _ in range(SETTLE_STEPS):
+                rm.art.apply_action(_act)          # 안 걸면 옛 목표로 튄다
+                world.step(render=not a.no_render)
+            print("[sim_main] 자세 READY 수렴 %s deg"
+                  % np.round(np.degrees(rm.art.get_joint_positions()[:6]), 1).tolist())
         # 벨트는 **멈춘 채로** 시작한다. 오케스트레이터가 set_velocity 로 돌린다.
         # (뜨자마자 돌면 머리가 붙기 전에 박스가 라인 끝까지 흘러가 버린다.)
         cc.run_all() if a.autorun else cc.stop_all()
@@ -193,11 +228,15 @@ def main():
         kit.close()
 
 
-def _bring_up_robot(world, stage, cfg, zone):
+def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None):
     """씬에 이미 있는 로봇 프림에 Lula 와 그리퍼를 물린다.
 
     씬에 로봇을 **넣지 않는다** — `layout_to_spec_test1_1.py` 가 참조로 넣어 뒀다.
     여기서 또 넣으면 두 벌이 겹친다.
+
+    `spawner`·`cur` 를 주면 흡착 간극 실측(`gap_fn`)까지 배선한다. 안 주면
+    예전처럼 상태만 보고 판정한다 — 게이트 스크립트에는 있는데 **정본 서버에만
+    빠져 있던** 것이라 오케스트레이터가 붙는 순간 드러난다.
     """
     import numpy as np
 
@@ -248,8 +287,34 @@ def _bring_up_robot(world, stage, cfg, zone):
         print("[sim_main] !! 로봇 베이스가 사양과 다르다: 씬 %s mm vs yaml %s mm"
               % (got_mm, base_mm))
 
+    def _gap_mm():
+        """흡착면~박스 윗면 간극 [mm]. 못 재면 None.
+
+        ★ 이걸 안 주면 `gripper._grasp_verdict` 의 간극 검사(GRIP_TOL_MM 3 mm)가
+          통째로 건너뛰어진다. 그러면 "is_holding 이 참이고 물린 프림 이름이 맞다"
+          까지만 보고 성공으로 친다 — 박스가 몇 mm 떠서 매달려도 모른다.
+          `cycle.py` 의 이송·배치 높이는 전부 "딱 붙었다" 를 가정하므로 매달린 만큼
+          밑면이 계산보다 낮게 내려가 이웃 상면을 긁는다.
+          `verify_suction.measure` 와 같은 식으로 툴 +Z 축에 투영한다 —
+          `rm.suction_pose()` 는 위치만 주고 축을 안 줘서 여기 못 쓴다.
+        rm.step() -> poll_grasp -> _grasp_verdict 경로라 **메인 스레드**다.
+        """
+        if spawner is None or cur is None or cur.get("box") is None:
+            return None
+        bid, half_h = cur["box"]
+        e = spawner._snap.get(bid)
+        if e is None:
+            return None
+        q6 = np.asarray(art.get_joint_positions()[:6], dtype=float)
+        fk_p, fk_R = lula.compute_forward_kinematics(EE_FRAME, q6)
+        zax = np.asarray(fk_R)[:, 2]
+        face = np.asarray(fk_p, dtype=float) + zax * rm.grip_len
+        c = np.asarray(e["pos_m"], dtype=float)
+        return (float(np.dot(c - face, zax)) - half_h) * 1000.0
+
     import robot_motion as RM
-    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM)
+    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM,
+                        gap_fn=_gap_mm)
     print("[sim_main] 로봇 %s  베이스 %s mm  EE %s  그리퍼 %s"
           % (ROBOT_PRIM, got_mm, EE_FRAME, GRIPPER_PRIM))
     return rm

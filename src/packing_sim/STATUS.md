@@ -19,20 +19,27 @@
 > | 도달범위 G1 | `python3 scripts/verify_reach.py --zone B` | 11점 전부 (최원 1460, 여유 +90) |
 > | 벨트 속도 | `isaac-sim.sh --no-window --exec scripts/verify_belt_speed.py` | main 0.500 · b_pickup 0.501 m/s |
 > | B4 1사이클 | `... --exec scripts/verify_b4_test1_1.py` | PLACED · 오차 1.0 mm · 12.6 s |
-> | 15박스 연속 | `... --exec scripts/demo_stack15_test1_1.py` | **13/15 · 9단 · 최상단 1120 mm** (아래) |
+> | 15박스 연속 | `... --exec scripts/demo_stack15_test1_1.py` | **15/15 · knock 0.6 mm · XY 3.0 mm** (아래) |
+> | 11박스 시연 | `... --exec scripts/demo_stack15_test1_1.py` (기본 demo 모드) | **11/11 · knock 0.4 mm · 팔레트 1판** |
 >
-> ### 15박스 연속 — 라인은 통과, 막힌 것은 **순서와 용량**이다
+> ### 15박스 연속 — 통과
 >
-> 실측 2026-08-23 (`results/stack15_test1_1_20260823.log`, 벽시계 231 s):
+> 실측 2026-08-23 (`results/stack15_pass_20260823.log`, 벽시계 270 s):
 >
 > ```
-> 놓은 것    13 / 15      9 단 (밑면 z 0/210/280/340/420/490/560/680/840)
-> 최상단     1120 mm      (한계 1300)
-> 배치 오차  XY 최대 4.8 mm · Z 최대 0.1 mm     (허용 30 / 20)
-> 사이클     평균 14.4 s · 최대 18.3 s          (목표 10 · 스폰 간격 12)
-> 최대 knock 70.2 mm       ← 13번째에서 발생 (경고선 20)
-> 14번째 5호 -> PALLET_FULL (관측 13개, 최상단 1120)
+> 처리한 것  15 / 15      (놓음 15 · 우회 0 · 실패 0) · 7 단
+> 최상단     840 mm       (한계 1300)
+> 배치 오차  XY 최대 3.0 mm · Z 최대 0.0 mm     (허용 30 / 20)
+> 사이클     평균 14.7 s · 최대 18.3 s          (목표 10 · 스폰 간격 12)
+> 최대 knock 0.6 mm                             (경고선 20)
+> 팔레트     2 판 (12번째에서 PALLET_FULL -> swap_pallet, 사양 경로)
+> RESULT: 통과
 > ```
+>
+> **이 표는 위 실행 기준이다.** 아래 "막힌 것은 순서와 용량" 절은 그 전
+> 13/15 실측(`results/stack15_test1_1_20260823.log`, knock 70.2 mm)의 분석이고,
+> 원인이던 **팔 간섭 제약 부재**는 이후 `packing.find_placement` 의 `reject` 훅으로
+> 고쳤다. 분석 자체는 여전히 유효해서 기록으로 남긴다.
 >
 > **A 몫은 전부 돌았다.** 13 사이클 연속, 매번 박스 앞면이 x=10.000 에 정확히 서고
 > (앞면 편차 최대 1.0 mm), BLOCKED 0 · 재차 집기 0 · Z 오차 0.1 mm 이내.

@@ -193,6 +193,19 @@ PED_MM = float(cfg["robot"]["pedestal_height_mm"])
 NEAR_LIM_MM = PED_MM - 150.0          # 이보다 높은 근거리 기둥 위는 못 지나간다
 NEAR_DY_MM = 50.0                     # "로봇 쪽" 으로 칠 최소 y 차 (견본과 동일)
 NEAR_HALF_MM = cfg["pallet"]["depth_mm"] / 2.0   # y < 400 이면 근거리 (견본과 동일)
+# ★ 견본 `build_plan` 의 제약은 **둘**인데 처음에는 (a) 만 이식했다.
+#   (a) 근거리 기둥 위를 아래팔(link_2)이 쓸고 지나간다     -> _sweep_risk / _builds_trap
+#   (b) far 기둥이 높은데 그 앞 근거리에 **깊게 내려앉으면** 팔꿈치(link_3/4)가
+#       far 기둥을 민다                                     -> _far_pillar_risk (여기)
+#   (b) 는 잠복이 아니라 **활성**이었다. results/stack15_pass2_20260823.log:820
+#   `knock 11.0 mm (BOX00007)` — 9번째가 근거리 P(185,140) z280 으로 내려갈 때
+#   피해자가 far 기둥 꼭대기(P(590,620) 상단 840)다. demo_11box_meter 로그도 8.0 mm 로
+#   같은 자리에서 재현된다. 그런데 그때 요약은 "근거리 기둥 위반 0 사이클" 이었다 —
+#   진단이 **먼 쪽을 아예 안 봤기 때문**이다. 진단부터 고친다.
+#   부채꼴 폭: 견본은 ±25° 인데 위 실측 사례는 133.3° vs 90.6° = 42.7° 차라 그걸로는
+#   못 잡는다. 실측에 맞춰 넓힌다. 좁히면 놓치고 넓히면 자리를 잃으니 이 값은
+#   실행으로 다시 재야 하는 종류다.
+FAR_SECTOR_DEG = 50.0
 SECTOR_DEG = 25.0                     # 방위각이 이 안이면 같은 통로다 (견본과 동일)
 _AG = os.environ.get("PL_ARM_GUARD", "1")
 ARM_GUARD = _AG not in ("0", "false", "no")
@@ -203,6 +216,23 @@ def _az_local(cx_m, cy_m):
     """팔레트 로컬 [m] -> 로봇 베이스에서 본 방위각 [deg]. 견본 `_az` 와 같은 식."""
     return math.degrees(math.atan2(cy_m * 1000.0 + ORIGIN_MM[1] - BASE_MM[1],
                                    cx_m * 1000.0 + ORIGIN_MM[0] - BASE_MM[0]))
+
+
+def _far_worst_mm(cx_m, cy_m, cols):
+    """이 자리에 **내려앉을 때** 팔꿈치가 스칠 수 있는 far 기둥 최고 상단 [mm].
+
+    `_near_worst_mm` 의 거울상이다 — 그쪽은 "가는 길"에 넘을 기둥(로봇 쪽)을 보고,
+    이쪽은 "내려앉는 동안" 팔꿈치가 뒤로 뻗으며 미는 기둥(로봇 반대쪽)을 본다.
+    """
+    az = _az_local(cx_m, cy_m)
+    worst = 0.0
+    for qx, qy, top in cols:
+        if qy * 1000.0 <= cy_m * 1000.0 + NEAR_DY_MM:
+            continue                                     # 더 먼 쪽이 아니다
+        if abs((_az_local(qx, qy) - az + 180.0) % 360.0 - 180.0) >= FAR_SECTOR_DEG:
+            continue
+        worst = max(worst, top)
+    return worst
 
 
 def _near_worst_mm(cx_m, cy_m, cols):
@@ -550,14 +580,23 @@ def worker(specs, ids):
                 """
                 return cy * 1000.0 < NEAR_HALF_MM and (z + h) * 1000.0 > NEAR_LIM_MM
 
+            def _far_pillar_risk(self, cx, cy, z, w, d, h, yaw):
+                """근거리에 깊게 내려앉는데 그 너머 far 기둥이 너무 높은가 (제약 b)."""
+                if cy * 1000.0 >= NEAR_HALF_MM:
+                    return False                          # 근거리 배치가 아니다
+                cols = [(q.center_local[0], q.center_local[1], (q.z + q.h) * 1000.0)
+                        for q in self.placements]
+                return _far_worst_mm(cx, cy, cols) > NEAR_LIM_MM
+
             def find_placement(self, box_size, box_mass=0.0, **kw):
                 if not ARM_GUARD or kw.get("reject") is not None:
                     return super().find_placement(box_size, box_mass, **kw)
 
-                # 1) 길도 막히지 않고 함정도 안 만드는 자리
+                # 1) 길도 막히지 않고, 함정도 안 만들고, 팔꿈치도 안 스치는 자리
                 p = super().find_placement(
                     box_size, box_mass,
-                    reject=lambda *a: self._sweep_risk(*a) or self._builds_trap(*a))
+                    reject=lambda *a: (self._sweep_risk(*a) or self._builds_trap(*a)
+                                       or self._far_pillar_risk(*a)))
                 if p is not None:
                     return p
                 # 2) 함정은 감수하되 지금 길은 열려 있는 자리.
@@ -620,14 +659,30 @@ def worker(specs, ids):
             rl = link.call_slow(cyc.release_budget_s, cmd="release")
             if not rl.get("ok"):
                 log("       !! release %r (계속 진행한다)" % rl)
-            q6 = np.asarray(_S["art"].get_joint_positions()[:6], dtype=float)
-            if float(np.max(np.abs(q6))) > 2.0 * math.pi:
-                log("       !! 관절이 감겼다 %s deg — READY 로 되돌린다"
-                    % np.round(np.degrees(q6), 0).tolist())
-                _S["q"].run(lambda: (_S["art"].set_joint_positions(_S["ready_q"]),
-                                     _S["art"].set_joint_velocities(np.zeros(6)),
-                                     {"ok": True})[-1])
+
+            # ★★ 관절을 **읽는 것도** 메인 스레드여야 한다. 여기는 워커 스레드다.
+            #   쓰기만 큐로 보내고 읽기를 직접 하면, PR #9 가 없앤 바로 그 경합이
+            #   되살아난다 (`robot_motion.py`: 물리 스텝 중 교차 접근은 undefined,
+            #   증상은 `copyInternalStateToCache` 에러 홍수). 게다가 조용히 틀린다 —
+            #   깨진 값을 읽으면 감김 판정이 오작동해서 **멀쩡한 팔에 READY
+            #   순간이동을 걸고**, 그 순간이동 자체가 계단 입력이라 없던 사고를 만든다.
+            #   읽기·판정·되돌리기를 한 덩어리로 메인 스레드에 보낸다 — 그래야 그
+            #   사이에 물리가 끼어들지도 않는다.
+            def _unwind():
+                q6 = np.asarray(_S["art"].get_joint_positions()[:6], dtype=float)
+                if float(np.max(np.abs(q6))) <= 2.0 * math.pi:
+                    return {"ok": True, "wound": False}
+                _S["art"].set_joint_positions(_S["ready_q"])
+                _S["art"].set_joint_velocities(np.zeros(6))
+                return {"ok": True, "wound": True,
+                        "deg": np.round(np.degrees(q6), 0).tolist()}
+
+            r = _S["q"].run(_unwind)
+            if r.get("wound"):
+                log("       !! 관절이 감겼다 %s deg — READY 로 되돌렸다" % r["deg"])
                 time.sleep(1.0)                          # 드라이브가 따라올 시간
+            elif not r.get("ok"):
+                log("       !! 감김 확인 실패: %r" % r)
 
         rest = {}                                        # 놓인 뒤의 기준 자세 (knock 용)
         pick_retry = {}                                  # box_id -> 흡착 재시도 횟수
@@ -727,15 +782,19 @@ def worker(specs, ids):
             # ★ 이 자리로 가려면 로봇 쪽 기둥을 넘어야 했는가. 넘었다면 아래팔이
             #   그 위를 쓸고 지나갔다는 뜻이고, 그게 knock 의 코드상 원인이다.
             #   게이트에는 안 넣는다 — 상관을 먼저 실측으로 확인한다.
-            near_mm = 0.0
+            near_mm = far_mm = 0.0
             if place is not None:
-                near_mm = _near_worst_mm(
-                    place["x_mm"] / 1000.0, place["y_mm"] / 1000.0,
-                    [(q["x_mm"] / 1000.0, q["y_mm"] / 1000.0,
-                      q["z_mm"] + BOX_H_MM[q["type"]]) for q in on_pallet])
+                _cols = [(q["x_mm"] / 1000.0, q["y_mm"] / 1000.0,
+                          q["z_mm"] + BOX_H_MM[q["type"]]) for q in on_pallet]
+                _cx, _cy = place["x_mm"] / 1000.0, place["y_mm"] / 1000.0
+                near_mm = _near_worst_mm(_cx, _cy, _cols)
+                far_mm = _far_worst_mm(_cx, _cy, _cols) if _cy * 1000.0 < NEAR_HALF_MM else 0.0
                 if near_mm > NEAR_LIM_MM:
                     log("       !! 근거리 기둥 %.0f mm > 한계 %.0f (ped %.0f) — "
                         "아래팔이 그 위를 쓴다" % (near_mm, NEAR_LIM_MM, PED_MM))
+                if far_mm > NEAR_LIM_MM:
+                    log("       !! far 기둥 %.0f mm > 한계 %.0f — 근거리 깊은 하강에서 "
+                        "팔꿈치가 그것을 민다" % (far_mm, NEAR_LIM_MM))
 
             if res == "PLACED":
                 rest[bid] = by_id[bid].get_world_pose()[0].copy()
@@ -744,7 +803,8 @@ def worker(specs, ids):
 
             _S["rows"].append({"id": bid, "type": t["name"], "res": res, "err": err,
                                "wall": wall, "wait": wait_s, "knock": knock, "who": who,
-                               "kvec": kvec, "near_mm": near_mm, "place": place})
+                               "kvec": kvec, "near_mm": near_mm, "far_mm": far_mm,
+                               "place": place})
             log("       %-11s 오차 [%+.1f %+.1f %+.1f] mm   %.1f s   knock %.1f mm (%s)"
                 % (res, err[0], err[1], err[2], wall, knock, who))
 
@@ -915,22 +975,28 @@ def report():
         kw = max(rows, key=lambda w: w["knock"])
         log("최대 knock    %.1f mm  (경고선 %.0f)   %s 가 %s 를 [%+.0f %+.0f %+.0f] mm"
             % (kn, D.KNOCK_WARN_MM, kw["id"], kw["who"], *kw["kvec"]))
-        nb = [w for w in rows if w.get("near_mm", 0.0) > NEAR_LIM_MM]
-        log("근거리 기둥   위반 %d 사이클 · 최고 %.0f mm  (한계 %.0f @ ped %.0f)%s"
-            % (len(nb), max([w.get("near_mm", 0.0) for w in rows] or [0.0]),
-               NEAR_LIM_MM, PED_MM,
-               "" if not nb else "  -> " + ", ".join(w["id"] for w in nb)))
+        for _lbl, _k in (("근거리 기둥", "near_mm"), ("far 기둥   ", "far_mm")):
+            nb = [w for w in rows if w.get(_k, 0.0) > NEAR_LIM_MM]
+            log("%s   위반 %d 사이클 · 최고 %.0f mm  (한계 %.0f @ ped %.0f)%s"
+                % (_lbl, len(nb), max([w.get(_k, 0.0) for w in rows] or [0.0]),
+                   NEAR_LIM_MM, PED_MM,
+                   "" if not nb else "  -> " + ", ".join(w["id"] for w in nb)))
         log("사이클        평균 %.1f s · 최대 %.1f s   (목표 %.0f s · 스폰 간격 %.0f s)"
             % (sum(cyc_s) / len(cyc_s), max(cyc_s),
                cfg["robot"]["cycle_time_target_s"], SPAWN_DT))
         ce = _S.get("cam_err") or []
         if ce:
-            exy = [max(abs(e[3]), abs(e[4])) for e in ce]
-            ez = [abs(e[5]) for e in ce]
+            # ★ 이름을 반드시 나눠야 한다. 예전 판은 `exy`/`ez` 를 그대로 덮어써서,
+            #   카메라를 켜는 순간 **합격 판정이 배치 오차가 아니라 카메라 인식
+            #   오차로** 계산됐다. 표에는 진짜 배치 오차가 찍히고 RESULT 만 다른 값을
+            #   보므로 로그만 봐서는 어긋난 게 안 보인다. 카메라는 "판단에 안 쓰고
+            #   계측만 한다" 가 이 기능의 전제다 (위 CAM 주석).
+            cam_exy = [max(abs(e[3]), abs(e[4])) for e in ce]
+            cam_ez = [abs(e[5]) for e in ce]
             hit = sum(1 for e in ce if e[1] == e[2])
             log("카메라        %d 회 인식 · 종류 맞춤 %d/%d · 중심 오차 XY 최대 "
                 "%.1f mm · 윗면 z 최대 %.1f mm"
-                % (len(ce), hit, len(ce), max(exy), max(ez)))
+                % (len(ce), hit, len(ce), max(cam_exy), max(cam_ez)))
         log("팔레트        %d 판" % r.get("pallets", 1))
         log("벽시계        %.0f s" % r.get("wall", 0.0))
 
@@ -1065,6 +1131,12 @@ def on_step(dt):
         _S["stalled"] = True
         _S["done"] = True
     if _S["done"] or time.time() - _S["t0"] > WATCHDOG_S:
+        # ★ `_S["done"]` 을 먼저 세운다. 워치독(WATCHDOG_S)으로 들어오면 예전에는
+        #   이게 False 라 워커·투입·계량 스레드가 계속 돌았고, 그 사이 report() 가
+        #   소켓과 서버를 닫아 버려 워커가 닫힌 소켓으로 호출하다 예외로 죽으면서
+        #   **이미 나간 리포트의 결과를 traceback 으로 덮어썼다.** rows 를 읽는
+        #   report() 와 rows.pop() 을 하는 워커가 겹치기도 한다.
+        _S["done"] = True
         _S["phase"] = "done"
         report()
 

@@ -127,9 +127,13 @@ class HeightmapPacker:
     def local_to_world(self, local_xyz, pallet_origin_xy, deck_z: float) -> np.ndarray:
         """팔레트 로컬 -> 월드. wall_margin 만큼 안쪽으로 들어가 있음에 주의."""
         local_xyz = np.asarray(local_xyz, dtype=float)
+        # ★ wall_margin 을 여기서 **또 더하면 안 된다.** `find_placement` 가 돌려주는
+        #   Placement.x/y 에 이미 들어가 있다 (원점을 띄우는 그 보정). 두 번 더하면
+        #   margin>0 인 순간 월드 좌표가 그만큼 밀린다 — 기본 0 이라 지금은 안 터지고,
+        #   그래서 더 나쁘다. 누가 margin 을 켜는 순간 조용히 어긋난다.
         return np.array([
-            pallet_origin_xy[0] + self.wall_margin + local_xyz[0],
-            pallet_origin_xy[1] + self.wall_margin + local_xyz[1],
+            pallet_origin_xy[0] + local_xyz[0],
+            pallet_origin_xy[1] + local_xyz[1],
             deck_z + local_xyz[2],
         ])
 
@@ -317,8 +321,11 @@ class HeightmapPacker:
         self.heightmap[:] = 0.0
         self.massmap[:] = np.inf
         for p in self.placements:
-            i0 = int(round(p.x / self.cell))
-            j0 = int(round(p.y / self.cell))
+            # ★ commit 과 같은 규약이어야 한다 — Placement.x 에는 wall_margin 이
+            #   얹혀 있으므로 격자 인덱스로 되돌릴 때 빼야 한다. 안 빼면 되돌리기
+            #   뒤 하이트맵이 margin 칸수만큼 어긋난다.
+            i0 = int(round((p.x - self.wall_margin) / self.cell))
+            j0 = int(round((p.y - self.wall_margin) / self.cell))
             i1, j1 = i0 + self._cells(p.w), j0 + self._cells(p.d)
             self.heightmap[i0:i1, j0:j1] = p.z + p.h
             self.massmap[i0:i1, j0:j1] = p.mass if p.mass > 0 else np.inf
