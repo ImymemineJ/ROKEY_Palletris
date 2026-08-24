@@ -15,6 +15,7 @@ class HeightmapPacker:
         self.max_stack = pal["max_stack_mm"]                # ★ G1 전까지 이 값만 바꿔가며 실험
         self.w_h, self.w_s = hm_cfg["w_height"], hm_cfg["w_support"]
         self.w_wall = hm_cfg.get("w_wall", 0.0)             # 벽 밀착도 (0 이면 기존 동작)
+        self.w_far = hm_cfg.get("w_far", 0.0)               # 로봇에서 먼 쪽 우선 (0 이면 기존 동작)
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
         self.min_sup = hm_cfg["min_support_ratio"]          # 0.7
@@ -25,6 +26,7 @@ class HeightmapPacker:
         #   "실제로 의미 있는 최소 점수차"(높이 1셀 = w_h*cell/max_stack)의 1% 를
         #   좌표 전체 범위(W+D)에 나눠 준 값이라, 진짜 점수차를 절대 뒤집지 못한다.
         self.tie_eps = 0.01 * self.w_h * self.cell / self.max_stack / (self.W + self.D)
+        self.last_warning = ""                              # 마지막 update 경고 (래퍼가 로그로 올린다)
         self.plans = {}                                      # (zone,box_id) -> PlacePose
         self.placed = []                                     # [(x,y,z,w,d,h,yaw), ...]
 
@@ -75,7 +77,13 @@ class HeightmapPacker:
             #   동점 후보 중에서만 고르는 것이라 적재율 손해는 0 이다 (측정: 60.0% 동일,
             #   팔이 넘어가는 배치가 11.1회 → 9.7회로 감소).
             order = ii + (bz.shape[1] - 1 - jj)
-            score = np.where(cand, base_score + self.w_wall * wall
+            # ★ 먼 쪽 우선은 **동점 처리로는 약하다.** tie_eps 는 의도적으로 아주 작아서
+            #   (진짜 점수차의 1%) 팔레트에 구조가 생기면 높이·지지·벽 항에 묻힌다.
+            #   실측: 동점 처리만으로는 팔 넘김 5.5 → 5.3 회로 거의 안 준다.
+            #   제대로 된 가중치가 필요하고, 다행히 적재율 손해가 없다
+            #   (w_far 0.2 에서 팔 넘김 2.2 회 · 적재율 66.3% 로 오히려 소폭 상승).
+            far = (jj + dc) / self.D                    # 먼 쪽일수록 1 에 가깝다
+            score = np.where(cand, base_score + self.w_wall * wall + self.w_far * far
                              - self.tie_eps * order, -np.inf)
             # ③ 지지율: 상위 K개만 정밀 계산 (전 후보는 너무 비쌈 — 명세서 §7.9)
             flat = np.argsort(score, axis=None)[::-1][: self.topk]
@@ -85,7 +93,7 @@ class HeightmapPacker:
                 sup = self._support_ratio(i, j, wc, dc, int(bz[i, j]))
                 if sup < self.min_sup: continue
                 s = (self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
-                     + self.w_wall * wall[i, j])
+                     + self.w_wall * wall[i, j] + self.w_far * far[i, j])
                 key = (s, -order[i, j])                      # 동점 → 위 order 기준
                 if best is None or key > best[0]:
                     best = (key, i, j, int(bz[i, j]), yaw, w, d)
@@ -130,6 +138,7 @@ class HeightmapPacker:
         """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)"""
         planned = self.plans.pop(box_id, None)               # ★ box_id 로 계획을 회수 (없으면 None)
         ok = True
+        self.last_warning = ""
         yaw = float(actual["yaw_deg"])
 
         # ① yaw 가 계획에서 yaw_tol_deg 이상 벗어났나
@@ -155,6 +164,14 @@ class HeightmapPacker:
         i = int(round((actual["x_mm"] - w / 2) / self.cell))
         j = int(round((actual["y_mm"] - d / 2) / self.cell))
         top_q = max(0, round((actual["z_mm"] + h_mm) / self.cell) * self.cell)   # ★ 셀 격자로 양자화
+        # ★ 실측이 한계를 넘으면 조용히 넘어가면 안 된다. 그대로 기록하면 그 위로는
+        #   영영 아무것도 못 놓고, 왜 그런지도 안 보인다. 실측 pose 가 잘못 왔다는
+        #   신호이므로(get_box_pose 가 박스 중심이 아닌 것을 주는 등) 크게 남긴다.
+        over = top_q > self.max_stack
+        if over:
+            self.last_warning = (f"{box_id}: 실측 상면 {top_q}mm 가 max_stack "
+                                 f"{self.max_stack}mm 를 넘었다 — 실측 pose 확인 필요")
+            ok = False
 
         # ② 실측 좌표가 배열 밖으로 나갈 때 안전하게 자르기.
         #    자르지 않으면 음수 인덱스 슬라이스가 되어 엉뚱한 칸을 덮어쓴다.
