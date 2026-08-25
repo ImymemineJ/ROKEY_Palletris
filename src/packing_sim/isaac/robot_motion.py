@@ -317,7 +317,10 @@ class RobotMotion:
                 pass                          # 잘못된 항목 하나가 이동을 막으면 안 된다
         with self._lk:
             self._obst = obst
-            self._req = (target, float(req.get("yaw_deg", 0.0)))
+            # ★ 구간 허용 오차도 같이 싣는다. 소켓 스레드가 만든 튜플을 물리 스레드가
+            #   그대로 받는다 — dict 를 넘기면 나중에 누가 고쳐 경합이 난다.
+            self._req = (target, float(req.get("yaw_deg", 0.0)),
+                         float(req.get("tol_m") or REACH_TOL_M))
             self._state = "MOVING"
             self._path = None
         return {"accepted": True}
@@ -517,7 +520,7 @@ class RobotMotion:
 
     def _start_move(self, req):
         """호 경로를 세운다. 끝점 IK 로 타당성과 페이싱을 먼저 확인한다."""
-        face, yaw_req = req
+        face, yaw_req, tol_m = req
         q0 = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
         f0 = self.suction_pose()
         _, R0 = self.lula.compute_forward_kinematics(self.ee, q0)
@@ -555,7 +558,7 @@ class RobotMotion:
                       # ★ 구간마다 요구 정밀도가 다르다. 이송(상공 이동·후퇴)은 mm 로
                       #   도착할 이유가 없고, 정밀해야 하는 건 집는/놓는 하강뿐이다.
                       #   상위(cycle)가 `tol_m` 으로 준다. 안 주면 기본값 = 예전 동작.
-                      "tol": float(req.get("tol_m") or REACH_TOL_M)}
+                      "tol": tol_m}
         self._goal_face = np.asarray(face, dtype=float)
         self._goal_yaw = float(yaw_to)              # ★ 도착 판정에 쓸 목표 자세
         self._hold = 0
