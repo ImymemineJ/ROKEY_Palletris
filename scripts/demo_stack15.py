@@ -811,11 +811,11 @@ def main():
                          "안 건드린다. 기본 0.5. 시연을 빨리 볼 때 0.8~1.0. "
                          "⚠ 올리면 릴리스 시점 잔여속도가 커져 박스가 놓인 뒤 흐를 수 "
                          "있다 — 착지 정밀도를 볼 때는 기본값으로 돌릴 것")
-    ap.add_argument("--algo-clearance", type=float, default=0.0, metavar="MM",
-                    help="algo 모드에서 이웃 간격을 박스 치수에 더한다. 0 = 트랙 C 코어 순정. "
-                         "★ 사본 패커는 30 을 쓴다 — 간격 20 으로 줄였을 때 13번째 박스가 "
-                         "이웃 모서리에 걸려 Z 오차 +208 mm 가 났던 값이다. 순정(0)이 "
-                         "그보다 좁으므로 깨지면 30 으로 올려 볼 것")
+    ap.add_argument("--algo-clearance", type=float, default=None, metavar="MM",
+                    help="계획 간격을 **덮어쓴다** (기본은 system.yaml 의 plan_clearance_mm=10). "
+                         "발자국을 이만큼 부풀려 박스 사이에 실제 틈을 남긴다. "
+                         "0 은 슬롯이 박스와 같은 크기라 물리적으로 성립하지 않는다 — "
+                         "실측에서 9kg 5호가 338mm 위에서 막히고 이웃을 1046mm 밀어냈다")
     ap.add_argument("--standoff", type=float, default=None, metavar="MM",
                     help="로봇을 팔레트 긴 변에서 뒤로 뺀 거리. 기본은 구 사양서 §3-1 의 300. "
                          "600 이면 여유 +126 mm. ※ 둘 다 G1 재검증이 필요하다")
@@ -984,7 +984,7 @@ def main():
         #   여유가 +13 mm 뿐이었다 (CLAUDE.md §1). 5 mm 를 그냥 써도 되는지는 재봐야 한다.
         ov = float(a.overhang)
         cfg_plan, plan_origin = cfg, origin
-        if ov > 0 or a.hm or a.corridor_gap is not None:
+        if ov > 0 or a.hm or a.corridor_gap is not None or a.algo_clearance is not None:
             import copy
             if a.plan_mode != "algo":
                 raise SystemExit("계획 덮어쓰기(--overhang/--hm/--corridor-gap)는 "
@@ -1005,6 +1005,9 @@ def main():
                   % (cfg_plan["pallet"]["width_mm"], cfg_plan["pallet"]["depth_mm"],
                      cfg["pallet"]["width_mm"], cfg["pallet"]["depth_mm"], ov,
                      [round(v, 1) for v in plan_origin]))
+
+        if a.algo_clearance is not None:
+            cfg_plan["heightmap"]["plan_clearance_mm"] = int(a.algo_clearance)
 
         # ── 계획 가중치 덮어쓰기 (--hm) ─────────────────────
         # ★ system.yaml 은 공용 파일이다 (철칙 10). 팀 결정 없이 안 고친다.
@@ -1193,10 +1196,13 @@ def main():
         if online and a.plan_mode == "algo":
             # ★ 트랙 C 코어를 그대로 쓴다. 비전 루프(PalletVision)를 안 태운다 —
             #   algo 는 자기 heightmap 을 소유하고 실측 pose 로 갱신한다 (CLAUDE.md D3).
-            svc = AlgoServices(specs, cfg_plan, a.algo_clearance, verbose=a.verbose)
+            # ★ 간격은 **코어가 건다** (heightmap_core.plan_clearance_mm). 여기서 또
+            #   더하면 두 번 걸린다. --algo-clearance 는 cfg 사본을 덮어쓸 뿐이다.
+            svc = AlgoServices(specs, cfg_plan, 0.0, verbose=a.verbose)
             places = {}
-            print("계획  ★트랙 C 코어 (packing_algo/heightmap_core.py) · 간격 %.0f mm"
-                  % a.algo_clearance)
+            print("계획  ★트랙 C 코어 (packing_algo/heightmap_core.py) · 간격 %d mm%s"
+                  % (cfg_plan["heightmap"].get("plan_clearance_mm", 0),
+                     "" if a.algo_clearance is None else " (--algo-clearance 로 덮어씀)"))
         elif online:
             PKM = _load_packer_module()
             hm, pal = cfg["heightmap"], cfg["pallet"]
