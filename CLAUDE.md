@@ -3,7 +3,7 @@
 > 워크스페이스 루트(`~/palletris_ws/`)에 둔다.
 > Claude Code 가 매 세션 시작 시 자동으로 읽는 프로젝트 컨텍스트다.
 >
-> ★ **숫자의 정본은 `src/packing_bringup/config/system.yaml` 이다.** 이 문서와 다르면 yaml 을 따르고,
+> ★ **숫자의 정본은 `config/system.yaml` 이다.** 이 문서와 다르면 yaml 을 따르고,
 >   다른 부분을 발견하면 지어내지 말고 보고할 것.
 
 ---
