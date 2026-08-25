@@ -9,8 +9,16 @@
 `system.yaml` 의 숫자만으로 벨트·바닥·스토퍼를 그린다.
 
 **이건 확인용 껍데기지 실제 씬이 아니다.** 없는 것:
-컨베이어 구동(`IsaacConveyor`) · 로봇 · 카메라 4종 · tf · Action Graph.
-전부 트랙 A 소관이다. 여기서 보는 것은 **박스가 벨트에 제대로 앉는가**뿐이다.
+로봇 · 카메라 4종 · tf · Action Graph — 전부 트랙 A 소관이다.
+여기서 보는 것은 **박스가 벨트에 제대로 앉아서 흘러가는가**뿐이다.
+
+### 벨트는 어떻게 도나
+
+`IsaacConveyor` OmniGraph 노드를 쓰지 않는다. 그 노드가 하는 일은 결국
+매 틱 `physxSurfaceVelocity` 를 써 주는 것뿐이라(`verify_belt_speed.py` 참조),
+여기서는 **그 속성을 정적 콜라이더에 직접 한 번 건다.** 형상은 안 움직이고
+표면만 흐르는 것처럼 동작한다 — 진짜 컨베이어와 같은 원리다.
+확장 기능(`isaacsim.asset.gen.conveyor`)이 없어도 돈다.
 
 ## 쓰는 순서
 
@@ -18,7 +26,7 @@
     2) 이 파일 붙여넣고 Ctrl+Enter          → 벨트·바닥·스토퍼가 생긴다
     3) script_editor_qr_boxes.py 붙여넣고 Ctrl+Enter  → QR 박스가 벨트 위에 뜬다
     4) ▶ Play                                → 박스가 벨트에 내려앉는다 (10mm 낙하)
-    5) (덤) PUSH_MPS 를 켜고 이 파일을 다시 Ctrl+Enter → 박스가 +X 로 흘러간다
+    → 박스가 +X 로 흘러가 스토퍼(x=10000)에 선다
 
 ## 좌표 규약 (CLAUDE.md §4)
 
@@ -30,11 +38,10 @@
 import os
 
 import omni.usd
-from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics
+from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 # ══════════════════════════════════════════════════════════════════════════
-PUSH_MPS = 0.0        # > 0 이면 이미 스폰된 박스에 +X 초기속도를 준다 (벨트 흉내)
-                      #   ★ 진짜 컨베이어가 아니다. 마찰로 곧 선다 — 눈으로 보는 용도.
+DRIVE_BELT = True     # 벨트를 실제로 굴린다 (physxSurfaceVelocity). 속도는 config 값.
 SHOW_PALLET = True    # 팔레트 3장을 참고용으로 그린다 (물리 없음)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -165,18 +172,53 @@ if SHOW_PALLET:
 print(f"[OK] 테스트 씬 — 바닥 z=0 · 벨트 상면 z={BELT_TOP} (폭 {BELT_W}) · "
       f"main {MAIN_LO}~{MAIN_HI} · 픽업 {PICK_LO}~{PICK_HI} · 스토퍼 {STOPPER_X}")
 
-# ── 덤: 이미 스폰된 박스를 +X 로 밀어 본다 ───────────────────────
-if PUSH_MPS > 0:
-    grp = stage.GetPrimAtPath("/World/QR_Boxes")
-    n = 0
-    if grp.IsValid():
-        for prim in grp.GetChildren():
-            rb = UsdPhysics.RigidBodyAPI(prim)
-            if rb:
-                rb.CreateVelocityAttr().Set(Gf.Vec3f(PUSH_MPS, 0.0, 0.0))
-                n += 1
-    print(f"[OK] 박스 {n}개에 +X {PUSH_MPS} m/s 초기속도.")
-    print("     ⚠ 진짜 컨베이어가 아니다 — 마찰로 곧 선다. IsaacConveyor 는 트랙 A 소관.")
+# ── 벨트 구동 — physxSurfaceVelocity ────────────────────────────
+#   IsaacConveyor 노드가 매 틱 하는 일을 정적 콜라이더에 한 번 걸어 둔다.
+#   형상은 안 움직이고 표면만 흐른다 (verify_belt_speed.py 의 설명과 같은 원리).
+def drive(prim, mps):
+    """+X 로 mps 만큼 흐르는 표면으로 만든다. 성공하면 True."""
+    try:
+        api = PhysxSchema.PhysxSurfaceVelocityAPI.Apply(prim)
+        api.CreateSurfaceVelocityEnabledAttr(True)
+        api.CreateSurfaceVelocityAttr(Gf.Vec3f(mps, 0.0, 0.0))
+        # 월드 기준으로 못 박는다 — 로컬이면 벨트를 회전시켰을 때 방향이 달라진다.
+        api.CreateSurfaceVelocityLocalSpaceAttr(False)
+        return True
+    except Exception as e:                            # noqa: BLE001
+        print(f"[WARN] PhysxSurfaceVelocityAPI 실패 ({e}) — 원시 속성으로 재시도")
+        try:
+            prim.ApplyAPI("PhysxSurfaceVelocityAPI")
+            prim.CreateAttribute("physxSurfaceVelocity:surfaceVelocityEnabled",
+                                 Sdf.ValueTypeNames.Bool).Set(True)
+            prim.CreateAttribute("physxSurfaceVelocity:surfaceVelocity",
+                                 Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(mps, 0.0, 0.0))
+            return True
+        except Exception as e2:                       # noqa: BLE001
+            print(f"[ERROR] 벨트 구동 실패: {e2}")
+            return False
 
-print()
+
+if DRIVE_BELT:
+    mps = CONV["belt_velocity_mps"]
+    # ★ 마찰이 없으면 표면이 흘러도 박스를 못 끈다. 벨트에 물리 재질을 준다.
+    #   ★ 물리 재질은 **UsdShade.Material 프림**이어야 한다. Scope 에 MaterialAPI 만
+    #     걸면 바인딩이 안 풀려서 조용히 기본 마찰로 돈다.
+    mat_path = "/World/TestScene/BeltMaterial"
+    belt_mat = UsdShade.Material.Define(stage, mat_path)
+    pm = UsdPhysics.MaterialAPI.Apply(belt_mat.GetPrim())
+    pm.CreateStaticFrictionAttr(0.8)
+    pm.CreateDynamicFrictionAttr(0.7)
+    pm.CreateRestitutionAttr(0.0)                     # 튀지 않게
+
+    ok = 0
+    for name in ("Belt_main", "Belt_pickup"):
+        prim = stage.GetPrimAtPath(f"/World/TestScene/{name}")
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            belt_mat, UsdShade.Tokens.weakerThanDescendants, "physics")
+        ok += 1 if drive(prim, mps) else 0
+    print(f"[OK] 벨트 {ok}/2 구동 — +X {mps} m/s (physxSurfaceVelocity)")
+    print(f"     박스는 스토퍼 x={STOPPER_X}mm 에서 선다.")
+else:
+    print("[INFO] DRIVE_BELT=False — 벨트가 멈춰 있다.")
+
 print("다음: script_editor_qr_boxes.py 를 붙여넣고 Ctrl+Enter → ▶ Play")
