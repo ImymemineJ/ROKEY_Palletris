@@ -12,7 +12,6 @@ orchestrator_node.py — 관제탑 (1차: B구역 전용)
   3. 로봇에게 명령하는 노드는 여기 하나뿐. algo도 detector도 로봇을 부르지 않는다
 """
 
-import math
 import threading
 import time
 
@@ -66,27 +65,6 @@ SERVICES = {
     "/conveyor/set_velocity": SetVelocity,
     "/sim/despawn_box":       DespawnBox,
 }
-
-# ── 단위 · 좌표 변환 ─────────────────────────────────────────
-# ⚠ 원래 자리는 packing_common/units.py · frames.py 이고 B·C 가 같은 것을
-#   import 해야 한다 (CLAUDE.md §1 · §8). 그런데 packing_common 은 아직
-#   빈 디렉터리다 (.gitkeep 뿐, package.xml 도 없음). 들어오면 여기를 지우고
-#   import 로 바꾼다 — packing_robot/cycle.py 의 pallet_place_to_world 와 같은 처지다.
-def m_to_mm(v):
-    """m(float) → mm(int). ★ 반올림한다. 잘라내면 1mm 씩 계속 아래로 쏠린다."""
-    return int(round(float(v) * 1000.0))
-
-
-def quat_to_yaw_deg(q):
-    """쿼터니언 → yaw(도). Z-up 이라 Z축 회전만 뽑는다.
-
-    BoxAtPickup.pose 는 geometry_msgs/Pose 라 방향이 쿼터니언으로 온다.
-    로봇에게 넘길 건 yaw 하나뿐이라 여기서 뽑아 쓴다.
-    """
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.degrees(math.atan2(siny, cosy))
-
 
 # ★ 로봇 모션 제한 시간. 집기·놓기는 5~10초 걸리므로 서비스 타임아웃(2초)과
 #   전혀 다른 값이다. 이걸 짧게 잡으면 정상 동작 중에 계획을 버린다.
@@ -256,25 +234,25 @@ class ZoneCycle:
         if msg.box_id in (self._rejected_id, self._done_id):
             return
 
-        # ── ③ m → mm ──
-        # ★ BoxAtPickup.pose 는 월드 좌표 m, 박스 "중심" 이다 (작업명세서 §2.1).
-        #   orchestrator 내부와 /robot/cmd 는 mm 라서 여기서 한 번만 바꾼다.
-        pos = msg.pose.position
+        # ── ③ 좌표는 이미 mm 정수다 ──
+        # ★ BoxAtPickup 은 mm 정수로 온다 (CLAUDE.md §3-2). 예전엔 여기서
+        #   Pose(m) → mm 변환과 쿼터니언 → yaw 추출을 했는데, 그 두 단계가
+        #   통째로 없어졌다. 발행자(pick_cam)가 이미 mm 로 바꿔 보낸다.
         self.box = {
             "box_id":   msg.box_id,
-            "x_mm":     m_to_mm(pos.x),
-            "y_mm":     m_to_mm(pos.y),
-            "yaw_deg":  quat_to_yaw_deg(msg.pose.orientation),
+            "x_mm":     int(msg.x_mm),
+            "y_mm":     int(msg.y_mm),
+            "yaw_deg":  float(msg.yaw_deg),
         }
 
         # ── ④ 단위 점검 (경고만) ──
-        # 스토퍼는 x = 10.0 m = 10000 mm 다 (CLAUDE.md §1).
-        # 100m 를 넘으면 발행자가 pose 에 m 가 아니라 mm 를 담은 것이다.
+        # 스토퍼는 x = 10000 mm 다 (CLAUDE.md §4).
+        # 100m 를 넘으면 발행자가 mm 가 아니라 µm 나 다른 단위를 담은 것이다.
         # 막지는 않는다 — 막으면 진짜 원인이 안 보인다. 대신 크게 남긴다.
         if abs(self.box["x_mm"]) > 100_000:
             self.log.warn(
-                f"x={pos.x} → {self.box['x_mm']}mm — 스토퍼는 10000mm 다. "
-                f"발행자가 pose 에 mm 를 담고 있지 않은지 확인할 것 (계약은 m)")
+                f"x={self.box['x_mm']}mm — 스토퍼는 10000mm 다. "
+                f"발행자가 단위를 잘못 담고 있지 않은지 확인할 것 (계약은 mm 정수)")
 
         self.log.info(
             f"[①→②] 박스 도착: {self.box['box_id']} "

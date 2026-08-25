@@ -1,8 +1,10 @@
-# 스토퍼(x=10000)에 박스가 도착했는지.
-# 발행: 트랙 D 의 detector_zone_b (천장 RGB). 구독: 트랙 B 의 orchestrator.
-# ★ 구독 콜백에서는 판단만 하고 무거운 일을 하지 않는다 (작업명세서 §1.5).
-# 작업명세서 §2.1 · §5.6
-
-bool               present   # false = 스토퍼 자리가 비었음 (B 는 대기 상태로 전환)
-string             box_id
-geometry_msgs/Pose pose      # 월드 좌표, 단위 m. ★ 박스 "중심"
+# 인식 노드 → 관제탑. 픽업 좌표까지 실어 보낸다 (CLAUDE.md §3-2)
+#
+# ★ geometry_msgs/Pose 를 쓰지 않는다. 단위 규칙이 "설정·DB = mm 정수" 인데
+#   Pose 는 m float 라 경계에서 매번 변환이 끼어들고, 쿼터니언에서 yaw 를 빼는
+#   코드가 노드마다 복붙된다.
+string  box_id
+bool    present      # false = 박스 없음. 무시하고 사이클을 시작하지 말 것
+int32   x_mm         # 박스 중심 (pick_cam 실측)
+int32   y_mm
+float32 yaw_deg

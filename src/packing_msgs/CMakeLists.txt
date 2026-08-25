@@ -10,7 +10,7 @@ project(packing_msgs)
 
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
-find_package(geometry_msgs REQUIRED)      # BoxAtPickup.msg 의 Pose
+# geometry_msgs 는 더 쓰지 않는다 — BoxAtPickup 이 Pose 를 버리고 mm 정수로 갔다 (§3-2).
 find_package(builtin_interfaces REQUIRED) # ZoneStatus.msg 의 Time
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -48,7 +48,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SwapPallet.srv"
   "srv/SetSpawnEnabled.srv"
 
-  DEPENDENCIES geometry_msgs builtin_interfaces
+  DEPENDENCIES builtin_interfaces
 )
 
 ament_package()

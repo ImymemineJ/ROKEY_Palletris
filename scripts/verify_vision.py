@@ -166,15 +166,14 @@ def main():
     hits = [m for m in n.seen if m.present]
     chk("BoxAtPickup(present=True) 수신", bool(hits), f"{len(hits)} 건")
     if hits:
-        p = hits[-1].pose.position
-        ez, ew = hits[-1].pose.orientation.z, hits[-1].pose.orientation.w
-        yaw = math.degrees(2 * math.atan2(ez, ew)) % 180.0
-        dx, dy = (p.x - CENTER[0]) * 1000, (p.y - CENTER[1]) * 1000
-        dz = (p.z - (BELT + BT["h_mm"] / 2000.0)) * 1000
+        # ★ BoxAtPickup 은 mm 정수다 (CLAUDE.md §3-2). 쿼터니언도 z 도 없다.
+        #   z 를 안 싣는 건 벨트 상면(800mm)이 고정이라 관제탑이 이미 알기 때문.
+        m = hits[-1]
+        yaw = m.yaw_deg % 180.0
+        dx, dy = m.x_mm - CENTER[0] * 1000, m.y_mm - CENTER[1] * 1000
         dyaw = min(abs(yaw - YAW % 180), 180 - abs(yaw - YAW % 180))
         chk("x 오차 < 10 mm", abs(dx) < 10, f"{dx:+.2f} mm")
         chk("y 오차 < 10 mm", abs(dy) < 10, f"{dy:+.2f} mm")
-        chk("z 는 박스 중심", abs(dz) < 1, f"{dz:+.2f} mm")
         chk("yaw 오차 < 3°", dyaw < 3, f"{dyaw:.2f}°")
         chk("box_id 가 실렸다", bool(hits[-1].box_id), hits[-1].box_id)
 

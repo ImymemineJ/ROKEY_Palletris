@@ -27,7 +27,6 @@ CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현�
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -36,6 +35,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformListener
 
 from packing_common.config import load
+from packing_common.units import m_to_mm   # ★ 직접 *1000 금지 (CLAUDE.md §4)
 from packing_msgs.msg import BoxAtPickup, ZoneStatus
 from packing_msgs.srv import GetBoxInfo, RegisterBox, ReportMiss, VerifyBox
 
@@ -402,17 +402,18 @@ class ZoneDetector(Node):
             self.get_logger().warn("픽업 QR 판독 실패 — box_id 없이 발행한다",
                                    throttle_duration_sec=2.0)
 
+        # ★ 계약은 mm 정수다 (CLAUDE.md §3-2). 내부 계산은 m 로 하지만
+        #   토픽에 실을 때 여기서 한 번만 mm 로 바꾼다.
+        #   z 는 싣지 않는다 — 벨트 상면(800mm)은 고정이라 관제탑이 안다.
         cx, cy, cz = out["center_m"]
-        pose = Pose()
-        pose.position.x, pose.position.y, pose.position.z = cx, cy, cz
-        half = np.radians(out["yaw_deg"]) / 2.0
-        pose.orientation.z, pose.orientation.w = float(np.sin(half)), float(np.cos(half))
-
-        self.pub.publish(BoxAtPickup(present=True, box_id=box_id, pose=pose))
+        self.pub.publish(BoxAtPickup(
+            present=True, box_id=box_id,
+            x_mm=m_to_mm(cx), y_mm=m_to_mm(cy),
+            yaw_deg=float(out["yaw_deg"])))
         if box_id and box_id != self._seen:
             self.get_logger().info(
                 f"도착 {box_id or '(미상)'} {out['type']['name']} "
-                f"({cx*1000:.0f}, {cy*1000:.0f}, {cz*1000:.0f}) mm "
+                f"({m_to_mm(cx)}, {m_to_mm(cy)}, {m_to_mm(cz)}) mm "
                 f"yaw {out['yaw_deg']:.1f}° · 맞춤오차 {out['fit_err_m']*1000:.1f} mm")
             self._crosscheck(box_id, out["type"])
         self._present = True
@@ -446,7 +447,7 @@ class ZoneDetector(Node):
         if self._present:
             self.get_logger().info("픽업 자리 비었다")
         self._present, self._seen = False, None
-        self.pub.publish(BoxAtPickup(present=False, box_id="", pose=Pose()))
+        self.pub.publish(BoxAtPickup(present=False, box_id=""))
 
 
 def _spin(node):
