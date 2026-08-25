@@ -39,12 +39,14 @@ USD 를 고치는 일(스폰·디스폰)은 소켓 스레드에서 하면 안 �
 락 없이 안전하다.
 """
 import math
+import os
 
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
 
 BOX_ROOT = "/World/boxes"                 # ★ 규칙 5. 소문자다
 BOX_PRIM_FMT = BOX_ROOT + "/%s"
 LOOKS_ROOT = "/World/Looks"
+QR_LOOKS_ROOT = LOOKS_ROOT + "/QR"        # 박스마다 텍스처가 달라 머티리얼도 박스마다다
 PHYS_MAT_PATH = LOOKS_ROOT + "/PhysicsMaterial"          # 씬 빌더가 만든다. 없으면 여기서
 
 # ── 박스 색 ────────────────────────────────────────────────
@@ -62,6 +64,19 @@ LINE_MAT = LOOKS_ROOT + "/BoxLine"
 # 되살릴 때는 _ensure_roots 의 머티리얼 생성 루프와 _make_box 의 displayColor ·
 # 바인딩 세 곳을 같이 되돌린다. 씬에 남아 있는 /World/Looks/BoxNo3·No4·No5 는
 # 예전 판이 만든 것이라 지금은 아무도 안 쓴다.
+# ── QR 라벨 ────────────────────────────────────────────────
+# 윗면에 붙이는 흰 바탕 QR 스티커. **시각 전용**이다 — 콜라이더도 리지드바디도
+# 걸지 않는다. 박스 프림의 자식이라 박스를 따라 같이 움직인다.
+#
+# ★ PNG 는 씬 밖에서 미리 굽는다 (`scripts/gen_qr_labels.py`).
+#   Isaac 내장 파이썬(3.11)에 cv2 가 있다는 보장이 없어서다. 여기서 만들려다
+#   실패하면 라벨 없는 박스로 데모가 돌고 인식이 통째로 죽는다.
+LABEL_PRIM = "Label"                      # 박스 프림의 자식 이름
+LABEL_LIFT_M = 0.001                      # 윗면에서 1 mm 띄운다 (z-fighting 방지)
+# ★ 거울상 방지 스위치. QR 은 회전에는 강하지만 **좌우 반전되면 절대 안 읽힌다.**
+#   USD 의 st 원점(좌하)과 PNG 원점(좌상)이 달라서 한 번 뒤집어 주는 것이 기본이다.
+#   씬에서 라벨이 육안으로는 멀쩡한데 cam1 이 못 읽으면 **먼저 이 값을 뒤집어 볼 것.**
+LABEL_FLIP_V = True
 # 스토퍼 앞 이 거리 안에 박스 **앞면**이 오고 거의 멎으면 픽업 대기로 본다.
 PICKUP_MARGIN_M = 0.060                   # 트랙A 가이드 §A6~A8 의 60 mm
 PICKUP_VEL_MPS = 0.01                     # |vx| < 1 cm/s
@@ -105,6 +120,19 @@ class Spawner:
         self.pickup_x0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
+        # ── QR 라벨 설정. 없거나 꺼져 있으면 라벨 없이 그냥 돈다 ──
+        _qr = (cfg.get("recognition") or {}).get("qr") or {}
+        self.qr_on = bool(_qr.get("enabled", False))
+        self.label_m = float(_qr.get("label_mm", 198)) / 1000.0
+        _dir = str(_qr.get("label_dir", "qr_labels"))
+        if not os.path.isabs(_dir):
+            # ★ 홈 디렉터리를 박지 않는다 (packing_common/config.py 주석 참조).
+            #   이 파일은 <ws>/src/packing_sim/isaac/spawner.py 라 3 단계 위가 ws 다.
+            _ws = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.realpath(__file__)))))
+            _dir = os.path.join(_ws, _dir)
+        self.label_dir = _dir
+        self._label_warned = False
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
         # 원점은 **모서리**이고 z 는 **상면**이다 (작업명세서 §3.3).
         _po = cfg["zones"]["pallet_origin_world_mm"][zone]
@@ -517,6 +545,76 @@ class Spawner:
                   % (len(on_pallet), on_pallet))
         return {"ok": True, "removed": len(on_pallet)}
 
+    def _attach_label(self, box_path, box_id, hz):
+        """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
+
+        ★ 콜라이더를 걸지 않는다. 걸면 흡착 패드가 1 mm 떠 있는 스티커에 먼저
+          닿아 박스를 그만큼 덜 눌러 잡는다 — 들다 놓치는 쪽이다.
+
+        ★ 부모(박스)에 RigidBodyAPI 가 걸려 있지만 이 자식은 CollisionAPI 가
+          없으므로 물리에 참여하지 않는다. 순수 시각 프림이다.
+        """
+        png = os.path.join(self.label_dir, box_id + ".png")
+        if not os.path.exists(png):
+            if not self._label_warned:      # 15 개가 다 없으면 로그가 15 줄 나온다
+                self._label_warned = True
+                self._log("[spawner] ⚠ QR 라벨 PNG 가 없다: %s\n"
+                          "           먼저: python3 scripts/gen_qr_labels.py\n"
+                          "           라벨 없이 계속한다 — cam1 이 등록을 못 해 "
+                          "전 박스가 RETURN 된다" % png)
+            return
+
+        half = self.label_m / 2.0
+        lp = box_path + "/" + LABEL_PRIM
+        m = UsdGeom.Mesh.Define(self.stage, lp)
+        z = hz + LABEL_LIFT_M
+        m.CreatePointsAttr([Gf.Vec3f(-half, -half, z), Gf.Vec3f(half, -half, z),
+                            Gf.Vec3f(half, half, z), Gf.Vec3f(-half, half, z)])
+        m.CreateFaceVertexCountsAttr([4])
+        m.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        m.CreateExtentAttr([Gf.Vec3f(-half, -half, z), Gf.Vec3f(half, half, z)])
+        m.CreateSubdivisionSchemeAttr("none")
+        # ★ st 는 정점 순서와 짝을 맞춘다. v 를 뒤집는 이유는 LABEL_FLIP_V 주석 참조.
+        v0, v1 = (1.0, 0.0) if LABEL_FLIP_V else (0.0, 1.0)
+        st = UsdGeom.PrimvarsAPI(m.GetPrim()).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+        st.Set([Gf.Vec2f(0.0, v0), Gf.Vec2f(1.0, v0),
+                Gf.Vec2f(1.0, v1), Gf.Vec2f(0.0, v1)])
+
+        if not self.stage.GetPrimAtPath(QR_LOOKS_ROOT):
+            UsdGeom.Scope.Define(self.stage, QR_LOOKS_ROOT)
+        mp = QR_LOOKS_ROOT + "/" + box_id
+        mat = UsdShade.Material.Define(self.stage, mp)
+        sh = UsdShade.Shader.Define(self.stage, mp + "/Shader")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
+        sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        # ★ 종이 라벨이라 반사가 거의 없어야 한다. 광택이 있으면 조명이 QR 위에
+        #   하이라이트를 만들어 흰 모듈과 검은 모듈의 대비가 무너진다.
+        sh.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.02, 0.02, 0.02))
+
+        reader = UsdShade.Shader.Define(self.stage, mp + "/stReader")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+        tex = UsdShade.Shader.Define(self.stage, mp + "/Tex")
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(png)
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            reader.ConnectableAPI(), "result")
+        # ★ clamp. repeat 로 두면 가장자리에서 QR 이 한 줄 되풀이돼 흰 여백을
+        #   갉아먹고, 여백이 좁아지면 디텍터가 QR 경계를 못 잡는다.
+        for w in ("wrapS", "wrapT"):
+            tex.CreateInput(w, Sdf.ValueTypeNames.Token).Set("clamp")
+        tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            tex.ConnectableAPI(), "rgb")
+        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+
+        UsdShade.MaterialBindingAPI.Apply(m.GetPrim())
+        UsdShade.MaterialBindingAPI(m.GetPrim()).Bind(mat)
+
     def _make_box(self, path, tname, dims, pos, yaw_deg, mass, box_id):
         """치수를 지오메트리에 굽는다 — `xformOp:scale` 을 안 쓴다.
 
@@ -568,6 +666,11 @@ class Spawner:
         if mat:
             UsdShade.MaterialBindingAPI.Apply(prim)
             UsdShade.MaterialBindingAPI(prim).Bind(mat)
+
+        # ★ 라벨은 머티리얼 바인딩 **뒤에** 붙인다. USD 의 머티리얼 바인딩은
+        #   자손이 물려받으므로, 먼저 붙이면 라벨이 빨강으로 덮인다.
+        if self.qr_on:
+            self._attach_label(path, box_id, hz)
 
         # ★ 물리 바인딩은 시각 머티리얼과 **별개 purpose** 다. `if mat:` 안에 넣으면
         #   안 된다 — 색이 없어도 마찰은 걸려야 한다.

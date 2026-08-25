@@ -142,3 +142,121 @@ def test_pick_cam_fov_covers_worst_case():
         pytest.xfail(f"pick_cam 시야가 {abs(worst):.0f} mm 모자란다 — "
                      "카메라를 광축 기준 90° 회전 필요 (트랙 A)")
     assert worst >= 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  QR 라벨 — 페이로드 규약 · 크기 · 해독
+# ══════════════════════════════════════════════════════════════════════
+from packing_vision.detect import read_qr                      # noqa: E402
+from packing_vision.label import (                             # noqa: E402
+    LABEL_MM, MIN_MODULE_PX, MODULES, QR_MM, make_payload, modules_for,
+    parse_payload, render_qr, required_qr_mm,
+)
+
+
+def render_with_label(box_type, center_xy, yaw_deg, K, R, t, payload,
+                      label_mm=LABEL_MM):
+    """render() 와 같되 윗면 한가운데에 **원근 투영된** QR 라벨을 얹는다.
+
+    라벨을 정사각으로 붙여 놓고 끝내면 안 된다. 실제 카메라는 박스가 화면
+    가장자리로 갈수록 라벨을 사다리꼴로 본다 — 그 상태에서도 읽히는지가
+    확인하고 싶은 것이다. 그래서 라벨 네 귀퉁이를 월드에 놓고 같이 투영한다.
+    """
+    img = render(box_type, center_xy, yaw_deg, K, R, t)
+    z_top = BELT_TOP_M + box_type["h_mm"] / 1000.0
+    half = label_mm / 2000.0                       # mm -> m, 반변
+    c, s = np.cos(np.radians(yaw_deg)), np.sin(np.radians(yaw_deg))
+    rot = np.array([[c, -s], [s, c]])
+    # 이미지 좌표계와 감기 방향을 맞춘다 — 뒤집히면 QR 이 거울상이 되어 안 읽힌다.
+    local = np.array([[-half, +half], [+half, +half], [+half, -half], [-half, -half]])
+    quad = (local @ rot.T) + np.asarray(center_xy, float)
+    dst = project(np.hstack([quad, np.full((4, 1), z_top)]), K, R, t).astype(np.float32)
+
+    lab = cv2.cvtColor(render_qr(payload, module_px=16), cv2.COLOR_GRAY2BGR)
+    n = lab.shape[0]
+    src = np.array([[0, 0], [n, 0], [n, n], [0, n]], np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(lab, M, (W, H))
+    mask = cv2.warpPerspective(np.full((n, n), 255, np.uint8), M, (W, H))
+    img[mask > 0] = warped[mask > 0]
+    return img
+
+
+def test_payload_is_waybill_only():
+    """★ QR 에 구역 글자를 넣지 않는다 — 구역은 주소로 정한다 (설계결정서 §5-3)."""
+    assert make_payload("BOX00007") == "BOX00007"
+    assert parse_payload("BOX00007") == "BOX00007"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "BOX 1", None])
+def test_payload_rejects_garbage(bad):
+    """★ 예외가 아니라 None 이다 — 구독 콜백에서 raise 하면 rclpy 가 삼킨다."""
+    assert parse_payload(bad) is None
+
+
+def test_payload_rejects_old_format():
+    """옛 규약 라벨이 씬에 남아 있으면 조용히 통과시키지 않고 잡아낸다."""
+    assert parse_payload("B|BOX00007") is None
+
+
+def test_payload_stays_25_modules():
+    """글자가 늘면 29 모듈로 커지고 같은 크기에서 해독 여유가 14% 깎인다."""
+    assert modules_for(make_payload("BOX00014")) == MODULES == 25
+
+
+def test_label_fits_every_box_top():
+    for b in TYPES:
+        narrow = min(b["w_mm"], b["d_mm"])
+        assert LABEL_MM <= narrow, f"{b['name']} 윗면({narrow})보다 라벨({LABEL_MM})이 크다"
+
+
+def test_label_big_enough_for_pick_cam():
+    """pick_cam 에서 모듈당 5 px 이상인가 — 이게 무너지면 흐림에 간헐 실패한다."""
+    fx = (W / 2.0) / np.tan(np.radians(HFOV) / 2.0)
+    z_cam = CFG["recognition"]["pick_cam"]["z_mm"] / 1000.0
+    worst_h = max(b["h_mm"] for b in TYPES) / 1000.0      # 제일 높은 = 제일 가까운
+    lowest_h = min(b["h_mm"] for b in TYPES) / 1000.0     # 제일 낮은 = 제일 먼 = 최악
+    assert worst_h >= lowest_h
+    mm_per_px = (z_cam - BELT_TOP_M - lowest_h) * 1000.0 / fx
+    assert QR_MM >= required_qr_mm(mm_per_px), (
+        f"QR {QR_MM} mm 로는 부족하다 — {required_qr_mm(mm_per_px):.0f} mm 필요 "
+        f"({mm_per_px:.2f} mm/px)")
+    assert QR_MM / MODULES / mm_per_px >= MIN_MODULE_PX
+
+
+@pytest.mark.parametrize("btype,center,yaw", CASES)
+def test_qr_decodes_from_projected_image(btype, center, yaw):
+    """★ 지금까지 read_qr 은 테스트가 한 건도 없었다. 여기가 첫 검증이다."""
+    K = make_K()
+    t = np.array([9.9, 0.0, CFG["recognition"]["pick_cam"]["z_mm"] / 1000.0])
+    payload = make_payload("BOX00007")
+    img = render_with_label(btype, center, yaw, K, R_DOWN, t, payload)
+    assert parse_payload(read_qr(img)) == "BOX00007"
+
+
+@pytest.mark.parametrize("btype,center,yaw", CASES)
+def test_label_does_not_break_box_detection(btype, center, yaw):
+    """라벨은 윗면 한가운데의 **빨갛지 않은 구멍**이다.
+
+    find_box 가 RETR_EXTERNAL 로 바깥 윤곽만 보므로 구멍은 무시돼야 한다.
+    그게 깨지면 로봇이 라벨 크기만큼 작은 박스를 집으려 든다.
+    """
+    K = make_K()
+    t = np.array([9.9, 0.0, CFG["recognition"]["pick_cam"]["z_mm"] / 1000.0])
+    plain = find_box(render(btype, center, yaw, K, R_DOWN, t))
+    with_lab = find_box(render_with_label(btype, center, yaw, K, R_DOWN, t,
+                                          make_payload("BOX00007")))
+    assert plain is not None and with_lab is not None
+    a, b = sorted(plain["size_px"]), sorted(with_lab["size_px"])
+    assert max(abs(x - y) for x, y in zip(a, b)) <= 2.0, "라벨이 치수를 바꿨다"
+    assert np.linalg.norm(np.subtract(plain["center_px"], with_lab["center_px"])) <= 2.0
+
+
+def test_label_constants_come_from_yaml():
+    """label.py 의 기본값과 yaml 이 갈리면 씬과 인식이 다른 크기를 믿게 된다."""
+    from packing_vision import label as L
+    q = CFG["recognition"]["qr"]
+    assert L._FROM_YAML, "yaml 을 못 읽고 기본값으로 떨어졌다"
+    assert (L.MODULE_MM, L.QUIET_MODULES, L.LABEL_MM) == (
+        q["module_mm"], q["quiet_modules"], q["label_mm"])
+    assert L._DEF["label_mm"] == q["label_mm"], "yaml 을 바꿨으면 label.py 기본값도 맞출 것"

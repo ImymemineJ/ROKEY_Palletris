@@ -78,19 +78,52 @@ def find_box(bgr, min_area_px=400, roi=None):
             "clipped": clipped}
 
 
-def read_qr(bgr):
+def read_qr(bgr, corners_px=None):
     """QR 이 보이면 문자열, 아니면 "".
 
-    ⚠ stage 1 씬에는 QR 이 없다 (spawner 가 단색 머티리얼만 입힌다).
-      그래서 이 함수는 지금 항상 "" 를 돌려준다 — 없는 것을 있다고 가정하지 않는다.
-      트랙 A 가 박스 윗면에 QR 텍스처를 넣으면 그때부터 값이 나온다.
-      호출부는 "" 를 정상 경로로 처리해야 한다.
+    ★ corners_px(박스 윗면 네 모서리)를 주면 **먼저 그 면을 정사각으로 펴서** 읽는다.
+
+      왜 필요한가: 하향 카메라라도 박스가 화면 중앙에서 벗어나면 윗면이
+      사다리꼴로 보인다. 그 상태로 그냥 디코더에 넣으면 자세에 따라 **결정적으로**
+      실패한다 — 무작위가 아니라서 같은 자리에 선 박스는 몇 번을 다시 봐도 계속
+      실패한다. 실측(하네스 투영): 5호가 y +39 mm · yaw −12도 에서 라벨이
+      207x207 px(모듈 6.7 px)로 충분히 큰데도 판독이 0 % 였다.
+      같은 그림을 펴서 넣으면 읽힌다.
+
+      이게 QR 을 키우는 것보다 낫다 — 카메라 위치가 바뀌어도 그대로 통한다.
+
+    ★ 펴서 실패하면 원본으로 한 번 더 본다. 모서리 추정이 틀렸을 수 있어서다.
     """
-    try:
-        data, pts, _ = cv2.QRCodeDetector().detectAndDecode(bgr)
-        return data or ""
-    except cv2.error:
-        return ""
+    def _decode(img):
+        try:
+            data, _pts, _ = cv2.QRCodeDetector().detectAndDecode(img)
+            return data or ""
+        except cv2.error:
+            return ""
+
+    if corners_px is not None:
+        try:
+            src = _order_corners(np.asarray(corners_px, np.float32))
+            side = int(max(np.linalg.norm(src[0] - src[1]),
+                           np.linalg.norm(src[1] - src[2])))
+            # ★ 2 배로 키워 편다. 원래 크기로 펴면 보간에서 모듈 경계가 뭉개진다.
+            side = max(64, min(1024, side * 2))
+            dst = np.array([[0, 0], [side, 0], [side, side], [0, side]], np.float32)
+            flat = cv2.warpPerspective(bgr, cv2.getPerspectiveTransform(src, dst),
+                                       (side, side))
+            got = _decode(flat)
+            if got:
+                return got
+        except (cv2.error, ValueError):
+            pass
+    return _decode(bgr)
+
+
+def _order_corners(pts):
+    """네 점을 좌상 → 우상 → 우하 → 좌하 순으로. 순서가 섞이면 편 그림이 뒤집힌다."""
+    c = pts.mean(axis=0)
+    ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+    return pts[np.argsort(ang)].astype(np.float32)
 
 
 def dominant_color_name(bgr, mask=None):
