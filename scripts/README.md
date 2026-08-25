@@ -26,6 +26,7 @@
 | `demo_stack15_test1_1.py` | 김학민 | **15박스 연속 — 실제 라인.** `demo_stack15`(B5)를 컨베이어 위로 옮긴 것. 급송이 없고 도착 순서 그대로 집으므로 온라인 패커를 쓴다. 스폰은 사양 스케줄(`boxes.stage1` 12 s x 15). `PL_N` 으로 개수 축소 |
 | `script_editor_lula.py` | 김병직 | **Isaac Sim GUI 의 Script Editor 에 붙여넣는 스니펫.** `POINT` 만 바꿔 11점 중 하나로 팔을 보낸다 |
 | `read_log.py` | 김병직 | Isaac Script Editor 출력을 터미널에서 읽는다 |
+| `script_editor_qr_boxes.py` | 정정인 → **김학민** | **QR 텍스처 박스 스폰 — 단독 테스트.** Script Editor 에 붙여넣어 QR 이 제대로 붙는지 확인한다. MDL 비동기 로드 함정을 피해 `UsdPreviewSurface` 를 직접 조립하고, 리지드바디를 Xform 루트에 건다(Cube 는 자식을 못 가진다). ⚠ **씬 통합 전 5가지를 맞춰야 한다** — 파일 상단 '트랙 A 인계 메모' 참조 (절대경로 · 박스 치수 3종 · `qr_payload` 기록 · `dest` · 스폰 위치). 스폰 담당은 §12 상 `spawner.py` 다 |
 | `gen_master_db.py` | 민범진 | D1 — **직접 추가할 것** |
 
 게이팅 검증 스크립트(G1~G7)는 전부 여기에 커밋한다. (작업명세서 §11)
