@@ -46,6 +46,25 @@ class HeightmapPacker:
         rb = cfg["robot"]
         self.arm_r = rb["gripper_body_diameter_mm"] // 2 // self.cell   # 122//10 = 12셀
         self.arm_gap = rb["gripper_length_mm"]                          # 150 mm
+        # ★ 통로 검사의 **방향성** — 팔은 로봇 쪽(py 0)에서 들어온다. 1.0 이면 지금까지의
+        #   대칭 검사, 0.0 이면 먼 쪽(py 큰 쪽)은 안 본다. 기본 1.0 = 기존 동작 그대로.
+        # ★★ 계획 간격 (2026-08-25, 김병직 실측 → 정정인 승인).
+        #   발자국을 이만큼 부풀려 잡아 **박스 사이에 실제 틈**을 남긴다.
+        #   간격 0 은 슬롯이 박스와 **정확히 같은 크기**라 물리적으로 성립하지 않는다:
+        #     · 콜라이더 contact offset 이 면마다 2 mm
+        #     · 배치 XY 오차가 실측 최대 7.6 mm · yaw 오차 4.0도 (410 박스 모서리 14 mm)
+        #   Isaac 실측(20박스·도착순·이격400): 간격 0 이면 9kg 5호가 338 mm 위에서
+        #   막히고 이웃을 **1046 mm 밀어 팔레트 밖으로 떨어뜨렸다** (RESULT 실패).
+        #   10 을 넣자 **20/20 · 10단 1300 mm · knock 11.5 mm · 통과**.
+        #   ⚠ plan 과 update 에 **똑같이** 걸어야 한다. 한쪽만 부풀리면 update 의
+        #     `i = round((actual.x_mm - w/2)/cell)` 이 셀 단위로 어긋나 발자국이
+        #     실제와 다른 자리에 찍힌다. 그래서 호출부가 아니라 **코어 안에서** 건다.
+        self.plan_clr = int(hm_cfg.get("plan_clearance_mm", 0))
+        self.corridor_far = float(hm_cfg.get("corridor_far_ratio", 1.0))
+        # ★ 로봇 쪽(py 작은 쪽) 여유는 **따로** 준다. 팔뚝은 이 방향에서 넘어 들어오므로
+        #   먼 쪽과 같은 기준(윗면+150)을 주면 넘어야 할 벽을 그대로 통과시킨다.
+        #   기본값은 arm_gap = 기존 동작 그대로.
+        self.near_gap = float(hm_cfg.get("corridor_near_gap_mm", self.arm_gap))
         self.min_sup = hm_cfg["min_support_ratio"]          # 0.7
         self.topk = hm_cfg["topk_support_check"]            # 50
         self.yaw_tol = hm_cfg["yaw_tol_deg"]                # 5.0 — 이만큼 틀어지면 AABB 기록
@@ -173,6 +192,7 @@ class HeightmapPacker:
             #   NO_FEASIBLE_POSE 로 답하고 이유는 last_warning 으로 올린다.
             self.last_warning = f"{box_id}: 치수가 잘못됐다 ({why})"
             return False, None, 0.0, "NO_FEASIBLE_POSE"
+        w_mm, d_mm = w_mm + self.plan_clr, d_mm + self.plan_clr   # ★ 계획 간격
         # ★ 예전엔 최선 1개만 남겼다. 지금은 상위 몇 개를 모은다 — 앞보기(_lookahead)가
         #   "이 자리에 놓으면 **다음 박스들**이 어떻게 되나" 를 굴려 보고 고르기 때문이다.
         #   앞보기가 꺼져 있으면 cands[0] 이 예전의 best 와 정확히 같다.
@@ -271,7 +291,10 @@ class HeightmapPacker:
         """가장 낮은 박스 종류조차 높이 제한에 걸려 어디에도 못 들어가면 팔레트가 끝난 것.
         (코드에 210 같은 상수를 박지 않고 config 의 boxes.types 에서 최소 높이를 읽는다.)"""
         t = min(self.box_types, key=lambda b: b["h_mm"])
-        for w, d in ((t["w_mm"], t["d_mm"]), (t["d_mm"], t["w_mm"])):   # 두 방향 다 확인
+        # ★ 여기도 간격을 더한다. 안 더하면 "가장 작은 박스는 들어간다" 로 오판해
+        #   PALLET_FULL 을 영영 안 내고 NO_FEASIBLE_POSE 만 반복한다.
+        c = self.plan_clr
+        for w, d in ((t["w_mm"] + c, t["d_mm"] + c), (t["d_mm"] + c, t["w_mm"] + c)):
             bz = self._base_z(w // self.cell, d // self.cell)
             if (bz + t["h_mm"] <= self.max_stack).any():
                 return False
@@ -308,9 +331,21 @@ class HeightmapPacker:
           몸통 반경 122.5). 그래서 그 구간은 이웃이 높아도 안 닿는다. 팔뚝은 그 위부터다.
         """
         c = self.arm_r
-        pad = np.pad(self.hm, c, mode="constant", constant_values=0)
-        big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + 2 * c, 1)
-        return big <= bz + h_mm + self.arm_gap + self.tol
+        # ★ 먼 쪽은 툴 **뒤**다 (2026-08-25 트랙 B 관찰). 팔은 py 0 쪽에서 들어오므로
+        #   팔뚝이 지나는 공간은 박스의 로봇 쪽 위이고, 먼 쪽에 아무리 높이 쌓여 있어도
+        #   툴이 이미 지나온 뒤라 안 걸린다. 대칭으로 보면 **먼 쪽까지 괜히 금지**해서
+        #   적재율만 깎는다. `corridor_far_ratio` 로 먼 쪽 여유폭을 줄인다 (기본 1.0 = 기존).
+        cf = int(round(c * self.corridor_far))
+        pad = np.pad(self.hm, ((c, c), (c, cf)), mode="constant", constant_values=0)
+        big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + c + cf, 1)
+        ok = big <= bz + h_mm + self.arm_gap + self.tol
+        if self.near_gap < self.arm_gap:
+            # 박스 **앞**(로봇 쪽) c 셀만 따로 본다. 발자국은 빼고 순수하게 앞쪽이다 —
+            #   팔이 넘어와야 하는 벽이 거기 있다.
+            padn = np.pad(self.hm, ((c, c), (c, 0)), mode="constant", constant_values=0)
+            near = self._sliding_max(self._sliding_max(padn, wc + 2 * c, 0), c, 1)
+            ok &= near[:, : self.D - dc + 1] <= bz + h_mm + self.near_gap + self.tol
+        return ok
 
     def update(self, box_id, w_mm, d_mm, h_mm, actual):
         """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)
@@ -329,6 +364,7 @@ class HeightmapPacker:
         if why:
             self.last_warning = f"{box_id}: 치수가 잘못됐다 ({why}) — 갱신하지 않는다"
             return False, self.fill_rate(), len(self.placed)
+        w_mm, d_mm = w_mm + self.plan_clr, d_mm + self.plan_clr   # ★ plan 과 동일하게
 
         prev = self.applied.get(box_id)
         if prev is not None:

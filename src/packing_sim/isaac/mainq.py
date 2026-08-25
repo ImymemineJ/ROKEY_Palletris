@@ -64,6 +64,14 @@ class MainQueue:
             try:
                 out["res"] = fn()
             except Exception as e:            # 작업 하나가 죽어도 루프는 산다
+                # ★ repr(e) 만 남기면 **어디서 났는지가 사라진다.** 2026-08-24 실측:
+                #   카메라 인식이 NameError("LOADER_DIR") 로 죽는데 그게 우리 코드인지
+                #   Isaac 내부인지 알 수 없어 엉뚱한 곳을 두 번 고쳤다.
+                #   호출자는 error 만 보므로 응답 크기는 그대로 두고, 트레이스백은
+                #   stdout 에 한 번 찍는다.
+                import traceback
+                print("[mainq] 작업 실패: %r\n%s" % (e, traceback.format_exc()),
+                      flush=True)
                 out["res"] = {"ok": False, "error": repr(e)}
                 self._log("[mainq] 작업 예외: %r" % (e,))
             if out.get("abandoned"):

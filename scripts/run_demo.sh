@@ -11,6 +11,9 @@
 # 브릿지 .so 경로를 잡는 일만 한다 — 둘 다 프로세스가 뜨기 **전에** 해야 한다.
 #
 #   ./scripts/run_demo.sh              시연 (창 · 11개 · 속도 0.7 · 창유지)
+#     -> 씬이 뜨면 멈춰 선다. **Play 를 눌러야 시작한다.**
+#        (창 없는 실행은 자동으로 시작한다. PL_AUTOPLAY=1 로 강제 가능)
+#        일시정지·Stop 은 아직 못 이어간다 — 누르면 그 실행은 거기서 끝이다.
 #   PL_N=15 ./scripts/run_demo.sh      15개로 (팔레트가 한 번 갈린다)
 #   PL_CAM=0 ./scripts/run_demo.sh     픽업 좌표 인식 끄기
 #   PL_WRISTROS=0 ./scripts/run_demo.sh   손목 카메라 ROS 발행 끄기
