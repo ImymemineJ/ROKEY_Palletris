@@ -824,6 +824,10 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--overhang", type=float, default=0.0, metavar="MM",
+                    help="박스가 팔레트 밖으로 이만큼 나가도 된다고 보고 계획한다. "
+                         "네 변 모두. 벽 쪽에서 --algo-clearance 로 잃는 자리를 되찾는다. "
+                         "★ --plan-mode algo 전용. 씬의 팔레트는 실물 크기 그대로다")
     ap.add_argument("--diag-knock", action="store_true",
                     help="이미 놓인 박스가 **처음 밀리는 순간**을 잡는다 — 그때의 팔 자세로 "
                          "링크별 거리를 내서 '팔이 쳤나 / 혼자 움직였나' 를 가른다")
@@ -943,6 +947,33 @@ def main():
         belt_z = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
         pick_x = cfg["conveyor"]["stopper_x_mm"] / 1000.0
         origin = cfg["zones"]["pallet_origin_world_mm"][a.zone]
+
+        # ── 팔레트 밖 여유 (--overhang) ─────────────────────
+        # ★ 씬의 팔레트는 **실물 크기 그대로** 두고, **계획만** 크게 본다. 그래서
+        #   박스가 가장자리에서 실제로 조금 밖으로 나간다. 벽에는 낄 이웃이 없으므로
+        #   --algo-clearance 를 벽에서까지 물릴 이유가 없다 — 그 손해를 되찾는 값이다.
+        # ⚠ 먼 변(+Y)이 늘면 **도달범위**를 먹는다. 이격 400 재검증에서 B존 먼 코너
+        #   여유가 +13 mm 뿐이었다 (CLAUDE.md §1). 5 mm 를 그냥 써도 되는지는 재봐야 한다.
+        ov = float(a.overhang)
+        cfg_plan, plan_origin = cfg, origin
+        if ov > 0:
+            import copy
+            if a.plan_mode != "algo":
+                raise SystemExit("--overhang 은 --plan-mode algo 에서만 배선돼 있다")
+            _cell = cfg["heightmap"]["cell_mm"]
+            if int(round(2 * ov)) % int(_cell):
+                print("!! --overhang %.1f: 2x%.1f = %d 가 격자 %d mm 의 배수가 아니다 — "
+                      "격자가 잘려 실제 여유가 줄어든다"
+                      % (ov, ov, int(round(2 * ov)), _cell))
+            cfg_plan = copy.deepcopy(cfg)
+            cfg_plan["pallet"]["width_mm"] = int(round(cfg["pallet"]["width_mm"] + 2 * ov))
+            cfg_plan["pallet"]["depth_mm"] = int(round(cfg["pallet"]["depth_mm"] + 2 * ov))
+            plan_origin = [origin[0] - ov, origin[1] - ov, origin[2]]
+            cfg_plan["zones"]["pallet_origin_world_mm"][a.zone] = list(plan_origin)
+            print("팔레트  계획 %d x %d mm (실물 %d x %d · 밖으로 %.1f) · 계획원점 %s"
+                  % (cfg_plan["pallet"]["width_mm"], cfg_plan["pallet"]["depth_mm"],
+                     cfg["pallet"]["width_mm"], cfg["pallet"]["depth_mm"], ov,
+                     [round(v, 1) for v in plan_origin]))
 
         if a.gui:
             # bring_up 의 기본 시점은 로봇 정면(-Y)이라 팔레트가 로봇 뒤에 가린다.
@@ -1069,7 +1100,7 @@ def main():
         if online and a.plan_mode == "algo":
             # ★ 트랙 C 코어를 그대로 쓴다. 비전 루프(PalletVision)를 안 태운다 —
             #   algo 는 자기 heightmap 을 소유하고 실측 pose 로 갱신한다 (CLAUDE.md D3).
-            svc = AlgoServices(specs, cfg, a.algo_clearance, verbose=a.verbose)
+            svc = AlgoServices(specs, cfg_plan, a.algo_clearance, verbose=a.verbose)
             places = {}
             print("계획  ★트랙 C 코어 (packing_algo/heightmap_core.py) · 간격 %.0f mm"
                   % a.algo_clearance)
@@ -1088,7 +1119,7 @@ def main():
                     wall_margin=0.0, enforce_load_order=True,
                     descent_halo=a.halo / 1000.0)
 
-            vision = PalletVision(by_id, specs, origin)
+            vision = PalletVision(by_id, specs, plan_origin)
             svc = OnlineServices(specs, factory, vision, a.clearance, verbose=a.verbose)
             places = {}
         else:
@@ -1096,7 +1127,7 @@ def main():
                             ("x_mm", "y_mm", "z_mm", "yaw_deg", "stack_top_mm") if k in p}
                       for bid, p in zip(ids, plan)}
             svc = PlanServices(specs, places, verbose=a.verbose)
-        cyc = CY.Cycle(link, svc, cfg, zone=a.zone)
+        cyc = CY.Cycle(link, svc, cfg_plan, zone=a.zone)
 
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
         parked, rejected = [], set()                      # 라인 밖으로 치운 것 / 그중 §5 거부
@@ -1247,7 +1278,8 @@ def main():
                 places[bid] = dict(svc.last) if svc.last else {
                     "x_mm": 0, "y_mm": 0, "z_mm": 0, "yaw_deg": 0}
             pos = np.asarray(rp.get_world_pose()[0], dtype=float)
-            want = np.asarray(CY.pallet_place_to_world(places[bid], spec["h_mm"], origin))
+            want = np.asarray(CY.pallet_place_to_world(places[bid], spec["h_mm"],
+                                                       plan_origin))
             err = (pos - want) * 1000.0
 
             # knock — 이미 놓인 박스가 이번 사이클에 얼마나 밀렸나
@@ -1383,6 +1415,27 @@ def main():
               % (top_mm, cfg["pallet"]["max_stack_mm"]))
         print("최대 knock    %.1f mm (경고선 %.0f)" % (max_knock, KNOCK_WARN_MM))
 
+        # ── 팔레트 밖으로 실제로 얼마나 나갔나 ──────────────
+        # ★ --overhang 을 안 써도 찍는다. 배치 오차만으로도 나갈 수 있고, 트럭 상차가
+        #   되느냐는 **계획값이 아니라 실측 외곽**이 정한다 (팔레트 3장 x 800 = 2400,
+        #   트럭 바닥 2800 — 여유 400 mm).
+        _px0, _py0 = origin[0], origin[1]
+        _px1 = _px0 + cfg["pallet"]["width_mm"]
+        _py1 = _py0 + cfg["pallet"]["depth_mm"]
+        _out, _worst = 0.0, "-"
+        for r in placed:
+            _c = np.asarray(by_id[r["id"]].get_world_pose()[0], dtype=float) * 1000.0
+            _w, _d, _ = [v * 1000.0 for v in _dim_of[r["id"]]]
+            if int(round(abs(_yaw_of(by_id[r["id"]].get_world_pose()[1])) / 90.0)) % 2:
+                _w, _d = _d, _w
+            _e = max(_px0 - (_c[0] - _w / 2.0), (_c[0] + _w / 2.0) - _px1,
+                     _py0 - (_c[1] - _d / 2.0), (_c[1] + _d / 2.0) - _py1)
+            if _e > _out:
+                _out, _worst = _e, r["id"]
+        print("팔레트 밖     %.1f mm (%s)%s"
+              % (max(0.0, _out), _worst,
+                 "   ← --overhang %.1f 로 허용한 값" % ov if ov > 0 else ""))
+
         # ── 최종 자리 대조 ─────────────────────────────────
         # knock 은 "얼마나 움직였나"만 말하고 **어디로 갔는지**를 안 말한다. 사고가 나면
         # 그게 필요하다 — 어느 방향으로 밀렸는지 알아야 무엇이 쳤는지 좁혀진다.
@@ -1398,7 +1451,7 @@ def main():
                 print("%3d  %-9s %-4s  (계획 없음 — 사이클이 배치 전에 끝났다)"
                       % (i, bid, specs[bid]["name"]))
                 continue
-            want = np.asarray(CY.pallet_place_to_world(pl, specs[bid]["h_mm"], origin))
+            want = np.asarray(CY.pallet_place_to_world(pl, specs[bid]["h_mm"], plan_origin))
             now = np.asarray(by_id[bid].get_world_pose()[0], dtype=float)
             dd = (now - want) * 1000.0
             mark = "  <-- 밀림" if float(np.linalg.norm(dd)) > KNOCK_WARN_MM else ""
