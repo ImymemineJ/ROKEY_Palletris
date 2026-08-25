@@ -387,19 +387,44 @@ def start_push():
     ★ USD 속성 쓰기가 Fabric 때문에 안 먹는 판이 있어 isaacsim.core 를 먼저 쓴다.
     """
     setter = None
+    state = {"logged": False, "errors": 0}
+
     try:
         from isaacsim.core.prims import RigidPrim         # Isaac 5.x
+        import numpy as np
         rp = RigidPrim(f"{BOXES_GROUP}/Box_.*")
+
+        # ★ 판마다 API 가 다르다. 있는 것을 쓴다.
+        #   - get_linear_velocities() -> (N, 3)
+        #   - get_velocities()        -> (N, 6)  선속도 0:3 · 각속도 3:6
+        #   ⚠ 2026-08-25: get_velocities()[0] 로 첫 행만 집어 1차원으로 만들어 놓고
+        #     v[:, 0] 을 했다가 "too many indices for array" 로 매 스텝 터졌다.
+        #     반환값은 이미 (N, k) 다 — 인덱싱하지 말 것.
+        lin = hasattr(rp, "get_linear_velocities") and hasattr(rp, "set_linear_velocities")
+
         def setter(_):                                    # noqa: E306
-            import numpy as np
-            v = rp.get_velocities()[0] if rp.get_velocities() is not None else None
-            if v is None:
-                return
-            v[:, 0] = BELT_MPS
-            rp.set_velocities(v)
-        drive_report.append("push: isaacsim.core.prims.RigidPrim")
+            try:
+                v = rp.get_linear_velocities() if lin else rp.get_velocities()
+                if v is None:
+                    return
+                v = np.asarray(v)
+                if v.ndim == 1:                           # 박스가 하나뿐인 경우
+                    v = v.reshape(1, -1)
+                if not state["logged"]:
+                    state["logged"] = True
+                    print(f"[INFO] push: velocity array shape {v.shape} "
+                          f"({'linear' if lin else 'lin+ang'})")
+                v[:, 0] = BELT_MPS                        # x 만 고정, 나머지는 물리에 맡긴다
+                (rp.set_linear_velocities if lin else rp.set_velocities)(v)
+            except Exception as e:                        # noqa: BLE001
+                state["errors"] += 1
+                if state["errors"] <= 3:                  # 매 스텝 도배하지 않는다
+                    print(f"[ERROR] push setter: {type(e).__name__}: {e}")
+
+        drive_report.append(
+            f"push: RigidPrim ({'set_linear_velocities' if lin else 'set_velocities'})")
     except Exception as e1:                               # noqa: BLE001
-        drive_report.append(f"push: RigidPrim unavailable ({type(e1).__name__})")
+        drive_report.append(f"push: RigidPrim unavailable ({type(e1).__name__}: {e1})")
 
         def setter(_):                                    # noqa: E306
             grp = stage.GetPrimAtPath(BOXES_GROUP)
