@@ -24,6 +24,7 @@ setup(
             'live_view = packing_algo.live_view:main',
             'robustness = packing_algo.robustness:main',
             'report = packing_algo.report:main',
+            'ceiling = packing_algo.ceiling:main',
         ],
     },
 )
