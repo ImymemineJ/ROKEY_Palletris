@@ -59,7 +59,6 @@ python3 scripts/verify_reach.py            # G1 도달범위 11점 (책상). --p
 python3 scripts/check_place_plan.py        # 알고리즘 배치 계획 프리플라이트
 python3 scripts/verify_spheres.py          # 충돌 구체가 메시를 덮는지
 python3 scripts/gen_collision_spheres.py --update   # descriptor 의 구체 재생성
-python3 scripts/read_log.py                # Isaac Script Editor 출력을 터미널에서
 ```
 
 **구체 좌표를 손으로 고치지 않는다.** 스크립트를 고치고 다시 돌린다.

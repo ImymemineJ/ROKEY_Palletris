@@ -24,8 +24,6 @@
 | `verify_belt_speed.py` | 김학민 | **벨트 이송속도 게이트.** `isaac-sim.sh --no-window --exec` **전용** — `IsaacConveyor` 가 렌더 틱에 물려 있어 `python.sh` 로는 값이 틀린다. main·b_pickup 을 따로 잰다 (scale.x 가 3 배 달라 한쪽만 맞을 수 있다) |
 | `verify_b4_test1_1.py` | 김학민 | **B4 를 실제 씬 `test1-1.usd` 에서.** `verify_b4_cycle` 은 합성 씬이고 이건 진짜 라인이다 — 박스가 벨트를 타고 와 스토퍼에 서고, A 의 `sim_server`/`spawner`/`conveyor_ctl` 과 B 의 `robot_motion` 이 같은 소켓에 붙는다 |
 | `demo_stack15_test1_1.py` | 김학민 | **15박스 연속 — 실제 라인.** `demo_stack15`(B5)를 컨베이어 위로 옮긴 것. 급송이 없고 도착 순서 그대로 집으므로 온라인 패커를 쓴다. 스폰은 사양 스케줄(`boxes.stage1` 12 s x 15). `PL_N` 으로 개수 축소 |
-| `script_editor_lula.py` | 김병직 | **Isaac Sim GUI 의 Script Editor 에 붙여넣는 스니펫.** `POINT` 만 바꿔 11점 중 하나로 팔을 보낸다 |
-| `read_log.py` | 김병직 | Isaac Script Editor 출력을 터미널에서 읽는다 |
 | `gen_master_db.py` | 민범진 | D1 — **직접 추가할 것** |
 
 게이팅 검증 스크립트(G1~G7)는 전부 여기에 커밋한다. (작업명세서 §11)
