@@ -19,11 +19,11 @@ boxes:
   stage1: {spawn_interval_s: 12.0, total_count: 15, zone: "B",
            zone_bias: {A: 0.0, B: 1.0, C: 0.0}}
   # ★ stage 2 는 박스 수를 직접 적지 않는다. **배송지 구조**에서 나온다:
-  #     구역 3 x 아파트 5 x 세대 7 = 105 개
+  #     구역 3 x 아파트 5 x 세대 10 = 150 개  (BOX001 ~ BOX150)
   #   아파트 목록은 packing_db/delivery_points.py 다 (구역당 5 곳).
   #   아파트를 5 곳으로 맞춘 이유는 그 파일 주석 참조 — 배송 순서 후보가
   #   5! = 120 가지라 전부 도로거리로 재 볼 수 있다.
-  stage2: {spawn_interval_s: 4.0, households_per_apt: 7}
+  stage2: {spawn_interval_s: 4.0, households_per_apt: 10}
 
 run_profile: "packing"         # "packing" | "coordination"
 profiles:

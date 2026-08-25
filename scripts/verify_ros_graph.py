@@ -44,8 +44,8 @@ from tf2_ros import StaticTransformBroadcaster
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                 "..", "src", "packing_common"))
 from packing_common.config import load                                  # noqa: E402
-from packing_vision.label import (BOX_ID_FMT, LABEL_MM,                 # noqa: E402
-                                  make_payload, render_qr)
+from packing_common.ids import box_id as make_box_id                    # noqa: E402
+from packing_vision.label import LABEL_MM, make_payload, render_qr      # noqa: E402
 from packing_msgs.msg import RobotCmd, RobotEvent                       # noqa: E402
 from packing_msgs.srv import (DespawnBox, SetSpawnEnabled, SetVelocity,  # noqa: E402
                               SwapPallet)
@@ -306,7 +306,7 @@ def main():
         y = float(rng.uniform(-0.10, 0.10))
         # ★ box_id 는 boxes_master 와 같은 규칙이어야 한다 — QR 이 정본이므로
         #   여기서 다른 규칙을 쓰면 DB 와 씬이 서로 다른 박스를 말하게 된다.
-        box_id = BOX_ID_FMT % i
+        box_id = make_box_id(i)
         z = str(zone_of.get(box_id, ZONES[0])).lower()
         if z not in ZONES:
             sys.exit(f"{box_id} 의 구역 {z!r} 이 담당 구역 {ZONES} 에 없다")

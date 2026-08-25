@@ -32,9 +32,9 @@ def call(t, name, req):
     rclpy.spin_until_future_complete(n, f, timeout_sec=10.0)   # 테스트 클라이언트라 허용
     return f.result()
 
-BOX = "BOX00000"
+BOX = "BOX001"
 # ★ QR 페이로드는 운송장번호 하나뿐이다 (packing_vision/label.py 규약).
-QR = "BOX00000"
+QR = "BOX001"
 
 print("① register_box — 4호(410x310x280) 등록")
 # ★ dest 를 비워 보낸다. 인식 노드가 실제로 그렇게 보낸다 — QR 에 구역 글자가
@@ -64,7 +64,7 @@ r = call(VerifyBox, "/db/verify_box", VerifyBox.Request(box_id=BOX, qr_payload=Q
 chk("match", r.match, f"registered_id={r.registered_id}")
 
 print("④ verify_box — 남의 QR 이면 mismatch")
-r = call(VerifyBox, "/db/verify_box", VerifyBox.Request(box_id="BOX00001", qr_payload=QR))
+r = call(VerifyBox, "/db/verify_box", VerifyBox.Request(box_id="BOX002", qr_payload=QR))
 chk("match=False", not r.match, f"registered_id={r.registered_id}")
 
 print("⑤ diverter — 등록된 박스는 B 로")
@@ -72,7 +72,7 @@ r = call(DiverterRequest, "/diverter/request", DiverterRequest.Request(box_id=BO
 chk("target=B", r.target == "B", f"reason={r.reason}")
 
 print("⑥ diverter — 미등록 박스는 RETURN + retry 증가")
-r = call(DiverterRequest, "/diverter/request", DiverterRequest.Request(box_id="BOX00009"))
+r = call(DiverterRequest, "/diverter/request", DiverterRequest.Request(box_id="BOX010"))
 chk("target=RETURN", r.target == "RETURN", f"reason={r.reason}")
 
 print("⑦ set_status — PICKED")
@@ -98,7 +98,7 @@ chk("count=0 placed=1", r.count == 0 and r.placed_count == 1, f"count={r.count} 
 
 print("⑫ mark_placed — 미등록 박스는 거부")
 r = call(MarkPlaced, "/db/mark_placed", MarkPlaced.Request(
-    box_id="BOX00014", zone="B", actual_pose=PlacePose()))
+    box_id="BOX015", zone="B", actual_pose=PlacePose()))
 chk("ok=False", not r.ok)
 
 n.destroy_node(); rclpy.shutdown()

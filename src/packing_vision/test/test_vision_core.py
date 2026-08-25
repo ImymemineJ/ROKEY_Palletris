@@ -184,8 +184,8 @@ def render_with_label(box_type, center_xy, yaw_deg, K, R, t, payload,
 
 def test_payload_is_waybill_only():
     """★ QR 에 구역 글자를 넣지 않는다 — 구역은 주소로 정한다 (설계결정서 §5-3)."""
-    assert make_payload("BOX00007") == "BOX00007"
-    assert parse_payload("BOX00007") == "BOX00007"
+    assert make_payload("BOX007") == "BOX007"
+    assert parse_payload("BOX007") == "BOX007"
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "BOX 1", None])
@@ -196,12 +196,12 @@ def test_payload_rejects_garbage(bad):
 
 def test_payload_rejects_old_format():
     """옛 규약 라벨이 씬에 남아 있으면 조용히 통과시키지 않고 잡아낸다."""
-    assert parse_payload("B|BOX00007") is None
+    assert parse_payload("B|BOX007") is None
 
 
 def test_payload_stays_25_modules():
     """글자가 늘면 29 모듈로 커지고 같은 크기에서 해독 여유가 14% 깎인다."""
-    assert modules_for(make_payload("BOX00014")) == MODULES == 25
+    assert modules_for(make_payload("BOX014")) == MODULES == 25
 
 
 def test_label_fits_every_box_top():
@@ -229,9 +229,9 @@ def test_qr_decodes_from_projected_image(btype, center, yaw):
     """★ 지금까지 read_qr 은 테스트가 한 건도 없었다. 여기가 첫 검증이다."""
     K = make_K()
     t = np.array([9.9, 0.0, CFG["recognition"]["pick_cam"]["z_mm"] / 1000.0])
-    payload = make_payload("BOX00007")
+    payload = make_payload("BOX007")
     img = render_with_label(btype, center, yaw, K, R_DOWN, t, payload)
-    assert parse_payload(read_qr(img)) == "BOX00007"
+    assert parse_payload(read_qr(img)) == "BOX007"
 
 
 @pytest.mark.parametrize("btype,center,yaw", CASES)
@@ -245,7 +245,7 @@ def test_label_does_not_break_box_detection(btype, center, yaw):
     t = np.array([9.9, 0.0, CFG["recognition"]["pick_cam"]["z_mm"] / 1000.0])
     plain = find_box(render(btype, center, yaw, K, R_DOWN, t))
     with_lab = find_box(render_with_label(btype, center, yaw, K, R_DOWN, t,
-                                          make_payload("BOX00007")))
+                                          make_payload("BOX007")))
     assert plain is not None and with_lab is not None
     a, b = sorted(plain["size_px"]), sorted(with_lab["size_px"])
     assert max(abs(x - y) for x, y in zip(a, b)) <= 2.0, "라벨이 치수를 바꿨다"

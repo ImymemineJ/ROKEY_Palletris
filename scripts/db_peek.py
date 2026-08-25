@@ -3,7 +3,7 @@
 
     python3 scripts/db_peek.py              # 요약 + 박스 목록
     python3 scripts/db_peek.py --events     # 상태 전이 이력까지
-    python3 scripts/db_peek.py --box BOX00003
+    python3 scripts/db_peek.py --box BOX003
     python3 scripts/db_peek.py --csv out.csv
 
 이 스크립트는 **읽기 전용**이다. 그런데도 db_service_node 와 같이 떠 있어도

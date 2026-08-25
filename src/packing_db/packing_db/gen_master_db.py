@@ -15,6 +15,7 @@ import random
 import sqlite3
 
 from packing_common.config import load
+from packing_common.ids import box_id as make_box_id
 from packing_db.delivery_points import APARTMENTS, address_of
 
 # ★ 파일명은 palletris.db 다 (CLAUDE.md §10). 트랙 D 가이드에는 packing.db 로
@@ -112,7 +113,7 @@ def build(cfg, db_path, schema_path):
         else:
             _z, d, nm = plan[i]
             addr, (la, lo) = address_of(d, nm), coord[(d, nm)]
-        rows.append(("BOX%05d" % i, addr, i, zones[i], la, lo))
+        rows.append((make_box_id(i), addr, i, zones[i], la, lo))
     conn.executemany(
         "INSERT INTO boxes_master(box_id, address, delivery_seq, zone, lat, lon) "
         "VALUES(?,?,?,?,?,?)", rows)

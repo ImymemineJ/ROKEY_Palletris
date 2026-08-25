@@ -27,7 +27,10 @@ import pathlib
 import sqlite3
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src" / "packing_vision"))
+_ROOT = pathlib.Path(__file__).resolve().parents[1] / "src"
+# ★ packing_common 도 넣는다 — label.py 가 운송장번호 규칙을 거기서 가져온다.
+for _p in ("packing_vision", "packing_common"):
+    sys.path.insert(0, str(_ROOT / _p))
 
 import cv2  # noqa: E402
 

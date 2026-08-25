@@ -8,9 +8,9 @@ QR 을 **만드는 쪽**(씬에 붙일 PNG 생성)과 **읽는 쪽**(인식 노�
 
 ## 페이로드 규약 — **운송장번호 하나뿐이다**
 
-    "<운송장번호>"      예: "BOX00000"
+    "<운송장번호>"      예: "BOX001"
 
-- `boxes_master.box_id` 와 **같은 값**이다 (`BOX%05d`)
+- `boxes_master.box_id` 와 **같은 값**이다 (`BOX%03d`, BOX001 부터)
 - **구역(A/B/C)은 QR 에 넣지 않는다.** 실제 송장 바코드가 그렇다 — 번호만 있고,
   주소는 사람이 읽는 글자로 인쇄돼 있다. 분류기는 번호로 주소를 조회한다.
   우리도 같다: `db_service_node._zone_by_address` 가
@@ -22,7 +22,7 @@ QR 을 **만드는 쪽**(씬에 붙일 PNG 생성)과 **읽는 쪽**(인식 노�
 ## ★ 운송장번호를 QR 에 넣는 이유 — 번호 밀림을 막는다
 
 QR 이 없으면 인식 노드가 박스를 **세어서** id 를 만들 수밖에 없다
-(`BOX%05d % n`). 그러면 cam1 이 한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀려
+(`BOX%03d % n`). 그러면 cam1 이 한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀려
 DB 의 다른 박스 기록을 덮어쓴다. 에러 없이 전부 틀리는 쪽이다.
 `recognition.cam1_box_miss_rate` 가 0 이 아닌 이상 이건 가정이 아니라 예정된 일이다.
 
@@ -49,9 +49,15 @@ except ImportError:                    # 문서 생성 등 cv2 없는 환경 방
     cv2 = None
 
 DESTS = ("A", "B", "C")                # 구역. QR 에는 안 들어간다 (위 규약 참조)
-BOX_ID_FMT = "BOX%05d"                 # ★ gen_master_db 와 같은 규칙
+# ★ 운송장번호 규칙은 packing_common.ids 가 정본이다 — 복사하지 않는다.
+#   DB 를 만드는 쪽 · QR 을 굽는 쪽 · 읽는 쪽 셋이 같아야 한다 (그 파일 주석 참조).
+from packing_common.ids import FMT as BOX_ID_FMT   # noqa: E402  "BOX%03d"
+from packing_common.ids import START as BOX_ID_START
+from packing_common.ids import box_id  # noqa: F401  — 재수출
 
-MODULES = 25                           # "BOX00000" 8 글자 -> version 2 (25x25)
+MODULES = 25                           # "BOX001" 6 글자 -> version 2 (25x25)
+#   ★ 8 글자("BOX00000")에서 6 글자로 줄여도 모듈 수는 25 그대로다 —
+#     cv2 인코더가 21 모듈(version 1)로 내려가지 않는다. 라벨 크기도 그대로다.
 
 # ── 크기는 system.yaml 이 정본이다 (CLAUDE.md §4 "코드에 숫자를 박지 않는다") ──
 # ★ 못 읽어도 죽지 않는다. 이 모듈은 Isaac 내장 파이썬에서도 import 될 수 있고,
@@ -77,7 +83,7 @@ MIN_MODULE_PX = 6.0                    # 이보다 작으면 비스듬한 자세
 
 
 def make_payload(box_id):
-    """"BOX00000" -> "BOX00000". 규약이 바뀌면 여기 한 곳만 고친다."""
+    """"BOX001" -> "BOX001". 규약이 바뀌면 packing_common.ids 한 곳만 고친다."""
     box_id = str(box_id).strip()
     if not box_id or any(c.isspace() for c in box_id):
         raise ValueError(f"운송장번호가 비었거나 공백이 들어 있다: {box_id!r}")
