@@ -217,7 +217,18 @@ class Cycle:
         #   에서 온 같은 자리 사이클은 멀쩡했다. 밀린 박스를 그대로 잡아 그대로 놓으므로
         #   배치 오차가 곧 그 30 mm 가 된다 (results/issues/21).
         #   -> 배치 구간과 같은 규약으로 **먼저 수직 상승**한 뒤 가로로 온다.
-        pick_air = pick_top + self.approach_m
+        # ★★ 픽 상공만 보면 안 된다 — **이미 쌓인 것의 최상단**도 넘어야 한다.
+        #   배치 구간(아래 `transit`)은 `stack_top` 을 넣는데 **여기만 pick_top** 이었다.
+        #   그래서 갈 때와 올 때의 고도가 달랐다.
+        #   2026-08-25 실측 (`results/ov5_s99.txt`, 김병직 육안 확인):
+        #     사이클 18  갈 때 z 1.58  (스택 기준)
+        #     사이클 19  올 때 z 1.28  (픽 기준)   <- 300 mm 낮다
+        #     그때 스택 최상단 1.172 — 흡착면은 108 mm 뜨지만 **팔 링크가 그 높이에서
+        #     훨씬 노출된다.** 궤적 스윕이 매번 link_2 를 지목한 것이 이 구간이다.
+        #   결과: 18번이 밀려 배치 오차 +7.5/+10.5 mm (update_heightmap 거부), 19번까지
+        #   흐트러졌다.
+        #   `_stack_top_m` 은 **실측 상면**으로 누적된다 (아래 참조) — 이미 있는 값이다.
+        pick_air = max(pick_top, self._stack_top_m) + self.approach_m
         cur = self._face_now()
         if cur is not None and cur[2] < pick_air - 1e-3:
             self._move([cur[0], cur[1], pick_air], pick_yaw, TRANSIT_TOL_MM)
