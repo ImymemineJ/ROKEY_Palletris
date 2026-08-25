@@ -824,6 +824,10 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--diag-release", action="store_true",
+                    help="`release` 를 부른 뒤 박스가 **언제 멈추는지** 100ms 구간으로 잰다. "
+                         "RELEASE_MIN_HOLD_S · release_damping_duration_s · settle_wait_s "
+                         "세 개(각 0.5s)가 다 필요한지 여기서만 갈린다")
     ap.add_argument("--poll-ms", type=float, default=None, metavar="MS",
                     help="`cycle.MOTION_POLL_S` 를 덮어쓴다 (기본 20ms). 헤드리스는 시뮬이 "
                          "실시간의 7배로 돌아 20ms 벽시계가 **138ms 시뮬**이 된다 — "
@@ -1151,6 +1155,21 @@ def main():
                 return _h_move(req)
 
             handlers["move_ee"] = h_move_diag
+        # ── 놓고 나서 박스가 언제 멈추나 (--diag-release) ──
+        # ★ `release` 는 세 단계(정지대기 -> damping 스파이크 -> 정착)로 1.5 s 를 쓴다.
+        #   화면에서는 팔이 완전히 멈춰 있어 제일 눈에 띄는 구간이다. 박스가 실제로
+        #   언제 멈추는지 100ms 구간으로 재야 어느 단계가 값을 하는지 갈린다.
+        rel = {"n0": None, "p0": None, "bins": []}
+        if a.diag_release:
+            _h_rel = handlers["release"]
+
+            def h_rel(req=None):
+                rel["n0"], rel["bins"] = _nt[0], []
+                rel["p0"] = np.asarray(cur["rp"].get_world_pose()[0], dtype=float)
+                return _h_rel(req)
+
+            handlers["release"] = h_rel
+
         # ── 사이클 시간이 어디로 가나 (--diag-time) ────────
         # ★ `n` 합계(실제 이동)는 한 사이클 19.5초 중 4.8초뿐이다. 나머지 15초가
         #   어디로 가는지 로그로는 안 보인다. 소켓 명령마다 **그 명령이 걸려 있는
@@ -1274,6 +1293,12 @@ def main():
                 lag = step_dt - (time.time() - t_step)
                 if lag > 0:
                     time.sleep(lag)
+            if a.diag_release and rel["n0"] is not None:
+                k = int((_nt[0] - rel["n0"]) / (0.1 * S.hz))    # 100ms 구간 번호
+                if k >= len(rel["bins"]) and k < 25:            # 2.5 초까지만
+                    now = np.asarray(cur["rp"].get_world_pose()[0], dtype=float)
+                    rel["bins"].append(float(np.linalg.norm(now - rel["p0"]) * 1000.0))
+                    rel["p0"] = now
             if a.diag_knock and kw["hit"] is None:
                 # ★ **이미 놓인** 박스만 본다 (rest). 매달린 박스는 --diag-tcp 몫이다.
                 #   첫 1 mm 에서 멈춘다 — 다 밀린 뒤의 자세는 범인을 안 가리킨다.
@@ -1411,6 +1436,13 @@ def main():
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
             print("       %s  오차 [%+.1f %+.1f %+.1f] mm  %.1f s 시뮬  knock %.1f mm (%s)"
                   % (res, err[0], err[1], err[2], steps0 / S.hz, knock, who))
+            if a.diag_release and rel["bins"]:
+                print("       ⏸ release 이후 박스 이동 (100ms 구간, mm)")
+                print("          " + "  ".join("%5.2f" % v for v in rel["bins"][:15]))
+                print("          %s"
+                      % "  ".join("%5s" % ("%.1fs" % ((i + 1) * 0.1))
+                                  for i in range(min(15, len(rel["bins"])))))
+                rel["n0"] = None
             if a.diag_time:
                 # 마지막 명령 이후 남은 스텝까지 닫는다
                 tm["acc"][tm["cur"]] = tm["acc"].get(tm["cur"], 0) + (_nt[0] - tm["at"])
