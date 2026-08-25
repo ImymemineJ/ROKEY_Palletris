@@ -23,13 +23,15 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ZoneStatus.msg"
   "msg/MetricsSummary.msg"
 
-  # ── /db/* 6 + /diverter/* 1 = 7 ──
+  # ── /db/* 7 + /diverter/* 1 = 8 ──
   "srv/RegisterBox.srv"
   "srv/GetBoxInfo.srv"
   "srv/VerifyBox.srv"
   "srv/SetStatus.srv"
   "srv/MarkPlaced.srv"
   "srv/ZoneQueue.srv"
+  # ★ 2026-08-25 추가 — 인식률의 분모를 바로잡기 위한 것이다 (파일 주석 참조).
+  "srv/ReportMiss.srv"
   "srv/DiverterRequest.srv"
 
   # ── /algo/* 4 ──

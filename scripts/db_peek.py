@@ -80,11 +80,19 @@ def main():
     cyc = q("SELECT AVG(placed_at - picked_at) FROM boxes_sorted "
             "WHERE status='PLACED' AND picked_at IS NOT NULL").fetchone()[0]
 
+    # ★ 인식률의 분모는 **라인에 올라온 박스 수**다 (2026-08-25 정정).
+    #   정답지 풀을 분모로 쓰면 풀을 넉넉히 깔수록 인식률이 낮게 나온다 — 거꾸로다.
+    #   실측: 풀 105 개에 15 개만 흘렸더니 14 % 로 찍혔다 (실제로는 100 %).
+    miss1 = q("SELECT COUNT(*) FROM scan_misses WHERE where_at='cam1'").fetchone()[0]
+    arrived = seen + miss1
+
     print("── 요약 ──")
-    print(f"  정답지(boxes_master)   {total} 개")
-    # ★ 분모가 master 인 이유: 등록된 것만 세면 인식률이 언제나 100 % 다 (명세서 §8.6)
-    print(f"  인식된 박스            {seen} / {total}"
-          f"{f'  ({seen/total*100:.0f} %)' if total else ''}")
+    print(f"  정답지 풀(boxes_master) {total} 개   ← 미리 깔아 둔 운송장·주소")
+    print(f"  라인에 올라옴          {arrived} 개")
+    print(f"  인식 성공              {seen} / {arrived}"
+          f"{f'  ({seen/arrived*100:.0f} %)' if arrived else ''}")
+    if miss1:
+        print(f"  인식 실패 (cam1)       {miss1} 개")
     print(f"  적재 완료              {placed}")
     print(f"  집기 실패              {failed}")
     print(f"  폐기                   {rejected}")

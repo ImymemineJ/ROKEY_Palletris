@@ -52,10 +52,11 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from packing_common.config import find_config, load
+from packing_db.gen_master_db import dong_of
 from packing_db.metrics import collect, fmt_rate
 from packing_msgs.msg import BoxInfo, MetricsSummary, ZoneStatus
 from packing_msgs.srv import (DiverterRequest, GetBoxInfo, MarkPlaced, RegisterBox,
-                              SetStatus, VerifyBox, ZoneQueue)
+                              ReportMiss, SetStatus, VerifyBox, ZoneQueue)
 
 # CLAUDE.md §3-1 BoxInfo.status 가 정의한 8 개. 이 밖의 값은 받지 않는다.
 VALID_STATUS = {"SPAWNED", "SCANNED", "VERIFIED", "DIVERTED",
@@ -112,6 +113,7 @@ class DbService(Node):
                 (SetStatus,   "/db/set_status",   self.on_set_status),
                 (MarkPlaced,  "/db/mark_placed",  self.on_mark_placed),
                 (ZoneQueue,   "/db/zone_queue",   self.on_zone_queue),
+                (ReportMiss,  "/db/report_miss", self.on_report_miss),
                 (DiverterRequest, "/diverter/request", self.on_diverter)):
             self.create_service(srv_type, name, fn, callback_group=cb)
 
@@ -185,6 +187,29 @@ class DbService(Node):
                               (box_id,)).fetchone()
         return row[0] if row else None
 
+    def _zone_by_address(self, box_id):
+        """운송장번호 -> 주소 -> 동 -> 담당 구역. 실제 택배 분류와 같은 순서다.
+
+        ★ 구역 배정은 **배송지 기준**이다 (설계결정서 §5-3 확정).
+          QR 에는 운송장번호만 있고 구역 글자는 없다 — 실제 송장 바코드가 그렇다.
+          그래서 주소를 조회해 동을 뽑고, zone_map 이 담당 구역을 정한다.
+
+        ★ 표에 없는 동이면 None 이다. 아무 구역에나 넣지 않는다 —
+          모르는 주소를 넣으면 그 박스는 영영 잘못 배송된다. 중재자가 RETURN 시킨다.
+
+        반환: (zone|None, address|None, dong|None) — 로그에 셋 다 필요하다
+        """
+        row = self.db.execute("SELECT address FROM boxes_master WHERE box_id=?",
+                              (box_id,)).fetchone()
+        if not row:
+            return None, None, None
+        addr = row[0]
+        dong = dong_of(addr)
+        if dong is None:
+            return None, addr, None
+        z = self.db.execute("SELECT zone FROM zone_map WHERE dong=?", (dong,)).fetchone()
+        return (z[0] if z else None), addr, dong
+
     def _retry_count(self, box_id):
         row = self.db.execute("SELECT retry_count FROM recirculation WHERE box_id=?",
                               (box_id,)).fetchone()
@@ -214,6 +239,23 @@ class DbService(Node):
         self._zone_cache[z] = (float(msg.fill_rate), int(msg.max_height_mm))
 
     # ══════════════════════════════════════════════════════════════
+    # /db/report_miss  — 인식 실패. **인식률의 분모**가 여기서 나온다
+    # ══════════════════════════════════════════════════════════════
+    def on_report_miss(self, req, res):
+        at = (req.where_at or "").strip() or "unknown"
+        with self._w:
+            self.db.execute(
+                "INSERT INTO scan_misses(where_at, reason, ts) VALUES(?,?,?)",
+                (at, (req.reason or "").strip(), self._now()))
+            self.db.commit()
+        n = self.db.execute("SELECT COUNT(*) FROM scan_misses WHERE where_at=?",
+                            (at,)).fetchone()[0]
+        res.ok, res.miss_count = True, int(n)
+        # ★ 경고로 남긴다. 이게 늘어나는데 조용하면 인식이 망가진 줄 모른다.
+        self.get_logger().warn(f"인식 실패 [{at}] {req.reason} — 누계 {n}")
+        return res
+
+    # ══════════════════════════════════════════════════════════════
     # /db/register_box  — cam1 판독 결과. 여기서 boxes_sorted 행이 처음 생긴다
     # ══════════════════════════════════════════════════════════════
     def on_register(self, req, res):
@@ -238,19 +280,30 @@ class DbService(Node):
             self.get_logger().warn(f"{box_id} 치수 {size} 가 사양 3종에 없다 — weight_g=0")
             mass = 0
 
-        master_zone = self._master_zone(box_id)
-        if master_zone is None:
-            # master 에 없는 id. 스포너와 id 규칙이 어긋난 것이다 (BOX%05d).
+        if self._master_zone(box_id) is None:
+            # master 에 없는 id. 스포너와 운송장번호 규칙이 어긋난 것이다.
             res.ok, res.message = False, f"master 에 없는 박스: {box_id}"
             self.get_logger().error(res.message)
             return res
 
-        dest = (req.dest or "").strip().upper()
-        zone = dest if dest in ("A", "B", "C") else master_zone
-        if dest and dest != master_zone:
-            # 인식이 틀렸다. 죽이지 않고 기록만 한다 — 이 값이 곧 오분류율 지표다.
+        # ★ 구역은 여기서 정해진다 — 주소의 동으로. cam1 이 보내온 req.dest 는
+        #   쓰지 않는다. QR 에 구역 글자가 없기 때문이다 (설계결정서 §5-3).
+        zone, addr, dong = self._zone_by_address(box_id)
+        if zone is None:
+            # 담당 구역이 없는 주소. 행은 만들되 zone 을 비워 둔다 —
+            # 중재자가 zone 없는 박스를 RETURN 으로 돌린다.
             self.get_logger().warn(
-                f"{box_id} dest 불일치: 읽은 값 {dest} · master {master_zone}")
+                f"{box_id} 담당 구역 없음: 주소 {addr!r} · 동 {dong!r} "
+                "— zone_map 에 없는 동이다")
+        else:
+            self.get_logger().info(
+                f"{box_id} 주소 {addr!r} -> 동 {dong} -> 구역 {zone}")
+
+        # req.dest 가 비어 있지 않으면 인식이 구역을 추측한 것이다. 기록만 한다.
+        dest = (req.dest or "").strip().upper()
+        if dest and dest != zone:
+            self.get_logger().warn(
+                f"{box_id} 인식이 보낸 dest {dest} 가 주소 기준 구역 {zone} 과 다르다")
 
         with self._w:
             self.db.execute(
@@ -267,7 +320,8 @@ class DbService(Node):
             self.db.commit()
         self._set_status(box_id, "SCANNED")
 
-        res.ok, res.message = True, f"zone={zone}"
+        res.ok, res.message = True, (f"zone={zone} (동 {dong})" if zone
+                                     else f"zone=없음 (동 {dong})")
         self.get_logger().debug(
             f"register_box {box_id} → {zone} ({(time.perf_counter()-t0)*1e3:.1f} ms)")
         return res

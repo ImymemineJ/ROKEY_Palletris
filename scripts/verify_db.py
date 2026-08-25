@@ -33,20 +33,31 @@ def call(t, name, req):
     return f.result()
 
 BOX = "BOX00000"
-QR = "PALLETRIS|B|BOX00000"
+# ★ QR 페이로드는 운송장번호 하나뿐이다 (packing_vision/label.py 규약).
+QR = "BOX00000"
 
 print("① register_box — 4호(410x310x280) 등록")
+# ★ dest 를 비워 보낸다. 인식 노드가 실제로 그렇게 보낸다 — QR 에 구역 글자가
+#   없으므로, 구역은 DB 가 주소(boxes_master.address)의 동으로 정해야 한다.
 r = call(RegisterBox, "/db/register_box", RegisterBox.Request(
     box_id=BOX, size_w_mm=410, size_d_mm=310, size_h_mm=280,
-    color="red", dest="B", qr_payload=QR))
+    color="red", dest="", qr_payload=QR))
 chk("ok", r.ok, r.message)
+
+print("①-2 구역이 배송지에서 정해졌나 (설계결정서 §5-3 · 미결 #9)")
+chk("응답이 구역과 동을 함께 알려 준다",
+    r.message.startswith("zone=") and "동 " in r.message, r.message)
 
 print("② get_box_info — weight_g 가 치수에서 채워졌나")
 r = call(GetBoxInfo, "/db/get_box_info", GetBoxInfo.Request(box_id=BOX))
 chk("found", r.found)
 chk("weight_g=5000 (4호)", r.info.weight_g == 5000, str(r.info.weight_g))
 chk("status=SCANNED", r.info.status == "SCANNED", r.info.status)
-chk("color/dest/qr 보존", (r.info.color, r.info.dest, r.info.qr_payload) == ("red", "B", QR))
+chk("color/qr 보존", (r.info.color, r.info.qr_payload) == ("red", QR),
+    f"color={r.info.color!r} qr={r.info.qr_payload!r}")
+# ★ dest 는 "인식이 보내온 값" 칸이다. 인식이 구역을 모르므로 비어 있는 것이 맞다.
+#   실제 배정 구역은 boxes_sorted.zone 이고 ⑤ 에서 확인한다.
+chk("dest 는 비어 있다 (구역은 주소가 정한다)", r.info.dest == "", repr(r.info.dest))
 
 print("③ verify_box — 같은 QR 이면 match")
 r = call(VerifyBox, "/db/verify_box", VerifyBox.Request(box_id=BOX, qr_payload=QR))
