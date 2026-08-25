@@ -173,3 +173,84 @@ def test_capacity_rate_is_monotonic():
     #   실제 높이로 바꿔 놓았나" 를 잡는 것이지 적재 성능 판정이 아니다 (위 monotonic
     #   단언이 본체다). 성능은 데스크 지표가 아니라 궤적 스윕으로 봐야 한다.
     assert prev > 0.35, f"30개 넣고 용량 기준 {prev * 100:.1f}% — 너무 낮다"
+
+
+def test_update_is_idempotent():
+    """★ 서비스 재시도로 같은 박스가 두 번 와도 값이 새면 안 된다 (CLAUDE.md §3-4).
+
+    타임아웃 2.0초 · 재시도 1회가 규약이므로 이 상황은 **정상 동작 중에 생긴다.**
+    멱등이 아니면 적재 개수·적재율이 부풀려지고, 두 번째 호출에서는 계획이 이미
+    회수돼 있어 yaw 검사까지 건너뛴다.
+    """
+    pk = HeightmapPacker(CFG)
+    ok, pose, _, _ = pk.plan("B001", 340, 250, 210)
+    assert ok
+
+    ok1, fill1, n1 = pk.update("B001", 340, 250, 210, dict(pose))
+    hm1 = pk.hm.copy()
+    ok2, fill2, n2 = pk.update("B001", 340, 250, 210, dict(pose))     # 재시도
+
+    assert (ok2, n2) == (ok1, n1), f"재시도로 {n1} → {n2} 개가 됐다"
+    assert fill2 == fill1, f"재시도로 적재율이 {fill1:.4f} → {fill2:.4f} 로 변했다"
+    assert np.array_equal(pk.hm, hm1), "재시도가 heightmap 을 바꿨다"
+
+    # 다른 박스는 정상적으로 들어가야 한다 (전부 막아버린 게 아님을 확인)
+    ok3, pose3, _, _ = pk.plan("B002", 340, 250, 210)
+    assert ok3
+    _, _, n3 = pk.update("B002", 340, 250, 210, dict(pose3))
+    assert n3 == n1 + 1, "멱등 처리가 다른 박스까지 막았다"
+
+
+def test_reset_clears_applied():
+    """★ 팔레트를 갈면(PALLET_FULL → SwapPallet) 같은 box_id 가 다시 들어갈 수 있어야 한다."""
+    pk = HeightmapPacker(CFG)
+    ok, pose, _, _ = pk.plan("B001", 340, 250, 210)
+    assert ok
+    pk.update("B001", 340, 250, 210, dict(pose))
+    pk.reset()
+
+    ok2, pose2, _, _ = pk.plan("B001", 340, 250, 210)
+    assert ok2
+    _, _, n = pk.update("B001", 340, 250, 210, dict(pose2))
+    assert n == 1, f"reset 후에도 '이미 반영됨' 으로 무시됐다 (적재 {n}개)"
+
+
+def test_bad_sizes_never_raise():
+    """★ 치수가 잘못돼도 **예외로 죽으면 안 된다** (§9 입력 검증 · §13 예외 처리).
+
+    rclpy 서비스 콜백에서 예외가 나면 응답이 안 나가고, 관제탑은 2초 뒤 재시도해
+    같은 예외를 또 만난다 — 박스 하나가 라인을 영구히 막는다.
+    실제로 0 이 올 수 있다: 인식 실패 또는 GetBoxInfo found=false 인데 기본값 0 전송.
+    (수정 전에는 scipy 가 RuntimeError: incorrect filter size 로 죽었다.)
+    """
+    pose = dict(x_mm=0, y_mm=0, z_mm=0, yaw_deg=0.0)
+    bad = [(0, 0, 0), (-340, -250, -210), (5, 5, 210), (340, 250, 0),
+           (float("nan"), 250, 210), (340, float("nan"), 210)]
+    for w, d, h in bad:
+        pk = HeightmapPacker(CFG)
+        ok, _, _, msg = pk.plan("BAD", w, d, h)          # 여기서 예외가 나면 실패
+        assert ok is False, f"{(w, d, h)} 가 통과됐다"
+        assert msg == "NO_FEASIBLE_POSE", f"{(w, d, h)} → {msg} (계약은 3가지뿐)"
+        assert pk.last_warning, f"{(w, d, h)} 에 이유가 안 남았다"
+        assert pk.update("BAD", w, d, h, pose)[0] is False
+        assert len(pk.placed) == 0, "잘못된 치수가 적재로 세어졌다"
+
+    # 정상 치수는 그대로 통과해야 한다 (검증이 과하지 않은지)
+    pk = HeightmapPacker(CFG)
+    assert pk.plan("OK1", 340, 250, 210)[0] is True
+
+
+def test_zone_lock_exists():
+    """★ 구역별 락이 있어야 한다 — 관제탑 1개가 A·B·C 를 겹쳐 굴린다 (§8).
+
+    노드를 띄우지 않고 클래스 소스만 본다 (rclpy init 없이 도는 단위 테스트).
+    """
+    import inspect
+
+    from packing_algo import algo_service_node as m
+    src = inspect.getsource(m.AlgoService)
+    assert "self.lock = {" in src, "구역별 락이 없다"
+    for cb in ("def on_plan", "def on_update"):
+        i = src.index(cb)
+        body = src[i:i + 1400]
+        assert "with self.lock[" in body, f"{cb} 이 락 없이 패커를 만진다"

@@ -2,263 +2,420 @@
 
 > 워크스페이스 루트(`~/palletris_ws/`)에 둔다.
 > Claude Code 가 매 세션 시작 시 자동으로 읽는 프로젝트 컨텍스트다.
+>
+> ★ **숫자의 정본은 `config/system.yaml` 이다.** 이 문서와 다르면 yaml 을 따르고,
+>   다른 부분을 발견하면 지어내지 말고 보고할 것.
 
 ---
 
 ## 0. 이 프로젝트가 뭔가
 
 창고 자동 팔레타이징 시뮬레이션. 컨베이어로 오는 박스를 로봇 팔이 집어
-3D bin-packing 알고리즘이 계산한 자리에 쌓는다. 로보틱스 캡스톤, 6일 일정.
+3D bin-packing 알고리즘이 계산한 자리에 쌓고, 팔레트째 트럭에 넣는다.
+로보틱스 캡스톤, 6일 일정.
 
 **우선순위: 완벽한 코드보다 "돌아가는 데모".**
 
 ---
 
-## 1. 환경 — 고정값. 지어내지 말 것
+## 1. 환경 — 고정값
 
 | 항목 | 값 |
 |---|---|
 | OS / 미들웨어 | Ubuntu 24.04 · ROS 2 **Jazzy** (Python 3.12) |
 | 시뮬레이터 | Isaac Sim **5.1** (내장 Python **3.11** — 버전이 다르다) |
-| 로봇 | 두산 **H2017** (도달거리 1700mm) + 페데스탈 **900mm** |
+| 로봇 | 두산 **H2017** (도달거리 1700mm) |
 | `ROS_DOMAIN_ID` | **115** (팀 전원 동일) |
 | 워크스페이스 | `~/palletris_ws` |
-| DB | SQLite `palletris.db` |
+| 실행 형태 | **다중 PC** ROS 2 통신 |
 
-### 좌표 · 치수 (Z-up, 컨베이어 진행 = +X)
+---
 
+## 2. ★★ 통신 구조 — 여기가 가장 크게 바뀌었다
+
+### 지금 구조: ROS 2 하나뿐
+
+```
+[Isaac Sim 안]                        [Isaac 밖 — rclpy 노드]
+Action Graph  ══ ROS 2 토픽/서비스 ══  관제탑 · 인식 · 알고리즘 · DB
+```
+
+Isaac 안팎을 잇는 통로는 **ROS 2 하나뿐이다.**
+Action Graph 의 C/rcl 백엔드가 Python 버전 차이(3.11 vs 3.12)를 우회하므로
+소켓이 필요 없다.
+
+### ❌ 폐기된 방식 — 절대 다시 도입하지 말 것
+
+| 폐기 | 대체 |
+|---|---|
+| **JSON 소켓 브리지 (localhost:8765)** | **Action Graph 가 직접 ROS 2 발행** |
+| `std_msgs/String` + JSON 문자열 | **`packing_msgs` 전용 타입** |
+| `ros_svc.py` 어댑터 | 노드가 직접 `create_client` |
+| `json.dumps()` / `json.loads()` 로 메시지 조립 | 필드에 직접 대입 |
+| 브리지 폴링 (`server.poll()`) | 구독 콜백 |
+
+**Claude Code 가 "Isaac 안에서 rclpy 를 못 쓰니 소켓이 필요하다"고 판단하면
+그건 틀린 것이다** — 필요한 건 **Action Graph 노드**이지 소켓이 아니다.
+
+> ⚠️ `src/packing_sim/isaac/sim_server.py` 가 아직 저장소에 남아 있다.
+> **김학민 소유 파일이므로 임의로 지우지 말 것.** 새 코드에서 import 하지도 말 것.
+
+> ⚠️ 옛 코드나 옛 대화 요약에 `localhost:8765`, `SimServer`, `handlers()`,
+> `std_msgs/String` 이 보이면 그건 **폐기된 버전**이다. 참고하지 말 것.
+
+---
+
+## 3. ★★ 인터페이스 전체 정의
+
+**토픽에 JSON 문자열을 쓰지 않는다.** 전부 `packing_msgs` 전용 타입이다.
+
+### 3-1. 공용 msg 2개
+
+```
+# msg/PlacePose.msg
+# ★ x_mm / y_mm 는 박스 "중심", z_mm 은 박스 "밑면"
+#   z 를 중심으로 쓰면 팔레트에 절반 파묻힌다.
+int32   x_mm
+int32   y_mm
+int32   z_mm
+float32 yaw_deg      # 0 또는 90
+```
+
+```
+# msg/BoxInfo.msg
+string  box_id
+int32   size_w_mm
+int32   size_d_mm
+int32   size_h_mm
+int32   weight_g
+string  color
+string  dest           # QR 목적지 "A"|"B"|"C"
+string  qr_payload
+int32   retry_count    # Return line 재순환 횟수
+string  status         # SPAWNED|SCANNED|VERIFIED|DIVERTED|PICKED|PLACED|PICK_FAILED|REJECTED
+```
+
+### 3-2. 토픽 4종
+
+| 토픽 | 타입 | 방향 |
+|---|---|---|
+| 카메라 영상 | `sensor_msgs/Image` | Action Graph → 인식 노드 |
+| `/tf` · `/tf_static` | Isaac `ROS2 Publish Transform Tree` | Action Graph → 전원 |
+| `/clock` | Isaac `ROS2 Publish Clock` | Action Graph → 전원 |
+| `/zone_*/box_at_pickup` | `packing_msgs/msg/BoxAtPickup` | 인식 → 관제탑 |
+| `/robot/cmd` | `packing_msgs/msg/RobotCmd` | 관제탑 → 로봇 |
+| `/robot/event` | `packing_msgs/msg/RobotEvent` | 로봇 → 관제탑 |
+| `/zone_*/status` | `packing_msgs/msg/ZoneStatus` | 관제탑 → 중재자·모니터링 |
+
+```
+# msg/BoxAtPickup.msg   — 인식 노드가 픽업 좌표까지 실어 보낸다
+string  box_id
+bool    present      # false = 박스 없음. 무시하고 사이클을 시작하지 말 것
+int32   x_mm         # 박스 중심 (pick_cam 실측)
+int32   y_mm
+float32 yaw_deg
+```
+
+```
+# msg/RobotCmd.msg   — 관제탑 → 로봇
+# 왜 서비스가 아니라 토픽인가: 모션이 5~10초 걸린다. 서비스로 묶으면
+# 그동안 응답을 붙들고 있어야 하고 타임아웃 관리가 복잡해진다.
+uint8 PICK  = 0
+uint8 PLACE = 1
+uint8 HOME  = 2
+uint8 STOP  = 3
+uint8   action
+
+string  box_id
+uint32  seq          # ★ 명령 일련번호. event 가 이 값을 되돌려줘야
+                     #   "지금 온 결과가 방금 그 명령의 것"임을 보장한다.
+
+int32   x_mm         # 박스 중심
+int32   y_mm
+int32   z_mm         # ★ 박스 밑면
+float32 yaw_deg
+
+int32   size_w_mm
+int32   size_d_mm
+int32   size_h_mm
+
+int32   approach_z_mm   # 수직 하강 가능 높이. 0 이면 로봇 재량
+```
+
+```
+# msg/RobotEvent.msg   — 로봇 → 관제탑
+uint32  seq          # RobotCmd.seq 를 그대로 복사
+uint8   action
+string  box_id
+
+bool    ok
+string  reason       # "GRASP_FAILED"|"IK_UNSOLVABLE"|"COLLISION"|
+                     # "DROPPED"|"TIMEOUT"|"ABORTED" / 성공이면 ""
+
+# ── 실측 결과 (PLACE 성공 시에만 유효) ──
+bool    has_actual
+int32   actual_x_mm
+int32   actual_y_mm
+int32   actual_z_mm      # 밑면 기준
+float32 actual_yaw_deg
+
+float32 duration_s
+```
+
+```
+# msg/ZoneStatus.msg   — 관제탑 → 중재자·모니터링. 2 Hz
+string  zone           # "a"|"b"|"c"
+string  state          # IDLE|FETCHING|PLANNING|PICKING|PLACING|UPDATING|DONE
+int32   queue_len
+int32   placed_count
+int32   rejected_count
+float32 fill_rate      # 분모는 max_stack 이 아니라 실제 최고높이
+int32   max_height_mm
+bool    accepting      # ★ false = 더 보내지 마라. 중재자는 이 칸만 본다
+builtin_interfaces/Time stamp
+```
+
+### 3-3. 서비스 15종 — 전부 `packing_msgs/srv`
+
+| 계열 | 이름 | 서버 | 요청 → 응답 |
+|---|---|---|---|
+| 알고리즘 | `PlanPlacement` | algo | `zone, box_id, w, d, h` → `ok, PlacePose, score, message` |
+| 알고리즘 | `UpdateHeightmap` | algo | `zone, box_id, w, d, h, actual_pose` → `ok, fill_rate, placed_count, max_height_mm` |
+| 알고리즘 | `CancelPlan` | algo | `zone, box_id` → `ok` |
+| 알고리즘 | `ResetHeightmap` | algo | `zone` → `ok` |
+| 씬 | `SetVelocity` | 씬 | `seg, velocity_mps` → `ok, actual_mps` |
+| 씬 | `DespawnBox` | 씬 | `box_id` → `ok` |
+| 씬 | `SetSpawnEnabled` | 씬 | `enabled` → `ok` |
+| 씬 | `SwapPallet` | 씬 | `zone` → `ok` |
+| DB | `RegisterBox` | db | `box_id, w, d, h, color, dest, qr_payload` → `ok, message` |
+| DB | `GetBoxInfo` | db | `box_id` → `found, BoxInfo` |
+| DB | `VerifyBox` | db | `box_id, qr_payload` → `match, registered_id` |
+| DB | `SetStatus` | db | `box_id, status, reason` → `ok` |
+| DB | `MarkPlaced` | db | `box_id, zone, actual_pose` → `ok` |
+| DB | `ZoneQueue` | db | `zone` → `count, placed_count` |
+| 중재자 | `DiverterRequest` | 중재자 | `box_id` → `target, reason` |
+
+**`PlanPlacement.message` 값 3가지:** `"OK"` · `"NO_FEASIBLE_POSE"` · `"PALLET_FULL"`
+**`DiverterRequest.target` 값 4가지:** `"A"` · `"B"` · `"C"` · `"RETURN"`
+
+### 3-4. 반드시 지킬 규약 5개
+
+1. **모든 노드에 `use_sim_time:=true`.**
+   없으면 tf 조회가 전부 실패하고 "lookup would require extrapolation" 이 뜬다.
+2. **`RobotCmd.seq` 를 `RobotEvent.seq` 가 그대로 되돌려준다.**
+   관제탑은 `ev.seq != self.seq` 면 무시한다. 없으면 타임아웃 후 늦게 온
+   이전 응답을 새 박스의 결과로 오인한다 — 에러 없이 엉뚱하게 도는 버그다.
+3. **`has_actual == true` 일 때만 `actual_*` 를 `UpdateHeightmap` 에 넣는다.**
+   계획값을 되보내면 오차가 누적돼 알고리즘은 1300 안이라 믿는데 실제 더미가 넘는다.
+4. **`DiverterRequest` 는 응답 제한 0.6초.** 초과 시 씬이 `NORMAL` 로 통과시킨다.
+   일반 서비스 타임아웃 2.0초를 쓰면 답이 올 때 박스가 이미 분기점을 지나 있다.
+5. **카메라 토픽 QoS 는 `qos_profile_sensor_data` (BEST_EFFORT).**
+   기본 RELIABLE 로 구독하면 이미지가 하나도 안 온다.
+
+---
+
+## 4. 좌표 · 치수
+
+**z = 0 은 도크 바닥 = 트럭 적재함 바닥이다. 야드 지면이 아니다.**
+야드 지면은 z = −850. 이 규약 덕분에 "팔레트를 들지 않고 밀어서 트럭에 넣는다"가
+높이차 0 으로 이미 만족된다.
+
+### 컨베이어 (진행 = +X)
 | 항목 | 값 |
 |---|---|
-| 벨트 상면 / 스토퍼 | z = 0.8 m / x = 10.0 m |
-| 로봇 베이스 | (10.9, **−0.1**, **0.9**) m |
-| 팔레트 원점(상면 X최소·Y최소 모서리) | **(10.3, +0.3, 0.15)** m |
-| 팔레트 | **1200 × 800** mm (Px=월드+X **1200** · Py=월드+Y **800**), 최대 적재 **1300** mm |
-| heightmap 격자 | 10 mm → **120 × 80** 셀 (`hm[px][py]`) |
-| 박스 3종 (mm / kg) | 340×250×210 / **3** · 410×310×280 / **5** · 480×380×340 / **9** |
+| 벨트 상면 (롤러 면) | z = **800** mm |
+| 스폰 지점 | (**500**, 0, 810) mm — 박스 밑면 중심 |
+| 스토퍼 | x = **10000** mm |
+| 픽업 구간 | x = 7500 ~ 10000 mm |
+| 벨트 속도 | 0.5 m/s |
 
-> **위 값의 출처는 `src/packing_bringup/config/system.yaml` 이다.** 어긋나면 config 가 맞다.
->
-> **팔레트가 왜 1200 × 800 인가 (2026-08-22 90° 회전):** 존 방향(Y)이 800 이어야
-> 3장을 붙여 2400 mm 가 되어 트럭 바닥 2800 에 들어간다. 1200 × 3 = 3600 은 초과라
-> 상차가 성립하지 않았다 (작업명세서 §3.2). 팔레트만 돌리면 최원점이 도달범위를
-> 넘으므로, 로봇이 **긴 변(1200) 바깥** 에 선다.
->
-> **이격 300 → 400 (2026-08-24):** joint_1 이 픽에서 배치로 90° 넘게 도는 동안 팔뚝이
-> 수평 원호를 그리며 근거리 기둥을 쓸어 밀었다. **궤적 전체 검사로만 잡힌다** — 정지
-> 자세 검사는 같은 계획을 통과로 본다(280 mm 차이). ⚠ 더 빼면 나빠진다(450 에서 −203).
-> `scripts/verify_transit_sweep_isaac.py` 로 재현. G1 재검증 시 B존 여유 +90 → **+13 mm**.
->
-> **`max_stack 1300` 근거:** 트럭 내高 1600 − 팔레트 150 − 천장여유 150 (§3.4).
-> ✅ **검증 완료 (2026-08-25).** `demo_stack15.py --plan-mode algo --standoff 400
-> --algo-clearance 10 --hm corridor_far_ratio=0.0 --hm corridor_near_gap_mm=0`
-> 로 **9단 1300mm** 를 세웠다 — 20/20 적재, 최대 knock **1.5mm**, 팔레트 밖 0.0mm
-> (`results/dir0.txt`). 이전 기록은 7단 1050mm 였다.
+### ★★ bbox 를 그대로 쓰지 마라
+
+| | bbox (프레임·난간 포함) | **써야 하는 값 (롤러 면)** |
+|---|---|---|
+| 폭 | 1970 mm | **1546 mm** |
+| Z 상면 | 1213 mm | **800 mm** |
+| X (main) | −33 ~ 7515 | **0 ~ 7500** |
+| X (b_pickup) | 7489 ~ 10005 | **7500 ~ 10000** |
+
+- **물리는 롤러에만 걸려 있다** (`bind_phys(_t + "/Rollers")`).
+- bbox 1213 은 **난간 꼭대기**다. 벨트 높이로 쓰면 로봇이 413 mm 위에서 놓는다.
+- 벨트 폭 1546 은 **의도된 값**이다 — 팔레트(1200×800) 반출 컨베이어 겸용.
+- 이음매 7489~7515 로 26 mm 겹침. 여기서 박스가 튀면 `pick_cam` 이 잡아준다.
+
+### 주요 프림
+| 프림 | X 범위 | Z 상면 |
+|---|---|---|
+| Stopper | 10000 ~ 10100 | 900 |
+| Pedestal | 10700 ~ 11100 | 900 |
+| Pallet | 10300 ~ 11500 | 150 |
+| PalletOutfeed | 10250 ~ 12500 | **0** |
+
+### 구역 · 로봇 · 팔레트
+| 구역 | 팔레트 원점 (mm) | 로봇 베이스 (mm) |
+|---|---|---|
+| A | (10300, **1800**, 150) | (10900, **1400**, **900**) |
+| B | (10300, **300**, 150) | (10900, **−100**, **900**) |
+| C | (10300, **−1200**, 150) | (10900, **−1600**, **900**) |
+
+> **이격 300 → 400 (2026-08-24, 김병직 실측).** joint_1 이 픽(−X)에서 배치(+Y)로 90°
+> 넘게 도는 동안 팔뚝이 수평 원호를 그리며 근거리 기둥을 쓸어 밀었다.
+> **궤적 전체 검사로만 잡힌다** — 정지 자세 검사는 같은 계획을 통과로 본다(280mm 차이).
+> ⚠ **더 빼면 나빠진다** (450 에서 −203). `scripts/verify_transit_sweep_isaac.py` 로 재현.
+
+- **페데스탈 900 mm** (구 문서의 500·700·1700 은 전부 폐기값)
+- 팔레트 **1200(X) × 800(Y)** × 두께 150 → Y 로 3장 = 2400, 트럭 바닥 2800
+- **최대 적재 1300 mm** (팔레트 **상면** 기준). 850 이 아니다.
+- heightmap 격자 10 mm → **120 × 80** 셀
+
+### 박스 3종
+| 이름 | w × d × h (mm) | 질량 | 혼입비 |
+|---|---|---|---|
+| 3호 | 340 × 250 × 210 | **3 kg** | 0.5 |
+| 4호 | 410 × 310 × 280 | **5 kg** | 0.3 |
+| 5호 | 480 × 380 × 340 | **9 kg** | 0.2 |
+
+### 랜덤 스폰 (평가 항목 "동적 대응")
+```yaml
+spawn_y_jitter_mm: 150      # y 를 −150 ~ +150 에서 균등 추출
+spawn_yaw_jitter_deg: 15    # yaw 를 −15 ~ +15 에서 균등 추출
+random_seed: 42             # 고정 — 절대 바꾸지 말 것
+```
+제약은 벨트 폭이 아니라 **로봇 도달거리 1700**이다.
+시드 고정이라 **"매번 다른 위치"와 "Play/Stop 재현성"을 동시에** 만족한다.
+
+> **`max_stack 1300` 검증 완료 (2026-08-25, 김병직 실측).** 이전 기록은 7단 1050mm 였다.
+> `demo_stack15.py --plan-mode algo --standoff 400 --algo-clearance 10
+> --hm corridor_far_ratio=0.0 --hm corridor_near_gap_mm=0` 로 **9단 1300mm** 를 세웠다 —
+> 20/20 적재, 최대 knock **1.5mm**, 팔레트 밖 0.0mm (`results/dir0.txt`).
 > 같은 실행에서 joint_5 는 **−107.1 ~ 25.2도**(한계 ±360)라 되감기도 필요 없다.
 
-> **통로 검사에는 방향이 있다 (2026-08-25):** 팔은 **로봇 쪽(Py 작은 쪽)에서** 들어온다.
-> 먼 쪽 기둥은 툴이 이미 지나온 뒤라 안 걸리고, 로봇 쪽 기둥은 팔뚝이 그 위를 넘어와야
-> 한다. `_corridor_ok` 는 원래 사방을 똑같이 봐서 **한쪽은 괜히 막고 한쪽은 통과시켰다.**
-> `corridor_far_ratio`(먼 쪽 여유폭 배율) · `corridor_near_gap_mm`(로봇 쪽 높이 여유)
-> 로 가른다. **둘 다 기본값이 기존 동작**이라 켜야만 바뀐다.
-> 데스크 스윕 20시드: 협곡 배치 1.20 → **0.05**, 적재율 −0.8%p, 놓는 개수는 오히려 +0.05.
-> 대칭으로 조이면 같은 효과에 −2.0%p 라 **방향성이 1.2%p 를 되돌려준다.**
+> **통로 검사에는 방향이 있다 (2026-08-25, 김병직 실측):** 팔은 **로봇 쪽(Py 작은 쪽)에서**
+> 들어온다. 먼 쪽 기둥은 툴이 이미 지나온 뒤라 안 걸리고, 로봇 쪽 기둥은 팔뚝이 그 위를
+> 넘어와야 한다. `_corridor_ok` 는 원래 사방을 똑같이 봐서 **한쪽은 괜히 막고 한쪽은
+> 통과시켰다.** `corridor_far_ratio`(먼 쪽 여유폭 배율) · `corridor_near_gap_mm`(로봇 쪽
+> 높이 여유)로 가른다. **둘 다 기본값이 기존 동작**이라 켜야만 바뀐다.
+> Isaac 20박스 A/B: 끄면 적재 17·버림 1·실패 2 · knock 63.2mm, 켜면 **20/0/0 · 1.5mm**.
 
 ### 단위 규칙
-
 - 설정 파일 · DB = **mm 정수** / Isaac · ROS 코드 = **m float**
-- 변환은 **반드시 `packing_common.units` 함수만** 사용. 직접 `/1000` 금지.
-- `PlacePose`: `x_mm`·`y_mm` = 박스 **중심**, `z_mm` = 박스 **밑면**
-  → z 를 중심으로 쓰면 팔레트에 절반 파묻힌다.
+- 변환은 **반드시 `packing_common.units` 함수만**. 직접 `/1000` 금지.
+- **코드에 숫자를 박지 않는다.** 전부 `system.yaml` 에서 읽는다.
 
 ---
 
-## 2. 왜 Isaac 안과 밖이 나뉘어 있나 — 핵심 제약
+## 5. 카메라 4종
 
-**Isaac Sim 은 Python 3.11, ROS 2 Jazzy 는 Python 3.12.**
-따라서 Isaac 내부 Python 에서 `packing_msgs` 를 import 할 수 없다.
+| 카메라 | 위치 | 역할 |
+|---|---|---|
+| `cam1` | x = 600 | 투입부 검사 · 크기/ID 판정 |
+| `cam2` | x = 1400 | 투입부 검증 |
+| **`pick_cam`** | 스토퍼 위 (y 0, z **2300**) 하향 | **픽업 좌표 실측** |
+| **`wrist_cam`** | 그리퍼 몸통 · offset (170, 0, 30) · tilt 18° | hand-eye |
 
-| | 무엇이 있나 |
-|---|---|
-| **Isaac 안** (Action Graph) | 카메라 발행, 씬 제어, 로봇 제어. C/rcl 백엔드라 버전 무관 |
-| **Isaac 밖** (rclpy 노드) | detector, orchestrator, algo, db_service_node. 실제 로직 전부 |
-
-**결론: 로직은 Isaac 밖에 짠다.** Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
+- 해상도 1280×720 · HFOV 60° · 30 Hz
+- ⚠️ **오프스크린 렌더는 GUI 조명 리그를 못 받는다.** 돔 라이트(`intensity: 1000`)가
+  꺼져 있으면 눈으로는 멀쩡한데 카메라 이미지가 캄캄하다.
+- ⚠️ 화면이 전부 0 이면 조명보다 **카메라가 형상 안에 파묻혔는지** 먼저 의심할 것.
+- **처리 효율**: 천장 카메라는 도착 신호가 왔을 때만 추론한다.
 
 ---
 
-## 3. 노드 구조
+## 6. flow — 박스 한 개 사이클
 
 ```
-[Isaac 안 — Action Graph]           [Isaac 밖 — rclpy]
-
-카메라 그래프  ──/line/rgb1,depth1──→ detector_line1 ──(srv)──→ db_service_node
-              ──/zone_b/rgb───────→ detector_zone_b
-                                          │(topic)
-                                          ↓
-sim_control_graph   ←──(srv)────────  orchestrator ──(srv)──→ algo
-robot_control_graph ←──(topic)──────      │        ──(srv)──→ db_service_node
-                    ──/robot/event──→     ┘
+1. 박스 스폰            씬 (랜덤 y ±150 · 랜덤 yaw ±15°)
+2. 투입부 인식           cam1 → RegisterBox → cam2 → VerifyBox
+3. 목적지 판단 · 분기     중재자 DiverterRequest (x=2000, 0.6초 제한)
+4. 픽업 위치 도착        pick_cam → BoxAtPickup (x·y·yaw)
+5. 벨트 정지            관제탑 SetVelocity(0)
+6. 놓을 자리 계산        PlanPlacement
+     ├─ NO_FEASIBLE_POSE → CancelPlan → 되돌림 (종료 아님)
+     └─ PALLET_FULL      → 트럭 상차
+7. 집기 → 놓기           RobotCmd → RobotEvent (실측 pose 회신)
+8. UpdateHeightmap → SetVelocity(0.5) → 1번으로 반복
 ```
-
-### 각 노드의 책임
-
-| 노드 | 트랙 | 하는 일 | 하지 않는 일 |
-|---|---|---|---|
-| `detector_line1` | D | 카메라1(RGB-D)로 크기·ID 판정 → DB 등록 | 로봇 명령 |
-| `detector_zone_b` | D | 천장 RGB로 도착 감지 + **pick pose(x/y/yaw)** 발행 | 로봇 명령 |
-| `orchestrator` | B | **로봇 명령의 유일한 발신자.** 7상태 상태머신 | 자리 계산 |
-| `algo` | C | heightmap 소유. 놓을 자리 계산 | **로봇 명령 금지** |
-| `db_service_node` | D | **`palletris.db` 를 여는 유일한 프로세스** | |
-
-★ **`algo` 나 `detector` 가 `/robot/cmd` 를 발행하면 설계 위반이다.**
-   벨트 정지·재시도·종료 판단이 여러 노드로 흩어지면 디버깅이 불가능해진다.
 
 ---
 
-## 4. 확정된 설계 결정 (2026-08 재검토 결과)
-
-### D1. 천장 카메라 토픽은 구역별 네임스페이스
-`/zone_a/rgb`, `/zone_b/rgb`, `/zone_c/rgb`.
-같은 토픽명을 3대가 공유하면 어느 구역 영상인지 구분 불가.
-
-### D2. `orchestrator` 가 로봇 명령의 유일한 발신자
-`algo → robot` 직접 호출 금지. `algo` 는 순수 계산기다.
-
-### D3. heightmap 은 `algo` 가 소유
-천장 depth 로 heightmap 을 재구성하지 않는다.
-`/algo/update_heightmap` 으로 **실측 pose** 를 받아 갱신한다.
-
-### D4. 천장 카메라는 RGB 만 (depth 없음)
-팔레트 위 z 는 `algo` 의 heightmap 이 이미 안다.
-RGB-D 는 메인 라인 카메라1 한 대뿐.
-
-| 값 | 출처 |
-|---|---|
-| x, y, yaw | 천장 RGB (실측) |
-| z (팔레트 위) | `algo` heightmap (계산) |
-| z (픽업 지점) | 벨트 상면 800mm + 박스 높이(DB) |
-
-### D5. `detector_zone_*` 이 pick pose 까지 발행
-```json
-{ "box_id": "BOX00007", "x_mm": 10000, "y_mm": -12, "yaw_deg": 3.1 }
-```
-y 와 yaw 를 "0 이라고 가정" 하면 그리퍼가 박스 모서리를 문다.
-
-### D6. DB 조회는 **서비스**. 토픽 캐싱 금지
-`orchestrator` 는 집기 직전에 `/db/get_box_info` 로 매번 조회한다.
-메모리 캐시를 쓰면 노드 재시작 시 날아가고, 2차 재순환에서 순서가 깨진다.
-
-> **철칙 4번("콜백 안 블로킹 금지") 정정:**
-> 싱글스레드 executor 에서만 데드락이다.
-> `ReentrantCallbackGroup` + `MultiThreadedExecutor` 면 합법적으로 해결된다.
-> 단 **이 프로젝트에서는 `call_async` + `done_callback` 만 쓴다.**
-
----
-
-## 5. ★ `NO_FEASIBLE_POSE` ≠ `PALLET_FULL` — 가장 자주 틀리는 곳
+## 7. ★ `NO_FEASIBLE_POSE` ≠ `PALLET_FULL`
 
 | 신호 | 의미 | 처리 |
 |---|---|---|
-| `NO_FEASIBLE_POSE` | **이 박스만** 자리가 없다. 다음 박스는 들어갈 수 있다 | 그 박스만 despawn 후 **계속** |
-| `PALLET_FULL` | 가장 작은 박스로도 후보가 없다 | **시나리오 종료** |
+| `NO_FEASIBLE_POSE` | **이 박스만** 자리가 없다 | 그 박스만 되돌림 후 **계속** |
+| `PALLET_FULL` | 가장 작은 박스로도 후보가 없다 | 트럭 상차 · 종료 |
 
-실측 (투입 30개 기준): `NO_FEASIBLE_POSE` 평균 4.3회, `PALLET_FULL` 9.2회.
-
-> ⚠ **이 수치는 확인이 필요하다.** 트랙 C 가 시드 30개로 재측정한 값은
-> `NO_FEASIBLE_POSE` **8.5회**, 첫 실패에 종료 시 충전율 **49.6%** → 버리고 계속 **60.2%**,
-> 팔레트 포화까지 가면 **65.6% ± 4.3** (적재 27.3개) 다. 조건이 다른 것으로 보인다.
-> 특히 `PALLET_FULL` 은 시나리오를 끝내는 신호라 **평균 9.2회가 나올 수 없다.**
-
-**첫 `NO_FEASIBLE_POSE` 에서 종료하면 충전율 56% 에서 데모가 멈춘다.**
-
-1차에는 Return line 이 없으므로 `/sim/despawn_box` 로 박스를 지운다.
-스토퍼에 두면 뒤 박스가 밀려 라인이 막힌다.
-
-```
-NO_FEASIBLE_POSE 수신
-  → /algo/cancel_plan(zone, box_id)
-  → /db/set_status(box_id, 'REJECTED')
-  → /sim/despawn_box(box_id)
-  → 벨트 재가동 → 다음 박스
-```
+**첫 `NO_FEASIBLE_POSE` 에서 종료하면 팔레트가 반만 찬 채 데모가 멈춘다.**
+스토퍼에 박스를 두면 뒤 박스가 밀려 라인이 막히므로 반드시 치운다.
 
 ---
 
-## 6. 시나리오 범위
+## 8. 노드 구조
 
-| | 1차 (stage 1) | 2차 (stage 2) |
-|---|---|---|
-| 구역 | **B 만** | A · B · C |
-| 박스 ID | **색상** (HSV 판정) | QR |
-| 목적지 `dest` | 없음 (필드는 미리 만들어 둠, 값은 `""`) | QR 에 포함 |
-| 중재자 | 불필요 | 필요 |
-| Return line | **없음** → despawn | 있음 → 반송 |
-| 카메라 | 2대 | 5대 |
-| 종료 | **팔레트 1장 만재 → 끝** | |
+| 노드 | 개수 | 트랙 | 하는 일 | 하지 않는 일 |
+|---|---|---|---|---|
+| **관제탑** | **1** | B | **로봇 명령의 유일한 발신자.** 상태머신 | 자리 계산 |
+| 구역 인식 노드 | 3 | D | 도착 감지 + 픽업 좌표 발행 | 로봇 명령 |
+| 라인 인식 노드 | 2 | D | cam1 판독 · cam2 검증 | 로봇 명령 |
+| 중재자 | 1 | D | 목적지 배분 · 되돌림 판단 | |
+| 적재 알고리즘 | 1 | C | heightmap 3장 소유 | **로봇 명령 금지** |
+| db_service_node | 1 | D | `palletris.db` 유일 writer | |
 
-**1차는 팔레트 교체·트럭 상차를 하지 않는다.**
-따라서 `/sim/swap_pallet`, `/algo/reset` 은 1차에서 호출하지 않는다.
+★ **관제탑은 하나다.** 구역이 3곳이어도 프로세스를 늘리지 않는다.
+★ 알고리즘이나 인식 노드가 `/robot/cmd` 를 발행하면 설계 위반이다.
 
----
+### 관제탑 상태 7개
+`IDLE` → `FETCHING` → `PLANNING` → `PICKING` → `PLACING` → `UPDATING` → `IDLE` / `DONE`
 
-## 7. orchestrator 상태 7개
-
-| 상태 | 하는 일 | 다음 |
-|---|---|---|
-| `IDLE` | 벨트 가동, 도착 대기 | 도착 → `FETCHING` |
-| `FETCHING` | 벨트 정지 + `/db/get_box_info` | 응답 → `PLANNING` |
-| `PLANNING` | `/algo/plan_placement` | ok → `PICKING` |
-| `PICKING` | `/robot/cmd` 집기 | 성공 → `PLACING` |
-| `PLACING` | `/robot/cmd` 놓기 | 성공 → `UPDATING` |
-| `UPDATING` | `/algo/update_heightmap` (**실측 pose**) | → `IDLE` |
-| `DONE` | 최종 지표 출력 후 정지 | (끝) |
-
-**이탈 3경로:**
-
-| 조건 | 처리 |
-|---|---|
-| `NO_FEASIBLE_POSE` | `cancel_plan` → `despawn_box` → `IDLE` |
-| `PALLET_FULL` | → `DONE` |
-| 픽/플레이스 실패 | `cancel_plan` → `set_status(PICK_FAILED)` → `IDLE` |
+**이탈 3경로:** `NO_FEASIBLE_POSE` · `PALLET_FULL` · 실패/타임아웃(**20초**)
+→ 모두 `CancelPlan` 을 호출한 뒤 복귀한다.
 
 ---
 
-## 8. 코딩 규칙
+## 9. 코딩 규칙
 
 - **모든 서비스 호출은 `call_async` + `future.add_done_callback`.**
   `spin_until_future_complete` 금지 — 콜백 안에서 부르면
   executor 가 자기 자신을 기다려 **에러 없이 조용히 멈춘다.**
 - `MultiThreadedExecutor` + `ReentrantCallbackGroup` 필수.
-- 서비스 타임아웃 2초. 초과 시 `cancel_plan` 후 복귀. **노드가 죽으면 안 된다.**
-- 카메라 토픽 QoS 는 `qos_profile_sensor_data` (BEST_EFFORT).
-  기본 RELIABLE 로 구독하면 이미지가 하나도 안 온다.
-- **모든 이탈 경로에서 `/algo/cancel_plan` 호출.**
-  빠뜨리면 그 자리가 영원히 예약된 채 남는다.
+- 로봇 모션 타임아웃 **20초**. 초과 시 `CancelPlan` 후 복귀. **노드가 죽으면 안 된다.**
+- 구독 콜백은 **입력을 검증한다.** rclpy 는 콜백 예외를 삼키므로,
+  잘못된 메시지 하나에 박스가 영원히 안 오는데 에러는 안 뜬다.
+- ⚠️ **Isaac 메인(물리) 스레드에서 blocking wait 을 하지 마라.**
+  판정을 `rm.step()` 이 내리는데 그 step 도 메인 스레드라 데드락이 된다.
 - **주석은 한국어.** 특히 "왜 이렇게 했는지".
 - `packing_common/frames.py` 를 **import** 해서 쓴다. 복사 금지.
 
 ---
 
-## 9. 자주 나오는 증상 → 원인
+## 10. 자주 나오는 증상 → 원인
 
 | 증상 | 원인 후보 |
 |---|---|
-| 토픽이 안 보이는데 에러도 없다 | `ROS_DOMAIN_ID` 불일치 |
-| 이미지가 하나도 안 온다 | QoS 가 RELIABLE (BEST_EFFORT 여야 함) |
-| 서비스 응답이 영원히 안 온다 | 콜백 안에서 동기 호출 (`spin_until_future_complete`) |
+| 토픽이 안 보이는데 에러도 없다 | `ROS_DOMAIN_ID` 불일치 / 콜백 예외가 삼켜짐 |
+| 이미지가 하나도 안 온다 | QoS 가 RELIABLE |
+| 카메라 이미지가 캄캄하다 | 돔 라이트 꺼짐 / **카메라가 형상 안에 파묻힘** |
+| tf lookup 이 계속 실패한다 | `use_sim_time` 미설정 / `/clock` 미발행 |
+| **로봇이 박스를 400 mm 위에서 놓는다** | **벨트 높이에 bbox 1213 을 씀 (800 이어야 함)** |
+| 서비스 응답이 영원히 안 온다 | 콜백 안에서 동기 호출 |
+| Isaac 이 통째로 멈춘다 | 메인 스레드에서 `Event.wait()` |
+| 로봇 응답이 엉뚱한 박스 것으로 처리된다 | `seq` 검사 누락 |
 | 박스가 벨트를 뚫고 떨어진다 | 스폰 z 에 `h/2` 안 더함 |
+| 흡착했는데 박스가 40 mm 떠서 붙는다 | 패드 D6 조인트 6축을 다 잠금 |
+| 팔이 최대 토크로 잡아채며 박스를 친다 | 웨이포인트 없이 계단 입력 |
+| 다층에서 팔이 기둥을 친다 | 페데스탈이 900 이 아님 |
+| 2층부터 `NO_FEASIBLE_POSE` 만 | `support_tol_mm` < `cell_mm` (둘 다 10) |
+| 충전율이 이상하게 낮다 | 분모를 `max_stack_mm` 고정으로 씀 |
+| 실제 더미가 계산보다 높다 | `UpdateHeightmap` 에 계획 pose 를 넣음 |
 | 쌓은 박스가 저절로 무너진다 | solver iteration 을 씬에 설정함 |
 | 놓고 나서 박스가 혼자 조금씩 미끄러진다 | 박스 프림에 solver iteration·마찰이 안 걸렸다 (`spawner.py` 는 걸고, `verify_suction.make_box` 는 안 건다) |
 | 박스가 슬롯에 안 들어가고 `IK_FAIL` | 계획 간격이 0 이라 슬롯이 박스와 정확히 같은 크기다 (`--algo-clearance`) |
 | 깊은 구덩이 자리에서만 `IK_FAIL` | `_corridor_ok` 가 로봇 쪽 기둥을 안 본다 (`corridor_near_gap_mm`) |
 | `database is locked` | `db_service_node` 외 프로세스가 `.db` 를 열었다 |
-| 2층부터 `NO_FEASIBLE_POSE` 만 | `support_tol_mm` < 양자화 간격 (10 이어야 함) |
-| 박스가 팔레트 밖에 놓임 | `frames.py` 를 복사해 씀 / 팔레트 원점 오류 |
-| 충전율이 이상하게 낮다 | 분모를 `max_stack`(1300) 고정으로 씀 (**실제 최고높이**여야 함) |
 
 ---
 
-## 9-1. ★ 계획 파라미터는 **Isaac 으로 판정한다**
+## 10-1. ★ 계획 파라미터는 **Isaac 으로 판정한다**
 
 데스크 지표(수용 테스트 · 시드 스윕)와 Isaac 이 **부호까지 어긋난다.** 2026-08-25 실측:
 
@@ -283,35 +440,85 @@ NO_FEASIBLE_POSE 수신
 
 ---
 
-## 10. 하지 말 것
+## 11. 하지 말 것
 
+- ❌ **JSON 소켓 브리지 재도입** (§2)
+- ❌ **토픽에 `std_msgs/String` + JSON 사용** — 전용 타입이 있다 (§3)
 - ❌ 공용 파일(`packing_msgs/`, `config/system.yaml`, 씬 USD)을 **승인 없이** 수정
-- ❌ `algo` 나 `detector` 에서 `/robot/cmd` 발행
+- ❌ **코드에 숫자 상수 박기** — 전부 `system.yaml` 에서 읽는다
+- ❌ **컨베이어 bbox 값(1970 · 1213)을 사양으로 쓰기**
+- ❌ **관제탑을 구역마다 띄우기** — 하나다
+- ❌ 알고리즘·인식 노드에서 `/robot/cmd` 발행
 - ❌ `spin_until_future_complete` 사용
-- ❌ `db_service_node` 외 프로세스에서 `sqlite3.connect("palletris.db")`
+- ❌ `random_seed: 42` 변경
+- ❌ 흡착 패드 D6 조인트 값 임의 변경 (`h2017_cell.usd` 실측값이다)
 - ❌ 아직 없는 노드의 mock 을 임의로 만들어 붙이기
 - ❌ 문서에 없는 숫자·API 추측해서 쓰기 (모르면 "확인 필요" 라고 남길 것)
-- ❌ 아직 필요 없는 최적화·리팩터링
 
 ---
 
-## 11. 팀 · 트랙
+## 12. 저장소 구조
+
+| 경로 | 무엇 |
+|---|---|
+| `src/packing_common/` | 공용 — `config.py` · `frames.py` · `units.py`. **복사 금지, import** |
+| `src/packing_msgs/` | 공용 인터페이스. 수정 = 팀 전원 재빌드 |
+| `src/packing_algo/` | 트랙 C — `heightmap_core.py` · `algo_service_node.py` |
+| `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` |
+| `src/packing_vision/` | 트랙 D — `vision_node.py` |
+| `src/packing_sim/isaac/` | 트랙 A — `spawner.py` · `camera_pick.py` · `conveyor_ctl.py` · `robot_motion.py` · `sim_main.py` |
+| `scripts/` | 검증 — `verify_reach.py` · `check_place_plan.py` 등 |
+
+★ **`spawner.py` 가 박스 스폰 담당이다.** 랜덤 지터는 여기서 적용한다.
+★ **`.claude/worktrees/` 는 작업 브랜치 사본이다. 여기를 고치지 말 것.**
+
+---
+
+## 13. 평가 항목과의 대응
+
+| 평가 항목 | 우리 대응 |
+|---|---|
+| ROS2 연동 (clock · 이미지 · tf) | Action Graph 3종 발행 |
+| 동적 대응 (랜덤 스폰) | y ±150 · yaw ±15° · `pick_cam` 실측 |
+| 다중 로봇 조율 | 로봇 3대 + 관제탑 + 중재자 |
+| 예외 처리 (크래시 없음) | 입력 검증 · 타임아웃 20초 · `CancelPlan` |
+| 처리 효율 (추론 주기 제한) | 천장 카메라는 도착 신호 시에만 추론 |
+| 검증 및 분석 (정량) | 종료 지표: 적재수 · 충전율 · 최고높이 · 소요시간 |
+| 재현성 (Play/Stop) | `random_seed: 42` · 리셋 처리 |
+| AI 비전 활용 | `pick_cam` 좌표 → `RobotCmd` · `wrist_cam` hand-eye |
+| 챌린지 | heightmap vs naive · `w_far` · `w_wall` 개선 실측 |
+
+---
+
+## 14. 팀 · 트랙
 
 | 트랙 | 담당 | 범위 |
 |---|---|---|
-| A | 김학민 | Isaac 씬, 카메라·컨베이어, USD |
-| B | 김병직 | 로봇 팔 제어, orchestrator |
-| C | 정정인 | 패킹 알고리즘 (`algo_service_node`) |
-| D | 민범진 | 비전/인식, DB 서비스, 인터페이스 설계 |
+| A | 김학민 | Isaac 씬, 카메라·컨베이어·tf, USD |
+| B | 김병직 | 로봇 팔 제어, 관제탑 |
+| C | 정정인 | 패킹 알고리즘 |
+| D | 민범진 | 비전/인식, DB, 인터페이스 설계 |
 
 **공용 파일 수정 = 팀 4명 전원 재빌드.** 바꿨으면 반드시 보고할 것.
 
 ---
 
-## 12. 미결 (확인 필요 — 추측 금지)
+## 15. 미결 (확인 필요 — 추측 금지)
 
 | 항목 | 담당 | 왜 |
 |---|---|---|
+| `spawn_y_jitter_mm` · `spawn_yaw_jitter_deg` **yaml + `spawner.py` 적용** | 김학민 | 키만 넣으면 아무 일도 안 일어난다 |
+| `sim_server.py` 존치 여부 | 김학민 | 소켓 폐기 후 남아 있다 |
+| `recognition.enabled: false` → `true` | 팀 | 최종 구현은 인식 포함 |
+| `stage: 1` → `2` 전환 시점 | 팀 | 최종은 3구역 |
+| tf 프레임 이름 규약 | 김학민 | 씬 prim 이름과 일치해야 함 |
+| 조각 이음매(7489~7515)에서 박스가 튀는지 | 김학민 | 3호(250)가 걸리면 라인이 막힌다 |
+| **서비스 응답의 float 이 안 실린다** | 김학민 | Isaac ROS2 브리지가 `Unable to write float value (nil)`. `SetVelocity.actual_mps` 만 해당. string·bool·**토픽 float32** 는 정상 (TS-023) |
+| `/sim/*` · `/conveyor/*` 서비스 경로 확정 | 팀 | §3-3 이 srv 타입만 정했다. `ros_graph.SERVICES` 의 잠정값을 쓰는 중 |
+| `msg/SpawnEvent.msg` 존치 여부 | 민범진 | §3 표에 없는데 저장소에 있다. Isaac Action Graph 쪽에서 쓸 수 있어 남겨 뒀다 |
+| `BoxInfo.weight_g` vs yaml `mass_g` | 민범진 | §3-1 은 `weight_g`, `system.yaml` 정본은 `mass_g: 3000`. 이름이 다르다 |
+| `/algo/reset_heightmap` 경로 확정 | 팀 | §3-3 이 srv 타입(`ResetHeightmap`)만 정하고 **서비스 경로를 안 적었다.** srv 이름에 맞춰 잠정 확정 |
+| §12 저장소 구조 누락 2건 | 팀 | `packing_algo` 에 `baseline.py`(§13 챌린지 근거), `packing_robot` 에 **관제탑이 어디 사는지**가 없다 |
 | `stage1.total_count` 15 → **30** | 팀 | 15 로는 팔레트가 안 참 (56.7% vs 65.5%) |
 | ~~`gripper_clearance_mm` 30 → 10~~ **기각** | 김병직 | ★ **방향이 반대였다.** "흡착 툴 단면 실측" 의 답은 **122.5 mm**(그리퍼 몸통 Ø245 반경)다. 다만 값을 올리는 대신 `_corridor_ok` 의 **높이 기준**을 고쳤다 (2026-08-24) — 링 반경은 122, 비교 기준은 밑면이 아니라 **윗면+그리퍼길이 150**. `clr 60` 안은 협곡을 안 줄이고 적재율만 깎아 폐기 |
 | `/sim/despawn_box` Day 4 → **Day 2** | 김학민 | §5 때문에 통합 전 필요 |
@@ -322,6 +529,6 @@ NO_FEASIBLE_POSE 수신
 | ~~`w_far` 0.1 유지 여부~~ **유지** | 김병직 | 2026-08-25 Isaac 20박스에서 `w_far` 0.1 유지 + 방향성 통로로 **20/20 · 최대 knock 1.5mm** (`results/dir0.txt`). 문서 18 의 knock 94mm 는 통로가 방향을 안 볼 때의 값이다 (TS-016) |
 | **방향성 통로 채택 여부** | 정정인 | 2026-08-25 트랙 B 가 `heightmap_core` 에 선택 키 2개를 넣었다 (`corridor_far_ratio` · `corridor_near_gap_mm`). **기본값이 기존 동작**이라 켜기 전엔 아무것도 안 바뀌고 수용 테스트 7개 그대로 통과한다. **묻는 것은 코드가 아니라 값이다** — `system.yaml` 에 `corridor_far_ratio: 0.0` · `corridor_near_gap_mm: 0` 을 넣을지. 안 넣으면 데모만 명령줄로 쓰고 **파이프라인에는 협곡 실패가 그대로 남는다.** **적재율을 지불하지 않는다 — 오히려 받는다.** 같은 명령에서 두 값만 바꾼 A/B (각 1회): 끄면 적재 17·버림 1·실패 2 · knock 63.2mm · 팔레트 밖 46.4mm · 실패, 켜면 **20/0/0 · knock 1.5mm · 밖 0.0mm · 통과**. 데스크 스윕이 본 −0.8%p 는 **실패의 부수 피해를 안 센 값**이었다 |
 | **계획 간격 `--algo-clearance`** 0 → ? | 정정인/팀 | 간격 0 은 슬롯이 박스와 정확히 같은 크기다. 물리 속성을 규정대로 걸자 **박스가 안 들어가고 `IK_FAIL`** 이 났다 (2026-08-25). 10 에서 해결. 정본 값으로 넣을지 결정 필요 |
-| **하중 순서 로직 없음** | 정정인 | 2026-08-25 실측에서 9kg 5호가 **z 840** 에 올라갔다. `--order arrival` 이면 "큰 것부터 급송" 이라는 유일한 방어막도 없다 |
+| ~~하중 순서 로직 없음~~ **안 한다** | 정정인 | 2026-08-25 결정. HeightGreedy 는 **평탄도**를 보는 방식이라 하중 순서를 별도로 넣지 않는다. 실측에서 9kg 5호가 z 840 에 올라가지만 knock 1.5mm 로 서 있다 — 1차 범위에서는 문제로 보지 않는다 |
 | **사이클 18.3 s (목표 10.0)** | 김병직 | 스택이 높아질수록 느려진다 — #1 13.5s → #20 23.4s. 이송 고도가 따라 올라가 호가 길어진다 (`--vel 0.8` 기준) |
 | 적재율 표기: 실제높이 기준 + **용량 기준 병기** | 팀 | §7.8 정본은 그대로 두고 `capacity_rate` 를 보조로 추가했다. 포화 시 66.9% vs 66.3% 로 사실상 같다 — 발표에 어느 곡선을 쓸지만 정하면 된다 (TS-017) |

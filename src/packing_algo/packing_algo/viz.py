@@ -20,12 +20,19 @@ from matplotlib import animation, font_manager
 from packing_algo.heightmap_core import HeightmapPacker
 from packing_common.config import load
 
-# 한글 라벨이 네모(□)로 깨지지 않게 CJK 폰트를 찾아 쓴다. 없으면 기본 폰트로 그냥 진행.
-for _name in ("Noto Sans CJK KR", "Noto Sans CJK JP", "NanumGothic", "Malgun Gothic"):
-    if any(f.name == _name for f in font_manager.fontManager.ttflist):
-        plt.rcParams["font.family"] = _name
-        break
-plt.rcParams["axes.unicode_minus"] = False   # 마이너스 기호가 깨지는 것 방지
+def pick_korean_font():
+    """한글 라벨이 네모(□)로 깨지지 않게 CJK 폰트를 찾아 쓴다. 없으면 기본 폰트로 진행.
+
+    ★ 다른 그림 스크립트도 이걸 import 해서 쓴다 — 복사하면 한쪽만 고쳐진다.
+    """
+    for name in ("Noto Sans CJK KR", "Noto Sans CJK JP", "NanumGothic", "Malgun Gothic"):
+        if any(f.name == name for f in font_manager.fontManager.ttflist):
+            plt.rcParams["font.family"] = name
+            break
+    plt.rcParams["axes.unicode_minus"] = False   # 마이너스 기호가 깨지는 것 방지
+
+
+pick_korean_font()
 
 # 박스 높이별 색 — 3호(210) 파랑 / 4호(280) 주황 / 5호(340) 초록
 COLORS = {210: "#4C9AFF", 280: "#FFAB00", 340: "#36B37E"}

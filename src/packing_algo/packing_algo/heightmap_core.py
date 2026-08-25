@@ -17,6 +17,7 @@ class HeightmapPacker:
         self.w_wall = hm_cfg.get("w_wall", 0.0)             # 벽 밀착도 (0 이면 기존 동작)
         self.w_far = hm_cfg.get("w_far", 0.0)               # 로봇에서 먼 쪽 우선 (0 이면 기존 동작)
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
+        # ★ 구 등방 halo. 아래 arm_* 로 대체됐고, robot 섹션이 없는 축약 cfg 에서만 쓴다.
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
         # ★ 하강 통로는 **팔 굵기**로 봐야 한다 — gripper_clearance_mm(30) 이 아니다.
         #   두 값 다 system.yaml 에 이미 있다. 새 상수를 지어내지 않는다.
@@ -39,10 +40,37 @@ class HeightmapPacker:
         #   좌표 전체 범위(W+D)에 나눠 준 값이라, 진짜 점수차를 절대 뒤집지 못한다.
         self.tie_eps = 0.01 * self.w_h * self.cell / self.max_stack / (self.W + self.D)
         self.last_warning = ""                              # 마지막 update 경고 (래퍼가 로그로 올린다)
+        self.last_reason = ""                               # "" | YAW | OUTSIDE | CLIPPED | OVER_MAX
         self.plans = {}                                      # (zone,box_id) -> PlacePose
         self.placed = []                                     # [(x,y,z,w,d,h,yaw), ...]
+        # ★ 이미 반영한 박스. box_id -> 그때의 ok.
+        #   CLAUDE.md §3-4 는 서비스 타임아웃 2.0초 · **재시도 1회** 를 규약으로 못 박았다.
+        #   재시도가 오면 update 가 두 번 불린다 — 멱등이 아니면 값이 샌다 (아래 update 주석).
+        self.applied = {}
 
     # ---------- 핵심 유틸 ----------
+    def _bad_size(self, w_mm, d_mm, h_mm):
+        """치수가 말이 되나. 안 되면 이유 문자열, 되면 "".
+
+        ★ 왜 필요한가: 셀 수가 0 이나 음수가 되면 `maximum_filter1d` 가
+          `RuntimeError: incorrect filter size` 로 **예외를 던진다.** 서비스 콜백에서
+          예외가 나면 rclpy 는 응답을 안 보내고, 관제탑은 2초 타임아웃 뒤 재시도해
+          같은 예외를 또 만난다 — 박스 하나가 라인을 영구히 막는다 (§9·§13).
+          "못 놓는다"와 "죽는다"는 다르다. 여기서 걸러 NO_FEASIBLE_POSE 로 답한다.
+
+        실제로 0 이 올 수 있다 — 인식이 실패했거나 `GetBoxInfo` 가 found=false 인데
+        관제탑이 기본값 0 을 그대로 보내는 경우다.
+        """
+        for name, v in (("w", w_mm), ("d", d_mm), ("h", h_mm)):
+            if not isinstance(v, (int, float)) or v != v:      # NaN 포함
+                return f"{name}={v!r} 가 수가 아니다"
+            if v <= 0:
+                return f"{name}={v} — 0 이하"
+        if w_mm < self.cell or d_mm < self.cell:
+            # 셀 격자보다 작으면 점유 셀이 0 개가 되어 필터가 죽는다
+            return f"{w_mm}x{d_mm} 가 격자({self.cell}mm)보다 작다"
+        return ""
+
     @staticmethod
     def _sliding_max(a, w, axis):
         """길이 w 윈도의 시작 인덱스별 최대. maximum_filter1d는 중심 기준이므로 슬라이스로 보정."""
@@ -56,6 +84,12 @@ class HeightmapPacker:
 
     def plan(self, box_id, w_mm, d_mm, h_mm):
         """→ (ok, PlacePose, score, message)"""
+        why = self._bad_size(w_mm, d_mm, h_mm)
+        if why:
+            # ★ 예외로 죽지 않는다. 계약상 message 는 3가지뿐이라(§3-3)
+            #   NO_FEASIBLE_POSE 로 답하고 이유는 last_warning 으로 올린다.
+            self.last_warning = f"{box_id}: 치수가 잘못됐다 ({why})"
+            return False, None, 0.0, "NO_FEASIBLE_POSE"
         best = None
         for yaw in (0, 90):
             w, d = (w_mm, d_mm) if yaw == 0 else (d_mm, w_mm)
@@ -179,10 +213,37 @@ class HeightmapPacker:
         return ok
 
     def update(self, box_id, w_mm, d_mm, h_mm, actual):
-        """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)"""
+        """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)
+
+        ★★ **멱등이어야 한다.** CLAUDE.md §3-4 가 서비스 재시도 1회를 규약으로 정했으므로
+        같은 box_id 로 두 번 들어오는 일이 정상 동작 중에 생긴다. 멱등이 아니면:
+
+          · `self.placed` 에 두 번 쌓여 **적재 개수와 부피가 늘고 적재율이 부풀려진다**
+          · `self.plans.pop` 이 두 번째엔 None 을 줘서 **yaw 검사가 통째로 건너뛰어진다**
+            (planned 가 없으면 dyaw=0 이라 아무리 틀어져 있어도 통과한다)
+
+        `self.hm` 만은 `np.maximum` 이라 원래 멱등이었다 — 그래서 heightmap 은 멀쩡한데
+        숫자만 새는, 로그로 알아채기 어려운 형태로 나타난다.
+        """
+        why = self._bad_size(w_mm, d_mm, h_mm)
+        if why:
+            self.last_warning = f"{box_id}: 치수가 잘못됐다 ({why}) — 갱신하지 않는다"
+            return False, self.fill_rate(), len(self.placed)
+
+        prev = self.applied.get(box_id)
+        if prev is not None:
+            # 재시도로 본다. 계획은 이미 회수됐고 hm 도 이미 반영됐다.
+            # ok 는 **처음 판정을 그대로** 돌려주고, 개수·적재율만 현재 값으로 준다
+            # (그 사이 다른 박스가 들어왔을 수 있다).
+            self.last_warning = f"{box_id}: 이미 반영된 박스다 — 재시도로 보고 무시했다"
+            return prev, self.fill_rate(), len(self.placed)
+
         planned = self.plans.pop(box_id, None)               # ★ box_id 로 계획을 회수 (없으면 None)
         ok = True
         self.last_warning = ""
+        # ★ ok=False 의 **사유**를 남긴다. 사유가 없으면 통합할 때 "왜 거절됐지" 를
+        #   로그만 보고 못 찾는다 — yaw 초과·경계 이탈·높이 초과가 다 같은 false 다.
+        self.last_reason = ""
         yaw = float(actual["yaw_deg"])
 
         # ① yaw 가 계획에서 yaw_tol_deg 이상 벗어났나
@@ -195,6 +256,10 @@ class HeightmapPacker:
             # 비스듬히 놓였다 = 축정렬 격자에 그대로 못 넣는다. 외접 사각형으로 부풀려
             # "여기는 뭔가 있다"고 안전하게 기록하고, 실패를 호출자(트랙 B)에게 알린다.
             w, d = self._aabb(w_mm, d_mm, yaw)
+            self.last_warning = (f"{box_id}: 실측 yaw {yaw:.1f}° 가 계획 "
+                                 f"{planned[0]['yaw_deg']:.0f}° 에서 {dyaw:.1f}° 벗어났다 "
+                                 f"(허용 {self.yaw_tol}°) — AABB {w}x{d} 로 기록")
+            self.last_reason = "YAW"
             ok = False
         else:
             w, d = (w_mm, d_mm) if round(yaw / 90) % 2 == 0 else (d_mm, w_mm)
@@ -215,6 +280,7 @@ class HeightmapPacker:
         if over:
             self.last_warning = (f"{box_id}: 실측 상면 {top_q}mm 가 max_stack "
                                  f"{self.max_stack}mm 를 넘었다 — 실측 pose 확인 필요")
+            self.last_reason = "OVER_MAX"
             ok = False
 
         # ② 실측 좌표가 배열 밖으로 나갈 때 안전하게 자르기.
@@ -222,16 +288,33 @@ class HeightmapPacker:
         i0, i1 = max(i, 0), min(i + wc, self.W)
         j0, j1 = max(j, 0), min(j + dc, self.D)
         if i0 >= i1 or j0 >= j1:                             # 통째로 팔레트 밖 — 기록할 것이 없다
+            self.last_warning = (f"{box_id}: 실측 ({actual['x_mm']},{actual['y_mm']}) 이 "
+                                 f"팔레트 밖이다 — 기록하지 않는다")
+            self.last_reason = "OUTSIDE"
+            # ★ 여기도 이 박스에 대한 **최종 판정**이다. applied 에 남겨야 재시도가
+            #   같은 답을 받는다 (안 남기면 재시도 때 아래 경로로 새로 들어간다).
+            self.applied[box_id] = False
             return False, self.fill_rate(), len(self.placed)
         if (i0, i1, j0, j1) != (i, i + wc, j, j + dc):       # 일부만 걸쳐 있다 = 이미 이상 상황
+            if not self.last_reason:
+                self.last_warning = (f"{box_id}: 실측 ({actual['x_mm']},{actual['y_mm']}) 에서 "
+                                     f"박스가 팔레트 가장자리에 걸쳤다 — 걸친 만큼만 기록")
+                self.last_reason = "CLIPPED"
             ok = False
 
         self.hm[i0:i1, j0:j1] = np.maximum(self.hm[i0:i1, j0:j1], top_q)
         self.placed.append((actual, w_mm, d_mm, h_mm))
+        self.applied[box_id] = ok
         return ok, self.fill_rate(), len(self.placed)
 
     def cancel(self, box_id): self.plans.pop(box_id, None)
-    def reset(self): self.hm[:] = 0; self.plans.clear(); self.placed.clear()
+    def reset(self):
+        # ★ applied 도 같이 비운다. 안 비우면 팔레트를 갈고 나서 같은 box_id 가
+        #   다시 와도 "이미 반영됨" 으로 무시된다.
+        self.hm[:] = 0
+        self.plans.clear()
+        self.placed.clear()
+        self.applied.clear()
 
     def fill_rate(self):
         """적재율 = 박스 부피 합 / (팔레트 바닥 넓이 × **실제 최고 높이**)  — 명세서 §7.8
