@@ -828,6 +828,10 @@ def main():
                     help="`release` 를 부른 뒤 박스가 **언제 멈추는지** 100ms 구간으로 잰다. "
                          "RELEASE_MIN_HOLD_S · release_damping_duration_s · settle_wait_s "
                          "세 개(각 0.5s)가 다 필요한지 여기서만 갈린다")
+    ap.add_argument("--seed", type=int, default=None, metavar="N",
+                    help="박스 등장 순서 시드를 덮어쓴다 (기본은 system.yaml 의 "
+                         "boxes.random_seed=42). 계획을 여러 개 만들어 **한 계획에만 "
+                         "해당하는 결론**을 거르는 데 쓴다")
     ap.add_argument("--poll-ms", type=float, default=None, metavar="MS",
                     help="`cycle.MOTION_POLL_S` 를 덮어쓴다 (기본 20ms). 헤드리스는 시뮬이 "
                          "실시간의 7배로 돌아 20ms 벽시계가 **138ms 시뮬**이 된다 — "
@@ -941,7 +945,8 @@ def main():
     import cycle as CY                                   # packing_robot
     import sim_link as SL
 
-    if a.pedestal is not None or a.standoff is not None or a.vel is not None:
+    if (a.pedestal is not None or a.standoff is not None or a.vel is not None
+            or a.seed is not None):
         # ★ system.yaml 을 안 고치고 로봇만 옮겨 본다 (철칙 3 — 숫자 변경은 팀 결정이다).
         #   `bring_up` 이 `_paths.system_config()` 로 base 를 읽으므로 그 함수만 감싼다.
         _orig_cfg = _paths.system_config
@@ -959,13 +964,19 @@ def main():
             if a.vel is not None:
                 # robot_motion 이 cfg["robot"]["joint_speed_scale"] 로 스텝 수를 정한다
                 c["robot"]["joint_speed_scale"] = float(a.vel)
+            if a.seed is not None:
+                # ★ 박스 등장 순서. `_pick_boxes` 가 이 값으로 뽑는다.
+                #   같은 시드로 이격만 바꾸면 **짝지은 비교**가 된다.
+                c["boxes"]["random_seed"] = int(a.seed)
             return c
 
         _paths.system_config = _patched
         print("★ 덮어쓴다 (system.yaml 은 그대로): 페데스탈 %s · 이격 %s · 속도배율 %s"
+              " · 시드 %s"
               % (a.pedestal if a.pedestal is not None else "기본",
                  a.standoff if a.standoff is not None else "기본",
-                 a.vel if a.vel is not None else "기본"))
+                 a.vel if a.vel is not None else "기본",
+                 a.seed if a.seed is not None else "기본"))
 
     ok_all = True
     server = link = None
