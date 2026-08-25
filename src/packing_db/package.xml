@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>packing_db</name>
+  <version>0.0.0</version>
+  <description>
+    palletris.db 의 유일한 writer (트랙 D). /db/* 서비스 6개와 중재자 /diverter/request 를
+    한 프로세스에서 제공한다 — 중재자가 sqlite 커넥션을 직접 공유해야 0.6 초 제한을
+    지킬 수 있기 때문이다 (작업명세서 §8.5, CLAUDE.md §3-4 규약 4).
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">민범진</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>packing_msgs</exec_depend>
+  <exec_depend>packing_common</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

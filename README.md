@@ -1,101 +1,278 @@
-# Project Palletris — 스마트 물류창고 로봇팔 3D 패킹 시스템
+# CLAUDE.md — Project Palletris
 
-컨베이어 + 로봇팔로 박스를 구역 분류하고, heightmap 기반 3D 최적화 패킹으로
-팔레트에 적재한 뒤 트럭에 상차하는 디지털 트윈 시스템.
+> 워크스페이스 루트(`~/palletris_ws/`)에 둔다.
+> Claude Code 가 매 세션 시작 시 자동으로 읽는 프로젝트 컨텍스트다.
+>
+> ★ **숫자의 정본은 `config/system.yaml` 이다.** 이 문서와 다르면 yaml 을 따르고,
+>   다른 부분을 발견하면 지어내지 말고 보고할 것.
+
+---
+
+## 0. 이 프로젝트가 뭔가
+
+창고 자동 팔레타이징 시뮬레이션. 컨베이어로 오는 박스를 로봇 팔이 집어
+3D bin-packing 알고리즘이 계산한 자리에 쌓고, 팔레트째 트럭에 넣는다.
+로보틱스 캡스톤, 6일 일정.
+
+**우선순위: 완벽한 코드보다 "돌아가는 데모".**
+
+---
+
+## 1. 환경 — 고정값
 
 | 항목 | 값 |
 |---|---|
-| OS | Ubuntu 24.04 LTS |
-| 미들웨어 | ROS 2 Jazzy |
-| 시뮬레이터 | NVIDIA Isaac Sim 5.1 |
-| 로봇 | 두산 H2017 (페데스탈 900mm) |
+| OS / 미들웨어 | Ubuntu 24.04 · ROS 2 **Jazzy** (Python 3.12) |
+| 시뮬레이터 | Isaac Sim **5.1** (내장 Python **3.11** — 버전이 다르다) |
+| 로봇 | 두산 **H2017** (도달거리 1700mm) |
+| `ROS_DOMAIN_ID` | **115** (팀 전원 동일) |
 | 워크스페이스 | `~/palletris_ws` |
-
-## 문서
-
-- `docs/작업명세서.md` — **인터페이스·수치의 정본**
-- `docs/설계결정서.md` — 왜 이렇게 정했는지의 근거
-- `docs/가이드/공통가이드_전원필독.md` · `docs/가이드/트랙A~D_*.md`
+| 실행 형태 | **다중 PC** ROS 2 통신 |
 
 ---
 
-## 개발 환경 세팅
+## 2. ★ 좌표 · 치수 — `system.yaml` 정본
 
-### 1. 저장소 받기
+**z = 0 은 도크 바닥 = 트럭 적재함 바닥이다. 야드 지면이 아니다.**
+야드 지면은 z = −850. 이 규약 덕분에 "팔레트를 들지 않고 밀어서 트럭에 넣는다"가
+높이차 0 으로 이미 만족된다.
 
-```bash
-git clone git@github.com:ImymemineJ/Project_Palletris.git ~/palletris_ws
-cd ~/palletris_ws
-```
+### 컨베이어 (진행 = +X)
+| 항목 | 값 |
+|---|---|
+| 벨트 상면 | z = **800** mm |
+| 스폰 지점 | (**500**, 0, 810) mm — 박스 밑면 중심 |
+| 스토퍼 | x = **10000** mm |
+| 픽업 구간 | x = 7500 ~ 10000 mm |
+| 벨트 속도 | 0.5 m/s |
 
-### 2. FastDDS 화이트리스트 배치
+### 구역 · 로봇 · 팔레트
+| 구역 | 팔레트 원점 (mm) | 로봇 베이스 (mm) |
+|---|---|---|
+| A | (10300, **1800**, 150) | (10900, **1500**, **900**) |
+| B | (10300, **300**, 150) | (10900, **0**, **900**) |
+| C | (10300, **−1200**, 150) | (10900, **−1500**, **900**) |
 
-유선망(10.10.0.1~4)으로만 통신하도록 제한하는 설정이다.
-없으면 DDS가 wifi·docker0 등 모든 인터페이스를 뒤져 노드 발견이 불안정해진다.
+- **페데스탈 900 mm** (구 문서의 500·700·1700 은 전부 폐기값)
+- 팔레트 **1200(X) × 800(Y)** × 두께 150
+  → Y 로 3장 붙여 2400, 트럭 바닥 2800 에 들어간다
+- **최대 적재 1300 mm** (팔레트 **상면** 기준). 850 이 아니다.
+- heightmap 격자 10 mm → **120 × 80** 셀
 
-```bash
-mkdir -p ~/.ros
-cp scripts/fastdds_whitelist.xml ~/.ros/
-```
-
-> 실습실 유선망에 연결하기 전(개인 노트북 단독 작업 등)에는 이 설정이 오히려
-> 통신을 막을 수 있다. 그때는 아래 `FASTRTPS_DEFAULT_PROFILES_FILE` 줄만 주석 처리한다.
-
-### 3. `~/.bashrc` 맨 아래에 추가 (작업명세서 §1.1)
-
-```bash
-source /opt/ros/jazzy/setup.bash
-export ROS_DOMAIN_ID=115
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTRTPS_DEFAULT_PROFILES_FILE=$HOME/.ros/fastdds_whitelist.xml
-source $HOME/palletris_ws/install/setup.bash
-```
-
-`nano ~/.bashrc` → 맨 아래에 붙여넣기 → **Ctrl+O** → **Enter** → **Ctrl+X**
-
-> ⚠️ **`ROS_DOMAIN_ID` 는 4명 전원 `115` 여야 한다.**
-> 값이 다르면 ROS2 통신이 **에러 없이 그냥 안 된다.** 수업 자료에 50과 103으로
-> 어긋나게 적혀 있으니 그대로 따르지 말 것. (설계결정서 §10.1)
->
-> `install/setup.bash` 는 첫 빌드 전에는 없어서 `No such file` 경고가 뜬다. 빌드하면 사라진다.
-
-### 4. 적용 및 확인
-
-```bash
-source ~/.bashrc
-echo $ROS_DOMAIN_ID        # → 115
-ls ~/.ros/                 # → fastdds_whitelist.xml
-```
-
-### 5. 빌드
-
-```bash
-cd ~/palletris_ws
-colcon build --symlink-install
-source install/setup.bash
-```
-
-### 6. 자기 브랜치로 이동
-
-```bash
-git switch track/sim       # 김학민 / 병직 track/robot / 정인 track/algo / 범진 track/db
-```
-
----
-
-## 트랙 담당
-
-| 트랙 | 담당 | 소유 디렉터리 | 브랜치 |
+### 박스 3종
+| 이름 | w × d × h (mm) | 질량 | 혼입비 |
 |---|---|---|---|
-| A 씬/에셋 | 김학민 | `src/packing_sim`, `src/packing_common`, `scripts/` | `track/sim` |
-| B 로봇제어 | 김병직 | `src/packing_robot` | `track/robot` |
-| C 패킹알고리즘 | 정정인 | `src/packing_algo` | `track/algo` |
-| D 인터페이스/DB | 민범진 | `src/packing_msgs`, `src/packing_db` | `track/db` |
-| 공용 | 합의 필요 | `src/packing_bringup`, `docs/`, `.github/` | — |
+| 3호 | 340 × 250 × 210 | **3 kg** | 0.5 |
+| 4호 | 410 × 310 × 280 | **5 kg** | 0.3 |
+| 5호 | 480 × 380 × 340 | **9 kg** | 0.2 |
 
-## 철칙 4개
+`random_seed: 42` 고정 — 베이스라인 비교에 필수. 함부로 바꾸지 말 것.
 
-1. §2 인터페이스는 Day 1 오전에 4인이 함께 확정한다.
-2. 씬 USD 는 김학민만 수정한다. git 이 아니라 `scripts/sync_scene.sh` 로 배포.
-3. 모든 숫자는 `src/packing_bringup/config/system.yaml` 에서 읽는다.
-4. 어떤 콜백 안에서도 `spin_until_future_complete` 를 쓰지 않는다.
+### 단위 규칙
+- 설정 파일 · DB = **mm 정수** / Isaac · ROS 코드 = **m float**
+- 변환은 **반드시 `packing_common.units` 함수만**. 직접 `/1000` 금지.
+- `PlacePose`: `x_mm`·`y_mm` = 박스 **중심**, `z_mm` = 박스 **밑면**
+  → z 를 중심으로 쓰면 팔레트에 절반 파묻힌다.
+- **코드에 숫자를 박지 않는다.** 전부 `system.yaml` 에서 읽는다 (철칙 3).
+
+---
+
+## 3. 왜 Isaac 안과 밖이 나뉘어 있나
+
+**Isaac Sim 은 Python 3.11, ROS 2 Jazzy 는 Python 3.12.**
+Isaac 내부 Python 에서 `packing_msgs` 를 import 할 수 없다.
+
+| | 무엇이 있나 |
+|---|---|
+| **Isaac 안** (Action Graph) | 카메라·tf·clock 발행, 씬 제어, 로봇 구동 |
+| **Isaac 밖** (rclpy 노드) | 인식, 관제탑, 알고리즘, DB. **판단 로직 전부** |
+
+Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
+
+---
+
+## 4. 카메라 4종 — 씬에 이미 있다
+
+| 카메라 | 위치 | 역할 |
+|---|---|---|
+| `cam1` | x = 600 | 투입부 검사 · 크기/ID 판정 |
+| `cam2` | x = 1400 | 투입부 검증 |
+| **`pick_cam`** | 스토퍼 위 (0, **2300**) 하향 | **픽업 좌표 실측** (x·y·yaw) |
+| **`wrist_cam`** | 그리퍼 몸통 · offset (170, 0, 30) · tilt 18° | hand-eye · 집는 순간 확인 |
+
+- 해상도 1280×720 · HFOV 60° · 30 Hz
+- **QoS 는 `qos_profile_sensor_data` (BEST_EFFORT).**
+  기본 RELIABLE 로 구독하면 이미지가 하나도 안 온다.
+- ⚠️ **오프스크린 렌더는 GUI 조명 리그를 못 받는다.** 돔 라이트(`intensity: 1000`)가
+  꺼져 있으면 눈으로는 멀쩡한데 카메라 이미지가 캄캄하다. 손목 카메라는
+  화면의 60 %가 순수 검정이 된다.
+- ⚠️ 화면이 전부 0 이면 조명보다 **카메라가 형상 안에 파묻혔는지** 먼저 의심할 것
+  (wrist_cam 이 실제로 그랬다. x=100 → 170 으로 빼서 해결).
+
+---
+
+## 5. flow — 박스 한 개 사이클
+
+```
+1. 박스 스폰            씬 (랜덤 위치 · 랜덤 yaw)
+2. 투입부 인식           cam1 판독 → DB 등록 → cam2 검증
+3. 목적지 판단 · 분기     중재자 (x=2000 트리거, 응답 0.6초 제한)
+4. 픽업 위치 도착        pick_cam → 픽업 좌표 (x·y·yaw)
+5. 벨트 정지            관제탑
+6. 놓을 자리 계산        적재 알고리즘
+     ├─ NO_FEASIBLE_POSE → 이 박스만 되돌림 (종료 아님)
+     └─ PALLET_FULL      → 트럭 상차
+7. 집기 → 놓기           로봇 (wrist_cam 이 집는 순간 확인)
+8. 높이맵 갱신 → 벨트 재가동 → 1번으로 반복
+```
+
+---
+
+## 6. ★ `NO_FEASIBLE_POSE` ≠ `PALLET_FULL`
+
+| 신호 | 의미 | 처리 |
+|---|---|---|
+| `NO_FEASIBLE_POSE` | **이 박스만** 자리가 없다. 다음 박스는 들어갈 수 있다 | 그 박스만 되돌림 후 **계속** |
+| `PALLET_FULL` | 가장 작은 박스로도 후보가 없다 | 트럭 상차 · 시나리오 종료 |
+
+**첫 `NO_FEASIBLE_POSE` 에서 종료하면 팔레트가 반만 찬 채 데모가 멈춘다.**
+스토퍼에 박스를 두면 뒤 박스가 밀려 라인이 막히므로 반드시 치운다.
+
+---
+
+## 7. 노드 구조
+
+| 노드 | 개수 | 트랙 | 하는 일 | 하지 않는 일 |
+|---|---|---|---|---|
+| 관제탑 | **3** | B | **로봇 명령의 유일한 발신자.** 상태머신 | 자리 계산 |
+| 구역 인식 노드 | **3** | D | 도착 감지 + 픽업 좌표 발행 | 로봇 명령 |
+| 라인 인식 노드 | **2** | D | cam1 판독 · cam2 검증 | 로봇 명령 |
+| 중재자 | **1** | D | 목적지 배분 · 되돌림 판단 | |
+| 적재 알고리즘 | **1** | C | heightmap 3장 소유 · 자리 계산 | **로봇 명령 금지** |
+| db_service_node | **1** | D | `palletris.db` 를 여는 **유일한** 프로세스 | |
+
+★ 알고리즘이나 인식 노드가 `/robot/cmd` 를 발행하면 설계 위반이다.
+★ 다른 프로세스가 `.db` 를 열면 `database is locked` 가 난다.
+
+### 관제탑 상태 7개
+`IDLE` → `FETCHING` → `PLANNING` → `PICKING` → `PLACING` → `UPDATING` → `IDLE` / `DONE`
+
+**이탈 3경로:** `NO_FEASIBLE_POSE` · `PALLET_FULL` · 실패/타임아웃(**20초**)
+→ 모두 `/algo/cancel_plan` 을 호출한 뒤 복귀한다.
+
+---
+
+## 8. 인터페이스 — 타입 확정
+
+**토픽에 JSON 문자열을 쓰지 않는다.** 전부 전용 타입이다.
+
+| 이름 | 타입 |
+|---|---|
+| 카메라 영상 | `sensor_msgs/Image` |
+| `/tf` · `/tf_static` | Isaac `ROS2 Publish Transform Tree` |
+| `/clock` | Isaac `ROS2 Publish Clock` |
+| `/zone_*/box_at_pickup` | `packing_msgs/msg/BoxAtPickup` |
+| `/robot/cmd` · `/robot/event` | `packing_msgs/msg/RobotCmd` · `RobotEvent` |
+| `/zone_*/status` | `packing_msgs/msg/ZoneStatus` |
+| 서비스 15종 | `packing_msgs/srv` |
+
+### 핵심 규약
+- **모든 노드에 `use_sim_time:=true`.** 없으면 tf 조회가 전부 실패하고
+  "lookup would require extrapolation" 이 뜬다.
+- `RobotCmd.seq` 를 `RobotEvent.seq` 가 그대로 되돌려준다.
+  없으면 타임아웃 후 늦게 온 이전 응답을 새 박스의 결과로 오인한다.
+- `RobotEvent.has_actual == true` 일 때만 `actual_*` 가 유효하다.
+  이 값을 `update_heightmap` 에 넣는다. **계획값을 되보내면 오차가 누적된다.**
+- 중재자 `DiverterRequest` 는 **응답 제한 0.6초**, 초과 시 `NORMAL` 로 통과.
+- 일반 서비스 타임아웃 **2.0초**, 재시도 1회 (`service.timeout_s`).
+
+---
+
+## 9. 코딩 규칙
+
+- **모든 서비스 호출은 `call_async` + `future.add_done_callback`.**
+  `spin_until_future_complete` 금지 — 콜백 안에서 부르면
+  executor 가 자기 자신을 기다려 **에러 없이 조용히 멈춘다.**
+- `MultiThreadedExecutor` + `ReentrantCallbackGroup` 필수.
+- 로봇 모션 타임아웃 **20초** (`ROBOT_TIMEOUT_S`). 초과 시 `cancel_plan` 후 복귀.
+  **노드가 죽으면 안 된다.**
+- 구독 콜백은 **입력을 검증한다.** rclpy 는 콜백 예외를 삼키므로,
+  잘못된 메시지 하나에 박스가 영원히 안 오는데 에러는 안 뜬다.
+- **주석은 한국어.** 특히 "왜 이렇게 했는지".
+- `packing_common/frames.py` 를 **import** 해서 쓴다. 복사 금지.
+
+---
+
+## 10. 자주 나오는 증상 → 원인
+
+| 증상 | 원인 후보 |
+|---|---|
+| 토픽이 안 보이는데 에러도 없다 | `ROS_DOMAIN_ID` 불일치 / 콜백 예외가 삼켜짐 |
+| 이미지가 하나도 안 온다 | QoS 가 RELIABLE |
+| 카메라 이미지가 캄캄하다 | 돔 라이트 꺼짐 / **카메라가 형상 안에 파묻힘** |
+| tf lookup 이 계속 실패한다 | `use_sim_time` 미설정 / `/clock` 미발행 |
+| 서비스 응답이 영원히 안 온다 | 콜백 안에서 동기 호출 |
+| 로봇 응답이 엉뚱한 박스 것으로 처리된다 | `seq` 검사 누락 |
+| 박스가 벨트를 뚫고 떨어진다 | 스폰 z 에 `h/2` 안 더함 |
+| 흡착했는데 박스가 40 mm 떠서 붙는다 | 패드 D6 조인트 6축을 다 잠금 (Z 5 mm 슬롯 필요) |
+| 팔이 최대 토크로 잡아채며 박스를 친다 | 웨이포인트 없이 계단 입력 (`joint_speed_scale` 확인) |
+| 다층에서 팔이 기둥을 친다 | 페데스탈이 900 이 아님 |
+| 2층부터 `NO_FEASIBLE_POSE` 만 | `support_tol_mm` < `cell_mm` (둘 다 10) |
+| 충전율이 이상하게 낮다 | 분모를 `max_stack_mm` 고정으로 씀 (실제 최고높이여야 함) |
+| 실제 더미가 계산보다 높다 | `update_heightmap` 에 계획 pose 를 넣음 |
+| `database is locked` | `db_service_node` 외 프로세스가 `.db` 를 열었다 |
+
+---
+
+## 11. 하지 말 것
+
+- ❌ 공용 파일(`packing_msgs/`, `config/system.yaml`, 씬 USD)을 **승인 없이** 수정
+- ❌ **코드에 숫자 상수 박기** — 전부 `system.yaml` 에서 읽는다
+- ❌ 알고리즘·인식 노드에서 `/robot/cmd` 발행
+- ❌ `spin_until_future_complete` 사용
+- ❌ 토픽에 JSON 문자열 사용
+- ❌ `random_seed: 42` 변경 (베이스라인 비교가 깨진다)
+- ❌ 흡착 패드 D6 조인트 값 임의 변경 (`h2017_cell.usd` 실측값이다)
+- ❌ 아직 없는 노드의 mock 을 임의로 만들어 붙이기
+- ❌ 문서에 없는 숫자·API 추측해서 쓰기 (모르면 "확인 필요" 라고 남길 것)
+
+---
+
+## 12. 평가 항목과의 대응 (참고)
+
+| 평가 항목 | 우리 대응 |
+|---|---|
+| ROS2 연동 (clock · 이미지 · tf) | Action Graph 3종 발행 |
+| 동적 대응 (랜덤 스폰) | **스폰 y·yaw 랜덤화 — 아직 미구현** |
+| 다중 로봇 조율 | 로봇 3대 + 관제탑 3개 + 중재자 |
+| 예외 처리 (크래시 없음) | 입력 검증 · 타임아웃 20초 · `cancel_plan` |
+| 처리 효율 (추론 주기 제한) | 천장 카메라는 도착 신호 시에만 추론 |
+| 검증 및 분석 (정량) | 종료 지표: 적재수 · 충전율 · 최고높이 · 소요시간 |
+| 재현성 (Play/Stop) | `random_seed: 42` · 리셋 처리 |
+| 챌린지 | heightmap vs naive · `w_far` · `w_wall` 개선 실측 |
+
+---
+
+## 13. 팀 · 트랙
+
+| 트랙 | 담당 | 범위 |
+|---|---|---|
+| A | 김학민 | Isaac 씬, 카메라·컨베이어·tf, USD |
+| B | 김병직 | 로봇 팔 제어, 관제탑 |
+| C | 정정인 | 패킹 알고리즘 |
+| D | 민범진 | 비전/인식, DB, 인터페이스 설계 |
+
+**공용 파일 수정 = 팀 4명 전원 재빌드.** 바꿨으면 반드시 보고할 것.
+
+---
+
+## 14. 미결 (확인 필요 — 추측 금지)
+
+| 항목 | 담당 | 왜 |
+|---|---|---|
+| **`belt_width_mm` 이 yaml 에 없다** | 김학민 | 랜덤 스폰 y 범위를 유도할 수 없다 |
+| **`spawn_y_jitter_mm` · `spawn_yaw_jitter_deg` 추가** | 팀 | 평가 항목 "동적 대응" 미충족 상태 |
+| `recognition.enabled: false` | 팀 | 최종 구현은 인식 포함 → `true` 로 바꿔야 함 |
+| `stage: 1` → `2` 전환 시점 | 팀 | 최종은 3구역 |
+| `gripper_clearance_mm` 30 → **10** | 김병직 | 충전율 **+7.2%p**. 툴 단면 실측 필요 |
+| tf 프레임 이름 규약 | 김학민 | 씬 prim 이름과 일치해야 함 |

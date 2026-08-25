@@ -26,6 +26,11 @@
 | `demo_stack15_test1_1.py` | 김학민 | **15박스 연속 — 실제 라인.** `demo_stack15`(B5)를 컨베이어 위로 옮긴 것. 급송이 없고 도착 순서 그대로 집으므로 온라인 패커를 쓴다. 스폰은 사양 스케줄(`boxes.stage1` 12 s x 15). `PL_N` 으로 개수 축소 |
 | `script_editor_lula.py` | 김병직 | **Isaac Sim GUI 의 Script Editor 에 붙여넣는 스니펫.** `POINT` 만 바꿔 11점 중 하나로 팔을 보낸다 |
 | `read_log.py` | 김병직 | Isaac Script Editor 출력을 터미널에서 읽는다 |
-| `gen_master_db.py` | 민범진 | D1 — **직접 추가할 것** |
+| `gen_master_db.py` | 민범진 | **D1 — boxes_master 생성.** 실행 전에 "정답지"를 깐다. 실행 중 흘러간 박스(`boxes_sorted`)와 대조해야 인식률을 잴 수 있다 — 등록된 것만 세면 언제나 100 % 로 나온다 (명세서 §8.6). stage 1 은 zone 전부 `B` (랜덤 금지). `ros2 run packing_db gen_master_db` 와 같다 |
+| `verify_db.py` | 민범진 | **D2 판정 — `/db/*` 6종 + `/diverter/request`.** 박스 하나를 등록→검증→분기→집기→적재까지 태우며 응답을 확인한다. 실패 경로(모르는 status·미등록 박스·남의 QR)도 같이 친다 — 성공 경로만 보면 조용히 잘못 도는 버그를 못 잡는다. `db_service_node` 를 먼저 띄울 것 |
+| `db_peek.py` | 민범진 | **palletris.db 를 사람이 읽는 표로.** SQL 도 sqlite3 CLI 도 필요 없다(이 PC 에 CLI 가 없다 — 가이드 D1 의 `sqlite3 ...` 확인 명령은 안 돈다). 읽기 전용(`mode=ro`)이라 `db_service_node` 와 같이 떠 있어도 안전하다. `--box BOX00003` 은 그 박스의 상태 전이 이력, `--csv` 는 발표용 덤프 |
+| `report.py` | 민범진 | **D3 — 발표의 "결과 수치".** 처리량·인식률·pick&place 성공률·평균 사이클·로봇 유휴율·최고 높이(실측)를 표로. 쿼리는 `packing_db/metrics.py` 하나를 `db_service_node` 의 `/metrics/summary` 와 **같이 쓴다** — 복붙하면 실시간 화면과 최종 보고서의 숫자가 갈린다. `--csv` 덤프, `--watch` 는 2초마다 다시 그린다. 읽기 전용이라 실행 중에 돌려도 안전하다 |
+| `verify_vision.py` | 민범진 | **D 인식 전 구간 — Isaac 없이.** 씬 USD 가 이 저장소에 없어서(sync_scene.sh 배포) 이 스크립트가 **Isaac 의 대역**을 선다 — 알려진 카메라·박스를 직접 투영해 `<ns>/rgb`·`<ns>/camera_info`·`/tf_static` 을 씬과 같은 규약으로 낸다. cam1 등록 → pick_cam 좌표 → 빈 벨트까지 확인. 실측 x 0.14 mm · yaw 0.05°. `db_service_node` 와 `vision_node` 를 먼저 띄울 것 |
+| `verify_ros_graph.py` | 민범진 | **★ ROS 2 그래프 전 구간 — Isaac 없이.** 진짜로 도는 것은 인식·DB·알고리즘·관제탑 넷이고, 이 스크립트가 **Isaac 이 하는 일 전부**를 대신한다 — `/clock`·`/tf_static`·카메라 2대·씬 서비스 4종·로봇(`/robot/cmd`→`/robot/event`). `verify_b4_cycle.py` 의 StandInServer 와 같은 자리의 ROS 2 판이다. 박스가 인식→등록→분기→집기→적재→heightmap 갱신까지 실제로 흘러간다. `ros2 launch packing_bringup bringup.launch.py` 를 먼저 띄울 것 |
 
 게이팅 검증 스크립트(G1~G7)는 전부 여기에 커밋한다. (작업명세서 §11)
