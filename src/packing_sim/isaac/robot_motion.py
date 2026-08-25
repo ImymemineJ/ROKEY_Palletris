@@ -99,6 +99,9 @@ SETTLE_HOLD = 3                           # 연속 이만큼 만족해야 REACHE
 #      교훈("정상상태 오차는 성질이다 — 위치 오차로 단계 전환 금지")의 적용이다.
 #   ⚠ yaw 는 그대로 YAW_TOL_DEG 를 요구한다. 느슨하게 하면 박스가 삐딱하게 앉아
 #     다음 층이 그 위에서 무너진다 (TS-015 재발).
+# ★ 정착 구간을 한 줄씩 찍는다 (데모가 --diag-time 에서 켠다). 구간당 430 ms 가
+#   어디서 나오는지 — **팔이 움직이는 중인지 이미 멈췄는지** — 이걸로만 갈린다.
+SETTLE_LOG = False
 SETTLE_PLATEAU_TICKS = 8                  # 이만큼 연속으로
 SETTLE_PLATEAU_M = 0.0002                 # 0.2 mm 이상 안 줄면 수렴 끝으로 본다
 ARC_MIN_R_M = 0.15                        # 반경이 이보다 작으면 각도가 무의미 — 직선
@@ -244,6 +247,7 @@ class RobotMotion:
         self._hold = 0
         self._settle = 0
         self._best, self._flat = float("inf"), 0
+        self._s0 = None
         self._tcp_mps = 0.0
         self._prev_tool = None
         self._g_evt = None          # grasp 결과 대기
@@ -564,6 +568,7 @@ class RobotMotion:
         self._hold = 0
         self._settle = int(SETTLE_MAX_S * self.hz)
         self._best, self._flat = float("inf"), 0      # 수렴 정체 판정 (위 SETTLE_PLATEAU_*)
+        self._s0 = None                              # 정착 진입 시점 (잔차, 틱) — SETTLE_LOG
         self._state = "MOVING"
         self._log("[robot_motion] move -> %s yaw %.1f -> %.1f  %s  |dq| %.1f deg  n %d"
                   % (np.round(face, 4), yaw_from, yaw_to,
@@ -618,6 +623,8 @@ class RobotMotion:
         # ★ yaw 와 yaw±180 은 물리적으로 같은 자세다 — 180° 주기로 비교한다.
         #   안 그러면 등가 각으로 수렴했는데 178° 틀렸다고 오판해 매번 한도까지 기다린다.
         dyaw = abs(yaw - _near(self._goal_yaw, yaw, 180.0))
+        if self._s0 is None:
+            self._s0 = (err, dyaw, self._settle)     # 호가 끝난 직후 값
         tol = p.get("tol", REACH_TOL_M)
         if err < tol and dyaw < YAW_TOL_DEG:
             self._hold += 1
@@ -663,6 +670,16 @@ class RobotMotion:
                      np.round(self._goal_face, 4), p["miss"], p["over"]))
 
     def _reach_done(self, err, p=None):
+        if SETTLE_LOG and self._s0 is not None:
+            e0, d0, t0 = self._s0
+            n = t0 - self._settle
+            # 잔차가 크게 줄었으면 **팔이 움직이는 중**이었다는 뜻이고,
+            # 거의 그대로면 **이미 멈춰 있었는데 로직이 붙잡은** 것이다.
+            self._log("[robot_motion] 정착 %3d틱 %5.0f ms · 잔차 %6.2f -> %5.2f mm "
+                      "(줄어든 %5.2f) · yaw %4.1f -> %4.1f도"
+                      % (n, 1000.0 * n / self.hz, e0 * 1000, err * 1000,
+                         (e0 - err) * 1000, d0, 0.0))
+        self._s0 = None
         # ★ REACH_TOL 을 못 맞추고 끝난 구간은 잔차를 남긴다 — 이 제어기의 정상상태가
         #   얼마인지가 여기서만 보인다. 한 줄로 짧게.
         if p is not None and err >= p.get("tol", REACH_TOL_M):

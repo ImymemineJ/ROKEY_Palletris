@@ -1201,6 +1201,8 @@ def main():
                             ("x_mm", "y_mm", "z_mm", "yaw_deg", "stack_top_mm") if k in p}
                       for bid, p in zip(ids, plan)}
             svc = PlanServices(specs, places, verbose=a.verbose)
+        if a.diag_time:
+            RM.SETTLE_LOG = True          # 구간마다 정착 틱·잔차를 한 줄씩 찍는다
         if a.poll_ms is not None:
             # ★ 모듈 상수만 덮어쓴다. cycle.py 정본은 그대로다.
             CY.MOTION_POLL_S = float(a.poll_ms) / 1000.0
