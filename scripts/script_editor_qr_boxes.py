@@ -51,11 +51,11 @@ QR_DIR = "/home/rokey/Downloads"          # ★ 저장소로 옮기면 여기만
 
 QR_CODES = [
     {"file": "qrcode_390440233_9a0fe13a95a623f42c4ae6443fac57b2.png",
-     "payload": "TODO-실제-QR-내용-1", "dest": "A"},
+     "payload": "TODO-QR-PAYLOAD-1", "dest": "A"},
     {"file": "qrcode_390443182_98c53133a43e86da032b7dbe25475d15.png",
-     "payload": "TODO-실제-QR-내용-2", "dest": "B"},
+     "payload": "TODO-QR-PAYLOAD-2", "dest": "B"},
     {"file": "qrcode_390443245_cdaa800198d93d60377bcdd0328e9636.png",
-     "payload": "TODO-실제-QR-내용-3", "dest": "C"},
+     "payload": "TODO-QR-PAYLOAD-3", "dest": "C"},
 ]
 
 SPAWN_COUNT = 8           # 몇 개 뿌려 볼지 (단독 테스트용. 사양은 stage1.total_count)
@@ -122,9 +122,9 @@ def load_spec():
         tried.append(c)
 
     raise RuntimeError(
-        "system.yaml 을 못 찾았다.\n"
-        f"  → 이 파일 위쪽의 WS_ROOT 를 실제 저장소 경로로 고칠 것 (지금: {WS_ROOT})\n"
-        "  찾아본 곳:\n    " + "\n    ".join(list(dict.fromkeys(tried))[:8]))
+        "system.yaml not found.\n"
+        f"  -> Fix WS_ROOT near the top of this file (now: {WS_ROOT})\n"
+        "  Tried:\n    " + "\n    ".join(list(dict.fromkeys(tried))[:8]))
 
 CFG = load_spec()
 BOXES = CFG["boxes"]["types"]
@@ -141,8 +141,8 @@ MAIN_LO, MAIN_HI = CONV["stage1"]["main_range_mm"]
 def _spawn_key(name, doc_default):
     v = CFG["boxes"].get(name)
     if v is None:
-        print(f"[WARN] system.yaml 에 boxes.{name} 이 없다 → CLAUDE.md §4 값 {doc_default} 사용.")
-        print(f"       (§15 미결: 'spawn_y_jitter_mm · spawn_yaw_jitter_deg yaml + spawner.py 적용')")
+        print(f"[WARN] boxes.{name} missing in system.yaml -> using CLAUDE.md 4 value {doc_default}")
+        print("       (open item 15: add spawn_y_jitter_mm / spawn_yaw_jitter_deg to yaml)")
         return doc_default
     return v
 
@@ -152,30 +152,36 @@ YAW_JITTER_DEG = _spawn_key("spawn_yaw_jitter_deg", 15)
 
 MM = 1000.0                                            # mm -> m (§4: Isaac 은 m float)
 
+
+def ascii_type(name):
+    """콘솔 출력 전용 로마자화. Isaac Script Editor 콘솔이 한글을 못 그린다
+    (`3호` 가 `3?` 로 나온다). 프림 속성에는 원래 이름을 그대로 넣는다."""
+    return {"3호": "No.3", "4호": "No.4", "5호": "No.5"}.get(name, name)
+
 stage = omni.usd.get_context().get_stage()
 if stage is None:
-    raise RuntimeError("열린 스테이지가 없다. 씬을 먼저 열 것 (File > Open).")
+    raise RuntimeError("No stage open. Open or create a scene first.")
 
 # ── QR 이미지 검증 ────────────────────────────────────────────────
 VALID = []
 for q in QR_CODES:
     p = os.path.join(QR_DIR, q["file"])
     if not os.path.exists(p):
-        print(f"[WARN] 파일 없음, 건너뜀: {p}")
+        print(f"[WARN] file not found, skipped: {p}")
         continue
     if any(c in q["file"] for c in " ()"):
         # Omniverse 에셋 리졸버가 이스케이프 안 된 공백/괄호에서 실패한다.
-        print(f"[WARN] 파일명에 공백/괄호 — 텍스처 로드가 실패할 수 있다: {q['file']}")
-        print("       → 파일명을 바꾸고 다시 넣을 것. 일단 건너뛴다.")
+        print(f"[WARN] space/parenthesis in filename may break the asset resolver: {q['file']}")
+        print("       -> rename the file. Skipping for now.")
         continue
     if str(q["payload"]).startswith("TODO"):
-        print(f"[WARN] payload 가 아직 자리표시자다: {q['file']}")
-        print("       → 실제 QR 내용으로 채우지 않으면 VerifyBox 가 항상 불일치를 낸다.")
+        print(f"[WARN] payload is still a placeholder: {q['file']}")
+        print("       -> fill in the real QR content, or VerifyBox will always mismatch.")
     VALID.append(dict(q, path=p))
 
 if not VALID:
-    raise RuntimeError("쓸 수 있는 QR 이미지가 없다. QR_DIR / 파일명을 확인할 것.")
-print(f"[INFO] QR {len(VALID)}종 · 박스 {len(BOXES)}종 · 시드 {SEED}")
+    raise RuntimeError("No usable QR image. Check QR_DIR and the filenames.")
+print(f"[INFO] {len(VALID)} QR codes | {len(BOXES)} box types | seed {SEED}")
 
 rng = random.Random(SEED)
 
@@ -184,7 +190,7 @@ rng = random.Random(SEED)
 # ══════════════════════════════════════════════════════════════════════════
 if not stage.GetPrimAtPath("/World/DomeLight").IsValid():
     UsdLux.DomeLight.Define(stage, "/World/DomeLight").CreateIntensityAttr(1000.0)
-    print("[INFO] DomeLight 생성 (intensity 1000).")
+    print("[INFO] DomeLight created (intensity 1000)")
 
 if not stage.GetPrimAtPath("/World/PhysicsScene").IsValid():
     UsdPhysics.Scene.Define(stage, "/World/PhysicsScene")
@@ -198,7 +204,7 @@ if MAKE_GROUND and not stage.GetPrimAtPath("/World/GroundPlane").IsValid():
     g.CreateDisplayColorAttr([Gf.Vec3f(0.25, 0.25, 0.28)])
     UsdGeom.XformCommonAPI(g).SetTranslate(Gf.Vec3d(0.0, 0.0, -gs / 2))
     UsdPhysics.CollisionAPI.Apply(g.GetPrim())        # RigidBodyAPI 없음 = 정적
-    print("[INFO] GroundPlane 생성 (상면 z=0).")
+    print("[INFO] GroundPlane created (top at z=0)")
 
 # ══════════════════════════════════════════════════════════════════════════
 # 4. QR 재질 — UsdPreviewSurface (전부 동기)
@@ -316,8 +322,8 @@ spacing_mm = BELT_MPS * INTERVAL_S * MM
 usable_mm = MAIN_HI - SPAWN_MM[0]
 if spacing_mm * (SPAWN_COUNT - 1) > usable_mm and SPAWN_COUNT > 1:
     spacing_mm = usable_mm / (SPAWN_COUNT - 1)
-    print(f"[INFO] 사양 간격 {BELT_MPS * INTERVAL_S:.1f} m 로는 {SPAWN_COUNT}개가 "
-          f"벨트({usable_mm / MM:.1f} m)를 넘는다 → {spacing_mm / MM:.2f} m 로 좁힌다.")
+    print(f"[INFO] spec spacing {BELT_MPS * INTERVAL_S:.1f} m x {SPAWN_COUNT} exceeds the "
+          f"belt ({usable_mm / MM:.1f} m) -> narrowing to {spacing_mm / MM:.2f} m")
 
 manifest = []
 for i in range(SPAWN_COUNT):
@@ -332,12 +338,12 @@ for i in range(SPAWN_COUNT):
 
 # ── 매니페스트 — 어느 박스에 어느 QR 이 붙었나 (§3-1 qr_payload · dest) ──
 print()
-print(f"{'box_id':10} {'종류':5} {'Px(mm)':>8} {'Py(mm)':>8} {'yaw':>7}  {'dest':4} payload")
+print(f"{'box_id':10} {'type':6} {'Px(mm)':>8} {'Py(mm)':>8} {'yaw':>7}  {'dest':4} payload")
 for m in manifest:
-    print(f"{m['box_id']:10} {m['box_type']:5} {m['x_mm']:8d} {m['y_mm']:8d} "
-          f"{m['yaw_deg']:6.1f}°  {m['dest']:4} {m['qr_payload']}")
+    print(f"{m['box_id']:10} {ascii_type(m['box_type']):6} {m['x_mm']:8d} {m['y_mm']:8d} "
+          f"{m['yaw_deg']:6.1f}d  {m['dest']:4} {m['qr_payload']}")
 print()
-print(f"[SUCCESS] {SPAWN_COUNT}개 스폰 — 벨트 상면 z={CONV['belt_top_z_mm']}mm 위, "
-      f"밑면 z={SPAWN_MM[2]}mm")
-print("          같은 값이 각 프림의 palletris:* 커스텀 속성에도 들어 있다.")
-print("          Play 를 눌러 벨트를 타는지 확인할 것.")
+print(f"[SUCCESS] spawned {SPAWN_COUNT} boxes | bottom z={SPAWN_MM[2]} mm "
+      f"(belt top z={CONV['belt_top_z_mm']} mm -> 10 mm drop on Play)")
+print("          Same values are on each prim as palletris:* custom attributes.")
+print("          Press Play and check they ride the belt to the stopper.")

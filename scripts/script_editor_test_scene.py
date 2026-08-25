@@ -41,7 +41,13 @@ import omni.usd
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 # ══════════════════════════════════════════════════════════════════════════
-DRIVE_BELT = True     # 벨트를 실제로 굴린다 (physxSurfaceVelocity). 속도는 config 값.
+DRIVE_BELT = True     # 벨트를 굴린다. 속도는 config 의 belt_velocity_mps.
+DRIVE_MODE = "auto"   # "auto" | "surface" | "push"
+                      #   surface : physxSurfaceVelocity — 진짜 컨베이어와 같은 원리.
+                      #             형상은 안 움직이고 표면만 흐른다.
+                      #   push    : 물리 스텝마다 벨트 위 박스의 +X 속도를 belt 속도로
+                      #             맞춘다. 스키마가 없어도 **무조건 돈다** (보험).
+                      #   auto    : surface 를 걸어 보고, 값이 안 박히면 push 로 넘어간다.
 SHOW_PALLET = True    # 팔레트 3장을 참고용으로 그린다 (물리 없음)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -94,9 +100,9 @@ def load_spec():
         tried.append(c)
 
     raise RuntimeError(
-        "system.yaml 을 못 찾았다.\n"
-        f"  → 이 파일 위쪽의 WS_ROOT 를 실제 저장소 경로로 고칠 것 (지금: {WS_ROOT})\n"
-        "  찾아본 곳:\n    " + "\n    ".join(list(dict.fromkeys(tried))[:8]))
+        "system.yaml not found.\n"
+        f"  -> Fix WS_ROOT near the top of this file (now: {WS_ROOT})\n"
+        "  Tried:\n    " + "\n    ".join(list(dict.fromkeys(tried))[:8]))
 
 CFG = load_spec()
 CONV = CFG["conveyor"]
@@ -112,12 +118,12 @@ STOPPER_X = CONV["stopper_x_mm"]                      # 10000
 BELT_W = CONV.get("belt_width_mm")
 if BELT_W is None:
     BELT_W = 1546
-    print(f"[WARN] system.yaml 에 conveyor.belt_width_mm 이 없다 → CLAUDE.md §4 값 {BELT_W} 사용.")
-    print("       (bbox 1970 은 난간 포함이라 사양이 아니다 — §4 'bbox 를 그대로 쓰지 마라')")
+    print(f"[WARN] conveyor.belt_width_mm missing in system.yaml -> using CLAUDE.md 4 value {BELT_W}")
+    print("       (bbox 1970 includes handrails - not the spec. See CLAUDE.md 4)")
 
 stage = omni.usd.get_context().get_stage()
 if stage is None:
-    raise RuntimeError("열린 스테이지가 없다. File > New 로 만들 것.")
+    raise RuntimeError("No stage open. Use File > New first.")
 
 if not stage.GetPrimAtPath("/World").IsValid():
     UsdGeom.Xform.Define(stage, "/World")
@@ -169,38 +175,83 @@ if SHOW_PALLET:
              org[1], org[1] + P["depth_mm"], org[2], P["thickness_mm"],
              Gf.Vec3f(0.55, 0.45, 0.30), collide=False)
 
-print(f"[OK] 테스트 씬 — 바닥 z=0 · 벨트 상면 z={BELT_TOP} (폭 {BELT_W}) · "
-      f"main {MAIN_LO}~{MAIN_HI} · 픽업 {PICK_LO}~{PICK_HI} · 스토퍼 {STOPPER_X}")
+print(f"[OK] test scene: floor z=0 | belt top z={BELT_TOP} (width {BELT_W}) | "
+      f"main {MAIN_LO}-{MAIN_HI} | pickup {PICK_LO}-{PICK_HI} | stopper {STOPPER_X}")
 
-# ── 벨트 구동 — physxSurfaceVelocity ────────────────────────────
-#   IsaacConveyor 노드가 매 틱 하는 일을 정적 콜라이더에 한 번 걸어 둔다.
-#   형상은 안 움직이고 표면만 흐른다 (verify_belt_speed.py 의 설명과 같은 원리).
-def drive(prim, mps):
-    """+X 로 mps 만큼 흐르는 표면으로 만든다. 성공하면 True."""
+# ── 벨트 구동 ────────────────────────────────────────────────────
+#   IsaacConveyor 노드가 매 틱 하는 일(physxSurfaceVelocity 쓰기)을 한 번 걸어 둔다.
+#   그게 이 판에서 안 먹으면 물리 스텝 콜백으로 박스를 직접 민다 (push).
+def try_surface(prim, mps):
+    """표면속도를 걸고 **되읽어 확인**한다. 값이 안 박히면 False."""
     try:
         api = PhysxSchema.PhysxSurfaceVelocityAPI.Apply(prim)
         api.CreateSurfaceVelocityEnabledAttr(True)
         api.CreateSurfaceVelocityAttr(Gf.Vec3f(mps, 0.0, 0.0))
-        # 월드 기준으로 못 박는다 — 로컬이면 벨트를 회전시켰을 때 방향이 달라진다.
-        api.CreateSurfaceVelocityLocalSpaceAttr(False)
-        return True
-    except Exception as e:                            # noqa: BLE001
-        print(f"[WARN] PhysxSurfaceVelocityAPI 실패 ({e}) — 원시 속성으로 재시도")
         try:
-            prim.ApplyAPI("PhysxSurfaceVelocityAPI")
-            prim.CreateAttribute("physxSurfaceVelocity:surfaceVelocityEnabled",
-                                 Sdf.ValueTypeNames.Bool).Set(True)
-            prim.CreateAttribute("physxSurfaceVelocity:surfaceVelocity",
-                                 Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(mps, 0.0, 0.0))
-            return True
-        except Exception as e2:                       # noqa: BLE001
-            print(f"[ERROR] 벨트 구동 실패: {e2}")
-            return False
+            api.CreateSurfaceVelocityLocalSpaceAttr(False)   # 판에 따라 없을 수 있다
+        except Exception:                                     # noqa: BLE001
+            pass
+    except Exception as e:                                    # noqa: BLE001
+        print(f"[WARN] PhysxSurfaceVelocityAPI unavailable ({type(e).__name__}: {e})")
+        return False
+    # ★ 되읽기. Apply 가 조용히 아무것도 안 하는 판이 있어서 반드시 확인한다.
+    a = prim.GetAttribute("physxSurfaceVelocity:surfaceVelocity")
+    got = a.Get() if a and a.IsValid() else None
+    if got is None:
+        print("[WARN] surfaceVelocity attribute did not stick")
+        return False
+    print(f"[INFO]   {prim.GetPath()}  surfaceVelocity={tuple(round(v,3) for v in got)}")
+    return True
 
+
+def start_push(mps):
+    """물리 스텝마다 벨트 위 박스의 +X 속도를 mps 로 맞춘다.
+
+    표면속도가 안 먹는 판을 위한 보험이다. 진짜 컨베이어는 아니지만
+    '박스가 벨트를 타고 스토퍼까지 간다' 를 확인하는 데는 충분하다.
+    """
+    try:
+        import omni.physx
+        iface = omni.physx.get_physx_interface()
+    except Exception as e:                                    # noqa: BLE001
+        print(f"[ERROR] omni.physx unavailable ({e}) - cannot push")
+        return None
+
+    x_lo, x_hi = MAIN_LO / MM, STOPPER_X / MM
+    z_lo = (BELT_TOP - 50) / MM
+
+    def on_step(dt):
+        grp = stage.GetPrimAtPath(BOXES_GROUP)
+        if not grp.IsValid():
+            return
+        for prim in grp.GetChildren():
+            xf = prim.GetAttribute("xformOp:translate")
+            t = xf.Get() if xf and xf.IsValid() else None
+            if t is None or not (x_lo <= t[0] < x_hi and t[2] > z_lo):
+                continue                                       # 벨트 밖이면 건드리지 않는다
+            va = prim.GetAttribute("physics:velocity")
+            if va and va.IsValid():
+                v = va.Get() or Gf.Vec3f(0, 0, 0)
+                va.Set(Gf.Vec3f(mps, v[1], v[2]))               # x 만 고정, y·z 는 물리에 맡긴다
+
+    sub = iface.subscribe_physics_step_events(on_step)
+    print(f"[OK] push mode active: +X {mps} m/s while on belt")
+    print("     (keep this handle alive; re-run this script to re-arm)")
+    return sub
+
+
+BOXES_GROUP = "/World/QR_Boxes"
+_push_sub = globals().get("_push_sub")                          # 재실행 시 이전 구독 해제
+if _push_sub is not None:
+    try:
+        _push_sub.unsubscribe()
+    except Exception:                                           # noqa: BLE001
+        pass
+    _push_sub = None
 
 if DRIVE_BELT:
     mps = CONV["belt_velocity_mps"]
-    # ★ 마찰이 없으면 표면이 흘러도 박스를 못 끈다. 벨트에 물리 재질을 준다.
+
     #   ★ 물리 재질은 **UsdShade.Material 프림**이어야 한다. Scope 에 MaterialAPI 만
     #     걸면 바인딩이 안 풀려서 조용히 기본 마찰로 돈다.
     mat_path = "/World/TestScene/BeltMaterial"
@@ -208,17 +259,25 @@ if DRIVE_BELT:
     pm = UsdPhysics.MaterialAPI.Apply(belt_mat.GetPrim())
     pm.CreateStaticFrictionAttr(0.8)
     pm.CreateDynamicFrictionAttr(0.7)
-    pm.CreateRestitutionAttr(0.0)                     # 튀지 않게
+    pm.CreateRestitutionAttr(0.0)                               # 튀지 않게
 
     ok = 0
-    for name in ("Belt_main", "Belt_pickup"):
-        prim = stage.GetPrimAtPath(f"/World/TestScene/{name}")
-        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
-            belt_mat, UsdShade.Tokens.weakerThanDescendants, "physics")
-        ok += 1 if drive(prim, mps) else 0
-    print(f"[OK] 벨트 {ok}/2 구동 — +X {mps} m/s (physxSurfaceVelocity)")
-    print(f"     박스는 스토퍼 x={STOPPER_X}mm 에서 선다.")
-else:
-    print("[INFO] DRIVE_BELT=False — 벨트가 멈춰 있다.")
+    if DRIVE_MODE in ("auto", "surface"):
+        for name in ("Belt_main", "Belt_pickup"):
+            prim = stage.GetPrimAtPath(f"/World/TestScene/{name}")
+            UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                belt_mat, UsdShade.Tokens.weakerThanDescendants, "physics")
+            ok += 1 if try_surface(prim, mps) else 0
+        print(f"[{'OK' if ok == 2 else 'WARN'}] surface mode: {ok}/2 belts driven "
+              f"(+X {mps} m/s)")
 
-print("다음: script_editor_qr_boxes.py 를 붙여넣고 Ctrl+Enter → ▶ Play")
+    if DRIVE_MODE == "push" or (DRIVE_MODE == "auto" and ok < 2):
+        if ok < 2 and DRIVE_MODE == "auto":
+            print("[INFO] surface mode did not take - falling back to push mode")
+        _push_sub = start_push(mps)
+
+    print(f"     boxes should stop at the stopper, x={STOPPER_X} mm")
+else:
+    print("[INFO] DRIVE_BELT=False - belt is static")
+
+print("NEXT: paste script_editor_qr_boxes.py, Ctrl+Enter, then press Play")
