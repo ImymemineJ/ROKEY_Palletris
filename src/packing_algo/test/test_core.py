@@ -350,3 +350,41 @@ def test_앞보기는_결정적이다():
                 pk.cancel(f"B{k}")
         poses.append(seq)
     assert poses[0] == poses[1], "같은 입력에 다른 계획이 나왔다 — 재현성이 깨진다"
+
+
+# ── 계열 대조군 (families.py) ────────────────────────────────────
+def _families():
+    from packing_algo.families import DBLFPacker, ExtremePointPacker, ShelfPacker
+    return (DBLFPacker, ShelfPacker, ExtremePointPacker)
+
+
+def test_계열_대조군이_같은_물리제약을_지킨다():
+    """대조군이 제약을 안 지키면 비교가 '전략 대 전략'이 아니게 된다 (families.py 서문)."""
+    cfg = CFG
+    for cls in _families():
+        pk = cls(cfg)
+        for k in range(40):
+            w, d, h = (340, 250, 210) if k % 2 else (480, 380, 340)
+            ok, pose, _, msg = pk.plan(f"B{k}", w, d, h)
+            if not ok:
+                assert msg in ("NO_FEASIBLE_POSE", "PALLET_FULL")
+                if msg == "PALLET_FULL":
+                    break
+                continue
+            assert pose["z_mm"] + h <= pk.max_stack, f"{cls.__name__}: 높이 제한 초과"
+            assert pose["yaw_deg"] in (0.0, 90.0)
+            pk.update(f"B{k}", w, d, h, pose)
+        assert int(pk.hm.max()) <= pk.max_stack, f"{cls.__name__}: heightmap 이 한계를 넘었다"
+
+
+def test_계열_대조군이_제안보다_낮다():
+    """이 순서가 뒤집히면 비교표의 결론이 바뀐다 — 조용히 통과시키면 안 된다."""
+    from packing_algo.compare_baseline import run_once
+    from packing_algo.heightmap_core import HeightmapPacker
+    cfg = CFG
+    seeds = (1, 2, 3)
+    def mean_fill(cls):
+        return sum(run_once(cls, cfg, None, s, s + 1000, 0)[3] for s in seeds) / len(seeds)
+    ours = mean_fill(HeightmapPacker)
+    for cls in _families():
+        assert ours > mean_fill(cls), f"{cls.__name__} 가 제안보다 높다 — 비교표를 다시 볼 것"
