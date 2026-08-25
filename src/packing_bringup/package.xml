@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>packing_bringup</name>
+  <version>0.0.0</version>
+  <description>
+    ROS 2 그래프 기동. system.yaml(모든 숫자의 정본)과 launch 파일이 여기 있다.
+    노드를 손으로 하나씩 띄우면 use_sim_time 을 빠뜨리기 쉬운데, 그러면 tf 조회가
+    전부 실패하면서 에러는 안 뜬다 (CLAUDE.md §3-4 규약 1). launch 가 그걸 막는다.
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">팀 공용</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>packing_algo</exec_depend>
+  <exec_depend>packing_db</exec_depend>
+  <exec_depend>packing_vision</exec_depend>
+  <exec_depend>palletris_orchestrator</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

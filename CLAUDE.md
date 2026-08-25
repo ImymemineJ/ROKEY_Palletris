@@ -396,6 +396,7 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | 이미지가 하나도 안 온다 | QoS 가 RELIABLE |
 | 카메라 이미지가 캄캄하다 | 돔 라이트 꺼짐 / **카메라가 형상 안에 파묻힘** |
 | tf lookup 이 계속 실패한다 | `use_sim_time` 미설정 / `/clock` 미발행 |
+| **노드는 살아 있는데 타이머가 하나도 안 돈다** | **`use_sim_time:=true` 인데 `/clock` 발행자가 없다.** ROS 시계가 0 에 멈춰 타이머가 영원히 안 뜬다 — 상태 발행·지표·**로봇 20초 타임아웃까지 전부 죽는다.** Isaac 을 먼저 띄우거나 `use_sim_time:=false` 로 돌릴 것 |
 | **로봇이 박스를 400 mm 위에서 놓는다** | **벨트 높이에 bbox 1213 을 씀 (800 이어야 함)** |
 | 서비스 응답이 영원히 안 온다 | 콜백 안에서 동기 호출 |
 | Isaac 이 통째로 멈춘다 | 메인 스레드에서 `Event.wait()` |
@@ -517,6 +518,11 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 - ❌ **JSON 소켓 브리지 재도입** (§2)
 - ❌ **토픽에 `std_msgs/String` + JSON 사용** — 전용 타입이 있다 (§3)
 - ❌ 공용 파일(`packing_msgs/`, `config/system.yaml`, 씬 USD)을 **승인 없이** 수정
+## 11. 하지 말 것
+
+- ❌ **JSON 소켓 브리지 재도입** (§2)
+- ❌ **토픽에 `std_msgs/String` + JSON 사용** — 전용 타입이 있다 (§3)
+- ❌ 공용 파일(`packing_msgs/`, `src/packing_bringup/config/system.yaml`, 씬 USD)을 **승인 없이** 수정
 - ❌ **코드에 숫자 상수 박기** — 전부 `system.yaml` 에서 읽는다
 - ❌ **컨베이어 bbox 값(1970 · 1213)을 사양으로 쓰기**
 - ❌ **관제탑을 구역마다 띄우기** — 하나다
@@ -535,9 +541,11 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 |---|---|
 | `src/packing_common/` | 공용 — `config.py` · `frames.py` · `units.py`. **복사 금지, import** |
 | `src/packing_msgs/` | 공용 인터페이스. 수정 = 팀 전원 재빌드 |
+| `src/packing_db/` | 트랙 D — `db_service_node.py` (palletris.db 유일 writer + 중재자) · `schema.sql` · `gen_master_db.py` |
 | `src/packing_algo/` | 트랙 C — `heightmap_core.py` · `algo_service_node.py` |
-| `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` |
-| `src/packing_vision/` | 트랙 D — `vision_node.py` |
+| `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` · `cycle.py` |
+| `src/palletris_orchestrator/` | 트랙 B — `orchestrator_node.py` (관제탑. 상태머신 7개) |
+| `src/packing_vision/` | 트랙 D — `vision_node.py` (cam1 등록 · cam2 검증 · pick_cam 좌표). 코어 `detect.py`·`geometry.py` 는 ROS 의존성 0 |
 | `src/packing_sim/isaac/` | 트랙 A — `spawner.py` · `camera_pick.py` · `conveyor_ctl.py` · `robot_motion.py` · `sim_main.py` |
 | `scripts/` | 검증 — `verify_reach.py` · `check_place_plan.py` 등 |
 
@@ -584,6 +592,7 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | `recognition.enabled: false` → `true` | 팀 | 최종 구현은 인식 포함 |
 | `stage: 1` → `2` 전환 시점 | 팀 | 최종은 3구역 |
 | tf 프레임 이름 규약 | 김학민 | 씬 prim 이름과 일치해야 함 |
+| `gripper_clearance_mm` 30 → **10** | 김병직 | 충전율 **+7.2%p** |
 | 조각 이음매(7489~7515)에서 박스가 튀는지 | 김학민 | 3호(250)가 걸리면 라인이 막힌다 |
 | **서비스 응답의 float 이 안 실린다** | 김학민 | Isaac ROS2 브리지가 `Unable to write float value (nil)`. `SetVelocity.actual_mps` 만 해당. string·bool·**토픽 float32** 는 정상 (TS-023) |
 | `/sim/*` · `/conveyor/*` 서비스 경로 확정 | 팀 | §3-3 이 srv 타입만 정했다. `ros_graph.SERVICES` 의 잠정값을 쓰는 중 |
