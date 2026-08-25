@@ -824,6 +824,9 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--diag-time", action="store_true",
+                    help="사이클 시간이 **어느 소켓 명령 밑에** 쌓이는지 스텝 수로 적는다. "
+                         "목표 10.0 s 대비 어디를 깎을지 정하는 근거")
     ap.add_argument("--render-every", type=int, default=1, metavar="N",
                     help="N 스텝에 한 번만 화면을 그린다. **물리는 한 스텝도 안 바뀐다** — "
                          "결과가 비트 단위로 같다. 2~4 면 벽시계가 짧아지고 화면이 그만큼 "
@@ -1089,6 +1092,8 @@ def main():
                  _ph["collider"]["rest_offset_mm"], _ph["collider"]["contact_offset_mm"],
                  _ph["material"]["static_friction"], _ph["material"]["dynamic_friction"]))
 
+        _nt = [0]        # 물리 스텝 카운터 (렌더 솎기 · 시간 계측 공용)
+
         # ── 몸: robot_motion + 소켓 서버 대역 ───────────────
         cur = {"rp": rps[0], "half_h": dims_m[0][2] / 2.0}
         # ★ 충돌구체와 READY 를 넘긴다 — robot_motion 이 IK **가지**를 고를 때 쓴다.
@@ -1137,6 +1142,21 @@ def main():
                 return _h_move(req)
 
             handlers["move_ee"] = h_move_diag
+        # ── 사이클 시간이 어디로 가나 (--diag-time) ────────
+        # ★ `n` 합계(실제 이동)는 한 사이클 19.5초 중 4.8초뿐이다. 나머지 15초가
+        #   어디로 가는지 로그로는 안 보인다. 소켓 명령마다 **그 명령이 걸려 있는
+        #   동안 흐른 물리 스텝**을 적어 둔다 — 대기가 어느 명령 밑에 쌓이는지 보인다.
+        #   소켓 스레드에서 도는 코드라 int 하나만 읽는다 (PhysX 접근 없음).
+        tm = {"cur": "(사이클 시작)", "at": 0, "acc": {}}
+        if a.diag_time:
+            def _timed(name, fn):
+                def h(req=None):
+                    tm["acc"][tm["cur"]] = tm["acc"].get(tm["cur"], 0) + (_nt[0] - tm["at"])
+                    tm["cur"], tm["at"] = name, _nt[0]
+                    return fn(req)
+                return h
+            handlers = {k: _timed(k, v) for k, v in handlers.items()}
+
         server = B4.StandInServer(handlers, port=a.port)
         print("소켓    127.0.0.1:%d  cmd %s" % (a.port, sorted(handlers)))
 
@@ -1177,7 +1197,6 @@ def main():
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
         parked, rejected = [], set()                      # 라인 밖으로 치운 것 / 그중 §5 거부
         # 이미 놓인 박스가 처음 밀리는 순간 (--diag-knock). 사이클마다 초기화한다.
-        _nt = [0]                                         # 렌더 솎기용 스텝 카운터
         if a.render_every < 1:
             raise SystemExit("--render-every 는 1 이상이어야 한다")
         if a.render_every > 1:
@@ -1291,6 +1310,7 @@ def main():
             cur["pose"] = None                            # 이번 스텝 tick 이 채운다
             diag["log"].clear()                           # 사이클마다 초기화 (--diag-tcp)
             kw["hit"], kw["n"] = None, 0                  # 사이클마다 초기화 (--diag-knock)
+            tm["acc"].clear(); tm["cur"], tm["at"] = "(사이클 시작)", _nt[0]
             for _ in range(int(0.3 * S.hz)):
                 tick()
 
@@ -1370,6 +1390,18 @@ def main():
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
             print("       %s  오차 [%+.1f %+.1f %+.1f] mm  %.1f s 시뮬  knock %.1f mm (%s)"
                   % (res, err[0], err[1], err[2], steps0 / S.hz, knock, who))
+            if a.diag_time:
+                # 마지막 명령 이후 남은 스텝까지 닫는다
+                tm["acc"][tm["cur"]] = tm["acc"].get(tm["cur"], 0) + (_nt[0] - tm["at"])
+                tot = sum(tm["acc"].values()) or 1
+                items = sorted(tm["acc"].items(), key=lambda kv: -kv[1])
+                print("       ⏱ 사이클 %.1f s — 명령별 (그 명령이 걸려 있는 동안 흐른 시간)"
+                      % (tot / S.hz))
+                for k2, v2 in items:
+                    if v2 <= 0:
+                        continue
+                    print("          %-16s %6.2f s  %4.1f%%  %s"
+                          % (k2, v2 / S.hz, 100.0 * v2 / tot, "█" * int(30.0 * v2 / tot)))
             if a.diag_knock and kw["hit"]:
                 n0, vid, dmm, face, links, tgt = kw["hit"]
                 print("       ★ 놓인 박스가 처음 밀린 순간: %s 가 스텝 %d (%.2f s) 에 "
