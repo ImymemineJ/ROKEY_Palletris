@@ -30,6 +30,30 @@ class HeightmapPacker:
         #     같이 오른다(검증 61.1/61.3/61.0%) — 과적합이 아니라는 신호다.
         self.w_level = hm_cfg.get("w_level", 0.0)           # 평면 유지 (0 이면 기존 동작)
         self.ring = hm_cfg.get("level_ring_cells", 4)       # 이웃으로 볼 바깥 셀 수
+        # ★★ 기둥 억제 3종 (2026-08-25, 김병직 제안 → 실측). **전부 기본 꺼짐**이라
+        #   켜야만 동작이 바뀐다. 왜 필요한가: 시드 7 실측에서 가운데 260x350 자리가
+        #   **16개 박스 동안 계속 비어 있다가**, 17번째로 (965,615) 기둥을 4단(윗면
+        #   1300)까지 올리는 순간 벽이 970mm 가 되어 통로 검사에 막혔다. 그 뒤 11개가
+        #   연속 버려졌다. 즉 자리가 없어진 게 아니라 **스스로 봉했다.**
+        #   가중치로는 못 고친다 — w_wall/w_far 를 끄면 우물이 오히려 늘어난다
+        #   (208 -> 296 L, 적재율 70.8 -> 57.2%).
+        #
+        #   top_box_max_h: 윗면이 max_stack 에 **정확히 닿는** 자리에 이 높이보다 큰
+        #     박스를 금지한다. 큰 박스로 꼭대기를 막지 않는다. 0 이면 꺼짐.
+        #     ※ 막힌 박스는 NO_FEASIBLE_POSE 로 되돌아간다 (§7). 리턴 라인 3바퀴 후
+        #       삭제가 팀 결정이므로 무한 순환은 retry_count 가 끊는다.
+        #   tower_ring_mm: 놓은 뒤 윗면이 **주변 링의 최저**보다 이만큼 넘게 높으면 금지.
+        #     ⚠ 링의 **최고**와 비교하면 안 된다 — 박스 높이가 최대 340 이라 그 조건은
+        #       항상 참이고 규칙이 한 번도 발동하지 않는다 (측정으로 확인).
+        #   tower_ring_cells: 위 링의 크기(셀). 25 = 250mm.
+        #   max_span_mm: 놓은 뒤 윗면이 **팔레트 전체 최저점**보다 이만큼 넘게 높으면 금지.
+        #     사실상 "층을 채우고 올라가라". ⚠ 적재율 지표에 속기 쉽다 — 600 에서
+        #     실제높이 기준 74.9% 가 나오지만 개수는 26 -> 13 이고 560mm 에서 멈춘다.
+        #     분모가 실제 최고높이라 낮게 끝나면 뻥튀기된다. **용량 기준으로 볼 것.**
+        self.top_box_max_h = int(hm_cfg.get("top_box_max_h", 0))
+        self.tower_ring_mm = int(hm_cfg.get("tower_ring_mm", 0))
+        self.tower_ring_cells = int(hm_cfg.get("tower_ring_cells", 25))
+        self.max_span_mm = int(hm_cfg.get("max_span_mm", 0))
         # ★ 앞보기 — 후보 몇 개를 실제로 놓아 보고, 그 뒤 박스를 굴려 본 뒤 고른다.
         #   왜 지금 되나: `plan()` 이 2.7ms 인데 로봇 모션이 5~10초다. **계산 예산이
         #   1000배 남는데 한 수만 보고 확정하고 있었다.**
@@ -44,7 +68,29 @@ class HeightmapPacker:
         # ★ 하강 통로는 **팔 굵기**로 봐야 한다 — gripper_clearance_mm(30) 이 아니다.
         #   두 값 다 system.yaml 에 이미 있다. 새 상수를 지어내지 않는다.
         rb = cfg["robot"]
-        self.arm_r = rb["gripper_body_diameter_mm"] // 2 // self.cell   # 122//10 = 12셀
+        # ★ 통로 반경. 기본은 그리퍼 몸통 반경(122mm -> 12셀) = 기존 동작.
+        #   ⚠ 이 모델은 팔을 **수직 원기둥**으로 본다. 실제 link_3(팔뚝)는 팔꿈치에서
+        #     비스듬히 내려와 옆으로 더 차지한다 (2026-08-25 영상 실측: 5호 2단 680mm
+        #     기둥이 발자국에서 **145mm** 떨어져 있었는데 반경 122 라 안 보였고,
+        #     팔뚝이 그 기둥 옆면에 걸려 46mm 위에서 멈췄다 — 잔차 55mm, IK_FAIL).
+        #     `corridor_radius_mm` 로 그 여유를 넓힌다.
+        self.arm_r = int(hm_cfg.get("corridor_radius_mm", 0)) // self.cell \
+            or rb["gripper_body_diameter_mm"] // 2 // self.cell   # 122//10 = 12셀
+        # ★★ 2단 통로 (2026-08-25). 팔은 **위로 갈수록 굵다** — 반경 하나로 사방을 보면
+        #   얕은 자리까지 같이 손해를 본다.
+        #   descriptor 실측 (link_4 충돌구체, 축이탈 + 반지름 = 축에서의 최대 폭):
+        #     손목 중심(z 0)     축이탈 203 + r 117 = **320 mm**
+        #     154 뒤            163 + 119 = 282 mm
+        #     307 뒤            127 +  98 = 225 mm
+        #     442 뒤             45 +  96 = 141 mm
+        #     594 뒤              7 + 108 = 115 mm
+        #   그리고 손목 중심은 흡착면에서 121(플랜지~손목) + 150(그리퍼) = **271 mm** 위다.
+        #   → 1단: 반경 122 안에서는 벽이 "내 윗면 + 150" 까지 (그리퍼 몸통만 지난다)
+        #     2단: 반경 320 안에서는 벽이 "내 윗면 + 271" 까지 (손목이 그 높이에 있다)
+        #   ⚠ 2단 값이 정본은 아니다 — 팔 자세에 따라 손목이 기울어 실제 폭이 달라진다.
+        #     그래서 **기본 꺼짐**으로 두고 Isaac 으로 재서 정한다 (CLAUDE.md §10-1).
+        self.arm_r2 = int(hm_cfg.get("corridor_tier2_radius_mm", 0)) // self.cell
+        self.arm_gap2 = int(hm_cfg.get("corridor_tier2_gap_mm", 271))
         self.arm_gap = rb["gripper_length_mm"]                          # 150 mm
         # ★ 통로 검사의 **방향성** — 팔은 로봇 쪽(py 0)에서 들어온다. 1.0 이면 지금까지의
         #   대칭 검사, 0.0 이면 먼 쪽(py 큰 쪽)은 안 본다. 기본 1.0 = 기존 동작 그대로.
@@ -184,6 +230,25 @@ class HeightmapPacker:
                 best, best_v = c, v
         return best
 
+    def _tower_ok(self, cand, bz, h_mm, wc, dc):
+        """기둥 억제 3종. 셋 다 꺼져 있으면 `cand` 를 그대로 돌려준다."""
+        if not (self.top_box_max_h or self.tower_ring_mm or self.max_span_mm):
+            return cand
+        top = bz + h_mm
+        if self.top_box_max_h and h_mm > self.top_box_max_h:
+            cand = cand & (top < self.max_stack)
+        if self.tower_ring_mm:
+            from scipy.ndimage import minimum_filter
+            ring_lo = minimum_filter(self.hm.astype(np.int32), size=self.tower_ring_cells)
+            # 발자국 **중심** 칸의 주변 최저와 비교한다 (bz 는 좌상단 기준 배열이다)
+            ii, jj = np.indices(bz.shape)
+            ci = np.clip(ii + wc // 2, 0, self.W - 1)
+            cj = np.clip(jj + dc // 2, 0, self.D - 1)
+            cand = cand & (top - ring_lo[ci, cj] <= self.tower_ring_mm)
+        if self.max_span_mm:
+            cand = cand & (top - int(self.hm.min()) <= self.max_span_mm)
+        return cand
+
     def plan(self, box_id, w_mm, d_mm, h_mm):
         """→ (ok, PlacePose, score, message)"""
         why = self._bad_size(w_mm, d_mm, h_mm)
@@ -204,6 +269,7 @@ class HeightmapPacker:
             ok_h = bz + h_mm <= self.max_stack              # ② 높이
             corridor = self._corridor_ok(wc, dc, bz, h_mm)  # ④ 통로 (전 후보, 필터로 싸다)
             cand = ok_h & corridor
+            cand = self._tower_ok(cand, bz, h_mm, wc, dc)   # ⑤ 기둥 억제 (기본 꺼짐)
             if not cand.any(): continue
             # 지지율 전 1차 점수. 후보가 아닌 칸은 -inf 로 빼서 topk 자리를 낭비하지 않게 한다.
             base_score = self.w_h * (1 - bz / self.max_stack)
@@ -339,6 +405,14 @@ class HeightmapPacker:
         pad = np.pad(self.hm, ((c, c), (c, cf)), mode="constant", constant_values=0)
         big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + c + cf, 1)
         ok = big <= bz + h_mm + self.arm_gap + self.tol
+        # ★ 2단 — 더 넓은 반경은 **더 높은 벽까지만** 봐준다. 얕은 이웃은 1단만 걸린다.
+        if self.arm_r2 > c:
+            c2 = self.arm_r2
+            cf2 = int(round(c2 * self.corridor_far))
+            pad2 = np.pad(self.hm, ((c2, c2), (c2, cf2)), mode="constant", constant_values=0)
+            big2 = self._sliding_max(self._sliding_max(pad2, wc + 2 * c2, 0),
+                                     dc + c2 + cf2, 1)
+            ok &= big2 <= bz + h_mm + self.arm_gap2 + self.tol
         if self.near_gap < self.arm_gap:
             # 박스 **앞**(로봇 쪽) c 셀만 따로 본다. 발자국은 빼고 순수하게 앞쪽이다 —
             #   팔이 넘어와야 하는 벽이 거기 있다.
