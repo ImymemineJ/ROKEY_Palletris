@@ -50,6 +50,10 @@ LOOKS_ROOT = "/World/Looks"
 FACE_RATIO = 0.9               # QR 한 변 = 박스 짧은 변의 이 비율
 LIFT_MM = 2.0                  # 윗면에서 이만큼 띄운다 (z-fighting 방지)
 REDO = False                   # True 면 이미 붙은 것도 다시 만든다
+# ★ 스포너는 박스를 8 초 간격으로 하나씩 내보낸다 (test_3.yaml spawn_interval_s).
+#   WATCH 를 켜 두면 새로 나온 박스에도 계속 붙는다. 끄면 지금 있는 것만 1 회.
+WATCH = True
+WATCH_PERIOD_S = 1.0           # 이 주기로 새 박스가 있는지 본다
 # ████████████████████████████████████████████████████████████████████
 
 stage = omni.usd.get_context().get_stage()
@@ -131,70 +135,120 @@ def local_bbox(prim):
     return r.GetMin(), r.GetMax()
 
 
-made = skipped = nodest = 0
-rows = []
-for prim in root.GetChildren():
-    a = prim.GetAttribute("box_dest")
-    dest = a.Get() if a and a.IsValid() else None
-    if not dest:
-        nodest += 1
-        continue
-    if dest not in ready:
-        rows.append((prim.GetName(), dest, "no QR for this dest"))
-        continue
+def attach_pass(verbose=True):
+    """지금 씬에 있는 박스를 훑어 QR 이 없는 것에만 붙인다. 여러 번 불러도 안전하다."""
+    made = skipped = nodest = 0
+    rows = []
+    for prim in root.GetChildren():
+        a = prim.GetAttribute("box_dest")
+        dest = a.Get() if a and a.IsValid() else None
+        if not dest:
+            nodest += 1
+            continue
+        if dest not in ready:
+            rows.append((prim.GetName(), dest, "no QR for this dest"))
+            continue
 
-    face_path = f"{prim.GetPath()}/QR_Face"
-    if stage.GetPrimAtPath(face_path).IsValid() and not REDO:
-        skipped += 1
-        continue
+        face_path = f"{prim.GetPath()}/QR_Face"
+        if stage.GetPrimAtPath(face_path).IsValid() and not REDO:
+            skipped += 1
+            continue
 
-    lo, hi = local_bbox(prim)
-    w, d = hi[0] - lo[0], hi[1] - lo[1]
-    if w <= 0 or d <= 0:
-        rows.append((prim.GetName(), dest, "zero-size bbox, skipped"))
-        continue
-    cx, cy = (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0
-    z = hi[2] + LIFT_MM / 1000.0
-    fh = min(w, d) * FACE_RATIO / 2.0
+        lo, hi = local_bbox(prim)
+        w, d = hi[0] - lo[0], hi[1] - lo[1]
+        if w <= 0 or d <= 0:
+            rows.append((prim.GetName(), dest, "zero-size bbox, skipped"))
+            continue
+        cx, cy = (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0
+        z = hi[2] + LIFT_MM / 1000.0
+        fh = min(w, d) * FACE_RATIO / 2.0
 
-    mesh = UsdGeom.Mesh.Define(stage, face_path)
-    mesh.CreateDoubleSidedAttr(True)
-    mesh.CreatePointsAttr([Gf.Vec3f(cx - fh, cy - fh, z), Gf.Vec3f(cx + fh, cy - fh, z),
-                           Gf.Vec3f(cx + fh, cy + fh, z), Gf.Vec3f(cx - fh, cy + fh, z)])
-    mesh.CreateFaceVertexCountsAttr([4])
-    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
-    mesh.CreateExtentAttr([Gf.Vec3f(cx - fh, cy - fh, z), Gf.Vec3f(cx + fh, cy + fh, z)])
-    mesh.CreateNormalsAttr([Gf.Vec3f(0, 0, 1)] * 4)
-    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
-    stv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
-        "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
-    stv.Set([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)])
-    UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(qr_material(dest))
+        mesh = UsdGeom.Mesh.Define(stage, face_path)
+        mesh.CreateDoubleSidedAttr(True)
+        mesh.CreatePointsAttr([Gf.Vec3f(cx - fh, cy - fh, z), Gf.Vec3f(cx + fh, cy - fh, z),
+                               Gf.Vec3f(cx + fh, cy + fh, z), Gf.Vec3f(cx - fh, cy + fh, z)])
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        mesh.CreateExtentAttr([Gf.Vec3f(cx - fh, cy - fh, z), Gf.Vec3f(cx + fh, cy + fh, z)])
+        mesh.CreateNormalsAttr([Gf.Vec3f(0, 0, 1)] * 4)
+        mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+        stv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+        stv.Set([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)])
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(qr_material(dest))
 
-    # ★ 콜라이더를 걸지 않는다. QR 면은 **그림일 뿐**이라 물리에 끼면
-    #   흡착 판정과 적재 높이가 2mm 씩 어긋난다.
+        # ★ 콜라이더를 걸지 않는다. QR 면은 **그림일 뿐**이라 물리에 끼면
+        #   흡착 판정과 적재 높이가 2mm 씩 어긋난다.
 
-    # 인식이 맞혔는지 대조할 값. 씬의 ground truth 옆에 나란히 둔다.
-    prim.CreateAttribute("box_qr_payload", Sdf.ValueTypeNames.String).Set(
-        ready[dest]["payload"])
-    made += 1
-    rows.append((prim.GetName(), dest, f"{w * 1000:.0f}x{d * 1000:.0f}mm "
-                                       f"top z={hi[2] * 1000:.0f}mm"))
+        # 인식이 맞혔는지 대조할 값. 씬의 ground truth 옆에 나란히 둔다.
+        prim.CreateAttribute("box_qr_payload", Sdf.ValueTypeNames.String).Set(
+            ready[dest]["payload"])
+        made += 1
+        rows.append((prim.GetName(), dest, f"{w * 1000:.0f}x{d * 1000:.0f}mm "
+                                           f"top z={hi[2] * 1000:.0f}mm"))
 
-print()
-print("=" * 66)
-print("  ATTACH QR")
-print("=" * 66)
-for name, dest, note in rows[:20]:
-    print(f"  {name:22} {dest:9} {note}")
-if len(rows) > 20:
-    print(f"  ... and {len(rows) - 20} more")
-print()
-print(f"  attached {made} | already had one {skipped} | no box_dest {nodest}")
-print(f"  QR images ready: {sorted(ready)}")
-print("=" * 66)
+    if verbose:
+        print()
+        print("=" * 66)
+        print("  ATTACH QR")
+        print("=" * 66)
+        for name, dest, note in rows[:20]:
+            print(f"  {name:22} {dest:9} {note}")
+        if len(rows) > 20:
+            print(f"  ... and {len(rows) - 20} more")
+        print()
+        print(f"  attached {made} | already had one {skipped} | no box_dest {nodest}")
+        print(f"  QR images ready: {sorted(ready)}")
+        print("=" * 66)
+    elif made:
+        # 감시 모드에서는 새로 붙은 것만 한 줄씩. 조용히 지나가면 도는지 알 수 없다.
+        for name, dest, note in rows:
+            if "mm" in note:
+                print(f"  [QR] {name:22} {dest:9} {note}")
+    return made, skipped, nodest
+
+
+# ── 1 회 실행 ─────────────────────────────────────────────────────
+made, skipped, nodest = attach_pass()
+
 if made == 0 and skipped == 0:
     print("  Nothing attached. Is the scene playing and are boxes spawned?")
 else:
     print("  Look at a box from above - the QR should be crisp, no highlight.")
     print("  Each box now also carries box_qr_payload for VerifyBox.")
+
+# ── 감시 모드 ─────────────────────────────────────────────────────
+# ★ 왜 필요한가: 스포너는 박스를 **한 번에 다 만들지 않는다**
+#   (`test_3.yaml  spawn_interval_s: 8`). 그래서 위의 1 회 실행은 그 순간
+#   벨트에 있던 박스만 잡는다. 12 개짜리 데모라면 96 초에 걸쳐 나오므로
+#   거의 다 놓친다. 이 구독이 새로 생긴 박스에 계속 붙여 준다.
+#
+#   앱 업데이트 스트림에 건다 — 물리 스텝 콜백이 아니라서 메인(물리) 스레드를
+#   붙들지 않는다 (CLAUDE.md §9).
+if WATCH:
+    import omni.kit.app
+
+    _S = globals().setdefault("_QR_WATCH", {})
+    if _S.get("sub") is not None:
+        # 다시 실행하면 옛 구독을 먼저 끊는다. 안 그러면 겹쳐 돌면서
+        # 스텝마다 두 번씩 훑는다.
+        _S["sub"].unsubscribe()
+        _S["sub"] = None
+        print("  [watch] previous watcher stopped")
+
+    _S["acc"] = 0.0
+
+    def _on_update(e):
+        _S["acc"] += e.payload.get("dt", 0.0)
+        if _S["acc"] < WATCH_PERIOD_S:
+            return
+        _S["acc"] = 0.0
+        try:
+            attach_pass(verbose=False)
+        except Exception as ex:      # 콜백에서 터지면 조용히 죽는다. 찍고 계속.
+            print(f"  [watch] error: {ex}")
+
+    _S["sub"] = omni.kit.app.get_app().get_update_event_stream() \
+        .create_subscription_to_pop(_on_update, name="palletris_qr_watch")
+    print(f"  [watch] ON - checks every {WATCH_PERIOD_S:g}s for newly spawned boxes.")
+    print("  [watch] to stop:  _QR_WATCH['sub'].unsubscribe(); _QR_WATCH['sub']=None")
