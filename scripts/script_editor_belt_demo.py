@@ -1,30 +1,19 @@
-"""Isaac Sim Script Editor 용 — **한 번에** 씬 + 박스 + 벨트 구동 + 자가진단.
+"""Isaac Sim Script Editor — 씬 + QR 박스 + 벨트 구동 + 자가진단, 한 파일.
 
-    Isaac Sim GUI ▸ File ▸ New ▸ Window ▸ Script Editor 에 붙여넣고 **Ctrl+Enter**.
-    (`isaac-sim.sh` 로 띄운 창이어야 한다. `python.sh --gui` 창에는 Script Editor 가 없다)
+    Isaac Sim GUI(`isaac-sim.sh`) ▸ File ▸ New ▸ Window ▸ Script Editor
+    ▸ 붙여넣고 Ctrl+Enter ▸ ▶ Play
 
-## 왜 합쳤나
+    ┌───────────────────────────────────────────────────────────────┐
+    │  손댈 곳은 아래 두 줄뿐이다 (바로 밑에 있다)                    │
+    │                                                               │
+    │    RUN   = "build"   씬·박스·벨트를 만든다   → 그다음 Play     │
+    │          = "check"   Play 뒤에 실제로 움직였는지 본다           │
+    │                                                               │
+    │    DRIVE = "auto"    표면속도 → 안 되면 자동으로 push          │
+    │          = "push"    박스 속도를 직접 세팅. 마찰과 무관하게 돈다 │
+    └───────────────────────────────────────────────────────────────┘
 
-`script_editor_test_scene.py` + `script_editor_qr_boxes.py` 를 나눠 뒀더니
-**앞 스크립트의 출력이 콘솔 위로 밀려 올라가** 벨트 구동이 성공했는지 실패했는지
-볼 수가 없었다. 진단이 안 보이면 고칠 수가 없다. 그래서 하나로 합치고,
-맨 끝에 **자가진단 블록**을 찍는다.
-
-## 쓰는 법
-
-    MODE = "build"   붙여넣고 Ctrl+Enter → 씬·박스·벨트 구동 + 진단 출력
-                     그 다음 ▶ Play
-    MODE = "check"   Play 를 몇 초 돌린 뒤 MODE 만 바꿔 Ctrl+Enter
-                     → 박스가 실제로 움직였는지 x 좌표로 보고한다
-
-## 벨트를 어떻게 굴리나
-
-`IsaacConveyor` OmniGraph 노드를 쓰지 않는다. 그 노드가 하는 일은 결국 매 틱
-`physxSurfaceVelocity` 를 써 주는 것뿐이라(`verify_belt_speed.py` 참조),
-여기서는 그 속성을 정적 콜라이더에 한 번 건다. 형상은 안 움직이고 표면만 흐른다.
-
-그게 이 판에서 안 먹으면 **물리 스텝 콜백으로 박스를 직접 민다**(push).
-어느 쪽이 걸렸는지는 진단 블록에 그대로 찍힌다.
+자세한 설명은 파일 맨 아래 NOTES 를 볼 것.
 """
 import os
 import random
@@ -32,12 +21,13 @@ import random
 import omni.usd
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
-# ══════════════════════════════════════════════════════════════════════════
-MODE = "build"            # "build" | "check"
-SPAWN_COUNT = 8
-DRIVE_MODE = "auto"       # "auto" | "surface" | "push" | "off"
-SHOW_PALLET = True
+# ██████████████████████  손댈 곳은 여기 두 줄  ██████████████████████
+RUN = "build"             # "build" (만들기)  |  "check" (Play 뒤 확인)
+DRIVE = "auto"            # "auto" | "surface" | "push" | "off"
+# ████████████████████████████████████████████████████████████████████
 
+SPAWN_COUNT = 8
+SHOW_PALLET = True
 WS_ROOT = "~/palletris_ws"     # ★ 저장소가 다른 데 있으면 이 줄만 고칠 것
 
 QR_DIR = "/home/rokey/Downloads"
@@ -121,16 +111,16 @@ def box_x_mm():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MODE = "check" — Play 뒤에 실제로 움직였는지만 본다
+#  RUN = "check" — Play 뒤에 실제로 움직였는지만 본다
 # ══════════════════════════════════════════════════════════════════════════
-if MODE == "check":
+if RUN == "check":
     prev = globals().get("_spawn_x") or {}
     now = box_x_mm()
     print("\n" + "=" * 62)
     print("  CHECK — did the boxes move?")
     print("=" * 62)
     if not now:
-        print("  no boxes found. Run with MODE='build' first.")
+        print("  no boxes found. Run with RUN='build' first.")
     else:
         moved = 0
         print(f"  {'box':10} {'x now (mm)':>12} {'x spawn':>10} {'moved':>9}  z(mm)")
@@ -146,15 +136,15 @@ if MODE == "check":
         if moved:
             print(f"  ==> {moved}/{len(now)} boxes moved. THE BELT WORKS.")
         else:
-            print("  ==> nothing moved.")
-            print("      1) did you press Play? (physics only runs while playing)")
-            print("      2) check the DRIVE line printed by MODE='build'")
-            print("      3) try DRIVE_MODE='push' explicitly, rebuild, Play again")
+            print("  ==> NOTHING MOVED.")
+            print("      Fix: scroll to the top, set  DRIVE = \"push\"")
+            print("           then Ctrl+Enter, press Stop, press Play again.")
+            print("           push sets box velocity directly - it ignores friction.")
     raise SystemExit  # noqa: PLR1722  (Script Editor 에서는 여기서 끝내는 게 맞다)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MODE = "build"
+#  RUN = "build"
 # ══════════════════════════════════════════════════════════════════════════
 if not stage.GetPrimAtPath("/World").IsValid():
     UsdGeom.Xform.Define(stage, "/World")
@@ -252,6 +242,30 @@ TYPE_COLOR = {"3호": Gf.Vec3f(0.35, 0.62, 0.47),
               "5호": Gf.Vec3f(0.30, 0.52, 0.78)}
 
 
+def phys_material(path, static_f, dynamic_f, restitution=0.0):
+    """물리 재질 하나. **UsdShade.Material 프림이어야 한다** — Scope 에 MaterialAPI 만
+    걸면 바인딩이 안 풀려 조용히 기본값으로 돈다."""
+    m = UsdShade.Material.Define(stage, path)
+    api = UsdPhysics.MaterialAPI.Apply(m.GetPrim())
+    api.CreateStaticFrictionAttr(static_f)
+    api.CreateDynamicFrictionAttr(dynamic_f)
+    api.CreateRestitutionAttr(restitution)
+    return m
+
+
+def bind_phys(prim, mat):
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+        mat, UsdShade.Tokens.weakerThanDescendants, "physics")
+
+
+# ★★ 여기가 "벨트가 안 끄는" 진짜 원인이었다.
+#    UsdPhysics 의 **기본 재질은 마찰이 0** 이다. 박스에 물리 재질을 안 붙이면
+#    벨트에만 0.8 을 줘도 접촉쌍의 마찰이 0 이 되어, 표면속도가 흘러도 못 끈다.
+#    벨트와 박스 **양쪽에** 붙여야 한다.
+BELT_MAT = phys_material(f"{SCENE_GROUP}/BeltMaterial", 0.9, 0.8)
+BOX_MAT = phys_material(f"{SCENE_GROUP}/BoxMaterial", 0.6, 0.5)
+
+
 def spawn(n, box, qr, qr_idx, x_mm, y_mm, yaw):
     w, d, h = box["w_mm"], box["d_mm"], box["h_mm"]
     rp = f"{BOXES_GROUP}/Box_{n:03d}"
@@ -275,6 +289,7 @@ def spawn(n, box, qr, qr_idx, x_mm, y_mm, yaw):
     body.CreateDisplayColorAttr([TYPE_COLOR.get(box["name"], Gf.Vec3f(0.8, 0.7, 0.5))])
     UsdGeom.XformCommonAPI(body).SetScale(Gf.Vec3f(w / MM, d / MM, h / MM))
     UsdPhysics.CollisionAPI.Apply(body.GetPrim())
+    bind_phys(body.GetPrim(), BOX_MAT)      # ★ 없으면 마찰 0 이라 벨트가 못 끈다
 
     if qr is not None:
         mesh = UsdGeom.Mesh.Define(stage, f"{rp}/QR_Face")
@@ -331,7 +346,7 @@ for i in range(SPAWN_COUNT):
                       SPAWN_MM[1] + rng.uniform(-yj, yj),
                       CFG["boxes"]["spawn_yaw_deg"] + rng.uniform(-wj, wj)))
 
-_spawn_x = {r["box_id"]: r["x"] for r in rows}       # MODE='check' 가 쓴다
+_spawn_x = {r["box_id"]: r["x"] for r in rows}       # RUN='check' 가 쓴다
 
 # ── 벨트 구동 ────────────────────────────────────────────────────
 _sub = globals().get("_belt_sub")
@@ -406,26 +421,16 @@ def start_push():
 
 
 mode_used = "off"
-if DRIVE_MODE != "off":
-    # ★ 물리 재질은 UsdShade.Material 프림이어야 한다. Scope 에 MaterialAPI 만
-    #   걸면 바인딩이 안 풀려 조용히 기본 마찰로 돈다. 마찰이 없으면 표면이
-    #   흘러도 박스를 못 끈다.
-    bm = UsdShade.Material.Define(stage, f"{SCENE_GROUP}/BeltMaterial")
-    pm = UsdPhysics.MaterialAPI.Apply(bm.GetPrim())
-    pm.CreateStaticFrictionAttr(0.8)
-    pm.CreateDynamicFrictionAttr(0.7)
-    pm.CreateRestitutionAttr(0.0)
-
+if DRIVE != "off":
     ok = 0
-    if DRIVE_MODE in ("auto", "surface"):
+    if DRIVE in ("auto", "surface"):
         for nm in ("Belt_main", "Belt_pickup"):
             pr = stage.GetPrimAtPath(f"{SCENE_GROUP}/{nm}")
-            UsdShade.MaterialBindingAPI.Apply(pr).Bind(
-                bm, UsdShade.Tokens.weakerThanDescendants, "physics")
+            bind_phys(pr, BELT_MAT)
             ok += 1 if try_surface(pr) else 0
         if ok == 2:
             mode_used = "surface"
-    if DRIVE_MODE == "push" or (DRIVE_MODE == "auto" and ok < 2):
+    if DRIVE == "push" or (DRIVE == "auto" and ok < 2):
         _belt_sub = start_push()
         if _belt_sub is not None:
             mode_used = "push"
@@ -449,7 +454,9 @@ print(f"  boxes    : {len(rows)} spawned | bottom z={SPAWN_MM[2]} "
       f"(={BELT_TOP}+10 -> 10mm drop) | spacing {spacing / MM:.2f} m"
       + (" (narrowed to fit belt)" if narrowed else ""))
 print(f"  qr       : {len(VALID)} image(s) | {qr_note}")
-print(f"  DRIVE    : {mode_used.upper()}   (requested '{DRIVE_MODE}', {BELT_MPS} m/s +X)")
+print("  friction : belt 0.9/0.8  box 0.6/0.5  (UsdPhysics default is 0 - "
+      "without this the belt cannot drag anything)")
+print(f"  DRIVE    : {mode_used.upper()}   (requested '{DRIVE}', {BELT_MPS} m/s +X)")
 for line in drive_report:
     print(f"             {line}")
 print("=" * 62)
@@ -457,4 +464,34 @@ if mode_used == "off":
     print("  !! belt is NOT driven. Boxes will just sit there.")
 else:
     print("  NEXT: press Play. Boxes should slide +X and stop at the stopper.")
-    print("        Then set MODE='check' at the top and Ctrl+Enter to verify.")
+    print("        Then set RUN='check' at the top and Ctrl+Enter to verify.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  NOTES
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ## 벨트를 어떻게 굴리나
+#
+# `IsaacConveyor` OmniGraph 노드를 쓰지 않는다. 그 노드가 하는 일은 결국 매 틱
+# `physxSurfaceVelocity` 를 써 주는 것뿐이라(`verify_belt_speed.py` 참조),
+# 여기서는 그 속성을 정적 콜라이더에 한 번 건다. 형상은 안 움직이고 표면만 흐른다.
+#
+# ★★ 표면속도는 **마찰로** 끈다. 그런데 `UsdPhysics` 의 **기본 재질은 마찰이 0** 이라,
+#    박스에 물리 재질을 안 붙이면 벨트에만 0.9 를 줘도 접촉쌍 마찰이 0 이 되어
+#    표면이 흘러도 박스가 그대로 서 있다. 2026-08-25 에 실제로 이 증상을 겪었다 —
+#    표면속도는 (0.5,0,0) 으로 잘 걸렸는데 박스가 1mm 도 안 움직였다.
+#    그래서 **벨트와 박스 양쪽에** 재질을 붙인다 (BELT_MAT / BOX_MAT).
+#
+# 그래도 안 돌면 `DRIVE = "push"` — 물리 스텝마다 박스 속도를 직접 세팅한다.
+# Isaac 은 Fabric 을 쓰므로 USD 속성 쓰기가 시뮬레이션에 안 먹는 판이 있어,
+# `isaacsim.core.prims.RigidPrim` 을 먼저 시도하고 안 되면 원시 USD 로 내려간다.
+#
+# ## 좌표 규약 (CLAUDE.md §4)
+#
+#     z = 0        도크 바닥 = 트럭 적재함 바닥   ← 야드 지면이 아니다
+#     z = 800      벨트 상면 (롤러 면)
+#     z = 810      스폰 지점, 박스 **밑면**  (Cube 는 중심 기준이라 h/2 를 더한다)
+#     x = 0~7500   main / 7500~10000 픽업 / 10000 스토퍼
+#
+# 확인 요령: 3호(h=210)가 벨트에 앉으면 중심 z 가 800 + 105 = **905** 여야 한다.
