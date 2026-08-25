@@ -551,7 +551,11 @@ class RobotMotion:
                       "dth": _wrap(math.atan2(v1[1], v1[0]) - th0),
                       "yaw0": yaw_from, "yaw1": yaw_to,
                       "u": 0.0, "du": 1.0 / steps, "prev": q0, "k": 0,
-                      "miss": 0, "over": 0}
+                      "miss": 0, "over": 0,
+                      # ★ 구간마다 요구 정밀도가 다르다. 이송(상공 이동·후퇴)은 mm 로
+                      #   도착할 이유가 없고, 정밀해야 하는 건 집는/놓는 하강뿐이다.
+                      #   상위(cycle)가 `tol_m` 으로 준다. 안 주면 기본값 = 예전 동작.
+                      "tol": float(req.get("tol_m") or REACH_TOL_M)}
         self._goal_face = np.asarray(face, dtype=float)
         self._goal_yaw = float(yaw_to)              # ★ 도착 판정에 쓸 목표 자세
         self._hold = 0
@@ -611,7 +615,8 @@ class RobotMotion:
         # ★ yaw 와 yaw±180 은 물리적으로 같은 자세다 — 180° 주기로 비교한다.
         #   안 그러면 등가 각으로 수렴했는데 178° 틀렸다고 오판해 매번 한도까지 기다린다.
         dyaw = abs(yaw - _near(self._goal_yaw, yaw, 180.0))
-        if err < REACH_TOL_M and dyaw < YAW_TOL_DEG:
+        tol = p.get("tol", REACH_TOL_M)
+        if err < tol and dyaw < YAW_TOL_DEG:
             self._hold += 1
             if self._hold >= SETTLE_HOLD:
                 self._reach_done(err, p)
@@ -628,7 +633,7 @@ class RobotMotion:
             return
         self._settle -= 1
         if self._settle <= 0:
-            if err > LOG_RESIDUAL_M or dyaw > YAW_TOL_DEG:
+            if err > max(LOG_RESIDUAL_M, tol) or dyaw > YAW_TOL_DEG:
                 self._warn_residual(p, err, dyaw)
             # ★ 여기서 REACHED 를 주면 호출부가 **그 자리에서 놓는다.**
             #   실패로 알려 cycle 이 이탈 경로(cancel_plan -> 복귀)를 타게 한다.
@@ -657,9 +662,9 @@ class RobotMotion:
     def _reach_done(self, err, p=None):
         # ★ REACH_TOL 을 못 맞추고 끝난 구간은 잔차를 남긴다 — 이 제어기의 정상상태가
         #   얼마인지가 여기서만 보인다. 한 줄로 짧게.
-        if err >= REACH_TOL_M:
+        if p is not None and err >= p.get("tol", REACH_TOL_M):
             self._log("[robot_motion] 정착 %.2f mm (허용 %.1f) — 더 안 줄어 종료"
-                      % (err * 1000, REACH_TOL_M * 1000))
+                      % (err * 1000, p.get("tol", REACH_TOL_M) * 1000))
         self._state = "REACHED"
         self._path = None
         self._last_err_m = err

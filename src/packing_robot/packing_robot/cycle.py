@@ -32,6 +32,15 @@ RESULTS = ("PLACED", "PICK_FAILED", "PALLET_FULL", "BLOCKED", "IK_FAIL")
 
 MOTION_TIMEOUT_S = 20.0          # 한 구간 이동에 이보다 오래 걸리면 이상한 것이다
 MOTION_POLL_S = 0.02
+# ★ 이송 구간 허용 오차. 상공 이동·후퇴는 mm 로 도착할 이유가 없다 — 그런데
+#   지금까지 집는/놓는 하강과 **같은 정밀도**를 요구하며 기다렸다.
+#   2026-08-25 실측: 웨이포인트 8개 중 6개가 이송인데, 정착 대기가 사이클당 5.26 s
+#   (웨이포인트당 653 ms)였다. 기본값은 `REACH_TOL_M`(2mm) 과 같게 두어 **켜기 전엔
+#   예전 동작 그대로**다. 데모가 `--transit-tol` 로 덮어써 값을 재고 정한다.
+#   ⚠ 올리면 다음 호가 그만큼 낮거나 옆에서 시작한다. 이격 400 여유가 +32.9 mm 라
+#     10 mm 는 그 1/3 을 먹는다 — 실측으로 정할 것.
+TRANSIT_TOL_MM = 2.0
+
 GRASP_GAP_MM = 2.0               # 흡착 직전 흡착면을 박스 상면 위 이만큼에 둔다
                                  #   ★ 패드 transZ 슬롯이 5 mm 다. 더 벌리면 떠서 붙는다
                                  #     (packing_robot.gripper.APPROACH_GAP_MM 과 같은 값)
@@ -211,15 +220,15 @@ class Cycle:
         pick_air = pick_top + self.approach_m
         cur = self._face_now()
         if cur is not None and cur[2] < pick_air - 1e-3:
-            self._move([cur[0], cur[1], pick_air], pick_yaw)
-        self._move([pick_c[0], pick_c[1], pick_air], pick_yaw)
+            self._move([cur[0], cur[1], pick_air], pick_yaw, TRANSIT_TOL_MM)
+        self._move([pick_c[0], pick_c[1], pick_air], pick_yaw, TRANSIT_TOL_MM)
         self._descend_to_gap(box_id, [pick_c[0], pick_c[1]], pick_top, pick_yaw)
 
         if not self._grasp(box_id):
             # §2.5 — 픽 실패는 계획을 버리고 벨트를 다시 돌린 뒤 종료한다.
             self.svc.set_status(box_id, "PICK_FAILED")
             self.svc.cancel_plan(self.zone, box_id)
-            self._move([pick_c[0], pick_c[1], pick_top + self.approach_m], pick_yaw)
+            self._move([pick_c[0], pick_c[1], pick_top + self.approach_m], pick_yaw, TRANSIT_TOL_MM)
             self._resume_belt()
             return "PICK_FAILED"
         self.svc.set_status(box_id, "PICKED")
@@ -245,8 +254,8 @@ class Cycle:
         # TRANSIT_LIFT_MM 은 **팔꿈치 간섭용**이다 (위 상수 주석 참조).
         transit = (max(pick_top, put_top, stack_top) + self.approach_m + h / 1000.0
                    + TRANSIT_LIFT_MM / 1000.0)
-        self._move([pick_c[0], pick_c[1], transit], pick_yaw)
-        self._move([cx, cy, transit], put_yaw)
+        self._move([pick_c[0], pick_c[1], transit], pick_yaw, TRANSIT_TOL_MM)
+        self._move([cx, cy, transit], put_yaw, TRANSIT_TOL_MM)
         # ★ 배치 approach 도 **매달린 박스 밑면** 기준이다 — 여기도 h 를 더한다.
         #   흡착면 기준으로 잡으면 박스 밑면이 `approach - h` 만큼만 뜬다. 박스가
         #   approach_offset(200)보다 높으면 밑면이 **같은 층 이웃 상면보다 아래**로 내려가
@@ -255,7 +264,7 @@ class Cycle:
         #   도착 잔차 208.9 mm · 이웃을 103.7 mm 밀어냄 · 그 위에 얹혀 Z 오차 +208.8 mm.
         #   정본은 check_place_plan.py:176 `carry_bottom = max(obstacle, top) + safe_mm`
         #   즉 h_safe(흡착면) = ... + safe + h 다. 152행 transit 은 이미 그렇게 돼 있었다.
-        self._move([cx, cy, put_top + self.approach_m + h / 1000.0], put_yaw)
+        self._move([cx, cy, put_top + self.approach_m + h / 1000.0], put_yaw, TRANSIT_TOL_MM)
         self._move([cx, cy, put_top + GRASP_GAP_MM / 1000.0], put_yaw)
 
         # TCP 정지 대기 · damping 스파이크 · settle 은 robot_motion 안에서 돈다 (§6.5)
@@ -263,7 +272,7 @@ class Cycle:
             self._log("[cycle] release 실패")
             self._abort(box_id)
             return "BLOCKED"
-        self._move([cx, cy, put_top + self.approach_m], put_yaw)
+        self._move([cx, cy, put_top + self.approach_m], put_yaw, TRANSIT_TOL_MM)
 
         # 6) **실제** pose 로 갱신한다 — 계획값이 아니라 (§7.6)
         actual = self._actual_place(box_id, h) or place
@@ -292,10 +301,14 @@ class Cycle:
         except Exception:
             return None
 
-    def _move(self, face_m, yaw_deg):
-        """흡착면을 face_m 으로 보낸다. 도착까지 기다린다."""
+    def _move(self, face_m, yaw_deg, tol_mm=None):
+        """흡착면을 face_m 으로 보낸다. 도착까지 기다린다.
+
+        `tol_mm` 을 주면 그 구간만 허용 오차를 바꾼다 (이송은 느슨하게, 하강은 그대로).
+        """
         r = self.link.call(cmd="move_ee", target_m=[float(v) for v in face_m],
-                           yaw_deg=float(yaw_deg), obstacles=self._obstacles)
+                           yaw_deg=float(yaw_deg), obstacles=self._obstacles,
+                           tol_m=None if tol_mm is None else float(tol_mm) / 1000.0)
         if not r.get("accepted"):
             raise MotionError(r.get("error", "rejected"))
         t0 = time.time()
