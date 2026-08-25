@@ -196,6 +196,17 @@ def main():
         stages.append((name, steps[k]["n_ok"]))
     print(f"      영상 + 정지화면 {len(stages)}장")
 
+    # ★ 같은 시퀀스를 베이스라인에도 먹여 나란히 재생한다. 표의 "+%p" 는 숫자일 뿐
+    #   무엇이 달라서 그런지 안 보인다 — 영상은 그걸 그대로 보여준다.
+    from packing_algo.baseline import BaselinePacker
+    _, steps_b = viz.simulate(cfg, n=args.boxes, noise=args.noise,
+                              seed_box=seed_show, seed_noise=seed_show + 1000,
+                              packer_cls=BaselinePacker)
+    viz.render_compare_video(cfg, steps, steps_b,
+                             os.path.join(out, "05_compare.mp4"), fps=args.fps)
+    print(f"      나란히 비교 영상 (제안 {steps[-1]['n_ok']}개 vs "
+          f"베이스라인 {steps_b[-1]['n_ok']}개)")
+
     # ── 2. 베이스라인 비교 ─────────────────────────────────────
     print(f"[2/4] 베이스라인 비교 (시드 {args.seeds})…")
     # counts=[] 로 부록(투입 개수별)은 건너뛴다 — 발표 지표는 "포화" 하나다
