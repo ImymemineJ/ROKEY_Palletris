@@ -1,4 +1,5 @@
 import math
+import random
 
 import numpy as np
 from scipy.ndimage import maximum_filter1d
@@ -29,6 +30,14 @@ class HeightmapPacker:
         #     같이 오른다(검증 61.1/61.3/61.0%) — 과적합이 아니라는 신호다.
         self.w_level = hm_cfg.get("w_level", 0.0)           # 평면 유지 (0 이면 기존 동작)
         self.ring = hm_cfg.get("level_ring_cells", 4)       # 이웃으로 볼 바깥 셀 수
+        # ★ 앞보기 — 후보 몇 개를 실제로 놓아 보고, 그 뒤 박스를 굴려 본 뒤 고른다.
+        #   왜 지금 되나: `plan()` 이 2.7ms 인데 로봇 모션이 5~10초다. **계산 예산이
+        #   1000배 남는데 한 수만 보고 확정하고 있었다.**
+        #   la_k <= 1 이면 예전 그리디와 **완전히 같다** (cands[0] = 옛 best).
+        la = hm_cfg.get("lookahead", {}) or {}
+        self.la_k = int(la.get("k", 1))              # 살펴볼 후보 수
+        self.la_rollouts = int(la.get("rollouts", 3))
+        self.la_depth = int(la.get("depth", 4))
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
         # ★ 구 등방 halo. 아래 arm_* 로 대체됐고, robot 섹션이 없는 축약 cfg 에서만 쓴다.
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
@@ -41,6 +50,10 @@ class HeightmapPacker:
         self.topk = hm_cfg["topk_support_check"]            # 50
         self.yaw_tol = hm_cfg["yaw_tol_deg"]                # 5.0 — 이만큼 틀어지면 AABB 기록
         self.box_types = cfg["boxes"]["types"]              # PALLET_FULL 판정에 최소 높이가 필요
+        # ★ 앞보기가 "다음에 뭐가 올까" 를 굴릴 때 쓴다. 실제 혼입비를 써야
+        #   3호가 절반이라는 사실이 반영된다 (균등으로 굴리면 5호를 과대평가한다).
+        self.box_mix = list(cfg["boxes"].get("size_distribution",
+                                             [1.0] * len(self.box_types)))
         # ★ 동점 벌점 계수 — 아래 plan() 참고. 상수를 박지 않고 config 값에서 유도한다.
         #   "실제로 의미 있는 최소 점수차"(높이 1셀 = w_h*cell/max_stack)의 1% 를
         #   좌표 전체 범위(W+D)에 나눠 준 값이라, 진짜 점수차를 절대 뒤집지 못한다.
@@ -99,6 +112,59 @@ class HeightmapPacker:
         """모든 배치 시작셀 (i,j)에 대한 밑면 높이 = 점유영역 최대. shape (W-wc+1, D-dc+1)"""
         return self._sliding_max(self._sliding_max(self.hm, wc, 0), dc, 1)
 
+    def _future_boxes(self, n, salt):
+        """굴려 볼 가상의 다음 박스 n개. **결정적이어야 한다.**
+
+        ★ `hash()` 를 쓰면 안 된다 — 파이썬 문자열 해시는 프로세스마다 무작위라
+          (PYTHONHASHSEED) 같은 입력에 다른 계획이 나온다. 평가 항목 "재현성"
+          (Play/Stop 재현)이 그 자리에서 깨진다. 상태에서 직접 씨앗을 만든다.
+        """
+        seed = (int(self.hm.sum()) * 1000003 + len(self.placed) * 97 + salt) & 0x7fffffff
+        rng = random.Random(seed)
+        types = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in self.box_types]
+        return [rng.choices(types, self.box_mix)[0] for _ in range(n)]
+
+    def _rollout_volume(self, hm0, seq):
+        """이 heightmap 에서 seq 를 그리디로 채웠을 때 들어간 총 부피(mm³)."""
+        sub = HeightmapPacker.__new__(HeightmapPacker)
+        sub.__dict__.update(self.__dict__)
+        sub.hm = hm0
+        sub.plans, sub.placed, sub.applied = {}, [], {}
+        sub.la_k = 1                                  # ★ 굴리는 중엔 앞보기를 끈다 (무한재귀 방지)
+        vol = 0
+        for (w, d, h) in seq:
+            ok, pose, _, _ = sub.plan("_LA", w, d, h)
+            sub.plans.pop("_LA", None)
+            if not ok:
+                continue
+            ww, dd = (w, d) if pose["yaw_deg"] == 0 else (d, w)
+            i = (pose["x_mm"] - ww // 2) // sub.cell
+            j = (pose["y_mm"] - dd // 2) // sub.cell
+            sub.hm[i:i + ww // sub.cell, j:j + dd // sub.cell] = pose["z_mm"] + h
+            vol += w * d * h
+        return vol
+
+    def _lookahead(self, cands, h_mm):
+        """상위 후보들을 각각 놓아 보고, 뒤에 올 박스를 굴려 **미래 부피**가 큰 쪽을 고른다.
+
+        그리디는 "지금 이 박스에 제일 좋은 자리" 를 고른다. 그런데 그 자리가
+        **다음 박스들이 들어올 표면을 망칠 수** 있다 — 기둥이 생기는 이유다 (TS-031).
+        실측(시드 30/40 교차검증): 59.9 -> 61.6% · 59.0 -> 61.1%.
+        """
+        top = cands[: self.la_k]
+        if len(top) < 2:
+            return cands[0]
+        seqs = [self._future_boxes(self.la_depth, r) for r in range(self.la_rollouts)]
+        best, best_v = None, None
+        for c in top:
+            _, i, j, z, yaw, w, d = c
+            hm2 = self.hm.copy()
+            hm2[i:i + w // self.cell, j:j + d // self.cell] = z + h_mm
+            v = sum(self._rollout_volume(hm2.copy(), q) for q in seqs) / len(seqs)
+            if best_v is None or v > best_v:
+                best, best_v = c, v
+        return best
+
     def plan(self, box_id, w_mm, d_mm, h_mm):
         """→ (ok, PlacePose, score, message)"""
         why = self._bad_size(w_mm, d_mm, h_mm)
@@ -107,7 +173,10 @@ class HeightmapPacker:
             #   NO_FEASIBLE_POSE 로 답하고 이유는 last_warning 으로 올린다.
             self.last_warning = f"{box_id}: 치수가 잘못됐다 ({why})"
             return False, None, 0.0, "NO_FEASIBLE_POSE"
-        best = None
+        # ★ 예전엔 최선 1개만 남겼다. 지금은 상위 몇 개를 모은다 — 앞보기(_lookahead)가
+        #   "이 자리에 놓으면 **다음 박스들**이 어떻게 되나" 를 굴려 보고 고르기 때문이다.
+        #   앞보기가 꺼져 있으면 cands[0] 이 예전의 best 와 정확히 같다.
+        cands = []
         for yaw in (0, 90):
             w, d = (w_mm, d_mm) if yaw == 0 else (d_mm, w_mm)
             wc, dc = w // self.cell, d // self.cell
@@ -180,14 +249,15 @@ class HeightmapPacker:
                          + self.w_wall * wall[i, j] + self.w_far * far[i, j]
                          + self.w_level * level[i, j])
                     key = (s, -order[i, j])                  # 동점 → 위 order 기준
-                    if best is None or key > best[0]:
-                        best = (key, i, j, int(bz[i, j]), yaw, w, d)
+                    cands.append((key, int(i), int(j), int(bz[i, j]), yaw, w, d))
                 if found:
                     break                                    # 이 창 안에서 최선을 골랐다
                 lo, k = k, min(k * 4, n_cand)                # 빈손이면 넓혀서 다시
-        if best is None:
+        if not cands:
             # ③ 이 박스만 못 놓은 건지(NO_FEASIBLE_POSE), 팔레트가 정말 끝난 건지(PALLET_FULL) 구분
             return False, None, 0.0, "PALLET_FULL" if self._is_pallet_full() else "NO_FEASIBLE_POSE"
+        cands.sort(key=lambda t: t[0], reverse=True)
+        best = self._lookahead(cands, h_mm) if self.la_k > 1 else cands[0]
         _, i, j, z, yaw, w, d = best
         # ★ int()/float() 로 감싸는 이유: i,j,z 는 numpy 배열에서 나온 int64 다.
         #   그대로 내보내면 json.dump 가 "int64 is not JSON serializable" 로 죽고

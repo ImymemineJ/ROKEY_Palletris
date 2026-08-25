@@ -299,3 +299,54 @@ def test_no_feasible_pose_는_정말_자리가_없을_때만():
                 assert sup < pk.min_sup, (
                     f"{ww}x{dd}x{h}: plan 은 자리가 없다는데 ({i},{j}) 에 "
                     f"z={bz[i, j]} 지지 {sup:.2f} 로 놓을 수 있다")
+
+
+def test_앞보기가_꺼져있으면_그리디와_같다():
+    """★ `lookahead.k <= 1` 은 예전 그리디와 **한 배치도 다르지 않아야** 한다.
+
+    앞보기는 지금 꺼져 있다 (§7.9 의 plan()<200ms 를 깨서 — system.yaml 주석 참조).
+    껐을 때 옛 동작과 정확히 같지 않으면, 끄는 것만으로 되돌릴 수가 없다.
+    """
+    import copy
+    a, b = copy.deepcopy(CFG), copy.deepcopy(CFG)
+    a["heightmap"]["lookahead"] = {"k": 1}
+    b["heightmap"].pop("lookahead", None)          # 키가 아예 없는 경우 = 기본값
+    pa, pb = HeightmapPacker(a), HeightmapPacker(b)
+    rb = random.Random(11)
+    for k in range(40):
+        w, d, h = rb.choice(BOXES)
+        ra = pa.plan(f"B{k}", w, d, h)
+        rc = pb.plan(f"B{k}", w, d, h)
+        assert ra[0] == rc[0] and ra[1] == rc[1], f"{k}번째에서 갈렸다: {ra[1]} vs {rc[1]}"
+        if ra[0]:
+            pa.update(f"B{k}", w, d, h, dict(ra[1]))
+            pb.update(f"B{k}", w, d, h, dict(rc[1]))
+        else:
+            pa.cancel(f"B{k}"); pb.cancel(f"B{k}")
+    assert len(pa.placed) == len(pb.placed)
+
+
+def test_앞보기는_결정적이다():
+    """★ 앞보기를 켜도 **같은 입력이면 같은 계획**이어야 한다 (평가 항목 재현성).
+
+    가상 미래 박스를 뽑을 때 `hash()` 를 쓰면 프로세스마다 결과가 달라진다
+    (PYTHONHASHSEED). heightmap 상태에서 씨앗을 만드는 이유다.
+    """
+    import copy
+    c = copy.deepcopy(CFG)
+    c["heightmap"]["lookahead"] = {"k": 4, "rollouts": 3, "depth": 4}
+    poses = []
+    for _ in range(2):
+        pk = HeightmapPacker(c)
+        rb = random.Random(5)
+        seq = []
+        for k in range(20):
+            w, d, h = rb.choice(BOXES)
+            ok, pose, _, _ = pk.plan(f"B{k}", w, d, h)
+            if ok:
+                seq.append(tuple(sorted(pose.items())))
+                pk.update(f"B{k}", w, d, h, dict(pose))
+            else:
+                pk.cancel(f"B{k}")
+        poses.append(seq)
+    assert poses[0] == poses[1], "같은 입력에 다른 계획이 나왔다 — 재현성이 깨진다"
