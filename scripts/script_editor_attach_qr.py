@@ -19,13 +19,19 @@
     (`box_id` · `box_type` · `box_color` · `box_dest` — 접두사 없음)
   · 배송지 값은 `test_3.yaml` 의 `boxes.dests` 와 같아야 한다
 
-## ★ 쓰기 전에 — QR_CODES 를 실제 값으로 채울 것
+## payload 는 실제로 디코딩해서 채웠다 (2026-08-25)
 
-지금 배송지 3종에 이미지를 짝지어 뒀는데, **그 이미지가 정말 그 문자열을
-인코딩하는지는 만든 사람만 안다.** 여기가 틀리면 인식이 읽은 값과 씬의
-`box_dest` 가 안 맞아 `VerifyBox` 가 항상 불일치를 낸다.
+`cv2.wechat_qrcode` 로 세 장을 직접 읽었다. 아래 값이 그 결과다 —
+**추측이 아니라 실측이므로 그대로 두면 된다.**
 
-폰 카메라로 찍어 보고 나온 문자열을 `payload` 에 적을 것.
+  ⚠ 다만 이 QR 들은 생성기(me-qr.com) 가 만든 **단축링크**라 내용이
+    배송지와 무관하다. 지금은 `QR_BY_DEST` 표가 링크↔배송지를 이어주므로
+    통합 테스트에 지장이 없다. 최종 발표용으로는 배송지 문자열
+    ("SEOUL" 등) 을 직접 인코딩한 QR 로 바꾸는 편이 낫다 — 링크보다
+    짧아서 모듈이 성기고, 표 없이도 뜻이 통한다.
+
+QR 을 새로 만들면 `payload` 도 같이 고칠 것. 여기가 틀리면 인식이 읽은
+값과 씬의 `box_dest` 가 안 맞아 `VerifyBox` 가 항상 불일치를 낸다.
 """
 import os
 
@@ -38,11 +44,11 @@ QR_DIR = "/home/rokey/Downloads"
 # 배송지 -> QR 이미지. payload 는 **그 이미지를 디코딩하면 나오는 문자열**이다.
 QR_BY_DEST = {
     "SEOUL":   {"file": "qrcode_390440233_9a0fe13a95a623f42c4ae6443fac57b2.png",
-                "payload": "TODO-decode-me-1"},
+                "payload": "https://q.me-qr.com/0wfauk13"},
     "BUSAN":   {"file": "qrcode_390443182_98c53133a43e86da032b7dbe25475d15.png",
-                "payload": "TODO-decode-me-2"},
+                "payload": "https://q.me-qr.com/n7gnvazl"},
     "DAEJEON": {"file": "qrcode_390443245_cdaa800198d93d60377bcdd0328e9636.png",
-                "payload": "TODO-decode-me-3"},
+                "payload": "https://q.me-qr.com/bv4lums8"},
 }
 
 BOX_ROOT = "/World/boxes"      # ★ spawner.py 규칙 5. **소문자**다
