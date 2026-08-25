@@ -92,6 +92,19 @@ class HeightmapPacker:
         self.arm_r2 = int(hm_cfg.get("corridor_tier2_radius_mm", 0)) // self.cell
         self.arm_gap2 = int(hm_cfg.get("corridor_tier2_gap_mm", 271))
         self.arm_gap = rb["gripper_length_mm"]                          # 150 mm
+        # ★★ 낙하 완화 (2026-08-25, 김병직 지적 "자유낙하가 되니 구속이 풀린 부분이 있다").
+        #   `_corridor_ok` 가 존재하는 이유는 **팔이 박스를 따라 내려가야** 하기 때문이다.
+        #   그런데 가벼운 박스는 협곡 입구에서 놓고 떨어뜨린다 (cycle.py DROP_*) —
+        #   팔이 안 내려가므로 벽이 `윗면 + 그리퍼길이` 를 넘어도 된다.
+        #   실측: 시드 7 끝 시점에 z=560 · 0.14 m² · 여유 740mm 자리가 **높이로는
+        #   3종이 다 들어가는데 통로가 막아** 비어 있었다. 계획이 낙하를 모르는 탓이다.
+        #   drop_relief_mm 만큼 그 자리에 한해 벽 높이를 더 봐준다. 0 이면 꺼짐.
+        #   ⚠ 로봇의 낙하 상한(PL_DROP_MM)보다 크게 잡으면 안 된다 — 계획이 "놓을 수
+        #     있다" 고 한 자리를 로봇이 못 놓는다.
+        self.drop_relief = int(hm_cfg.get("drop_relief_mm", 0))
+        self.drop_max_kg = float(hm_cfg.get("drop_max_kg", 0.0))
+        self._mass_kg = {(b["w_mm"], b["d_mm"], b["h_mm"]): b["mass_g"] / 1000.0
+                         for b in cfg["boxes"]["types"]}
         # ★ 통로 검사의 **방향성** — 팔은 로봇 쪽(py 0)에서 들어온다. 1.0 이면 지금까지의
         #   대칭 검사, 0.0 이면 먼 쪽(py 큰 쪽)은 안 본다. 기본 1.0 = 기존 동작 그대로.
         # ★★ 계획 간격 (2026-08-25, 김병직 실측 → 정정인 승인).
@@ -257,6 +270,12 @@ class HeightmapPacker:
             #   NO_FEASIBLE_POSE 로 답하고 이유는 last_warning 으로 올린다.
             self.last_warning = f"{box_id}: 치수가 잘못됐다 ({why})"
             return False, None, 0.0, "NO_FEASIBLE_POSE"
+        # ★ 낙하 대상인지는 **간격을 더하기 전** 실제 치수로 판단한다
+        relief = 0
+        if self.drop_relief and self.drop_max_kg > 0:
+            kg = self._mass_kg.get((w_mm, d_mm, h_mm))
+            if kg is not None and kg <= self.drop_max_kg:
+                relief = self.drop_relief
         w_mm, d_mm = w_mm + self.plan_clr, d_mm + self.plan_clr   # ★ 계획 간격
         # ★ 예전엔 최선 1개만 남겼다. 지금은 상위 몇 개를 모은다 — 앞보기(_lookahead)가
         #   "이 자리에 놓으면 **다음 박스들**이 어떻게 되나" 를 굴려 보고 고르기 때문이다.
@@ -267,9 +286,16 @@ class HeightmapPacker:
             wc, dc = w // self.cell, d // self.cell
             bz = self._base_z(wc, dc)                       # ① 경계는 shape가 처리
             ok_h = bz + h_mm <= self.max_stack              # ② 높이
-            corridor = self._corridor_ok(wc, dc, bz, h_mm)  # ④ 통로 (전 후보, 필터로 싸다)
+            # ④ 통로 (전 후보, 필터로 싸다). 떨어뜨릴 수 있는 박스는 벽을 더 봐준다.
+            corridor = self._corridor_ok(wc, dc, bz, h_mm, relief)
             cand = ok_h & corridor
-            cand = self._tower_ok(cand, bz, h_mm, wc, dc)   # ⑤ 기둥 억제 (기본 꺼짐)
+            # ⑤ 기둥 억제 (기본 꺼짐). ★ **한 칸도 안 남으면 포기하고 원래 후보를 쓴다.**
+            #   이 규칙의 값어치는 "초반에 협곡을 안 만드는" 것이지 "막판에 못 놓게 하는"
+            #   게 아니다. 실측(35박스 끝 시점): 3호가 높이·통로를 3038칸 통과하는데
+            #   기둥 억제가 **전부** 죽여 버림이 10개씩 났다 (시드 99). 지지율이 상위
+            #   50개에서 몰살당할 때 창을 넓히는 것과 같은 처리다 (아래 ③ 주석).
+            tow = self._tower_ok(cand, bz, h_mm, wc, dc)
+            cand = tow if tow.any() else cand
             if not cand.any(): continue
             # 지지율 전 1차 점수. 후보가 아닌 칸은 -inf 로 빼서 topk 자리를 낭비하지 않게 한다.
             base_score = self.w_h * (1 - bz / self.max_stack)
@@ -377,7 +403,7 @@ class HeightmapPacker:
         foot = self.hm[i:i + wc, j:j + dc]
         return float((np.abs(foot - base_z) <= self.tol).mean())   # ★ tol=10 필수
 
-    def _corridor_ok(self, wc, dc, bz, h_mm):
+    def _corridor_ok(self, wc, dc, bz, h_mm, relief=0):
         """주변 '팔 굵기' 만큼을 보되, 기준은 박스 **윗면 + 그리퍼 길이** 다.
 
         ★ 2026-08-24 수정. 구 코드는 반경 30mm 링을 박스 **밑면**(bz)과 비교했다.
@@ -404,7 +430,7 @@ class HeightmapPacker:
         cf = int(round(c * self.corridor_far))
         pad = np.pad(self.hm, ((c, c), (c, cf)), mode="constant", constant_values=0)
         big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + c + cf, 1)
-        ok = big <= bz + h_mm + self.arm_gap + self.tol
+        ok = big <= bz + h_mm + self.arm_gap + relief + self.tol
         # ★ 2단 — 더 넓은 반경은 **더 높은 벽까지만** 봐준다. 얕은 이웃은 1단만 걸린다.
         if self.arm_r2 > c:
             c2 = self.arm_r2

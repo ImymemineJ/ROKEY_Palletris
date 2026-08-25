@@ -1038,7 +1038,8 @@ def main():
                     "top_box_max_h": 0, "tower_ring_mm": 0,
                     "tower_ring_cells": 25, "max_span_mm": 0,
                     "corridor_radius_mm": 0,
-                    "corridor_tier2_radius_mm": 0, "corridor_tier2_gap_mm": 271}
+                    "corridor_tier2_radius_mm": 0, "corridor_tier2_gap_mm": 271,
+                    "drop_relief_mm": 0, "drop_max_kg": 0.0}
             # ★ 중첩 키도 받는다: `--hm lookahead.k=4`. 앞보기가 dict 라 스칼라
             #   문법으로는 손댈 수가 없었다 (type(dict)(float) 로 죽는다).
             if "." in _k:
@@ -1596,7 +1597,11 @@ def main():
         # ★ 버림은 실패가 아니다 (§5). 뭉뚱그리면 "실패 N건" 이 부풀려 나오고
         #   발표에서 알고리즘 정상 판단과 진짜 고장을 구분할 수 없다.
         n_rej = len([r for r in rows if r["res"] == "REJECTED"])
-        n_fail = len(rows) - len(placed) - n_rej
+        # ★ `PALLET_FULL` 은 **정상 종료**다 (CLAUDE.md §7: 가장 작은 박스로도 후보가
+        #   없다 -> 트럭 상차 · 종료). 실패로 세면 안 된다 — 실제로 시드 99 가 29개를
+        #   깔끔히 쌓고 팔레트가 차서 끝났는데 "진짜 실패" 로 찍혔다 (2026-08-25).
+        n_full = len([r for r in rows if r["res"] == "PALLET_FULL"])
+        n_fail = len(rows) - len(placed) - n_rej - n_full
         print("\n놓은 것       %d / %d   (적재 %d · 버림 %d · 실패 %d)"
               % (len(placed), len(rows), len(placed), n_rej, n_fail))
         print("%s   %d 단 (밑면 z %s)"
@@ -1662,8 +1667,9 @@ def main():
                  sum(r["sim_s"] for r in rows) / max(1, len(rows))))
 
         for cond, msg in (
-                (len(placed) + n_rej == len(rows),
-                 "%d 개가 PLACED 도 REJECTED 도 아니다 (진짜 실패)" % n_fail),
+                (len(placed) + n_rej + n_full == len(rows),
+                 "%d 개가 PLACED · REJECTED · PALLET_FULL 어느 것도 아니다 (진짜 실패)"
+                 % n_fail),
                 (not off, "배치 오차 초과 %s" % [r["id"] for r in off]),
                 (max_knock <= KNOCK_WARN_MM,
                  "이미 놓인 박스가 %.1f mm 밀렸다 — 이송 높이를 볼 것" % max_knock),
