@@ -824,6 +824,11 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--poll-ms", type=float, default=None, metavar="MS",
+                    help="`cycle.MOTION_POLL_S` 를 덮어쓴다 (기본 20ms). 헤드리스는 시뮬이 "
+                         "실시간의 7배로 돌아 20ms 벽시계가 **138ms 시뮬**이 된다 — "
+                         "사이클 시간의 3분의 1이 이 인공물이다. 실제 로봇은 실시간이라 "
+                         "20ms 가 그냥 20ms 다")
     ap.add_argument("--transit-tol", type=float, default=None, metavar="MM",
                     help="이송 구간(상공 이동·후퇴) 허용 오차. 기본은 하강과 같은 2mm 라 "
                          "예전 동작 그대로다. 올리면 정착 대기가 줄지만 다음 호가 "
@@ -1196,6 +1201,11 @@ def main():
                             ("x_mm", "y_mm", "z_mm", "yaw_deg", "stack_top_mm") if k in p}
                       for bid, p in zip(ids, plan)}
             svc = PlanServices(specs, places, verbose=a.verbose)
+        if a.poll_ms is not None:
+            # ★ 모듈 상수만 덮어쓴다. cycle.py 정본은 그대로다.
+            CY.MOTION_POLL_S = float(a.poll_ms) / 1000.0
+            print("폴링      %.1f ms (기본 20.0) — 시뮬이 실시간보다 빠를 때만 의미 있다"
+                  % a.poll_ms)
         if a.transit_tol is not None:
             # ★ 모듈 상수만 덮어쓴다. cycle.py 정본은 안 고친다 (기본값 = 예전 동작).
             CY.TRANSIT_TOL_MM = float(a.transit_tol)
