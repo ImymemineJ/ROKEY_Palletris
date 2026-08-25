@@ -55,8 +55,9 @@ from packing_common.config import find_config, load
 from packing_db.gen_master_db import dong_of
 from packing_db.metrics import collect, fmt_rate
 from packing_msgs.msg import BoxInfo, MetricsSummary, ZoneStatus
-from packing_msgs.srv import (DiverterRequest, GetBoxInfo, MarkPlaced, RegisterBox,
-                              ReportMiss, SetStatus, VerifyBox, ZoneQueue)
+from packing_msgs.srv import (DiverterDecide, DiverterRequest, GetBoxInfo,
+                              MarkPlaced, RegisterBox, ReportMiss, SetStatus,
+                              VerifyBox, ZoneQueue)
 
 # CLAUDE.md §3-1 BoxInfo.status 가 정의한 8 개. 이 밖의 값은 받지 않는다.
 VALID_STATUS = {"SPAWNED", "SCANNED", "VERIFIED", "DIVERTED",
@@ -114,7 +115,8 @@ class DbService(Node):
                 (MarkPlaced,  "/db/mark_placed",  self.on_mark_placed),
                 (ZoneQueue,   "/db/zone_queue",   self.on_zone_queue),
                 (ReportMiss,  "/db/report_miss", self.on_report_miss),
-                (DiverterRequest, "/diverter/request", self.on_diverter)):
+                (DiverterRequest, "/diverter/request", self.on_diverter),
+                (DiverterDecide,  "/diverter/decide",  self.on_diverter_decide)):
             self.create_service(srv_type, name, fn, callback_group=cb)
 
         # ── 구역 수용 여부 캐시 ──
@@ -122,6 +124,10 @@ class DbService(Node):
         #   버퍼 잔량·예상 여유시간을 직접 계산하던 옛 방식은 관제탑과 계산이
         #   어긋나면 조용히 잘못 보낸다. 판단 주체를 관제탑 하나로 몰아 둔다.
         self._accepting = {}                     # zone(대문자) → bool
+        # ★ 분기기별 질의용 판단 캐시 (DiverterDecide.srv 주석 참조).
+        #   한 바퀴에 한 번만 판단하기 위한 것이다.
+        self._dv_cache = {}                      # box_id → (target, reason)
+        self._n_diverters = len(self.cfg["zones"]["list"])
         # ★ fill_rate·max_height_mm 은 DB 가 모른다 — heightmap 을 가진 algo 만 안다.
         #   유일한 유입 경로가 관제탑의 ZoneStatus 다. 여기서 받아 지표에 얹는다.
         self._zone_cache = {}                    # zone → (fill_rate, max_height_mm)
@@ -426,11 +432,66 @@ class DbService(Node):
     def on_diverter(self, req, res):
         """목적지를 정한다. target 은 "A"|"B"|"C"|"RETURN" 네 가지뿐이다.
 
-        전부 로컬 sqlite 조회라 마이크로초에 끝난다. 여기서 다른 노드에 서비스를
-        걸면 그 왕복이 0.6 초를 먹는다 — 그래서 중재자가 이 프로세스에 있다.
+        씬이 한 번 묻고 게이트 3 개를 스스로 운전하는 방식이다.
+        게이트마다 묻고 싶으면 `/diverter/decide` 를 쓴다.
         """
         t0 = time.perf_counter()
         box_id = req.box_id.strip()
+        res.target, res.reason = self._decide(box_id)
+        return self._diverter_done(res, box_id, t0)
+
+    # ══════════════════════════════════════════════════════════════
+    # /diverter/decide  — 분기기 한 대에 대한 답. ★ 0.6 초 안에
+    # ══════════════════════════════════════════════════════════════
+    def on_diverter_decide(self, req, res):
+        """이 분기기로 뺄지 말지. 판단은 **첫 분기기에서 한 번만** 한다.
+
+        ★ 분기기마다 새로 판단하면 retry_count 가 한 바퀴에 3 오른다 —
+          멀쩡한 박스가 두 바퀴 만에 폐기된다. 그래서 캐시한다.
+          마지막 분기기를 답한 뒤 버린다: 다음 바퀴에는 다시 판단해야 한다
+          (반송 루프를 돌아 cam1 을 다시 지나 등록됐을 수 있다).
+        """
+        t0 = time.perf_counter()
+        box_id = req.box_id.strip()
+        did = int(req.diverter_id)
+
+        cached = self._dv_cache.get(box_id)
+        if did <= 1 or cached is None:
+            cached = self._decide(box_id)      # 여기서만 부작용이 일어난다
+            self._dv_cache[box_id] = cached
+        target, reason = cached
+
+        mine = self._zone_of_diverter(did)
+        res.divert = bool(mine is not None and target == mine)
+        res.target, res.reason = target, reason
+        if did >= self._n_diverters:
+            self._dv_cache.pop(box_id, None)   # 한 바퀴 끝 — 다음엔 다시 판단
+        self.get_logger().info(
+            f"분기기 {did}({mine or '?'}) {box_id} -> "
+            f"{'빼낸다' if res.divert else '통과'} (목적지 {target} · {reason})"
+            f"  [{(time.perf_counter() - t0) * 1000:.1f}ms]")
+        return res
+
+    def _zone_of_diverter(self, diverter_id):
+        """분기기 번호 -> 담당 구역. 1 이 메인 라인에서 제일 앞이다.
+
+        ★ 순서는 `zones.list` 를 따른다. 씬의 물리 배치와 이 목록의 순서가
+          어긋나면 A 로 갈 박스가 C 지선으로 빠진다 — 에러 없이 틀린다.
+          배치가 다르면 yaml 의 zones.list 순서를 씬에 맞출 것.
+        """
+        zs = [str(z).upper() for z in self.cfg["zones"]["list"]]
+        i = int(diverter_id) - 1
+        return zs[i] if 0 <= i < len(zs) else None
+
+    def _decide(self, box_id):
+        """중재자의 판단 규칙 5 단계. -> (target, reason)
+
+        전부 로컬 sqlite 조회라 마이크로초에 끝난다. 여기서 다른 노드에 서비스를
+        걸면 그 왕복이 0.6 초를 먹는다 — 그래서 중재자가 이 프로세스에 있다.
+
+        ★ 부작용이 있다 (retry/bypass 증가 · status 기록). **한 바퀴에 한 번만**
+          불러야 한다.
+        """
         row = self.db.execute(
             "SELECT zone, status FROM boxes_sorted WHERE box_id=?", (box_id,)).fetchone()
 
@@ -438,35 +499,30 @@ class DbService(Node):
         if row is None:
             n = self._bump(box_id, "retry_count")
             if n > self._max_retry:
-                res.target, res.reason = "RETURN", f"REJECTED_RETRY_{n}"
+                reason = f"REJECTED_RETRY_{n}"
                 if self._master_zone(box_id) is not None:
-                    self._set_status(box_id, "REJECTED", res.reason)
-            else:
-                res.target, res.reason = "RETURN", f"NOT_REGISTERED_RETRY_{n}"
-            return self._diverter_done(res, box_id, t0)
+                    self._set_status(box_id, "REJECTED", reason)
+                return "RETURN", reason
+            return "RETURN", f"NOT_REGISTERED_RETRY_{n}"
 
         zone, status = (row[0] or "").upper(), row[1]
 
         # ② 이미 폐기된 박스
         if status == "REJECTED":
-            res.target, res.reason = "RETURN", "ALREADY_REJECTED"
-            return self._diverter_done(res, box_id, t0)
+            return "RETURN", "ALREADY_REJECTED"
 
         # ③ 목적 구역이 이상하다
         if zone not in ("A", "B", "C"):
-            res.target, res.reason = "RETURN", f"BAD_ZONE_{zone or 'EMPTY'}"
-            return self._diverter_done(res, box_id, t0)
+            return "RETURN", f"BAD_ZONE_{zone or 'EMPTY'}"
 
         # ④ 구역이 더 못 받는다 → 되돌린다. ★ 실패가 아니므로 bypass 로 센다
         if self._accepting.get(zone) is False:
             n = self._bump(box_id, "bypass_count")
-            res.target, res.reason = "RETURN", f"ZONE_{zone}_FULL_BYPASS_{n}"
-            return self._diverter_done(res, box_id, t0)
+            return "RETURN", f"ZONE_{zone}_FULL_BYPASS_{n}"
 
         # ⑤ 정상 — 해당 구역으로 보낸다
-        res.target, res.reason = zone, "OK"
         self._set_status(box_id, "DIVERTED")
-        return self._diverter_done(res, box_id, t0)
+        return zone, "OK"
 
     def _diverter_done(self, res, box_id, t0):
         dt = (time.perf_counter() - t0) * 1e3

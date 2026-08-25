@@ -95,17 +95,10 @@ ROBOT_TIMEOUT_S  = 20.0
 CALL_TIMEOUT_S   = 2.0    # 서비스 응답 제한. 넘으면 계획을 버리고 IDLE 로 돌아간다
 WAIT_SERVER_S    = 2.0    # 서버가 아직 안 떴을 때 기다려 볼 시간
 TIMEOUT_SCAN_S   = 0.1    # 타임아웃 감시 주기
-
-
-class _ZoneLog:
-    """로그 앞에 구역을 붙인다. 셋이 한 프로세스에서 떠들면 누가 한 말인지 모른다."""
-
-    def __init__(self, logger, zone):
-        self._l, self._p = logger, f"[{zone}] "
-
-    def __getattr__(self, name):
-        fn = getattr(self._l, name)
-        return lambda msg, *a, **kw: fn(self._p + str(msg), *a, **kw)
+# ★ IDLE 인데 스토퍼에 박스가 이만큼 서 있으면 치운다.
+#   로봇 타임아웃(20초)보다 짧게 둔다 — 이쪽은 아무 작업도 진행 중이 아니라
+#   오래 기다릴 이유가 없고, 그동안 뒤 박스가 계속 밀려온다.
+STUCK_TIMEOUT_S  = 12.0
 
 
 class ZoneCycle:
@@ -125,7 +118,15 @@ class ZoneCycle:
         #   빈 팔레트인데도 NO_FEASIBLE_POSE 가 돌아온다. 실측으로 확인한 버그다 —
         #   에러 로그는 algo 쪽에만 찍히고 관제탑은 "자리가 없구나" 로 오해한다.
         self.zone_id = self.zone.upper()
-        self.log = _ZoneLog(node.get_logger(), self.zone)
+        # ★ 구역별 **자식 로거**를 쓴다. 로그 앞에 구역이 붙어 누가 한 말인지 보인다.
+        #
+        # ★ 래퍼로 감싸면 안 된다. 한때 __getattr__ + 람다로 감쌌다가 노드가 죽었다:
+        #     ValueError: Logger severity cannot be changed between calls.
+        #   rclpy 는 `once` · `throttle_duration_sec` 를 **호출 위치**(파일·줄·함수)로
+        #   캐시하는데, 래퍼를 쓰면 모든 로그가 람다 한 줄에서 나온 것으로 보인다.
+        #   심각도가 섞이는 순간 예외가 나고, 그 예외가 구독 콜백을 타고 올라가
+        #   **프로세스가 통째로 죽는다.** 실측으로 확인했다.
+        self.log = node.get_logger().get_child(self.zone)
         self.belt_mps = float(belt_mps)
 
         # ReentrantCallbackGroup: 콜백이 서로를 막지 않게 한다.
@@ -142,6 +143,14 @@ class ZoneCycle:
         #   또 버리고, 또 집으려 하는 무한 루프가 된다 — 에러 없이 라인만 선다.
         #   실측으로 확인했다(ROS 그래프 검증). 같은 id 가 다시 오면 무시한다.
         self._rejected_id = None
+        # ★ IDLE 인데 스토퍼에 박스가 계속 서 있는 것을 감시한다.
+        #   cam1 이 놓쳐 등록이 안 됐거나(box_id 빈 문자열), camera_info·tf 가 없어
+        #   좌표를 못 내면 관제탑은 "무시" 하고 끝난다. 그러면 **아무도 그 박스를
+        #   치우지 않는다** — 뒤 박스가 밀려 라인이 통째로 막힌다 (CLAUDE.md §7
+        #   "스토퍼에 박스를 두면 라인이 막히므로 반드시 치운다").
+        #   로봇 타임아웃(check_robot_timeout)은 PICKING/PLACING 만 본다.
+        self._stuck_id = None            # 못 쓰고 있는 박스 id ("" 면 식별 실패)
+        self._stuck_since = None
         # ★ 방금 **적재를 끝낸** 박스. 버린 박스와 같은 이유로 필요하다 —
         #   PLACE 를 답한 직후에도 detector 가 보내 둔 이전 프레임이 큐에 남아 있어
         #   present=true·같은 box_id 로 도착한다. 그대로 두면 **같은 박스를 두 번
@@ -225,13 +234,22 @@ class ZoneCycle:
             # 그건 진짜 새 박스다 (재순환). 빗장을 푼다.
             self._rejected_id = None
             self._done_id = None
+            self._stuck_id = self._stuck_since = None
             return
+
+        # ── ①-b 이 박스를 지금 처리하지 못한다면 언제부터인지 기록한다 ──
+        #   아래 어느 관문에 걸려 return 하든 스토퍼에는 박스가 남는다.
+        if self._stuck_since is None or msg.box_id != self._stuck_id:
+            self._stuck_id, self._stuck_since = msg.box_id, time.time()
 
         # ── ② box_id 가 비었으면 아무것도 못 한다 ──
         # 다음 단계가 /db/get_box_info(box_id) 인데 빈 문자열로는 조회가 안 된다.
         # detector 가 색 → box_id 매칭에 실패하면 이렇게 온다.
         if not msg.box_id:
-            self.log.warn("box_at_pickup 에 box_id 가 비어 있다 — 무시")
+            # ★ once 로 억누르지 않는다. 이 상태가 이어지면 라인이 막히는데
+            #   경고가 한 번만 뜨면 조용히 선 것처럼 보인다.
+            self.log.warn("box_at_pickup 에 box_id 가 비어 있다 — 무시",
+                          throttle_duration_sec=5.0)
             return
 
         # ── ②-b 방금 버렸거나 방금 다 쌓은 박스면 씬이 치울 때까지 건드리지 않는다 ──
@@ -537,6 +555,7 @@ class ZoneCycle:
         # 로봇 타임아웃도 이 타이머로 같이 본다 (0.5초면 20초 판정에 충분하다).
         # 상태를 먼저 정리하고 나서 발행해야 방금 끊긴 것이 바로 보인다.
         self.check_robot_timeout()
+        self.check_stuck_box()
 
         msg = ZoneStatus()
         msg.zone = self.zone
@@ -552,6 +571,32 @@ class ZoneCycle:
         msg.accepting = (self.state != DONE)
         msg.stamp = self.node.get_clock().now().to_msg()
         self.pub_status.publish(msg)
+
+    def check_stuck_box(self):
+        """IDLE 인데 스토퍼에 박스가 오래 서 있으면 치운다.
+
+        ★ 안 치우면 뒤 박스가 밀려 라인이 통째로 막힌다 (CLAUDE.md §7).
+          로봇 타임아웃은 PICKING/PLACING 만 보므로 이 구간은 감시가 없었다.
+
+        ★ box_id 를 아는 경우에만 치울 수 있다 — DespawnBox 가 id 로 받는다.
+          픽업에서도 QR 을 못 읽어 id 가 빈 경우는 씬 쪽 개입이 필요하다.
+          그때는 **에러를 계속 낸다.** 조용히 서 있는 것이 제일 나쁘다.
+        """
+        if self.state != IDLE or self._stuck_since is None:
+            return
+        if time.time() - self._stuck_since < STUCK_TIMEOUT_S:
+            return
+        bid = self._stuck_id
+        if not bid:
+            self.log.error(
+                f"스토퍼에 박스가 {STUCK_TIMEOUT_S:.0f}초째 서 있는데 식별이 안 된다 "
+                "— 씬에서 치워야 라인이 풀린다 (QR·조명 확인)",
+                throttle_duration_sec=10.0)
+            return
+        self.log.error(f"{bid} 가 {STUCK_TIMEOUT_S:.0f}초째 처리되지 않는다 — 치운다")
+        self._stuck_id = self._stuck_since = None
+        self.box = {"box_id": bid}
+        self.discard_box("STUCK_AT_STOPPER")
 
     # ── 서비스 호출 헬퍼 ──────────────────────────────────────
     def call_set_velocity(self, mps, then):

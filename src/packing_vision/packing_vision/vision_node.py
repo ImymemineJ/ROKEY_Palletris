@@ -255,8 +255,14 @@ class LineDetector(Node):
         if res.match:
             self.get_logger().info(f"cam2 검증 OK {box_id}")
         else:
+            # ★ 경고만 남기고 끝내면 순서가 꼬인 박스가 그대로 지나간다.
+            #   그렇다고 여기서 버리면 멀쩡한 박스를 죽일 수 있다 — cam2 가 잘못
+            #   읽었을 수도 있기 때문이다. 그래서 **기록만** 남기고 판단은 미룬다.
+            #   불일치가 늘어나는지는 지표(scan_misses)로 보인다.
+            #   ⚠ 미결: 불일치를 REJECTED 로 할지 재순환으로 돌릴지는 팀이 정할 값이다.
             self.get_logger().warn(
                 f"cam2 검증 불일치 {box_id} — 등록 주인 {res.registered_id or '(없음)'}")
+            self._report_miss("cam2", "VERIFY_MISMATCH")
 
     # ★ 모든 서비스 호출은 call_async + done_callback 이다.
     #   콜백 안에서 spin_until_future_complete 를 부르면 executor 가 자기 자신을

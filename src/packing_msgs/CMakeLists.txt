@@ -23,7 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ZoneStatus.msg"
   "msg/MetricsSummary.msg"
 
-  # ── /db/* 7 + /diverter/* 1 = 8 ──
+  # ── /db/* 7 + /diverter/* 2 = 9 ──
   "srv/RegisterBox.srv"
   "srv/GetBoxInfo.srv"
   "srv/VerifyBox.srv"
@@ -33,6 +33,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   # ★ 2026-08-25 추가 — 인식률의 분모를 바로잡기 위한 것이다 (파일 주석 참조).
   "srv/ReportMiss.srv"
   "srv/DiverterRequest.srv"
+  # ★ 2026-08-25 — 분기기 3대를 게이트 단위로 운전하기 위한 것 (파일 주석 참조)
+  "srv/DiverterDecide.srv"
 
   # ── /algo/* 4 ──
   "srv/PlanPlacement.srv"
