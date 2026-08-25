@@ -824,6 +824,14 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--hm", action="append", metavar="KEY=VAL",
+                    help="heightmap 가중치를 **계획용 사본에만** 덮어쓴다. 여러 번 쓸 수 있다. "
+                         "예: --hm w_wall=0.0 --hm w_far=0.0 --hm w_height=1.2. "
+                         "system.yaml 은 안 고친다")
+    ap.add_argument("--corridor-gap", type=float, default=None, metavar="MM",
+                    help="_corridor_ok 가 허용하는 주변 기둥 높이 여유. 기본은 "
+                         "gripper_length_mm(150) — 박스 윗면보다 160 mm 높은 벽까지 통과한다. "
+                         "0 이면 주변이 내 윗면을 못 넘는다 (협곡 금지)")
     ap.add_argument("--overhang", type=float, default=0.0, metavar="MM",
                     help="박스가 팔레트 밖으로 이만큼 나가도 된다고 보고 계획한다. "
                          "네 변 모두. 벽 쪽에서 --algo-clearance 로 잃는 자리를 되찾는다. "
@@ -956,16 +964,19 @@ def main():
         #   여유가 +13 mm 뿐이었다 (CLAUDE.md §1). 5 mm 를 그냥 써도 되는지는 재봐야 한다.
         ov = float(a.overhang)
         cfg_plan, plan_origin = cfg, origin
-        if ov > 0:
+        if ov > 0 or a.hm or a.corridor_gap is not None:
             import copy
             if a.plan_mode != "algo":
-                raise SystemExit("--overhang 은 --plan-mode algo 에서만 배선돼 있다")
+                raise SystemExit("계획 덮어쓰기(--overhang/--hm/--corridor-gap)는 "
+                                 "--plan-mode algo 에서만 배선돼 있다")
+            # ★ **계획용 사본**이다. 씬과 robot_motion 은 진짜 cfg 를 그대로 쓴다.
+            cfg_plan = copy.deepcopy(cfg)
+        if ov > 0:
             _cell = cfg["heightmap"]["cell_mm"]
             if int(round(2 * ov)) % int(_cell):
                 print("!! --overhang %.1f: 2x%.1f = %d 가 격자 %d mm 의 배수가 아니다 — "
                       "격자가 잘려 실제 여유가 줄어든다"
                       % (ov, ov, int(round(2 * ov)), _cell))
-            cfg_plan = copy.deepcopy(cfg)
             cfg_plan["pallet"]["width_mm"] = int(round(cfg["pallet"]["width_mm"] + 2 * ov))
             cfg_plan["pallet"]["depth_mm"] = int(round(cfg["pallet"]["depth_mm"] + 2 * ov))
             plan_origin = [origin[0] - ov, origin[1] - ov, origin[2]]
@@ -974,6 +985,36 @@ def main():
                   % (cfg_plan["pallet"]["width_mm"], cfg_plan["pallet"]["depth_mm"],
                      cfg["pallet"]["width_mm"], cfg["pallet"]["depth_mm"], ov,
                      [round(v, 1) for v in plan_origin]))
+
+        # ── 계획 가중치 덮어쓰기 (--hm) ─────────────────────
+        # ★ system.yaml 은 공용 파일이다 (철칙 10). 팀 결정 없이 안 고친다.
+        #   여기서 **계획용 사본만** 바꿔 값을 재 보고, 숫자를 들고 트랙 C 와 얘기한다.
+        for _kv in (a.hm or []):
+            _k, _, _v = _kv.partition("=")
+            _k = _k.strip()
+            # system.yaml 에 아직 없는 **선택 키**는 코어가 기본값으로 읽는다.
+            # 그런 키까지 막으면 실험 자체가 안 되므로 화이트리스트로 통과시킨다.
+            _OPT = {"corridor_far_ratio": 1.0, "corridor_near_gap_mm": 150.0}
+            if _k not in cfg_plan["heightmap"] and _k not in _OPT:
+                raise SystemExit("--hm %s: heightmap 에 없는 키다. 있는 키 %s (+선택 %s)"
+                                 % (_k, sorted(cfg_plan["heightmap"]), sorted(_OPT)))
+            _old = cfg_plan["heightmap"].get(_k, _OPT.get(_k))
+            cfg_plan["heightmap"][_k] = type(_old)(float(_v)) if isinstance(_old, int) \
+                else float(_v)
+            print("계획값  heightmap.%s  %s -> %s" % (_k, _old, cfg_plan["heightmap"][_k]))
+
+        # ── 협곡 허용 깊이 (--corridor-gap) ─────────────────
+        # ★ `_corridor_ok` 는 "주변 기둥이 **박스 윗면 + gripper_length_mm(150) + tol**
+        #   까지는 괜찮다" 로 본다. 즉 지금은 박스보다 160 mm 높은 벽에 둘러싸인 구덩이도
+        #   통과한다. 이 값을 줄이면 협곡이 얕아진다. 0 이면 "주변이 내 윗면을 넘으면 안
+        #   된다" 가 된다.
+        # ⚠ **계획 사본에만** 건다. robot_motion 은 같은 키로 툴 길이를 읽으므로
+        #   (robot_motion.py:191) 진짜 cfg 를 건드리면 흡착면 위치가 통째로 틀어진다.
+        if a.corridor_gap is not None:
+            _old = cfg_plan["robot"]["gripper_length_mm"]
+            cfg_plan["robot"]["gripper_length_mm"] = float(a.corridor_gap)
+            print("계획값  협곡 허용 %s -> %s mm (툴 길이는 %s 그대로)"
+                  % (_old, a.corridor_gap, _old))
 
         if a.gui:
             # bring_up 의 기본 시점은 로봇 정면(-Y)이라 팔레트가 로봇 뒤에 가린다.

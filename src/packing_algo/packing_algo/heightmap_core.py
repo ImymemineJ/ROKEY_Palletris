@@ -23,6 +23,13 @@ class HeightmapPacker:
         rb = cfg["robot"]
         self.arm_r = rb["gripper_body_diameter_mm"] // 2 // self.cell   # 122//10 = 12셀
         self.arm_gap = rb["gripper_length_mm"]                          # 150 mm
+        # ★ 통로 검사의 **방향성** — 팔은 로봇 쪽(py 0)에서 들어온다. 1.0 이면 지금까지의
+        #   대칭 검사, 0.0 이면 먼 쪽(py 큰 쪽)은 안 본다. 기본 1.0 = 기존 동작 그대로.
+        self.corridor_far = float(hm_cfg.get("corridor_far_ratio", 1.0))
+        # ★ 로봇 쪽(py 작은 쪽) 여유는 **따로** 준다. 팔뚝은 이 방향에서 넘어 들어오므로
+        #   먼 쪽과 같은 기준(윗면+150)을 주면 넘어야 할 벽을 그대로 통과시킨다.
+        #   기본값은 arm_gap = 기존 동작 그대로.
+        self.near_gap = float(hm_cfg.get("corridor_near_gap_mm", self.arm_gap))
         self.min_sup = hm_cfg["min_support_ratio"]          # 0.7
         self.topk = hm_cfg["topk_support_check"]            # 50
         self.yaw_tol = hm_cfg["yaw_tol_deg"]                # 5.0 — 이만큼 틀어지면 AABB 기록
@@ -155,9 +162,21 @@ class HeightmapPacker:
           몸통 반경 122.5). 그래서 그 구간은 이웃이 높아도 안 닿는다. 팔뚝은 그 위부터다.
         """
         c = self.arm_r
-        pad = np.pad(self.hm, c, mode="constant", constant_values=0)
-        big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + 2 * c, 1)
-        return big <= bz + h_mm + self.arm_gap + self.tol
+        # ★ 먼 쪽은 툴 **뒤**다 (2026-08-25 트랙 B 관찰). 팔은 py 0 쪽에서 들어오므로
+        #   팔뚝이 지나는 공간은 박스의 로봇 쪽 위이고, 먼 쪽에 아무리 높이 쌓여 있어도
+        #   툴이 이미 지나온 뒤라 안 걸린다. 대칭으로 보면 **먼 쪽까지 괜히 금지**해서
+        #   적재율만 깎는다. `corridor_far_ratio` 로 먼 쪽 여유폭을 줄인다 (기본 1.0 = 기존).
+        cf = int(round(c * self.corridor_far))
+        pad = np.pad(self.hm, ((c, c), (c, cf)), mode="constant", constant_values=0)
+        big = self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + c + cf, 1)
+        ok = big <= bz + h_mm + self.arm_gap + self.tol
+        if self.near_gap < self.arm_gap:
+            # 박스 **앞**(로봇 쪽) c 셀만 따로 본다. 발자국은 빼고 순수하게 앞쪽이다 —
+            #   팔이 넘어와야 하는 벽이 거기 있다.
+            padn = np.pad(self.hm, ((c, c), (c, 0)), mode="constant", constant_values=0)
+            near = self._sliding_max(self._sliding_max(padn, wc + 2 * c, 0), c, 1)
+            ok &= near[:, : self.D - dc + 1] <= bz + h_mm + self.near_gap + self.tol
+        return ok
 
     def update(self, box_id, w_mm, d_mm, h_mm, actual):
         """★ 실측 pose로 갱신 — 이게 자기교정의 핵심 (명세서 §7.6)"""
