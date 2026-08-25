@@ -78,19 +78,28 @@ def draw(fig, axes, st, fills):
     ax_fr.set_xlabel("적재된 박스 수"); ax_fr.grid(alpha=0.3)
     ax_fr.legend(fontsize=7, loc="lower right", framealpha=0.9)
 
+    el = st.get("elapsed_s", 0.0)
     fig.suptitle(f"zone {st['zone']}  ·  적재 {st['count']}개  ·  "
                  f"적재율 {st['fill'] * 100:.1f}% (실제높이) / "
                  f"{st.get('cap', 0.0) * 100:.1f}% (용량)  ·  "
-                 f"최고 {st['hmax']}mm / {ms}mm", fontsize=13)
+                 f"최고 {st['hmax']}mm / {ms}mm  ·  소요 {el:.0f}s", fontsize=13)
 
 
 def main():
     ap = argparse.ArgumentParser(description="실시간 적재 뷰어")
-    ap.add_argument("-p", "--path", default="/tmp/algo_state.json")
+    ap.add_argument("-p", "--path", default="/tmp/algo_state.json",
+                    help="algo 에 준 snapshot_path 와 같은 값. 구역 접미사는 자동으로 붙는다")
+    ap.add_argument("-z", "--zone", default="b", help="볼 구역 (a|b|c)")
     ap.add_argument("--save", default="", help="갱신마다 PNG 를 남길 디렉터리")
     ap.add_argument("--interval", type=float, default=0.5)
     ap.add_argument("--headless", action="store_true", help="창 없이 --save 만 (원격용)")
     args = ap.parse_args()
+    # ★ algo 가 구역마다 다른 파일에 쓴다 (heightmap 3장 · CLAUDE.md §8).
+    #   여기서 같은 규칙으로 경로를 만든다 — 사용자가 두 곳에 같은 규칙을 손으로
+    #   맞추게 하면 반드시 어긋난다.
+    stem, ext = os.path.splitext(args.path)
+    if not stem.endswith(f"_{args.zone.lower()}"):
+        args.path = f"{stem}_{args.zone.lower()}{ext or '.json'}"
     if args.headless:
         matplotlib.use("Agg")
     if args.save:

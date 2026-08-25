@@ -70,7 +70,15 @@ BOX_PRIM_FMT = "/World/boxes/%s"          # 공통가이드 §3 규칙 5
 # ★ 도착 판정은 **작업공간**에서 한다. 관절 0.5° 는 1 m 리치에서 8.7 mm 라,
 #   흡착 접근 간극 2 mm 를 판정할 수 없다 (실측으로 2.14 mm 떠서 붙어 실패했다).
 IK_TOL_M = 0.005                          # Lula 해를 FK 로 되돌렸을 때 허용 오차
-REACH_TOL_M = 0.001                       # 흡착면이 목표에서 이 안이면 REACHED
+# ★ 1 mm 였다. **이 제어기의 정상상태 오차보다 작아서 애초에 못 들어가는 값**이었다.
+#   2026-08-25 실측 (`results/time2.txt`, 구간 26개): 최소 1.03 · 중앙 1.23 ·
+#   90% 1.51 · 최대 2.05 mm. 최소값조차 1 mm 를 넘는다.
+#   -> 2 mm 로 푼다. 중앙값이 SETTLE_HOLD(3틱) 만에 통과하고, 꼬리(2.05)는 아래
+#      수렴 정체 판정이 받는다.
+#   ⚠ 흡착에는 영향이 없다 — `cycle._descend_to_gap` 이 **실측으로 한 번 보정하는
+#     닫힌 루프**라 IK 잔차에 안 걸린다. GRIP_TOL_MM 은 3.0 이고 실측 간극은
+#     1.28~1.97 mm 였다.
+REACH_TOL_M = 0.002                       # 흡착면이 목표에서 이 안이면 REACHED
 # ★ 도착 판정에 **자세**도 넣는다 (2026-08-24, TS-015).
 #   위치만 보면 손목이 도는 중에 REACHED 가 나가고, 그 상태로 흡착을 놓아
 #   박스가 삐딱하게 떨어져 넘어졌다. 실측에서 다음 구간이 yaw 112.9 에서 시작했다.
@@ -81,6 +89,21 @@ YAW_TOL_DEG = 2.0                         # 툴 yaw 가 이 안이어야 REACHED
 #   제어기에서는 임계값에 영영 못 들어간다 (구 저장소 RMPflow 교훈).
 SETTLE_MAX_S = 2.5                        # 궤적을 다 보낸 뒤 수렴을 기다리는 한도
 SETTLE_HOLD = 3                           # 연속 이만큼 만족해야 REACHED
+# ★★ 정상상태 오차가 남는 제어기에서는 REACH_TOL_M(1mm)에 **영영 못 들어간다.**
+#   2026-08-25 실측(`results/time1.txt`): 웨이포인트 8개가 **전부** SETTLE_MAX_S 를
+#   꽉 채웠고, `motion_status` 대기가 사이클 시간의 **80~88%** 였다 (사이클 20초 중
+#   16~20초). 그런데 `잔차` 경고는 **0건** — LOG_RESIDUAL_M(5mm) 미만이라는 뜻이다.
+#   즉 팔은 이미 멈춰 있었고 1mm 에 못 들어왔을 뿐이다. 주석이 스스로 "1~2mm 는
+#   정상 처짐" 이라고 적어 놓고 임계값을 1mm 로 둔 것이 원인이다.
+#   -> **절대 임계값이 아니라 "더 줄어드는가"로 끝낸다.** 이게 옛 저장소 RMPflow
+#      교훈("정상상태 오차는 성질이다 — 위치 오차로 단계 전환 금지")의 적용이다.
+#   ⚠ yaw 는 그대로 YAW_TOL_DEG 를 요구한다. 느슨하게 하면 박스가 삐딱하게 앉아
+#     다음 층이 그 위에서 무너진다 (TS-015 재발).
+# ★ 정착 구간을 한 줄씩 찍는다 (데모가 --diag-time 에서 켠다). 구간당 430 ms 가
+#   어디서 나오는지 — **팔이 움직이는 중인지 이미 멈췄는지** — 이걸로만 갈린다.
+SETTLE_LOG = False
+SETTLE_PLATEAU_TICKS = 8                  # 이만큼 연속으로
+SETTLE_PLATEAU_M = 0.0002                 # 0.2 mm 이상 안 줄면 수렴 끝으로 본다
 ARC_MIN_R_M = 0.15                        # 반경이 이보다 작으면 각도가 무의미 — 직선
 BISECT = 10                               # 속도한계를 넘으면 u 증분을 이만큼까지 반절
 MOVE_LIMIT_S = 20.0                       # 한 구간 상한. 무한루프 방지
@@ -223,6 +246,8 @@ class RobotMotion:
         self._goal_yaw = 0.0        # 같은 이동의 툴 yaw 목표 (자세 판정용)
         self._hold = 0
         self._settle = 0
+        self._best, self._flat = float("inf"), 0
+        self._s0 = None
         self._tcp_mps = 0.0
         self._prev_tool = None
         self._g_evt = None          # grasp 결과 대기
@@ -296,7 +321,10 @@ class RobotMotion:
                 pass                          # 잘못된 항목 하나가 이동을 막으면 안 된다
         with self._lk:
             self._obst = obst
-            self._req = (target, float(req.get("yaw_deg", 0.0)))
+            # ★ 구간 허용 오차도 같이 싣는다. 소켓 스레드가 만든 튜플을 물리 스레드가
+            #   그대로 받는다 — dict 를 넘기면 나중에 누가 고쳐 경합이 난다.
+            self._req = (target, float(req.get("yaw_deg", 0.0)),
+                         float(req.get("tol_m") or REACH_TOL_M))
             self._state = "MOVING"
             self._path = None
         return {"accepted": True}
@@ -496,7 +524,7 @@ class RobotMotion:
 
     def _start_move(self, req):
         """호 경로를 세운다. 끝점 IK 로 타당성과 페이싱을 먼저 확인한다."""
-        face, yaw_req = req
+        face, yaw_req, tol_m = req
         q0 = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
         f0 = self.suction_pose()
         _, R0 = self.lula.compute_forward_kinematics(self.ee, q0)
@@ -530,11 +558,17 @@ class RobotMotion:
                       "dth": _wrap(math.atan2(v1[1], v1[0]) - th0),
                       "yaw0": yaw_from, "yaw1": yaw_to,
                       "u": 0.0, "du": 1.0 / steps, "prev": q0, "k": 0,
-                      "miss": 0, "over": 0}
+                      "miss": 0, "over": 0,
+                      # ★ 구간마다 요구 정밀도가 다르다. 이송(상공 이동·후퇴)은 mm 로
+                      #   도착할 이유가 없고, 정밀해야 하는 건 집는/놓는 하강뿐이다.
+                      #   상위(cycle)가 `tol_m` 으로 준다. 안 주면 기본값 = 예전 동작.
+                      "tol": tol_m}
         self._goal_face = np.asarray(face, dtype=float)
         self._goal_yaw = float(yaw_to)              # ★ 도착 판정에 쓸 목표 자세
         self._hold = 0
         self._settle = int(SETTLE_MAX_S * self.hz)
+        self._best, self._flat = float("inf"), 0      # 수렴 정체 판정 (위 SETTLE_PLATEAU_*)
+        self._s0 = None                              # 정착 진입 시점 (잔차, 틱) — SETTLE_LOG
         self._state = "MOVING"
         self._log("[robot_motion] move -> %s yaw %.1f -> %.1f  %s  |dq| %.1f deg  n %d"
                   % (np.round(face, 4), yaw_from, yaw_to,
@@ -589,15 +623,27 @@ class RobotMotion:
         # ★ yaw 와 yaw±180 은 물리적으로 같은 자세다 — 180° 주기로 비교한다.
         #   안 그러면 등가 각으로 수렴했는데 178° 틀렸다고 오판해 매번 한도까지 기다린다.
         dyaw = abs(yaw - _near(self._goal_yaw, yaw, 180.0))
-        if err < REACH_TOL_M and dyaw < YAW_TOL_DEG:
+        if self._s0 is None:
+            self._s0 = (err, dyaw, self._settle)     # 호가 끝난 직후 값
+        tol = p.get("tol", REACH_TOL_M)
+        if err < tol and dyaw < YAW_TOL_DEG:
             self._hold += 1
             if self._hold >= SETTLE_HOLD:
                 self._reach_done(err, p)
             return
         self._hold = 0
+        # ── 수렴 정체 = 이 제어기의 정상상태다. 더 기다려도 안 들어온다 ──
+        if err < self._best - SETTLE_PLATEAU_M:
+            self._best, self._flat = err, 0
+        else:
+            self._flat += 1
+        if (self._flat >= SETTLE_PLATEAU_TICKS
+                and dyaw < YAW_TOL_DEG and err < REACH_ABORT_M):
+            self._reach_done(err, p)
+            return
         self._settle -= 1
         if self._settle <= 0:
-            if err > LOG_RESIDUAL_M or dyaw > YAW_TOL_DEG:
+            if err > max(LOG_RESIDUAL_M, tol) or dyaw > YAW_TOL_DEG:
                 self._warn_residual(p, err, dyaw)
             # ★ 여기서 REACHED 를 주면 호출부가 **그 자리에서 놓는다.**
             #   실패로 알려 cycle 이 이탈 경로(cancel_plan -> 복귀)를 타게 한다.
@@ -624,6 +670,21 @@ class RobotMotion:
                      np.round(self._goal_face, 4), p["miss"], p["over"]))
 
     def _reach_done(self, err, p=None):
+        if SETTLE_LOG and self._s0 is not None:
+            e0, d0, t0 = self._s0
+            n = t0 - self._settle
+            # 잔차가 크게 줄었으면 **팔이 움직이는 중**이었다는 뜻이고,
+            # 거의 그대로면 **이미 멈춰 있었는데 로직이 붙잡은** 것이다.
+            self._log("[robot_motion] 정착 %3d틱 %5.0f ms · 잔차 %6.2f -> %5.2f mm "
+                      "(줄어든 %5.2f) · yaw %4.1f -> %4.1f도"
+                      % (n, 1000.0 * n / self.hz, e0 * 1000, err * 1000,
+                         (e0 - err) * 1000, d0, 0.0))
+        self._s0 = None
+        # ★ REACH_TOL 을 못 맞추고 끝난 구간은 잔차를 남긴다 — 이 제어기의 정상상태가
+        #   얼마인지가 여기서만 보인다. 한 줄로 짧게.
+        if p is not None and err >= p.get("tol", REACH_TOL_M):
+            self._log("[robot_motion] 정착 %.2f mm (허용 %.1f) — 더 안 줄어 종료"
+                      % (err * 1000, p.get("tol", REACH_TOL_M) * 1000))
         self._state = "REACHED"
         self._path = None
         self._last_err_m = err

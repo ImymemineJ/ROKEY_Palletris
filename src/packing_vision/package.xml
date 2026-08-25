@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>packing_vision</name>
+  <version>0.0.0</version>
+  <description>
+    카메라 토픽(rgb + depth + camera_info)을 구독해 박스의 색과 크기를 재고
+    결과를 토픽으로 발행한다. Isaac 이 아니라 ROS 프로세스에서 돈다.
+  </description>
+  <maintainer email="jungji0913@khu.ac.kr">정정인</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>packing_common</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

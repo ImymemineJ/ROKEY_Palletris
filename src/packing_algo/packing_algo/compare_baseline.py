@@ -109,8 +109,12 @@ def markdown_table(sat, by_n, counts, seeds, noise_mm, TARGET):
           f"- 베이스라인 대비: **+{fa - fb:.1f}%p** (+{(fa / fb - 1) * 100:.0f}%)",
           f"- 포화까지 박스 {st.mean([r[0] for r in sat[a]]):.0f}개를 흘려보내야 하고 "
           f"그중 {st.mean([r[2] for r in sat[a]]):.0f}개가 버려진다 "
-          f"(스폰 간격 12초 기준 약 {st.mean([r[0] for r in sat[a]]) * 12 / 60:.0f}분).",
-          "",
+          f"(스폰 간격 12초 기준 약 {st.mean([r[0] for r in sat[a]]) * 12 / 60:.0f}분)."]
+    # ★ counts 가 비면 부록을 통째로 뺀다. report.py 는 counts=[] 로 부르는데,
+    #   제목만 찍고 표가 비어 나오면 "돌리다 만 결과" 로 읽힌다.
+    if not counts:
+        return "\n".join(L) + "\n"
+    L += ["",
           "## 부록 — 투입 개수별 (몇 개를 흘려보낼지 정하는 근거)", "",
           "> 발표 지표는 위의 '포화' 표를 쓴다. 아래는 config 의 `stage1.total_count` 를",
           "> 정하기 위한 자료다. 투입이 모자라면 팔레트가 차기 전에 실험이 끝난다.", "",

@@ -22,6 +22,10 @@ setup(
             'algo_service_node = packing_algo.algo_service_node:main',
             'rehearsal_check = packing_algo.preflight:main',
             'live_view = packing_algo.live_view:main',
+            'robustness = packing_algo.robustness:main',
+            'report = packing_algo.report:main',
+            'ceiling = packing_algo.ceiling:main',
+            'dump_plan = packing_algo.dump_plan:main',
         ],
     },
 )

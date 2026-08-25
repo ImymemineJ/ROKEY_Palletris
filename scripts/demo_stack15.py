@@ -148,6 +148,109 @@ STAGE_XY = (14.5, 4.2)
 STAGE_PITCH = 0.75
 STAGE_COLS = 5
 
+# ★ 버림(despawn) 자리 — `Spawner._despawn` 이 하는 일을 이 데모 안에서 한다.
+#   이 데모는 `sim_main` 소켓을 안 거치고 프림을 직접 들고 있으므로 서비스 호출 대신
+#   프림을 라인 밖으로 옮긴다. 벨트(x 9.65 ±0.6)·팔레트(10.3,0.3)·로봇(10.9,-0.1)
+#   어디에도 안 걸리고, 대기 스테이징(+Y 4.2)과도 반대쪽이라 겹치지 않는다.
+PARK_XY = (14.5, -3.0)
+
+
+PHYS_MAT_PATH = "/World/Looks/PhysicsMaterial"          # spawner.py 와 같은 경로
+
+
+def _phys_material(stage, cfg):
+    """`system.yaml` 의 마찰을 담은 물리 머티리얼. 없으면 만든다 (spawner.py:370 과 동일).
+
+    ★ 이게 없으면 박스가 PhysX **기본 마찰**로 돌고 `physics.material` 0.6/0.5 는
+      아무데도 안 걸린다. 스택이 서느냐 미끄러지느냐를 직접 가르는 값이다.
+    """
+    from pxr import UsdGeom, UsdPhysics, UsdShade
+    if not stage.GetPrimAtPath("/World/Looks"):
+        UsdGeom.Scope.Define(stage, "/World/Looks")
+    prim = stage.GetPrimAtPath(PHYS_MAT_PATH)
+    if not prim:
+        m = cfg["physics"]["material"]
+        pm = UsdShade.Material.Define(stage, PHYS_MAT_PATH)
+        api = UsdPhysics.MaterialAPI.Apply(pm.GetPrim())
+        api.CreateStaticFrictionAttr(float(m["static_friction"]))
+        api.CreateDynamicFrictionAttr(float(m["dynamic_friction"]))
+        api.CreateRestitutionAttr(0.0)
+        prim = pm.GetPrim()
+    return prim
+
+
+def _apply_physics(stage, prim, cfg, rigid=True):
+    """`spawner.py` 가 박스마다 거는 물리 속성을 그대로 건다.
+
+    ★ 왜 필요한가 — 이 데모는 스포너를 안 거치고 `verify_suction.make_box` 로 씬을
+      직접 만든다. 그 함수는 콜라이더·리지드바디·질량만 걸고 **솔버 반복수·오프셋·
+      물리 머티리얼을 안 건다.** 그래서 데모 박스만 PhysX 기본값으로 돌았다:
+      solverPositionIterationCount 기본(4) vs 규정 24. 놓고 난 박스가 접촉을 다 풀지
+      못해 여러 스텝에 걸쳐 **조금씩 미끄러진다** (CLAUDE.md §9 "쌓은 박스가 저절로
+      무너진다"). 2026-08-25 실측: #14 에서 BOX00012 가 70.7 mm 흘렀는데 팔은 그
+      근처에 없었다.
+
+    ★ 솔버 반복수는 **박스마다** 건다. PhysicsScene 에 걸면 무시된다 (spawner.py:30).
+    """
+    from pxr import PhysxSchema, UsdShade
+    ph = cfg["physics"]
+    col = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+    col.CreateRestOffsetAttr(ph["collider"]["rest_offset_mm"] / 1000.0)
+    col.CreateContactOffsetAttr(ph["collider"]["contact_offset_mm"] / 1000.0)
+    if rigid:
+        rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        rb.CreateSolverPositionIterationCountAttr(
+            int(ph["rigid_body"]["solver_position_iterations"]))
+        rb.CreateSolverVelocityIterationCountAttr(
+            int(ph["rigid_body"]["solver_velocity_iterations"]))
+    mat = _phys_material(stage, cfg)
+    UsdShade.MaterialBindingAPI.Apply(prim)
+    UsdShade.MaterialBindingAPI(prim).Bind(
+        UsdShade.Material(mat), UsdShade.Tokens.weakerThanDescendants, "physics")
+
+
+def _link_dists(rm, lo, hi):
+    """지금 자세에서 **링크별로** 피해 박스 AABB 까지의 최소거리 [mm]. 가까운 순.
+
+    `robot_motion._arm_clearance` 와 같은 계산인데, 최악값 하나가 아니라 **어느 링크인지**
+    를 남긴다. "박스가 혼자 밀렸다" 와 "팔이 쳤다" 를 가르는 게 이 목록이다.
+    """
+    q = np.asarray(rm.art.get_joint_positions()[:6], dtype=float)
+    lo, hi = np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+    out = []
+    for link, sph in (rm.spheres or {}).items():
+        if link == "base_link":
+            continue
+        try:
+            pos, rot = rm.lula.compute_forward_kinematics(link, q)
+        except Exception:
+            continue
+        pos, rot = np.asarray(pos), np.asarray(rot)
+        best = float("inf")
+        for c, r in sph:
+            w = pos + rot @ np.asarray(c, dtype=float)
+            over = np.maximum(lo - w, w - hi)
+            d = (float(np.linalg.norm(np.maximum(over, 0.0)))
+                 if np.any(over > 0) else float(np.max(over))) - r
+            best = min(best, d)
+        if best < float("inf"):
+            out.append((best * 1000.0, link))
+    out.sort()
+    return out
+
+
+def _park(rp, dm, idx):
+    """거부·실패한 박스를 라인 밖으로 옮긴다. `Spawner._despawn` 과 같은 역할이다.
+
+    속도를 0 으로 지우지 않으면 옮긴 자리에서 튄다 (급송 코드와 같은 이유).
+    """
+    px = PARK_XY[0] + (idx % STAGE_COLS) * STAGE_PITCH
+    py = PARK_XY[1] - (idx // STAGE_COLS) * STAGE_PITCH
+    rp.set_world_pose(position=np.array([px, py, dm[2] / 2.0 + 0.002]),
+                      orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+    rp.set_linear_velocity(np.zeros(3))
+    rp.set_angular_velocity(np.zeros(3))
+
 
 # ─────────────────────────────────────────────────────────────
 # 배치 계획 — Isaac 없이 돈다
@@ -438,6 +541,7 @@ class OnlineServices:
         self.c = clearance_mm / 1000.0
         self.calls, self._log, self._v = [], log, verbose
         self.last = None                                 # 마지막 계획 (요약표용)
+        self.last_plan_msg = None                        # 직전 plan_placement 의 msg (§5 판정용)
 
     def _rec(self, name, *a):
         self.calls.append((name,) + a)
@@ -473,7 +577,9 @@ class OnlineServices:
         if p is None:
             self._log("             [svc] 자리 없음 (관측 %d개, 최상단 %.0f mm)"
                       % (seen, top * 1000))
+            self.last_plan_msg = "PALLET_FULL"
             return False, None, "PALLET_FULL"
+        self.last_plan_msg = "OK"
         cx, cy, _ = p.center_local
         place = {"x_mm": int(round(cx * 1000.0)), "y_mm": int(round(cy * 1000.0)),
                  "z_mm": int(round(p.z * 1000.0)), "yaw_deg": int(round(p.yaw_deg)),
@@ -523,6 +629,7 @@ class AlgoServices:
         self.c = int(clearance_mm)
         self.calls, self._log, self._v = [], log, verbose
         self.last = None                            # 온라인 경로가 실측 대조에 쓴다
+        self.last_plan_msg = None                   # 직전 plan_placement 의 msg (§5 판정용)
 
     def _rec(self, name, *a):
         self.calls.append((name,) + a)
@@ -535,8 +642,10 @@ class AlgoServices:
         # ★ 맨 앞에서 지운다. 안 지우면 계획에 실패한 박스가 **직전 박스의 좌표**를
         #   물려받아 대조표에 찍힌다 (아래 online 경로가 `svc.last` 를 그대로 읽는다).
         self.last = None
+        self.last_plan_msg = None
         ok, pose, _score, msg = self.pk.plan(box_id, int(w) + self.c,
                                              int(d) + self.c, int(h))
+        self.last_plan_msg = msg
         if not ok:
             self._log("             [algo] %s" % msg)
             return False, None, msg
@@ -592,6 +701,7 @@ class PlanServices:
     def __init__(self, specs, places, log=print, verbose=False):
         self.specs = dict(specs)                    # box_id -> system.yaml 박스 스펙
         self.places = dict(places)                  # box_id -> PlacePose
+        self.last_plan_msg = None                   # 직전 plan_placement 의 msg (§5 판정용)
         self.calls = []
         self._log = log
         self._v = verbose
@@ -616,7 +726,9 @@ class PlanServices:
         self._rec("/algo/plan_placement", zone, box_id)
         p = self.places.get(box_id)
         if p is None:
+            self.last_plan_msg = "PALLET_FULL"
             return False, None, "PALLET_FULL"
+        self.last_plan_msg = "OK"
         return True, dict(p), "OK"
 
     def set_status(self, box_id, status):
@@ -699,11 +811,11 @@ def main():
                          "안 건드린다. 기본 0.5. 시연을 빨리 볼 때 0.8~1.0. "
                          "⚠ 올리면 릴리스 시점 잔여속도가 커져 박스가 놓인 뒤 흐를 수 "
                          "있다 — 착지 정밀도를 볼 때는 기본값으로 돌릴 것")
-    ap.add_argument("--algo-clearance", type=float, default=0.0, metavar="MM",
-                    help="algo 모드에서 이웃 간격을 박스 치수에 더한다. 0 = 트랙 C 코어 순정. "
-                         "★ 사본 패커는 30 을 쓴다 — 간격 20 으로 줄였을 때 13번째 박스가 "
-                         "이웃 모서리에 걸려 Z 오차 +208 mm 가 났던 값이다. 순정(0)이 "
-                         "그보다 좁으므로 깨지면 30 으로 올려 볼 것")
+    ap.add_argument("--algo-clearance", type=float, default=None, metavar="MM",
+                    help="계획 간격을 **덮어쓴다** (기본은 system.yaml 의 plan_clearance_mm=10). "
+                         "발자국을 이만큼 부풀려 박스 사이에 실제 틈을 남긴다. "
+                         "0 은 슬롯이 박스와 같은 크기라 물리적으로 성립하지 않는다 — "
+                         "실측에서 9kg 5호가 338mm 위에서 막히고 이웃을 1046mm 밀어냈다")
     ap.add_argument("--standoff", type=float, default=None, metavar="MM",
                     help="로봇을 팔레트 긴 변에서 뒤로 뺀 거리. 기본은 구 사양서 §3-1 의 300. "
                          "600 이면 여유 +126 mm. ※ 둘 다 G1 재검증이 필요하다")
@@ -712,6 +824,41 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--diag-release", action="store_true",
+                    help="`release` 를 부른 뒤 박스가 **언제 멈추는지** 100ms 구간으로 잰다. "
+                         "RELEASE_MIN_HOLD_S · release_damping_duration_s · settle_wait_s "
+                         "세 개(각 0.5s)가 다 필요한지 여기서만 갈린다")
+    ap.add_argument("--poll-ms", type=float, default=None, metavar="MS",
+                    help="`cycle.MOTION_POLL_S` 를 덮어쓴다 (기본 20ms). 헤드리스는 시뮬이 "
+                         "실시간의 7배로 돌아 20ms 벽시계가 **138ms 시뮬**이 된다 — "
+                         "사이클 시간의 3분의 1이 이 인공물이다. 실제 로봇은 실시간이라 "
+                         "20ms 가 그냥 20ms 다")
+    ap.add_argument("--transit-tol", type=float, default=None, metavar="MM",
+                    help="이송 구간(상공 이동·후퇴) 허용 오차. 기본은 하강과 같은 2mm 라 "
+                         "예전 동작 그대로다. 올리면 정착 대기가 줄지만 다음 호가 "
+                         "그만큼 낮게 시작한다 — 이격 400 여유가 +32.9mm 다")
+    ap.add_argument("--diag-time", action="store_true",
+                    help="사이클 시간이 **어느 소켓 명령 밑에** 쌓이는지 스텝 수로 적는다. "
+                         "목표 10.0 s 대비 어디를 깎을지 정하는 근거")
+    ap.add_argument("--render-every", type=int, default=1, metavar="N",
+                    help="N 스텝에 한 번만 화면을 그린다. **물리는 한 스텝도 안 바뀐다** — "
+                         "결과가 비트 단위로 같다. 2~4 면 벽시계가 짧아지고 화면이 그만큼 "
+                         "빨라 보인다. 궤적을 바꾸는 --vel 과 다르다")
+    ap.add_argument("--hm", action="append", metavar="KEY=VAL",
+                    help="heightmap 가중치를 **계획용 사본에만** 덮어쓴다. 여러 번 쓸 수 있다. "
+                         "예: --hm w_wall=0.0 --hm w_far=0.0 --hm w_height=1.2. "
+                         "system.yaml 은 안 고친다")
+    ap.add_argument("--corridor-gap", type=float, default=None, metavar="MM",
+                    help="_corridor_ok 가 허용하는 주변 기둥 높이 여유. 기본은 "
+                         "gripper_length_mm(150) — 박스 윗면보다 160 mm 높은 벽까지 통과한다. "
+                         "0 이면 주변이 내 윗면을 못 넘는다 (협곡 금지)")
+    ap.add_argument("--overhang", type=float, default=0.0, metavar="MM",
+                    help="박스가 팔레트 밖으로 이만큼 나가도 된다고 보고 계획한다. "
+                         "네 변 모두. 벽 쪽에서 --algo-clearance 로 잃는 자리를 되찾는다. "
+                         "★ --plan-mode algo 전용. 씬의 팔레트는 실물 크기 그대로다")
+    ap.add_argument("--diag-knock", action="store_true",
+                    help="이미 놓인 박스가 **처음 밀리는 순간**을 잡는다 — 그때의 팔 자세로 "
+                         "링크별 거리를 내서 '팔이 쳤나 / 혼자 움직였나' 를 가른다")
     ap.add_argument("--verbose", action="store_true", help="서비스 호출까지 전부 찍는다")
     ap.add_argument("--log", default=None)
     a = ap.parse_args()
@@ -829,6 +976,69 @@ def main():
         pick_x = cfg["conveyor"]["stopper_x_mm"] / 1000.0
         origin = cfg["zones"]["pallet_origin_world_mm"][a.zone]
 
+        # ── 팔레트 밖 여유 (--overhang) ─────────────────────
+        # ★ 씬의 팔레트는 **실물 크기 그대로** 두고, **계획만** 크게 본다. 그래서
+        #   박스가 가장자리에서 실제로 조금 밖으로 나간다. 벽에는 낄 이웃이 없으므로
+        #   --algo-clearance 를 벽에서까지 물릴 이유가 없다 — 그 손해를 되찾는 값이다.
+        # ⚠ 먼 변(+Y)이 늘면 **도달범위**를 먹는다. 이격 400 재검증에서 B존 먼 코너
+        #   여유가 +13 mm 뿐이었다 (CLAUDE.md §1). 5 mm 를 그냥 써도 되는지는 재봐야 한다.
+        ov = float(a.overhang)
+        cfg_plan, plan_origin = cfg, origin
+        if ov > 0 or a.hm or a.corridor_gap is not None or a.algo_clearance is not None:
+            import copy
+            if a.plan_mode != "algo":
+                raise SystemExit("계획 덮어쓰기(--overhang/--hm/--corridor-gap)는 "
+                                 "--plan-mode algo 에서만 배선돼 있다")
+            # ★ **계획용 사본**이다. 씬과 robot_motion 은 진짜 cfg 를 그대로 쓴다.
+            cfg_plan = copy.deepcopy(cfg)
+        if ov > 0:
+            _cell = cfg["heightmap"]["cell_mm"]
+            if int(round(2 * ov)) % int(_cell):
+                print("!! --overhang %.1f: 2x%.1f = %d 가 격자 %d mm 의 배수가 아니다 — "
+                      "격자가 잘려 실제 여유가 줄어든다"
+                      % (ov, ov, int(round(2 * ov)), _cell))
+            cfg_plan["pallet"]["width_mm"] = int(round(cfg["pallet"]["width_mm"] + 2 * ov))
+            cfg_plan["pallet"]["depth_mm"] = int(round(cfg["pallet"]["depth_mm"] + 2 * ov))
+            plan_origin = [origin[0] - ov, origin[1] - ov, origin[2]]
+            cfg_plan["zones"]["pallet_origin_world_mm"][a.zone] = list(plan_origin)
+            print("팔레트  계획 %d x %d mm (실물 %d x %d · 밖으로 %.1f) · 계획원점 %s"
+                  % (cfg_plan["pallet"]["width_mm"], cfg_plan["pallet"]["depth_mm"],
+                     cfg["pallet"]["width_mm"], cfg["pallet"]["depth_mm"], ov,
+                     [round(v, 1) for v in plan_origin]))
+
+        if a.algo_clearance is not None:
+            cfg_plan["heightmap"]["plan_clearance_mm"] = int(a.algo_clearance)
+
+        # ── 계획 가중치 덮어쓰기 (--hm) ─────────────────────
+        # ★ system.yaml 은 공용 파일이다 (철칙 10). 팀 결정 없이 안 고친다.
+        #   여기서 **계획용 사본만** 바꿔 값을 재 보고, 숫자를 들고 트랙 C 와 얘기한다.
+        for _kv in (a.hm or []):
+            _k, _, _v = _kv.partition("=")
+            _k = _k.strip()
+            # system.yaml 에 아직 없는 **선택 키**는 코어가 기본값으로 읽는다.
+            # 그런 키까지 막으면 실험 자체가 안 되므로 화이트리스트로 통과시킨다.
+            _OPT = {"corridor_far_ratio": 1.0, "corridor_near_gap_mm": 150.0}
+            if _k not in cfg_plan["heightmap"] and _k not in _OPT:
+                raise SystemExit("--hm %s: heightmap 에 없는 키다. 있는 키 %s (+선택 %s)"
+                                 % (_k, sorted(cfg_plan["heightmap"]), sorted(_OPT)))
+            _old = cfg_plan["heightmap"].get(_k, _OPT.get(_k))
+            cfg_plan["heightmap"][_k] = type(_old)(float(_v)) if isinstance(_old, int) \
+                else float(_v)
+            print("계획값  heightmap.%s  %s -> %s" % (_k, _old, cfg_plan["heightmap"][_k]))
+
+        # ── 협곡 허용 깊이 (--corridor-gap) ─────────────────
+        # ★ `_corridor_ok` 는 "주변 기둥이 **박스 윗면 + gripper_length_mm(150) + tol**
+        #   까지는 괜찮다" 로 본다. 즉 지금은 박스보다 160 mm 높은 벽에 둘러싸인 구덩이도
+        #   통과한다. 이 값을 줄이면 협곡이 얕아진다. 0 이면 "주변이 내 윗면을 넘으면 안
+        #   된다" 가 된다.
+        # ⚠ **계획 사본에만** 건다. robot_motion 은 같은 키로 툴 길이를 읽으므로
+        #   (robot_motion.py:191) 진짜 cfg 를 건드리면 흡착면 위치가 통째로 틀어진다.
+        if a.corridor_gap is not None:
+            _old = cfg_plan["robot"]["gripper_length_mm"]
+            cfg_plan["robot"]["gripper_length_mm"] = float(a.corridor_gap)
+            print("계획값  협곡 허용 %s -> %s mm (툴 길이는 %s 그대로)"
+                  % (_old, a.corridor_gap, _old))
+
         if a.gui:
             # bring_up 의 기본 시점은 로봇 정면(-Y)이라 팔레트가 로봇 뒤에 가린다.
             # 적재가 보이도록 팔레트 쪽(+Y)에서 되돌아본다.
@@ -844,6 +1054,12 @@ def main():
         VS.make_belt(stage, belt_z, pick_x - 0.35, 0.0, size=(1.2, 1.0))
         VS.make_pallet(stage, origin, cfg)
         VS.make_pedestal(stage, S.base, cfg)
+        # ★ 마찰은 **양쪽 면**의 머티리얼로 정해진다. 박스에만 걸고 팔레트·벨트를
+        #   기본값으로 두면 1층이 규정 마찰로 안 선다.
+        for _p in ("/World/TestPallet", VS.BELT):
+            _pr = stage.GetPrimAtPath(_p)
+            if _pr:
+                _apply_physics(stage, _pr, cfg, rigid=False)
 
         from pxr import Gf, UsdGeom
         COLOR = {"3호": (0.86, 0.42, 0.20), "4호": (0.78, 0.66, 0.36),
@@ -860,6 +1076,7 @@ def main():
                                b["mass_g"] / 1000.0)
             UsdGeom.Gprim(prim).GetDisplayColorAttr().Set(
                 [Gf.Vec3f(*COLOR.get(b["name"], (0.85, 0.25, 0.20)))])
+            _apply_physics(stage, prim, cfg)          # ★ 솔버 반복수·오프셋·마찰
             ids.append(bid)
             dims_m.append(dm)
             specs[bid] = b
@@ -874,6 +1091,7 @@ def main():
             rp.initialize()
             rps.append(rp)
         by_id = dict(zip(ids, rps))
+        _dim_of = dict(zip(ids, dims_m))                  # bid -> [w,d,h] m (--diag-knock)
 
         V.teleport(S, S.ready, steps=int(0.3 * S.hz))
         for _ in range(int(0.7 * S.hz)):
@@ -883,6 +1101,14 @@ def main():
         print("ZONE    %s   base %s mm   팔레트 원점 %s mm"
               % (a.zone, list(np.round(S.base * 1000).astype(int)), origin))
         print("박스    %d 개  %s" % (len(ids), [b["name"] for b in fed]))
+        _ph = cfg["physics"]
+        print("물리    솔버 %d/%d · 오프셋 rest %.0f · contact %.0f mm · 마찰 %.2f/%.2f"
+              % (_ph["rigid_body"]["solver_position_iterations"],
+                 _ph["rigid_body"]["solver_velocity_iterations"],
+                 _ph["collider"]["rest_offset_mm"], _ph["collider"]["contact_offset_mm"],
+                 _ph["material"]["static_friction"], _ph["material"]["dynamic_friction"]))
+
+        _nt = [0]        # 물리 스텝 카운터 (렌더 솎기 · 시간 계측 공용)
 
         # ── 몸: robot_motion + 소켓 서버 대역 ───────────────
         cur = {"rp": rps[0], "half_h": dims_m[0][2] / 2.0}
@@ -918,7 +1144,9 @@ def main():
         #     대신 **새 move_ee 가 올 때 직전 목표의 도달 결과를 확정**한다. 사이클의
         #     마지막 항목이 곧 배치 하강 바닥이다 (그 뒤 move 는 놓고 나서의 후퇴다).
         diag = {"tgt": None, "face": None, "box": None, "log": []}
-        if a.diag_tcp:
+        # ★ --diag-knock 도 이 훅이 필요하다 — 박스가 밀린 순간이 **어느 구간**인지
+        #   말하려면 그때 진행 중이던 move_ee 목표를 알아야 한다.
+        if a.diag_tcp or a.diag_knock:
             _h_move = handlers["move_ee"]
 
             def h_move_diag(req):
@@ -930,6 +1158,36 @@ def main():
                 return _h_move(req)
 
             handlers["move_ee"] = h_move_diag
+        # ── 놓고 나서 박스가 언제 멈추나 (--diag-release) ──
+        # ★ `release` 는 세 단계(정지대기 -> damping 스파이크 -> 정착)로 1.5 s 를 쓴다.
+        #   화면에서는 팔이 완전히 멈춰 있어 제일 눈에 띄는 구간이다. 박스가 실제로
+        #   언제 멈추는지 100ms 구간으로 재야 어느 단계가 값을 하는지 갈린다.
+        rel = {"n0": None, "p0": None, "bins": []}
+        if a.diag_release:
+            _h_rel = handlers["release"]
+
+            def h_rel(req=None):
+                rel["n0"], rel["bins"] = _nt[0], []
+                rel["p0"] = np.asarray(cur["rp"].get_world_pose()[0], dtype=float)
+                return _h_rel(req)
+
+            handlers["release"] = h_rel
+
+        # ── 사이클 시간이 어디로 가나 (--diag-time) ────────
+        # ★ `n` 합계(실제 이동)는 한 사이클 19.5초 중 4.8초뿐이다. 나머지 15초가
+        #   어디로 가는지 로그로는 안 보인다. 소켓 명령마다 **그 명령이 걸려 있는
+        #   동안 흐른 물리 스텝**을 적어 둔다 — 대기가 어느 명령 밑에 쌓이는지 보인다.
+        #   소켓 스레드에서 도는 코드라 int 하나만 읽는다 (PhysX 접근 없음).
+        tm = {"cur": "(사이클 시작)", "at": 0, "acc": {}}
+        if a.diag_time:
+            def _timed(name, fn):
+                def h(req=None):
+                    tm["acc"][tm["cur"]] = tm["acc"].get(tm["cur"], 0) + (_nt[0] - tm["at"])
+                    tm["cur"], tm["at"] = name, _nt[0]
+                    return fn(req)
+                return h
+            handlers = {k: _timed(k, v) for k, v in handlers.items()}
+
         server = B4.StandInServer(handlers, port=a.port)
         print("소켓    127.0.0.1:%d  cmd %s" % (a.port, sorted(handlers)))
 
@@ -938,10 +1196,13 @@ def main():
         if online and a.plan_mode == "algo":
             # ★ 트랙 C 코어를 그대로 쓴다. 비전 루프(PalletVision)를 안 태운다 —
             #   algo 는 자기 heightmap 을 소유하고 실측 pose 로 갱신한다 (CLAUDE.md D3).
-            svc = AlgoServices(specs, cfg, a.algo_clearance, verbose=a.verbose)
+            # ★ 간격은 **코어가 건다** (heightmap_core.plan_clearance_mm). 여기서 또
+            #   더하면 두 번 걸린다. --algo-clearance 는 cfg 사본을 덮어쓸 뿐이다.
+            svc = AlgoServices(specs, cfg_plan, 0.0, verbose=a.verbose)
             places = {}
-            print("계획  ★트랙 C 코어 (packing_algo/heightmap_core.py) · 간격 %.0f mm"
-                  % a.algo_clearance)
+            print("계획  ★트랙 C 코어 (packing_algo/heightmap_core.py) · 간격 %d mm%s"
+                  % (cfg_plan["heightmap"].get("plan_clearance_mm", 0),
+                     "" if a.algo_clearance is None else " (--algo-clearance 로 덮어씀)"))
         elif online:
             PKM = _load_packer_module()
             hm, pal = cfg["heightmap"], cfg["pallet"]
@@ -957,7 +1218,7 @@ def main():
                     wall_margin=0.0, enforce_load_order=True,
                     descent_halo=a.halo / 1000.0)
 
-            vision = PalletVision(by_id, specs, origin)
+            vision = PalletVision(by_id, specs, plan_origin)
             svc = OnlineServices(specs, factory, vision, a.clearance, verbose=a.verbose)
             places = {}
         else:
@@ -965,9 +1226,30 @@ def main():
                             ("x_mm", "y_mm", "z_mm", "yaw_deg", "stack_top_mm") if k in p}
                       for bid, p in zip(ids, plan)}
             svc = PlanServices(specs, places, verbose=a.verbose)
-        cyc = CY.Cycle(link, svc, cfg, zone=a.zone)
+        if a.diag_time:
+            RM.SETTLE_LOG = True          # 구간마다 정착 틱·잔차를 한 줄씩 찍는다
+        if a.poll_ms is not None:
+            # ★ 모듈 상수만 덮어쓴다. cycle.py 정본은 그대로다.
+            CY.MOTION_POLL_S = float(a.poll_ms) / 1000.0
+            print("폴링      %.1f ms (기본 20.0) — 시뮬이 실시간보다 빠를 때만 의미 있다"
+                  % a.poll_ms)
+        if a.transit_tol is not None:
+            # ★ 모듈 상수만 덮어쓴다. cycle.py 정본은 안 고친다 (기본값 = 예전 동작).
+            CY.TRANSIT_TOL_MM = float(a.transit_tol)
+            print("이송 허용  %.1f mm (하강은 %.1f mm 그대로)"
+                  % (a.transit_tol, 2.0))
+        cyc = CY.Cycle(link, svc, cfg_plan, zone=a.zone)
 
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
+        parked, rejected = [], set()                      # 라인 밖으로 치운 것 / 그중 §5 거부
+        # 이미 놓인 박스가 처음 밀리는 순간 (--diag-knock). 사이클마다 초기화한다.
+        if a.render_every < 1:
+            raise SystemExit("--render-every 는 1 이상이어야 한다")
+        if a.render_every > 1:
+            print("렌더    %d 스텝에 1번만 그린다 (물리는 그대로 — 결과 동일)"
+                  % a.render_every)
+        kw = {"hit": None, "n": 0}
+        KNOCK_TRIP_MM = 1.0                               # 이 이상 움직이면 "밀렸다" 로 본다
         j5 = [1e9, -1e9]                                  # 손목 감김 추적 (아래 주석)
 
         # ★ 물리를 **벽시계에 묶는다** — 재현성의 핵심이다.
@@ -1006,7 +1288,10 @@ def main():
             rm.step()
             pos, quat = cur["rp"].get_world_pose()
             cur["pose"] = ([float(v) for v in pos], _yaw_of(quat))
-            S.world.step(render=S.render)
+            # ★ 렌더만 건너뛴다. `world.step` 은 매번 부르므로 물리 스텝 수는 그대로다 —
+            #   결과가 비트 단위로 같다. 궤적을 바꾸는 --vel 과 여기가 다르다.
+            _nt[0] += 1
+            S.world.step(render=S.render and (_nt[0] % a.render_every == 0))
             _j5(S, j5)
             if realtime:
                 # 남은 시간만 잔다. 이미 늦었으면 안 잔다 (따라잡기를 시도하지 않는다 —
@@ -1014,6 +1299,32 @@ def main():
                 lag = step_dt - (time.time() - t_step)
                 if lag > 0:
                     time.sleep(lag)
+            if a.diag_release and rel["n0"] is not None:
+                k = int((_nt[0] - rel["n0"]) / (0.1 * S.hz))    # 100ms 구간 번호
+                if k >= len(rel["bins"]) and k < 25:            # 2.5 초까지만
+                    now = np.asarray(cur["rp"].get_world_pose()[0], dtype=float)
+                    rel["bins"].append(float(np.linalg.norm(now - rel["p0"]) * 1000.0))
+                    rel["p0"] = now
+            if a.diag_knock and kw["hit"] is None:
+                # ★ **이미 놓인** 박스만 본다 (rest). 매달린 박스는 --diag-tcp 몫이다.
+                #   첫 1 mm 에서 멈춘다 — 다 밀린 뒤의 자세는 범인을 안 가리킨다.
+                kw["n"] += 1
+                for _pid, _ref in rest.items():
+                    _p = np.asarray(by_id[_pid].get_world_pose()[0], dtype=float)
+                    _d = (_p - _ref) * 1000.0
+                    if float(np.linalg.norm(_d)) <= KNOCK_TRIP_MM:
+                        continue
+                    _w, _d, _h = _dim_of[_pid]
+                    # yaw 90/270 이면 x·y 반폭이 바뀐다. 안 바꾸면 AABB 가 틀려
+                    # 링크 거리가 통째로 어긋난다.
+                    if int(round(abs(_yaw_of(by_id[_pid].get_world_pose()[1])) / 90.0)) % 2:
+                        _w, _d = _d, _w
+                    _hf = np.array([_w, _d, _h], dtype=float) / 2.0
+                    kw["hit"] = (kw["n"], _pid, [float(v) for v in _d],
+                                 [float(v) for v in rm.suction_pose()],
+                                 _link_dists(rm, _p - _hf, _p + _hf)[:3],
+                                 list(diag["tgt"]) if diag["tgt"] else None)
+                    break
             if a.diag_tcp:
                 # 현재 흡착면(FK)과 **매달린 박스 중심**을 갱신한다.
                 # 짝짓기는 h_move_diag 가 한다 (소켓 스레드는 이 값을 읽기만 한다).
@@ -1050,6 +1361,8 @@ def main():
             cur["rp"], cur["half_h"], cur["bid"] = rp, dm[2] / 2.0, bid
             cur["pose"] = None                            # 이번 스텝 tick 이 채운다
             diag["log"].clear()                           # 사이클마다 초기화 (--diag-tcp)
+            kw["hit"], kw["n"] = None, 0                  # 사이클마다 초기화 (--diag-knock)
+            tm["acc"].clear(); tm["cur"], tm["at"] = "(사이클 시작)", _nt[0]
             for _ in range(int(0.3 * S.hz)):
                 tick()
 
@@ -1091,7 +1404,8 @@ def main():
                 places[bid] = dict(svc.last) if svc.last else {
                     "x_mm": 0, "y_mm": 0, "z_mm": 0, "yaw_deg": 0}
             pos = np.asarray(rp.get_world_pose()[0], dtype=float)
-            want = np.asarray(CY.pallet_place_to_world(places[bid], spec["h_mm"], origin))
+            want = np.asarray(CY.pallet_place_to_world(places[bid], spec["h_mm"],
+                                                       plan_origin))
             err = (pos - want) * 1000.0
 
             # knock — 이미 놓인 박스가 이번 사이클에 얼마나 밀렸나
@@ -1108,10 +1422,64 @@ def main():
             if res == "PLACED":
                 rest[bid] = pos.copy()
 
+            # ── §5 판정 — `NO_FEASIBLE_POSE` ≠ `PALLET_FULL` ────────────────
+            # ★ `cycle.run` 은 둘 다 뭉뚱그려 돌려준다(`BLOCKED`). 어느 쪽인지는
+            #   svc 가 받은 msg 만 안다 — orchestrator.py:240 과 같은 방식이다.
+            #   여기서 안 치우면 거부된 박스가 **스토퍼에 그대로 서 있고**, 다음
+            #   박스를 같은 자리로 급송하면서 겹친다. 실측: 14번 NO_FEASIBLE_POSE
+            #   직후 15번이 간극 -13.95 mm 로 흡착 실패했다.
+            pmsg = getattr(svc, "last_plan_msg", None)
+            if res != "PLACED" and res != "PALLET_FULL" and pmsg == "NO_FEASIBLE_POSE":
+                res = "REJECTED"                      # 정상 판단이다. 실패로 세지 않는다
+            if res != "PLACED":
+                _park(rp, dm, len(parked))            # 라인 밖으로 — 다음 박스 길을 연다
+                parked.append(bid)
+                if res == "REJECTED":
+                    rejected.add(bid)
+                    places.pop(bid, None)             # 계획이 없다. 대조표에서 빼야 한다
+
             rows.append({"id": bid, "type": spec["name"], "res": res, "err": err,
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
             print("       %s  오차 [%+.1f %+.1f %+.1f] mm  %.1f s 시뮬  knock %.1f mm (%s)"
                   % (res, err[0], err[1], err[2], steps0 / S.hz, knock, who))
+            if a.diag_release and rel["bins"]:
+                print("       ⏸ release 이후 박스 이동 (100ms 구간, mm)")
+                print("          " + "  ".join("%5.2f" % v for v in rel["bins"][:15]))
+                print("          %s"
+                      % "  ".join("%5s" % ("%.1fs" % ((i + 1) * 0.1))
+                                  for i in range(min(15, len(rel["bins"])))))
+                rel["n0"] = None
+            if a.diag_time:
+                # 마지막 명령 이후 남은 스텝까지 닫는다
+                tm["acc"][tm["cur"]] = tm["acc"].get(tm["cur"], 0) + (_nt[0] - tm["at"])
+                tot = sum(tm["acc"].values()) or 1
+                items = sorted(tm["acc"].items(), key=lambda kv: -kv[1])
+                print("       ⏱ 사이클 %.1f s — 명령별 (그 명령이 걸려 있는 동안 흐른 시간)"
+                      % (tot / S.hz))
+                for k2, v2 in items:
+                    if v2 <= 0:
+                        continue
+                    print("          %-16s %6.2f s  %4.1f%%  %s"
+                          % (k2, v2 / S.hz, 100.0 * v2 / tot, "█" * int(30.0 * v2 / tot)))
+            if a.diag_knock and kw["hit"]:
+                n0, vid, dmm, face, links, tgt = kw["hit"]
+                print("       ★ 놓인 박스가 처음 밀린 순간: %s 가 스텝 %d (%.2f s) 에 "
+                      "[%+.1f %+.1f %+.1f] mm"
+                      % (vid, n0, n0 / S.hz, dmm[0], dmm[1], dmm[2]))
+                print("         그때 흡착면 %s   진행 중이던 move_ee 목표 %s"
+                      % (np.round(np.array(face), 3),
+                         np.round(np.array(tgt), 3) if tgt else "-"))
+                # ★ 여기가 판정이다. 음수면 **그 링크가 박스 안에 들어가 있다** = 팔이 쳤다.
+                #   전부 넉넉히 양수면 팔은 안 닿았다 = 물리(이웃 접촉·지지 부족)다.
+                print("         링크별 거리  %s"
+                      % "  ".join("%s %+.1f mm" % (ln, dv) for dv, ln in links))
+                if not links:
+                    print("         -> 충돌구체가 안 실렸다. 링크 판정 불가")
+                elif links[0][0] > 20.0:
+                    print("         -> 팔은 %s 가 %.1f mm 로 가장 가깝다. **안 닿았다** — "
+                          "이웃 접촉이나 지지 부족을 봐야 한다" % (links[0][1], links[0][0]))
+                else:
+                    print("         -> **%s 가 쳤다** (%.1f mm)" % (links[0][1], links[0][0]))
             if a.diag_tcp and diag["log"]:
                 tg, fc, bx = diag["log"][-1]
                 tg, fc = np.array(tg, dtype=float), np.array(fc, dtype=float)
@@ -1148,7 +1516,13 @@ def main():
                               % (k, str(np.round(t2, 3)), ae[0], ae[1],
                                  float(np.hypot(ae[0], ae[1])),
                                  oo[0], oo[1], float(np.hypot(*oo))))
-            if res != "PLACED":
+            if res == "REJECTED":
+                print("       ·· 이 박스는 자리가 없다 (NO_FEASIBLE_POSE) — "
+                      "버리고 계속한다 (누적 %d)" % len(rejected))
+            elif res == "PALLET_FULL":
+                print("       == PALLET_FULL — 시나리오를 여기서 끝낸다 (CLAUDE.md §5)")
+                break
+            elif res != "PLACED":
                 print("       !! 이 박스는 실패다. 다음으로 넘어간다")
 
         # ── 표 ─────────────────────────────────────────────
@@ -1174,12 +1548,38 @@ def main():
                if r["res"] == "PLACED" and (float(np.linalg.norm(r["err"][:2])) > PLACE_TOL_XY_MM
                                             or abs(r["err"][2]) > PLACE_TOL_Z_MM)]
 
-        print("\n놓은 것       %d / %d" % (len(placed), len(rows)))
+        # ★ 버림은 실패가 아니다 (§5). 뭉뚱그리면 "실패 N건" 이 부풀려 나오고
+        #   발표에서 알고리즘 정상 판단과 진짜 고장을 구분할 수 없다.
+        n_rej = len([r for r in rows if r["res"] == "REJECTED"])
+        n_fail = len(rows) - len(placed) - n_rej
+        print("\n놓은 것       %d / %d   (적재 %d · 버림 %d · 실패 %d)"
+              % (len(placed), len(rows), len(placed), n_rej, n_fail))
         print("%s   %d 단 (밑면 z %s)"
               % ("배치 단수    " if online else "계획 층수    ", len(layers), layers))
         print("실측 최상단   %.0f mm (팔레트 상면 기준) / max_stack %d mm"
               % (top_mm, cfg["pallet"]["max_stack_mm"]))
         print("최대 knock    %.1f mm (경고선 %.0f)" % (max_knock, KNOCK_WARN_MM))
+
+        # ── 팔레트 밖으로 실제로 얼마나 나갔나 ──────────────
+        # ★ --overhang 을 안 써도 찍는다. 배치 오차만으로도 나갈 수 있고, 트럭 상차가
+        #   되느냐는 **계획값이 아니라 실측 외곽**이 정한다 (팔레트 3장 x 800 = 2400,
+        #   트럭 바닥 2800 — 여유 400 mm).
+        _px0, _py0 = origin[0], origin[1]
+        _px1 = _px0 + cfg["pallet"]["width_mm"]
+        _py1 = _py0 + cfg["pallet"]["depth_mm"]
+        _out, _worst = 0.0, "-"
+        for r in placed:
+            _c = np.asarray(by_id[r["id"]].get_world_pose()[0], dtype=float) * 1000.0
+            _w, _d, _ = [v * 1000.0 for v in _dim_of[r["id"]]]
+            if int(round(abs(_yaw_of(by_id[r["id"]].get_world_pose()[1])) / 90.0)) % 2:
+                _w, _d = _d, _w
+            _e = max(_px0 - (_c[0] - _w / 2.0), (_c[0] + _w / 2.0) - _px1,
+                     _py0 - (_c[1] - _d / 2.0), (_c[1] + _d / 2.0) - _py1)
+            if _e > _out:
+                _out, _worst = _e, r["id"]
+        print("팔레트 밖     %.1f mm (%s)%s"
+              % (max(0.0, _out), _worst,
+                 "   ← --overhang %.1f 로 허용한 값" % ov if ov > 0 else ""))
 
         # ── 최종 자리 대조 ─────────────────────────────────
         # knock 은 "얼마나 움직였나"만 말하고 **어디로 갔는지**를 안 말한다. 사고가 나면
@@ -1188,11 +1588,23 @@ def main():
         print("  #  박스      종류  계획 P(x,y) z      실제 어긋남 dx  dy  dz")
         for i, (bid, dm) in enumerate(zip(ids, dims_m), 1):
             pl = places.get(bid)
+            if bid in rejected:
+                print("%3d  %-9s %-4s  (자리 없음 — 버림. 라인 밖으로 치웠다)"
+                      % (i, bid, specs[bid]["name"]))
+                continue
+            if bid in parked:
+                # ★ 치운 박스는 **주차 자리**에 있다. 계획 대비 어긋남을 찍으면 수 m 짜리
+                #   숫자가 나오고 "밀림" 표시까지 붙어 진짜 밀린 박스를 가린다.
+                _plan = ("(%4d,%4d) %4d" % (pl["x_mm"], pl["y_mm"], pl["z_mm"])
+                         if pl else "(계획 없음)")
+                print("%3d  %-9s %-4s  %-16s 실패 — 라인 밖으로 치웠다"
+                      % (i, bid, specs[bid]["name"], _plan))
+                continue
             if pl is None:
                 print("%3d  %-9s %-4s  (계획 없음 — 사이클이 배치 전에 끝났다)"
                       % (i, bid, specs[bid]["name"]))
                 continue
-            want = np.asarray(CY.pallet_place_to_world(pl, specs[bid]["h_mm"], origin))
+            want = np.asarray(CY.pallet_place_to_world(pl, specs[bid]["h_mm"], plan_origin))
             now = np.asarray(by_id[bid].get_world_pose()[0], dtype=float)
             dd = (now - want) * 1000.0
             mark = "  <-- 밀림" if float(np.linalg.norm(dd)) > KNOCK_WARN_MM else ""
@@ -1205,7 +1617,8 @@ def main():
                  sum(r["sim_s"] for r in rows) / max(1, len(rows))))
 
         for cond, msg in (
-                (len(placed) == len(rows), "%d 개가 PLACED 가 아니다" % (len(rows) - len(placed))),
+                (len(placed) + n_rej == len(rows),
+                 "%d 개가 PLACED 도 REJECTED 도 아니다 (진짜 실패)" % n_fail),
                 (not off, "배치 오차 초과 %s" % [r["id"] for r in off]),
                 (max_knock <= KNOCK_WARN_MM,
                  "이미 놓인 박스가 %.1f mm 밀렸다 — 이송 높이를 볼 것" % max_knock),
