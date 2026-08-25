@@ -23,7 +23,6 @@ CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현�
     은 트랙 A 가 같은 방식으로 CameraHelper 를 붙여야 이 노드가 그림을 받는다.
     토픽 이름은 전부 파라미터라 씬 쪽 이름이 정해지면 launch 에서 맞추면 된다.
 """
-import threading
 
 import numpy as np
 import rclpy
@@ -38,34 +37,17 @@ from tf2_ros import Buffer, TransformListener
 
 from packing_common.config import load
 from packing_msgs.msg import BoxAtPickup, ZoneStatus
-from packing_msgs.srv import RegisterBox, VerifyBox
+from packing_msgs.srv import GetBoxInfo, RegisterBox, ReportMiss, VerifyBox
 
 from packing_vision.detect import dominant_color_name, find_box, read_qr
+from packing_vision.label import parse_payload
 from packing_vision.geometry import box_pose_from_corners, quat_to_R
 
 
-class BoxLine:
-    """투입부에서 등록된 순서 그대로의 대기열. 두 노드가 같이 쓴다."""
-
-    def __init__(self):
-        self._q = []
-        self._lock = threading.Lock()
-
-    def push(self, box_id, type_name):
-        with self._lock:
-            self._q.append((box_id, type_name))
-
-    def peek(self):
-        with self._lock:
-            return self._q[0] if self._q else (None, None)
-
-    def pop(self):
-        with self._lock:
-            return self._q.pop(0) if self._q else (None, None)
-
-    def __len__(self):
-        with self._lock:
-            return len(self._q)
+# ★ 예전에 여기 있던 BoxLine(등록 순서 대기열)은 없앴다 (2026-08-25).
+#   투입부와 픽업이 **다른 프로세스**가 됐고(구역별로 따로 띄운다), 구역이 셋이면
+#   단일 FIFO 자체가 틀린다 — 분기기가 박스를 A/B/C 로 갈라 보내므로 도착 순서가
+#   등록 순서와 다르다. 지금은 픽업 카메라가 박스 윗면 QR 을 직접 읽는다.
 
 
 class CameraSub:
@@ -119,13 +101,12 @@ def camera_pose(tf_buf, world_frame, frame_id):
 class LineDetector(Node):
     """cam1 판독 → RegisterBox · cam2 재판독 → VerifyBox."""
 
-    def __init__(self, cfg, line):
+    def __init__(self, cfg):
         super().__init__("line_detector")
-        self.cfg, self.line = cfg, line
+        self.cfg = cfg
+        self._n_reg = 0             # 등록 누계 (로그·지표용)
         self.types = cfg["boxes"]["types"]
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
-        # stage 1 은 전 박스가 한 구역으로 간다. 지어내지 않고 yaml 에서 읽는다.
-        self.default_dest = str(cfg["boxes"]["stage1"]["zone"]).upper()
 
         self.declare_parameter("cam1_ns", "/cam1")
         self.declare_parameter("cam2_ns", "/cam2")
@@ -139,8 +120,15 @@ class LineDetector(Node):
                                           callback_group=cb)
         self.cli_ver = self.create_client(VerifyBox, "/db/verify_box",
                                           callback_group=cb)
+        # ★ 인식률의 분모를 만드는 통로다. 박스를 봤는데 식별 못 하면 여기로 알린다 —
+        #   안 알리면 그 박스는 통계에서 사라져 인식률이 언제나 100 % 로 나온다.
+        self.cli_miss = self.create_client(ReportMiss, "/db/report_miss",
+                                           callback_group=cb)
 
-        self._n = 0                 # 다음 박스 순번. boxes_master 와 같은 BOX%05d 규칙
+        # ★ 박스 순번 카운터를 두지 않는다. box_id 는 **QR 이 정본**이다.
+        #   세어서 만들면 cam1 이 한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀려
+        #   DB 의 다른 박스 기록을 덮어쓴다 — 에러 없이 전부 틀리는 쪽이다.
+        self._miss1 = 0             # QR 판독 실패 누계 (지표·로그용)
         self._armed1 = True         # 빈 화면을 한 번 봐야 다음 박스를 센다
         self._armed2 = True
 
@@ -179,6 +167,7 @@ class LineDetector(Node):
                                     self.belt_top_m, self.types)
         if out is None:
             self.get_logger().warn(f"{cam.ns}: 사양 3종과 안 맞는다")
+            self._report_miss(cam.ns.strip("/"), "SIZE_MISMATCH")
             return None, None
         return det, out
 
@@ -192,34 +181,51 @@ class LineDetector(Node):
         self._armed1 = False
         bt = out["type"]
 
-        box_id = "BOX%05d" % self._n            # ★ boxes_master 와 같은 규칙
-        self._n += 1
+        qr = read_qr(bgr, det["corners_px"])
+        box_id = parse_payload(qr)
+        if box_id is None:
+            # ★ QR 을 못 읽었다 = 이 박스는 등록하지 않고 흘려보낸다.
+            #   운송장번호를 지어내면 안 된다 (위 self._miss1 주석 참조).
+            #   등록 안 된 박스는 중재자가 미등록으로 보고 RETURN 시킨다 —
+            #   설계결정서 §2.2 가 요구한 "리젝트 라인이 실제로 발동" 이 이 경로다.
+            #   yaml 의 recognition.cam1_box_miss_rate 로 인위적 드롭을 주입할
+            #   필요도 없다. 라벨이 흐리거나 잘리면 여기가 자연히 걸린다.
+            self._miss1 += 1
+            self.get_logger().warn(
+                f"cam1 QR 판독 실패 (누계 {self._miss1}) — 등록 건너뜀"
+                + (f" · 읽힌 값 {qr!r}" if qr else " · QR 이 안 보인다"))
+            self._report_miss("cam1", "QR_UNREADABLE")
+            return
         color = dominant_color_name(bgr) or "red"
 
-        qr = read_qr(bgr)
-        if qr:
-            dest = qr.split("|")[1] if "|" in qr else self.default_dest
-        else:
-            # ⚠ stage 1 씬에는 QR 이 없다 (spawner 가 단색 머티리얼만 입힌다).
-            #   목적지는 yaml 의 stage1.zone 을 쓰고, payload 는 cam2 가 같은
-            #   규칙으로 다시 만들 수 있게 결정적으로 합성한다. 그래야 검증이
-            #   "순번이 어긋났는가" 를 실제로 잡아낸다.
-            dest = self.default_dest
-            qr = f"PALLETRIS|{dest}|{box_id}"
-
+        # ★ dest 를 비워 보낸다. QR 에는 운송장번호만 있고 구역 글자가 없다 —
+        #   구역은 db_service_node 가 주소(boxes_master.address)의 동으로 정한다.
+        #   여기서 추측해 채우면 인식이 구역까지 아는 척하게 되고, 실제 분류
+        #   근거(주소)와 어긋나도 아무도 모른다 (설계결정서 §5-3).
         req = RegisterBox.Request(
             box_id=box_id, size_w_mm=int(bt["w_mm"]), size_d_mm=int(bt["d_mm"]),
-            size_h_mm=int(bt["h_mm"]), color=color, dest=dest, qr_payload=qr)
+            size_h_mm=int(bt["h_mm"]), color=color, dest="", qr_payload=qr)
         self._call(self.cli_reg, req, lambda r, b=box_id, t=bt: self._reg_done(r, b, t))
+
+    def _report_miss(self, where_at, reason):
+        """박스를 봤는데 식별 못 했다 — DB 에 알린다 (인식률의 분모).
+
+        ★ 응답을 기다리지 않는다. 이건 통계용이라 라인을 세울 이유가 없다.
+        """
+        if not self.cli_miss.service_is_ready():
+            self.get_logger().warn("/db/report_miss 가 아직 없다 — 통계에서 빠진다",
+                                   once=True)
+            return
+        self.cli_miss.call_async(ReportMiss.Request(where_at=where_at, reason=reason))
 
     def _reg_done(self, res, box_id, bt):
         if res is None or not res.ok:
             self.get_logger().error(
                 f"register_box 실패 {box_id}: {getattr(res, 'message', 'no response')}")
             return
-        self.line.push(box_id, bt["name"])
+        self._n_reg += 1
         self.get_logger().info(
-            f"cam1 등록 {box_id} ({bt['name']}) → {res.message} · 대기열 {len(self.line)}")
+            f"cam1 등록 {box_id} ({bt['name']}) → {res.message} · 누계 {self._n_reg}")
 
     def _on_cam2(self, bgr, header):
         det, _ = self._measure(bgr, self.cam2)
@@ -230,14 +236,16 @@ class LineDetector(Node):
             return
         self._armed2 = False
 
-        qr = read_qr(bgr)
-        if not qr:
-            # cam1 과 같은 규칙으로 다시 만든다. 순번이 어긋났으면 여기서 갈린다.
-            idx = self._n - 1
-            if idx < 0:
-                return
-            qr = f"PALLETRIS|{self.default_dest}|BOX%05d" % idx
-        box_id = qr.split("|")[-1]
+        qr = read_qr(bgr, det["corners_px"])
+        box_id = parse_payload(qr)
+        if box_id is None:
+            # cam1 이 등록한 박스인데 cam2 가 못 읽었다 = 검증 불가.
+            # 여기서 box_id 를 추측해 VerifyBox 를 부르면 **엉뚱한 박스를
+            # 통과시킨다.** 부르지 않는 쪽이 안전하다.
+            self.get_logger().warn(
+                "cam2 QR 판독 실패 — 검증 건너뜀"
+                + (f" · 읽힌 값 {qr!r}" if qr else " · QR 이 안 보인다"))
+            return
         self._call(self.cli_ver, VerifyBox.Request(box_id=box_id, qr_payload=qr),
                    lambda r, b=box_id: self._ver_done(r, b))
 
@@ -262,11 +270,29 @@ class LineDetector(Node):
 
 
 class ZoneDetector(Node):
-    """pick_cam 하향 → 스토퍼 도착과 집을 좌표를 BoxAtPickup 으로."""
+    """구역 하나의 하향 카메라 → 스토퍼 도착과 집을 좌표를 BoxAtPickup 으로.
 
-    def __init__(self, cfg, line):
-        super().__init__("detector_zone_b")
-        self.cfg, self.line = cfg, line
+    ★ **구역마다 따로 띄운다** (CLAUDE.md §8 "구역 인식 노드 3"). 한 프로세스에
+      몰면 파이썬 GIL 때문에 세 구역 추론이 줄을 서서 돈다 — 구역을 늘린 의미가
+      없어진다. 프로세스를 나눠야 코어를 실제로 나눠 쓴다.
+
+    ★ box_id 는 **자기 카메라가 읽은 QR** 에서 나온다 (2026-08-25).
+      예전에는 투입부 노드가 등록한 순서를 in-process 큐로 넘겨받았는데,
+      그 방식은 세 가지가 깨진다:
+        1. 프로세스를 나누면 큐를 공유할 수 없다
+        2. 구역이 셋이면 **단일 FIFO 자체가 틀린다** — 분기기가 박스를 A/B/C 로
+           갈라 보내므로 도착 순서가 등록 순서와 다르다
+        3. 투입부가 한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀린다
+      픽업 카메라는 박스 윗면을 바로 위에서 본다. 라벨이 거기 있으므로
+      **읽으면 그만이다.** 구역끼리 아무것도 공유하지 않는다.
+    """
+
+    def __init__(self, cfg):
+        # ★ 노드 이름은 launch 가 `name="detector_zone_a"` 로 붙인다.
+        #   구역마다 **프로세스가 따로**라 name= 을 줘도 안전하다
+        #   (한 프로세스에 노드가 둘일 때만 위험하다 — bringup.launch.py 주석 참조).
+        super().__init__("zone_detector")
+        self.cfg = cfg
         self.types = cfg["boxes"]["types"]
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
 
@@ -275,30 +301,32 @@ class ZoneDetector(Node):
         # tf 의 뿌리 프레임. Action Graph 가 parentPrim=/World 로 tf 를 낸다.
         self.declare_parameter("world_frame", "World")
         # ★ 처리 효율 (평가 항목). 카메라는 30 Hz 로 오지만 추론은 이 주기로만 한다.
-        #   더 중요한 절약은 아래 accepting 게이트다 — 관제탑이 집는 중이면
-        #   추론 자체를 안 한다.
+        #   더 중요한 절약은 아래 IDLE 게이트다 — 관제탑이 집는 중이면 추론 자체를 안 한다.
         self.declare_parameter("infer_rate_hz", 5.0)
 
         self.zone = str(self.get_parameter("zone").value).lower()
+        ns = str(self.get_parameter("pick_cam_ns").value)
         self.world_frame = str(self.get_parameter("world_frame").value)
         self._min_dt = 1.0 / max(0.1, float(self.get_parameter("infer_rate_hz").value))
         self._last = 0.0
         self._present = False
         self._idle = True          # 관제탑이 놀고 있는가
+        self._seen = None          # 직전에 발행한 box_id (중복 로그 억제)
 
         cb = ReentrantCallbackGroup()
         self.tf_buf = Buffer()
         self.tf_lis = TransformListener(self.tf_buf, self)
 
+        self.cli_info = self.create_client(GetBoxInfo, "/db/get_box_info",
+                                           callback_group=cb)
         self.pub = self.create_publisher(
             BoxAtPickup, f"/zone_{self.zone}/box_at_pickup", 10)
         self.create_subscription(
             ZoneStatus, f"/zone_{self.zone}/status", self._on_status, 10,
             callback_group=cb)
-        self.cam = CameraSub(self, self.get_parameter("pick_cam_ns").value,
-                             self._on_image, cb)
+        self.cam = CameraSub(self, ns, self._on_image, cb)
         self.get_logger().info(
-            f"detector_zone_b 시작 — /zone_{self.zone}/box_at_pickup 발행")
+            f"detector_zone_{self.zone} 시작 — {ns} -> /zone_{self.zone}/box_at_pickup")
 
     def _on_status(self, msg):
         # IDLE 일 때만 추론한다. 집는 중에는 새 좌표가 필요 없고, 오히려 팔이
@@ -330,7 +358,7 @@ class ZoneDetector(Node):
 
         try:
             tr = self.tf_buf.lookup_transform(
-                self.world_frame, self.cam.frame_id or "pick_cam",
+                self.world_frame, self.cam.frame_id or self.cam.ns.strip("/"),
                 rclpy.time.Time())
         except Exception as e:                  # noqa: BLE001
             # use_sim_time 이 꺼져 있거나 /clock 이 없으면 여기서 계속 실패한다.
@@ -350,14 +378,23 @@ class ZoneDetector(Node):
             self._publish_absent()
             return
 
-        box_id, expect = self.line.peek()
-        if box_id is None:
-            # 투입부가 등록한 적 없는 박스가 서 있다. 관제탑은 box_id 로 DB 를
-            # 조회하므로 빈 문자열을 보내면 거기서 막힌다 — 그게 맞는 동작이다.
-            self.get_logger().warn("대기열이 비었다 — 투입부 인식을 놓쳤다")
-        elif expect and expect != out["type"]["name"]:
-            self.get_logger().warn(
-                f"{box_id}: 투입부는 {expect}, 픽업은 {out['type']['name']} 로 봤다")
+        # ★ box_id 는 여기서 읽는다. 다른 노드에서 받아오지 않는다.
+        #
+        # ★ 한 번 읽으면 박스가 떠날 때까지 **기억한다.** 매 프레임 다시 읽으려
+        #   들면 안 된다 — 해독 실패는 무작위가 아니라 **자세에 따라 결정적**이라,
+        #   나쁜 자세로 멈춘 박스는 몇 번을 다시 봐도 계속 실패한다.
+        #   실측(투영 48 회): 자세를 흔들면 98 % 지만, 한 자세로 굳으면 0 % 아니면 100 % 다.
+        #   박스는 스토퍼에서 멈춰 있으므로 한 번만 맞히면 된다.
+        box_id = parse_payload(read_qr(bgr, det["corners_px"])) or ""
+        if not box_id and self._present and self._seen:
+            # 같은 박스를 계속 보고 있다 — 아까 읽은 값을 그대로 쓴다.
+            box_id = self._seen
+        elif not box_id:
+            # 라벨을 아직 한 번도 못 읽었다. 관제탑은 box_id 로 DB 를 조회하므로
+            # 빈 문자열이면 거기서 막힌다 — 그게 맞는 동작이다.
+            # 지어내면 남의 박스 기록을 덮는다.
+            self.get_logger().warn("픽업 QR 판독 실패 — box_id 없이 발행한다",
+                                   throttle_duration_sec=2.0)
 
         cx, cy, cz = out["center_m"]
         pose = Pose()
@@ -365,39 +402,72 @@ class ZoneDetector(Node):
         half = np.radians(out["yaw_deg"]) / 2.0
         pose.orientation.z, pose.orientation.w = float(np.sin(half)), float(np.cos(half))
 
-        self.pub.publish(BoxAtPickup(present=True, box_id=box_id or "", pose=pose))
-        if not self._present:
+        self.pub.publish(BoxAtPickup(present=True, box_id=box_id, pose=pose))
+        if box_id and box_id != self._seen:
             self.get_logger().info(
-                f"도착 {box_id or '(미등록)'} {out['type']['name']} "
+                f"도착 {box_id or '(미상)'} {out['type']['name']} "
                 f"({cx*1000:.0f}, {cy*1000:.0f}, {cz*1000:.0f}) mm "
                 f"yaw {out['yaw_deg']:.1f}° · 맞춤오차 {out['fit_err_m']*1000:.1f} mm")
+            self._crosscheck(box_id, out["type"])
         self._present = True
+        if box_id:
+            self._seen = box_id
+
+    def _crosscheck(self, box_id, btype):
+        """투입부가 등록한 치수와 픽업에서 잰 치수가 같은가 — 비동기로 확인만.
+
+        ★ 발행을 여기에 매달지 않는다. 서비스 응답을 기다렸다가 좌표를 내면
+          로봇이 그만큼 늦게 움직인다. 어긋나면 경고만 남기고 지표로 쓴다.
+        """
+        if not self.cli_info.service_is_ready():
+            return
+        fut = self.cli_info.call_async(GetBoxInfo.Request(box_id=box_id))
+
+        def done(f):
+            r = f.result() if f.done() else None
+            if r is None or not r.found:
+                self.get_logger().warn(f"{box_id}: 투입부 등록 기록이 없다")
+                return
+            want = (r.info.size_w_mm, r.info.size_d_mm, r.info.size_h_mm)
+            got = (btype["w_mm"], btype["d_mm"], btype["h_mm"])
+            if want != got:
+                self.get_logger().warn(
+                    f"{box_id}: 투입부는 {want}, 픽업은 {got} 로 봤다")
+
+        fut.add_done_callback(done)
 
     def _publish_absent(self):
         if self._present:
-            # 박스가 떠났다 = 관제탑이 집어갔다. 대기열에서 뺀다.
-            self.line.pop()
-            self.get_logger().info(f"픽업 자리 비었다 · 대기열 {len(self.line)}")
-        self._present = False
+            self.get_logger().info("픽업 자리 비었다")
+        self._present, self._seen = False, None
         self.pub.publish(BoxAtPickup(present=False, box_id="", pose=Pose()))
 
 
-def main(args=None):
-    rclpy.init(args=args)
-    cfg = load()
-    line = BoxLine()
-    nodes = [LineDetector(cfg, line), ZoneDetector(cfg, line)]
+def _spin(node):
     ex = MultiThreadedExecutor()
-    for n in nodes:
-        ex.add_node(n)
+    ex.add_node(node)
     try:
         ex.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        for n in nodes:
-            n.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
+
+
+def main(args=None):
+    """투입부 인식 — cam1 등록 · cam2 검증. 라인이 하나라 이 노드도 하나다."""
+    rclpy.init(args=args)
+    _spin(LineDetector(load()))
+
+
+def zone_main(args=None):
+    """구역 인식 — 구역마다 **따로 띄운다** (CLAUDE.md §8 "구역 인식 노드 3").
+
+    한 프로세스에 셋을 몰면 파이썬 GIL 때문에 추론이 줄을 서서 돈다.
+    """
+    rclpy.init(args=args)
+    _spin(ZoneDetector(load()))
 
 
 if __name__ == "__main__":

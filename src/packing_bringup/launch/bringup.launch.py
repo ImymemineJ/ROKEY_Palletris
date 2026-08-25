@@ -33,20 +33,47 @@ Isaac(Action Graph)이 내는 것은 여기서 안 띄운다 — /clock · /tf �
   → scripts/verify_ros_graph.py 는 /clock 을 스스로 내주므로 true 로 둬도 된다.
 """
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction
+from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+def _as_list(v):
+    """launch 인자 문자열 "['a','b']" -> ["a","b"]. 한 개짜리 "b" 도 받는다."""
+    import ast
+    v = str(v).strip()
+    if v.startswith("["):
+        return [str(x) for x in ast.literal_eval(v)]
+    return [x for x in v.replace(",", " ").split() if x]
 
 
 def generate_launch_description():
     zone = LaunchConfiguration("zone")
+    zones = LaunchConfiguration("zones")
+    pick_cam_ns = LaunchConfiguration("pick_cam_ns")
     use_sim_time = LaunchConfiguration("use_sim_time")
     log_level = LaunchConfiguration("log_level")
 
     args = [
         DeclareLaunchArgument("zone", default_value="b",
                               description="관제탑이 맡을 구역. stage 1 은 b 하나다"),
+        # ★ 구역 인식은 **구역마다 프로세스를 따로** 띄운다 (CLAUDE.md §8 "3").
+        #   관제탑과 다르다 — 관제탑은 상태머신이라 하나여야 명령이 안 겹치지만,
+        #   인식은 이미지 추론이라 한 프로세스에 몰면 파이썬 GIL 때문에 세 구역이
+        #   줄을 서서 돈다. 프로세스를 나눠야 코어를 실제로 나눠 쓴다.
+        #   stage 2 예:
+        #     zones:="['a','b','c']"
+        #     pick_cam_ns:="['/pick_cam_a','/pick_cam_b','/pick_cam_c']"
+        #   ⚠ 두 목록의 **순서와 개수가 짝**이어야 한다. 어긋나면 다른 구역
+        #     카메라로 좌표를 낸다 — 아래 _zone_detectors 가 시작할 때 막는다.
+        DeclareLaunchArgument(
+            "zones", default_value="['b']",
+            description="인식 노드가 볼 구역 목록. stage 2 는 ['a','b','c']"),
+        DeclareLaunchArgument(
+            "pick_cam_ns", default_value="['/pick_cam']",
+            description="zones 와 같은 순서의 픽업 카메라 네임스페이스"),
         DeclareLaunchArgument("use_sim_time", default_value="true",
                               description="규약 1. Isaac 없이 돌릴 때만 false"),
         DeclareLaunchArgument("log_level", default_value="info"),
@@ -62,7 +89,7 @@ def generate_launch_description():
 
     def node(pkg, exe, cond, extra=None):
         # ★ name= 을 주지 않는다.
-        #   vision_node 는 한 프로세스에 노드 둘(line_detector · detector_zone_b)을
+        #   vision_node 는 한 프로세스에 노드 둘(line_detector · zone_detector)을
         #   띄운다. launch 가 name 을 주면 **둘 다** 그 이름으로 덮어써서 그래프에
         #   같은 이름이 두 개 생긴다 ("nodes that share an exact name" 경고).
         #   그러면 파라미터·서비스가 어느 쪽 것인지 알 수 없어진다.
@@ -72,6 +99,25 @@ def generate_launch_description():
                     arguments=cli,
                     condition=IfCondition(LaunchConfiguration(cond)))
 
+    def _zone_detectors(context, *_a, **_k):
+        """zones / pick_cam_ns 를 실행 시점에 펼쳐 구역마다 프로세스를 만든다.
+
+        launch 인자는 문자열이라 선언 시점에는 개수를 모른다. OpaqueFunction 으로
+        값을 받은 뒤에야 노드를 몇 개 만들지 정할 수 있다.
+        """
+        zs = _as_list(zones.perform(context))
+        cs = _as_list(pick_cam_ns.perform(context))
+        if len(zs) != len(cs):
+            raise RuntimeError(
+                f"zones {zs} 와 pick_cam_ns {cs} 의 개수가 다르다. "
+                "짝이 어긋나면 다른 구역 카메라로 좌표를 낸다")
+        return [Node(package="packing_vision", executable="zone_detector",
+                     name=f"detector_zone_{z}", output="screen",
+                     parameters=common + [{"zone": z, "pick_cam_ns": c}],
+                     arguments=cli,
+                     condition=IfCondition(LaunchConfiguration("vision")))
+                for z, c in zip(zs, cs)]
+
     return LaunchDescription(args + [GroupAction([
         # 알고리즘 — heightmap 3장을 소유한다. 로봇 명령은 절대 안 낸다.
         node("packing_algo", "algo_service_node", "algo"),
@@ -80,12 +126,16 @@ def generate_launch_description():
         # 두 프로세스가 같은 .db 를 열면 `database is locked` 가 난다.
         node("packing_db", "db_service_node", "db"),
 
-        # 인식 — cam1 등록 · cam2 검증 · pick_cam 픽업 좌표.
-        node("packing_vision", "vision_node", "vision",
-             [{"zone": zone}]),
+        # 투입부 인식 — cam1 등록 · cam2 검증. 라인이 하나라 이것도 하나다.
+        node("packing_vision", "vision_node", "vision"),
 
-        # 관제탑 — ★ /robot/cmd 를 내는 유일한 노드다 (CLAUDE.md §8).
-        #   구역이 3곳이어도 이 프로세스를 늘리지 않는다.
+        # 관제탑 — ★ 로봇 명령을 내는 유일한 노드다 (CLAUDE.md §8).
+        #   구역이 3곳이어도 **프로세스도 노드도 하나**다. 구역별 상태만 늘어난다.
+        #   인식 노드와 반대다 — 인식은 이미지 추론이라 GIL 때문에 나눠야 하지만,
+        #   관제탑은 상태머신이라 하나여야 명령이 겹치지 않는다.
         node("palletris_orchestrator", "orchestrator_node", "orchestrator",
-             [{"zone": zone}]),
+             [{"zone": zone, "zones": ParameterValue(zones, value_type=None)}]),
+
+        # 구역 인식 — 구역 수만큼 프로세스가 생긴다.
+        OpaqueFunction(function=_zone_detectors),
     ])])

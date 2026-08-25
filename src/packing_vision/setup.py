@@ -20,6 +20,9 @@ setup(
     entry_points={
         'console_scripts': [
             'vision_node = packing_vision.vision_node:main',
+            # ★ 구역 인식은 구역마다 따로 띄운다 — GIL 때문에 한 프로세스에
+            #   몰면 세 구역 추론이 줄을 서서 돈다 (CLAUDE.md §8).
+            'zone_detector = packing_vision.vision_node:zone_main',
         ],
     },
 )

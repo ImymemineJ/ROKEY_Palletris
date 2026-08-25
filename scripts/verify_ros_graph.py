@@ -14,7 +14,7 @@
       <ns>/rgb · camera_info     cam1 · pick_cam
       /conveyor/set_velocity     벨트
       /sim/despawn_box 외 3종     씬 서비스
-      /robot/cmd → /robot/event  로봇 팔
+      /zone_*/robot/cmd → /zone_*/robot/event  로봇 팔
 
 ★ 왜 대역을 세우나 (CLAUDE.md §11 "mock 을 임의로 만들어 붙이기" 와 다른 점)
   운영 그래프에 가짜를 끼워 넣는 게 아니다. scripts/ 에 있는 **검증 하네스**이고,
@@ -44,6 +44,8 @@ from tf2_ros import StaticTransformBroadcaster
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                 "..", "src", "packing_common"))
 from packing_common.config import load                                  # noqa: E402
+from packing_vision.label import (BOX_ID_FMT, LABEL_MM,                 # noqa: E402
+                                  make_payload, render_qr)
 from packing_msgs.msg import RobotCmd, RobotEvent                       # noqa: E402
 from packing_msgs.srv import (DespawnBox, SetSpawnEnabled, SetVelocity,  # noqa: E402
                               SwapPallet)
@@ -54,9 +56,23 @@ HFOV = CFG["recognition"]["hfov_deg"]
 BELT = CFG["conveyor"]["belt_top_z_mm"] / 1000.0
 TYPES = CFG["boxes"]["types"]
 STOPPER = CFG["conveyor"]["stopper_x_mm"] / 1000.0
+# ★ 로봇 토픽·픽업 카메라는 **구역별**이다. 구역이 셋인데 토픽이 하나면
+#   A 구역 명령을 C 구역 로봇도 받아 세 대가 같은 자리로 간다.
+#   어느 구역을 흉내낼지는 boxes_master 가 정한다 — 박스마다 담당 구역이 다르다.
+ZONES = [str(z).lower() for z in CFG["zones"]["list"]] \
+    if int(CFG["stage"]) >= 2 else [str(CFG["boxes"]["stage1"]["zone"]).lower()]
 
-CAMS = {"cam1": np.array([CFG["recognition"]["cam1_x_mm"] / 1000.0, 0.0, 2.300]),
-        "pick_cam": np.array([9.795, 0.0, 2.300])}
+# 구역별 픽업 카메라. 씬에 아직 1 대뿐이라 좌표는 같게 두고 토픽만 가른다
+# (⚠ 트랙 A 가 3 대를 놓으면 그때 y 를 구역별 팔레트 쪽으로 옮긴다).
+CAMS = {"cam1": np.array([CFG["recognition"]["cam1_x_mm"] / 1000.0, 0.0, 2.300])}
+if len(ZONES) == 1:
+    CAMS["pick_cam"] = np.array([9.795, 0.0, 2.300])
+    PICK_CAM = {ZONES[0]: "pick_cam"}
+else:
+    PICK_CAM = {}
+    for _z in ZONES:
+        CAMS[f"pick_cam_{_z}"] = np.array([9.795, 0.0, 2.300])
+        PICK_CAM[_z] = f"pick_cam_{_z}"
 R_DOWN = np.array([[1.0, 0, 0], [0, -1.0, 0], [0, 0, -1.0]])
 
 # ★ 실측 오차. 로봇이 계획대로 정확히 놓지 않는다는 것을 재현한다.
@@ -70,18 +86,38 @@ def K_mat():
     return np.array([[fx, 0, W / 2.0], [0, fx, H / 2.0], [0, 0, 1.0]])
 
 
-def render(box_type, center_xy, yaw_deg, t_cam):
+def _project(loc_xy, z, center_xy, yaw_deg, t_cam):
+    c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
+    P = np.hstack([(np.asarray(loc_xy) @ np.array([[c, -s], [s, c]]).T)
+                   + np.asarray(center_xy, float), np.full((len(loc_xy), 1), z)])
+    uv = (K_mat() @ ((P - t_cam) @ R_DOWN).T).T
+    return uv[:, :2] / uv[:, 2:3]
+
+
+def render(box_type, center_xy, yaw_deg, t_cam, payload=None):
+    """빨간 윗면 + (payload 가 있으면) 원근 투영된 QR 라벨.
+
+    ★ 라벨을 안 그리면 cam1 이 QR 을 못 읽어 **한 개도 등록되지 않는다.**
+      QR 이 정본이 된 뒤로는 이 하네스도 라벨을 그려야 진짜 경로를 검증한다.
+    """
     img = np.full((H, W, 3), (90, 90, 90), np.uint8)
     if box_type is None:
         return img
     w, d = box_type["w_mm"] / 1000.0, box_type["d_mm"] / 1000.0
     z = BELT + box_type["h_mm"] / 1000.0
-    c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
     loc = np.array([[w / 2, d / 2], [-w / 2, d / 2], [-w / 2, -d / 2], [w / 2, -d / 2]])
-    P = np.hstack([(loc @ np.array([[c, -s], [s, c]]).T) + np.asarray(center_xy, float),
-                   np.full((4, 1), z)])
-    uv = (K_mat() @ ((P - t_cam) @ R_DOWN).T).T
-    cv2.fillPoly(img, [np.round(uv[:, :2] / uv[:, 2:3]).astype(np.int32)], (40, 40, 235))
+    uv = _project(loc, z, center_xy, yaw_deg, t_cam)
+    cv2.fillPoly(img, [np.round(uv).astype(np.int32)], (40, 40, 235))
+    if payload:
+        half = LABEL_MM / 2000.0
+        lab_loc = np.array([[-half, half], [half, half], [half, -half], [-half, -half]])
+        dst = _project(lab_loc, z, center_xy, yaw_deg, t_cam).astype(np.float32)
+        lab = cv2.cvtColor(render_qr(payload, module_px=16), cv2.COLOR_GRAY2BGR)
+        n = lab.shape[0]
+        src = np.array([[0, 0], [n, 0], [n, n], [0, n]], np.float32)
+        M = cv2.getPerspectiveTransform(src, dst)
+        mask = cv2.warpPerspective(np.full((n, n), 255, np.uint8), M, (W, H))
+        img[mask > 0] = cv2.warpPerspective(lab, M, (W, H))[mask > 0]
     return img
 
 
@@ -91,7 +127,7 @@ class IsaacStandIn(Node):
     def __init__(self, plan):
         super().__init__("isaac_stand_in")
         cb = ReentrantCallbackGroup()
-        self.plan = list(plan)          # [(type, center_xy, yaw), ...]
+        self.plan = list(plan)          # [(type, center_xy, yaw, payload), ...]
         self.log = self.get_logger()
 
         # ── /clock — 규약 1 ──────────────────────────────────────
@@ -131,10 +167,13 @@ class IsaacStandIn(Node):
         self.create_service(SwapPallet, "/sim/swap_pallet",
                             lambda q, r: (setattr(r, "ok", True), r)[1], callback_group=cb)
 
-        # ── 로봇 ──────────────────────────────────────────────────
-        self.pub_ev = self.create_publisher(RobotEvent, "/robot/event", 10)
-        self.create_subscription(RobotCmd, "/robot/cmd", self._on_cmd, 10,
-                                 callback_group=cb)
+        # ── 로봇 — 구역마다 한 대 ─────────────────────────────────
+        self.pub_ev = {z: self.create_publisher(
+            RobotEvent, f"/zone_{z}/robot/event", 10) for z in ZONES}
+        for z in ZONES:
+            self.create_subscription(
+                RobotCmd, f"/zone_{z}/robot/cmd",
+                lambda m, _z=z: self._on_cmd(m, _z), 10, callback_group=cb)
 
         # ── 라인 상태 ─────────────────────────────────────────────
         # gap → cam1 → pick → (집힘) → gap → ...
@@ -161,8 +200,8 @@ class IsaacStandIn(Node):
         self.pub_clock.publish(msg)
 
     # ── 카메라 ────────────────────────────────────────────────────
-    def _send(self, nm, bt, center, yaw):
-        img = render(bt, center, yaw, CAMS[nm])
+    def _send(self, nm, bt, center, yaw, payload=None):
+        img = render(bt, center, yaw, CAMS[nm], payload)
         m = Image()
         m.header.frame_id, m.height, m.width = nm, H, W
         m.encoding, m.step, m.data = "bgr8", W * 3, img.tobytes()
@@ -174,10 +213,18 @@ class IsaacStandIn(Node):
         self.pub_img[nm].publish(m)
 
     def _pump_cameras(self):
-        bt, center, yaw = self.cur if self.cur else (None, (0, 0), 0.0)
+        if self.cur:
+            bt, center, yaw, pay, zone = self.cur
+        else:
+            bt, center, yaw, pay, zone = None, (0, 0), 0.0, None, ZONES[0]
         x1 = CFG["recognition"]["cam1_x_mm"] / 1000.0
-        self._send("cam1", bt if self.stage == "cam1" else None, (x1, center[1]), yaw)
-        self._send("pick_cam", bt if self.stage == "pick" else None, center, yaw)
+        self._send("cam1", bt if self.stage == "cam1" else None,
+                   (x1, center[1]), yaw, pay)
+        # ★ 픽업 카메라는 **그 박스의 구역** 것만 박스를 보여 준다.
+        #   전부에 보여 주면 세 구역이 같은 박스를 동시에 집으려 든다.
+        for z in ZONES:
+            show = bt if (self.stage == "pick" and z == zone) else None
+            self._send(PICK_CAM[z], show, center, yaw, pay)
 
     def _advance(self):
         el = time.time() - self._t_cam1
@@ -188,7 +235,8 @@ class IsaacStandIn(Node):
         elif self.stage == "cam1" and self.cur and el > 2.0:
             # cam1 에서 잠깐 보여 준 뒤 스토퍼로 옮긴다 (벨트 이송을 압축한 것)
             self.stage = "pick"
-            self.log.info(f"[씬] 박스가 스토퍼에 도착 — {self.cur[0]['name']}")
+            self.log.info(f"[씬] 박스가 스토퍼에 도착 — {self.cur[0]['name']} "
+                          f"→ 구역 {self.cur[4].upper()}")
 
     # ── 씬 서비스 ─────────────────────────────────────────────────
     def _set_velocity(self, req, res):
@@ -209,7 +257,7 @@ class IsaacStandIn(Node):
         return res
 
     # ── 로봇 ──────────────────────────────────────────────────────
-    def _on_cmd(self, cmd):
+    def _on_cmd(self, cmd, zone):
         """PICK/PLACE 를 받아 성공을 돌려준다. ★ seq 를 반드시 되돌려준다."""
         ev = RobotEvent()
         ev.seq = cmd.seq                 # ← 이게 없으면 관제탑이 결과를 못 짝짓는다
@@ -220,7 +268,7 @@ class IsaacStandIn(Node):
         ev.duration_s = 1.0
 
         if cmd.action == RobotCmd.PICK:
-            self.log.info(f"[로봇] PICK {cmd.box_id} "
+            self.log.info(f"[로봇 {zone}] PICK {cmd.box_id} "
                           f"({cmd.x_mm},{cmd.y_mm},{cmd.z_mm}) yaw {cmd.yaw_deg:.1f}")
             self.stage = "gone"          # 집혔으니 스토퍼가 빈다
         elif cmd.action == RobotCmd.PLACE:
@@ -231,24 +279,39 @@ class IsaacStandIn(Node):
             ev.actual_y_mm = cmd.y_mm + PLACE_ERR_MM[1]
             ev.actual_z_mm = cmd.z_mm + PLACE_ERR_MM[2]
             ev.actual_yaw_deg = cmd.yaw_deg
-            self.log.info(f"[로봇] PLACE {cmd.box_id} → 팔레트 "
+            self.log.info(f"[로봇 {zone}] PLACE {cmd.box_id} → 팔레트 "
                           f"({cmd.x_mm},{cmd.y_mm},{cmd.z_mm})")
             self.placed.append(cmd.box_id)
             # 다음 박스를 투입한다
             self.cur = self.plan.pop(0) if self.plan else None
             self.stage = "gap" if self.cur else "gone"      # ★ 빈 벨트를 먼저 보여 준다
             self._t_cam1 = time.time()
-        self.pub_ev.publish(ev)
+        self.pub_ev[zone].publish(ev)
 
 
 def main():
     n_box = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     rng = np.random.default_rng(CFG["boxes"]["random_seed"])
+
+    # ★ 박스가 어느 구역으로 가는지는 **boxes_master 가 정본**이다.
+    #   씬이 따로 정하면 DB 가 아는 구역과 어긋나 로봇이 남의 팔레트에 쌓는다.
+    _db = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "palletris.db")
+    _c = sqlite3.connect(f"file:{_db}?mode=ro", uri=True)
+    zone_of = dict(_c.execute("SELECT box_id, zone FROM boxes_master").fetchall())
+    _c.close()
+
     plan = []
     for i in range(n_box):
         bt = TYPES[int(rng.integers(0, len(TYPES)))]
         y = float(rng.uniform(-0.10, 0.10))
-        plan.append((bt, (STOPPER - 0.22, y), float(rng.uniform(-15, 15))))
+        # ★ box_id 는 boxes_master 와 같은 규칙이어야 한다 — QR 이 정본이므로
+        #   여기서 다른 규칙을 쓰면 DB 와 씬이 서로 다른 박스를 말하게 된다.
+        box_id = BOX_ID_FMT % i
+        z = str(zone_of.get(box_id, ZONES[0])).lower()
+        if z not in ZONES:
+            sys.exit(f"{box_id} 의 구역 {z!r} 이 담당 구역 {ZONES} 에 없다")
+        plan.append((bt, (STOPPER - 0.22, y), float(rng.uniform(-15, 15)),
+                     make_payload(box_id), z))
 
     rclpy.init()
     scene = IsaacStandIn(plan)
@@ -256,7 +319,7 @@ def main():
     ex.add_node(scene)
 
     print(f"\n박스 {n_box} 개를 그래프에 흘려보낸다 "
-          f"({', '.join(b[0]['name'] for b in plan)})\n")
+          f"({', '.join(b[0]['name'] + '→' + b[4].upper() for b in plan)})\n")
     deadline = time.time() + 20 + 15 * n_box
     while time.time() < deadline and len(scene.placed) < n_box:
         ex.spin_once(timeout_sec=0.1)
@@ -282,12 +345,27 @@ def main():
         ok = ok and cond
         print(f"  {'✓' if cond else '✗ 실패'} {label}{(' — ' + detail) if detail else ''}")
 
+    # ★ NO_FEASIBLE_POSE 로 버려진 박스는 **실패가 아니다** (CLAUDE.md §7).
+    #   "이 박스만 자리가 없다" 는 정상 이탈 경로이고, 그때 라인을 세우지 않고
+    #   계속 도는 것이 요구사항이다. 예전 판은 "전부 PLACED" 를 요구해서
+    #   설계대로 동작한 실행을 실패로 셌다 — 그러면 진짜 버그와 구분이 안 된다.
+    #   대신 **놓인 것 + 버린 것 = 전부** 인지를 본다.
+    done = [r for r in rows if r[1] in ("PLACED", "REJECTED")]
+    kept = [r for r in rows if r[1] == "PLACED"]
+    dropped = [r for r in rows if r[1] == "REJECTED"]
+
     print()
-    chk(f"로봇이 {n_box} 개를 놓았다", len(placed) == n_box, f"{len(placed)} 개")
+    chk(f"로봇이 놓은 수 = PLACED 수", len(placed) == len(kept),
+        f"로봇 {len(placed)} · DB {len(kept)}")
     chk("DB 에 행이 다 생겼다", len(rows) == n_box, f"{len(rows)} 행")
-    chk("전부 PLACED", all(r[1] == "PLACED" for r in rows),
-        ", ".join(f"{r[0]}={r[1]}" for r in rows))
-    chk("실측 pose 가 기록됐다", all(r[2] is not None for r in rows))
+    chk("모든 박스가 결말을 봤다 (PLACED 또는 REJECTED)", len(done) == n_box,
+        ", ".join(f"{r[0]}={r[1]}" for r in rows if r[1] not in ("PLACED", "REJECTED"))
+        or f"적재 {len(kept)} · 폐기 {len(dropped)}")
+    chk("실측 pose 가 기록됐다", all(r[2] is not None for r in kept))
+    if dropped:
+        print(f"  · 폐기 {len(dropped)} 개 — "
+              + ", ".join(r[0] for r in dropped)
+              + " (NO_FEASIBLE_POSE 는 정상 경로다)")
     print("\n  적재 결과")
     for r in rows:
         print(f"    {r[0]}  {r[1]:8s}  ({r[2]}, {r[3]}, {r[4]}) mm")
