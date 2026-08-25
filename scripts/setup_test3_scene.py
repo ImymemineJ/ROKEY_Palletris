@@ -18,7 +18,8 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   [7] 지선 레일을 롤러 가장자리(±RAIL_HALF)로 맞춘다
   [8] 스폰부 카메라를 만든다 (광학값은 CamPick 에서 복사)
   [9] 순환 루프 (방향 · 높이 · 프레임 · 레일)
-  [10] 전부 검증한다
+  [10] 팔레트 가이드 벽 (overhang 7.8 고려 · 편도 여유 5)
+  [11] 전부 검증한다
 
 ═══ 왜 이렇게 하는가 — 실측으로 얻은 것들 ═══════════════════════════════════
 
@@ -587,10 +588,77 @@ else:
         rail("/World/MainRail_spawn_far0", x0, gap[0], -y - th, -y, z0, z1)
         rail("/World/MainRail_spawn_far1", gap[1], x1, -y - th, -y, z0, z1)
 
+# ══ [10] 팔레트 가이드 벽 ═══════════════════════════════════════════════════
+# 합류 라인에서 팔레트가 옆으로 흔들리지 않게 잡는다.
+#
+# ★★ 기준을 **롤러가 아니라 팔레트 가장자리로** 잡는다.
+#    합류 롤러는 784.4 인데 팔레트는 800 이라 양쪽으로 각 **7.8 mm 씩 롤러 밖으로
+#    나온다**(overhang, 실측). 롤러 가장자리(중심 +-392.2)에 가이드를 세우면
+#    가이드가 팔레트를 물어 버린다.
+#    -> 팔레트 가장자리(중심 +-400) 바깥으로 `clearance_mm` 만큼 띄운다.
+#
+# 지금 팔레트를 막는 것은 조각 프레임(중심 +-500)뿐이라 편도 여유가 100 mm 다.
+# 가이드를 세우면 편도 5 mm 가 된다.
+#
+# 높이는 기존 `Rail_*` 와 같은 800~950 — 팔레트 몸통만 잡고 그 위 적재물
+# (최대 1950)은 안 건드린다.
+say("\n[10] 팔레트 가이드 벽")
+PG = (cfg.get("truck", {}).get("pallet_guide") or {})
+if not PG.get("enabled"):
+    say("   꺼져 있다 (truck.pallet_guide.enabled)")
+else:
+    clr = float(PG.get("clearance_mm", 5))
+    th = float(PG.get("thickness_mm", 20))
+    z0, z1 = [float(v) for v in PG.get("z_mm", [800, 950])]
+    fmt = str(PG.get("name_fmt", "/World/PalletGuide_%s_%s"))
+    # 팔레트의 **가로(Y)** 치수. 커브를 돌고 나면 이 값이 라인을 가로지른다.
+    pal_y = float(cfg["pallet"]["width_mm"])
+    half = pal_y / 2.0 + clr
+
+    for z in ("A", "B", "C"):
+        mp = "/World/MergeLine_%s/Rollers" % z
+        v = bb(mp)
+        if not v:
+            chk("%s 존재" % mp, False)
+            continue
+        cy = (v[1] + v[4]) / 2.0
+        roll_w = v[4] - v[1]
+        over = (pal_y - roll_w) / 2.0
+        for suf, sign in (("lo", -1.0), ("hi", +1.0)):
+            name = fmt % (z, suf)
+            inner = cy + sign * half
+            y0, y1 = sorted((inner, inner + sign * th))
+            cu = UsdGeom.Cube.Define(st, name)
+            cu.GetSizeAttr().Set(1.0)
+            pr = cu.GetPrim()
+            # ★ 순서가 반드시 [translate, scale] 이어야 한다.
+            #   [scale, translate] 로 만들면 translate 가 scale 만큼 곱해져 나간다
+            #   (실측 2026-08-25: X -4528.9 를 넣었는데 -19206.3 = x4.241 로 나왔다).
+            #   이미 잘못 만들어진 것도 고쳐야 하므로 **매번 지우고 다시 쌓는다.**
+            xf = UsdGeom.Xformable(pr)
+            xf.ClearXformOpOrder()
+            for a in ("xformOp:translate", "xformOp:scale"):
+                if pr.HasAttribute(a):
+                    pr.RemoveProperty(a)
+            xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Vec3d((v[0] + v[3]) / 2000.0, (y0 + y1) / 2000.0,
+                         (z0 + z1) / 2000.0))
+            xf.AddScaleOp().Set(
+                Gf.Vec3f((v[3] - v[0]) / 1000.0, (y1 - y0) / 1000.0,
+                         (z1 - z0) / 1000.0))
+            if not pr.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI.Apply(pr)
+        va, vb = bb(fmt % (z, "lo")), bb(fmt % (z, "hi"))
+        say("   %s  롤러 %.1f (중심 %.1f) · 팔레트 %.0f -> overhang %+.2f mm/편"
+            % (z, roll_w, cy, pal_y, over))
+        say("       가이드 안쪽 %.1f ~ %.1f  (간격 %.1f · 편도 여유 %.1f)"
+            % (va[4], vb[1], vb[1] - va[4], clr))
+        say("       X %.1f~%.1f  Z %.1f~%.1f" % (va[0], va[3], va[2], va[5]))
+
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)
 
-# ══ [10] 검증 ════════════════════════════════════════════════════════════════
+# ══ [11] 검증 ════════════════════════════════════════════════════════════════
 say("\n" + "=" * 74)
 say("=== 검증 ===")
 for z, p in sorted(JUNC.items()):
