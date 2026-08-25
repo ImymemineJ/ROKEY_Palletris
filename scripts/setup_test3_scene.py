@@ -16,7 +16,9 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   [5] 지선을 **한 조각으로** 스토퍼까지 늘리고 로봇 중심에 맞춘다
   [6] 연장 조각을 비활성화한다
   [7] 지선 레일을 롤러 가장자리(±RAIL_HALF)로 맞춘다
-  [8] 전부 검증한다
+  [8] 스폰부 카메라를 만든다 (광학값은 CamPick 에서 복사)
+  [9] 순환 루프 (방향 · 높이 · 프레임 · 레일)
+  [10] 전부 검증한다
 
 ═══ 왜 이렇게 하는가 — 실측으로 얻은 것들 ═══════════════════════════════════
 
@@ -65,6 +67,7 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   씬에 이미 들어 있고 이 스크립트가 다시 만들지 않는다. **씬 파일이 정본이다.**
   되돌릴 지점: `test_3_v1.usd` (3 존 완주 `RESULT 통과` 시점).
 """
+import math
 import os
 import sys
 
@@ -372,10 +375,222 @@ for z, p in sorted(JUNC.items()):
             % (z, suf, (v0[0] + v0[3]) / 2.0, (v1[0] + v1[3]) / 2.0,
                (v1[0] + v1[3]) / 2.0 - cx))
 
+# ══ [8] 스폰부 카메라 ════════════════════════════════════════════════════════
+# ★ 광학값을 **지어내지 않는다.** 이미 검증된 `CamPick_A` (HFOV 정확히 60°,
+#   마지막 완주 3/3 · 오차 4.0 mm)에서 초점거리·조리개·클리핑을 그대로 복사한다.
+#   높이도 픽업 카메라와 같게 둔다 — 벨트면이 같은 800 이라 시야 폭이 같아진다.
+# ★ 위치는 `conveyor.spawn_point_mm` 에서 끌어온다. X 는 스폰 지점, Y 는 본선 중심
+#   (스폰 y 는 -66 인데 지터가 +-150 이라 벨트 가운데가 더 안전하다).
+say("\n[8] 스폰부 카메라")
+CAM_SPAWN = str(cfg.get("cameras", {}).get("spawn_prim")
+                or "/World/CamSpawn/Camera")
+SRC_CAM = str(sorted(cfg["cameras"]["pick_prim"].values())[0])
+
+src = st.GetPrimAtPath(SRC_CAM)
+if not src.IsValid():
+    chk("본보기 카메라 %s" % SRC_CAM, False)
+else:
+    spawn_mm = [float(v) for v in cfg["conveyor"]["spawn_point_mm"]]
+    # 픽업 카메라의 월드 높이가 정본이다
+    zw = UsdGeom.XformCache().GetLocalToWorldTransform(src) \
+        .ExtractTranslation()[2] * 1000.0
+    want = (spawn_mm[0], 0.0, zw)
+
+    parent = CAM_SPAWN.rsplit("/", 1)[0]
+    UsdGeom.Xform.Define(st, parent)
+    cam = UsdGeom.Camera.Define(st, CAM_SPAWN)
+    # 광학값 복사 — 없는 속성은 만들지 않는다 (본보기에 있는 것만 따라간다)
+    for nm in ("focalLength", "horizontalAperture", "verticalAperture",
+               "horizontalApertureOffset", "verticalApertureOffset",
+               "clippingRange", "focusDistance", "fStop", "projection"):
+        a = src.GetAttribute(nm)
+        if a and a.IsValid() and a.Get() is not None:
+            cam.GetPrim().CreateAttribute(nm, a.GetTypeName()).Set(a.Get())
+
+    # ★ 자세는 부모 Xform 에 둔다 (픽업 카메라와 같은 구조: translate/orient/scale).
+    #   기본 자세 그대로가 -Z 하향이라 회전을 안 준다 — 픽업 카메라도 그렇다.
+    pp = st.GetPrimAtPath(parent)
+    a = xop(pp, "translate", Gf.Vec3d(0, 0, 0))
+    # 카메라 prim 자체에 오프셋이 있을 수 있으므로 **재고 고치기**로 맞춘다
+    for _it in range(6):
+        t = UsdGeom.XformCache().GetLocalToWorldTransform(cam.GetPrim()) \
+            .ExtractTranslation()
+        d = [want[k] - t[k] * 1000.0 for k in range(3)]
+        if max(abs(v) for v in d) < 0.05:
+            break
+        c = a.Get()
+        a.Set(Gf.Vec3d(*[float(c[k]) + d[k] / 1000.0 for k in range(3)]))
+    t = UsdGeom.XformCache().GetLocalToWorldTransform(cam.GetPrim()) \
+        .ExtractTranslation()
+    fl = cam.GetPrim().GetAttribute("focalLength").Get()
+    ha = cam.GetPrim().GetAttribute("horizontalAperture").Get()
+    hfov = 2.0 * math.degrees(math.atan(float(ha) / (2.0 * float(fl))))
+    belt = float(cfg["conveyor"]["belt_top_z_mm"])
+    half = (t[2] * 1000.0 - belt) * math.tan(math.radians(hfov / 2.0))
+    say("   %s  월드 (%.1f, %.1f, %.1f)" % (CAM_SPAWN, t[0] * 1000,
+                                           t[1] * 1000, t[2] * 1000))
+    say("   HFOV %.1f deg · 벨트면까지 %.0f mm · 가로 시야 %.0f mm (본선 폭 903)"
+        % (hfov, t[2] * 1000 - belt, half * 2))
+
+# ══ [9] 순환 루프 ═══════════════════════════════════════════════════════════
+# 박스가 리턴 벨트에서 멈추던 것. 원인이 **6 개**였고 전부 실측으로 갈랐다
+# (2026-08-25). 하나만 고치면 다음 것에서 다시 선다 — 순서대로 다 걸어야 한다.
+#
+#   1. `_01` 롤러면이 769.5 로 30.5 mm 낮다
+#      들어갈 땐 떨어지지만 **나올 땐 못 올라온다.**
+#   2. `_01` 커브 direction 부호가 반대
+#      커브의 direction 은 진행 방향이 아니라 **회전축**이다.
+#      -37 → 커브 입구 X -3620 에서 정지 · 속도를 올리면 벨트 밖으로 이탈.
+#      +37 → 커브 완주.
+#   3. 루프 조각의 **프레임 충돌이 켜져 있다**
+#      프레임 꼭대기가 1166~1213 = 롤러면 위 366~413 mm 라 조각 이음매에서
+#      벽이 된다. `_01`(Y 끝 -1395.2) 과 `_02`(Y 시작 -1394.3) 가 맞닿아 있었다.
+#      본선 스폰 조각도 같이 끈다 — 그 옆벽(Y +-575.5)이 루프의 **합류**를 막았다
+#      (실측: 박스가 Y -671 에서 정지, 앞면 -546 이 벽을 파고든 자리).
+#   4. `Rail_C_far` 가 Y -790 에 서서 **루프 입구를 막는다**
+#      X -23204~-16279 이라 `_04` 커브 위를 가로지른다. 본선 끝까지만 남긴다.
+#   5. 3 번의 부작용 — 프레임을 끄면 **옆가드도 사라진다**
+#      `_01` 커브 출구에서 박스가 +X 로 빠져 바닥까지 떨어졌다 (Z 105).
+#      지선에서 쓴 방법과 같게 가드 레일을 세운다.
+#   6. ★ `_02` 의 direction 이 틀렸다 — **`_local_axis` 환산을 믿으면 안 된다**
+#      `_02` 롤러는 로컬축 길이가 0.472 / 1.000 / 1.040 로 심하게 비균등하다.
+#      환산은 (1,0,0) 을 주는데 실측하면 그게 **월드 +X** 다:
+#          (1,0,0)  dx +698  dy   -1   → 벨트 밖으로 떨어짐
+#          (0,1,0)  dx   +0  dy +444   → 정상
+#      이것 때문에 박스가 `_02` 위에 올라가고도 안 움직였다.
+#
+# ⚠ 한때 "`_02` 를 커브 출구(X -2208)로 옮긴다" 를 시도했는데 **필요 없었다.**
+#   6 번을 고치자 원래 자리에서 그대로 통과했다. 증상이 비슷하다고 배치를
+#   건드리면 진짜 원인을 덮는다.
+#
+# 검증: 본선 X -21931 에서 박스 하나를 놓고 `_04 -> _05 -> _01 -> _02 -> 본선`
+#       을 다 지나는지 본다 (실측 27 초, 최저 Z 894.6 = 안 떨어짐).
+say("\n[9] 순환 루프")
+LOOP = (cfg["conveyor"].get("loop") or {})
+if not LOOP:
+    say("   설정에 conveyor.loop 가 없다 — 건너뛴다")
+else:
+    ref_top = bb(REF_ROLLER)[5]
+
+    # 1. 롤러면을 기준(본선)에 맞춘다
+    for tp in LOOP.get("level_to_ref") or []:
+        prim = st.GetPrimAtPath(tp)
+        if not prim.IsValid():
+            chk("%s 존재" % tp, False)
+            continue
+        a = xop(prim, "translate", Gf.Vec3d(0, 0, 0))
+        z0 = bb(tp + "/Rollers")[5]
+        for _it in range(6):
+            v = bb(tp + "/Rollers")
+            d = ref_top - v[5]
+            if abs(d) < 0.05:
+                break
+            t = a.Get()
+            a.Set(Gf.Vec3d(float(t[0]), float(t[1]), float(t[2]) + d / 1000.0))
+        say("   %-30s 롤러면 %.1f -> %.1f" % (tp, z0, bb(tp + "/Rollers")[5]))
+
+    # 2·6. direction — 커브는 회전축, 직선은 실측 월드축. 둘 다 값 그대로 쓴다.
+    for key in ("curve_dir", "straight_dir"):
+        for tp, d in (LOOP.get(key) or {}).items():
+            nd = st.GetPrimAtPath(tp + "/ConveyorBeltGraph/ConveyorNode")
+            if not nd or not nd.IsValid():
+                chk("%s 의 ConveyorNode" % tp, False)
+                continue
+            before = nd.GetAttribute("inputs:direction").Get()
+            nd.GetAttribute("inputs:direction").Set(
+                Gf.Vec3f(*[float(x) for x in d]))
+            say("   %-30s direction %s -> %s" % (tp, before, tuple(d)))
+
+    # 3. 프레임 충돌 끄기
+    noff = 0
+    for tp in LOOP.get("frames_off") or []:
+        prim = st.GetPrimAtPath(tp)
+        if not prim.IsValid():
+            chk("%s 존재" % tp, False)
+            continue
+        for ch in prim.GetChildren():
+            nm = ch.GetName()
+            if not nm.startswith("SM_") or "Decal" in nm:
+                continue
+            at = ch.GetAttribute("physics:collisionEnabled")
+            if not at or not at.IsValid():
+                at = ch.CreateAttribute("physics:collisionEnabled",
+                                        Sdf.ValueTypeNames.Bool)
+            at.Set(False)
+            noff += 1
+    say("   프레임 충돌 끔 %d 개" % noff)
+
+    # 4. Rail_C_far 를 본선 끝까지 줄인다 (+X 끝은 그대로)
+    rx = LOOP.get("rail_c_far_end_x_mm")
+    RC = "/World/Rail_C_far"
+    prim = st.GetPrimAtPath(RC)
+    if rx is not None and prim.IsValid():
+        v0 = bb(RC)
+        sa = xop(prim, "scale", Gf.Vec3f(1, 1, 1))
+        ta = xop(prim, "translate", Gf.Vec3d(0, 0, 0))
+        keep, want = v0[3], v0[3] - float(rx)
+        for _it in range(8):
+            v = bb(RC)
+            cur = v[3] - v[0]
+            if abs(cur - want) > 0.05 and cur > 1e-6:
+                sc = sa.Get()
+                sa.Set(Gf.Vec3f(float(sc[0]) * (want / cur),
+                                float(sc[1]), float(sc[2])))
+            v = bb(RC)
+            d = keep - v[3]
+            if abs(d) > 0.05:
+                t = ta.Get()
+                ta.Set(Gf.Vec3d(float(t[0]) + d / 1000.0,
+                                float(t[1]), float(t[2])))
+        v1 = bb(RC)
+        say("   Rail_C_far X %.1f~%.1f -> %.1f~%.1f" % (v0[0], v0[3], v1[0], v1[3]))
+    elif rx is not None:
+        chk("%s 존재" % RC, False)
+
+    # 5. 가드 레일 (프레임을 끈 자리를 대신한다)
+    def rail(name, x0, x1, y0, y1, z0, z1):
+        """월드 좌표로 직육면체 가드. 재고 고치기로 정확히 맞춘다."""
+        cu = UsdGeom.Cube.Define(st, name)
+        cu.GetSizeAttr().Set(1.0)
+        pr = cu.GetPrim()
+        ta = xop(pr, "translate", Gf.Vec3d(0, 0, 0))
+        sa = xop(pr, "scale", Gf.Vec3f(1, 1, 1))
+        sa.Set(Gf.Vec3f((x1 - x0) / 1000.0, (y1 - y0) / 1000.0,
+                        (z1 - z0) / 1000.0))
+        ta.Set(Gf.Vec3d((x0 + x1) / 2000.0, (y0 + y1) / 2000.0,
+                        (z0 + z1) / 2000.0))
+        if not pr.HasAPI(UsdPhysics.CollisionAPI):
+            UsdPhysics.CollisionAPI.Apply(pr)
+        v = bb(name)
+        say("   %-28s X %9.1f~%9.1f  Y %8.1f~%8.1f  Z %6.1f~%6.1f"
+            % (name.rsplit("/", 1)[-1], v[0], v[3], v[1], v[4], v[2], v[5]))
+
+    g = LOOP.get("guard_rail") or {}
+    if g:
+        v1r, v2r = bb("/World/ConveyorTrack_01/Rollers"), \
+            bb("/World/ConveyorTrack_02/Rollers")
+        th = float(g.get("thickness_mm", 20))
+        gx = max(v1r[3], v2r[3])          # 안쪽 면을 롤러 가장자리에 붙인다
+        rail(str(g["name"]), gx, gx + th,
+             float(g["y_mm"][0]), float(g["y_mm"][1]),
+             float(g["z_mm"][0]), float(g["z_mm"][1]))
+
+    m = LOOP.get("main_rail") or {}
+    if m:
+        th = float(m.get("thickness_mm", 20))
+        y, z0, z1 = float(m["y_mm"]), float(m["z_mm"][0]), float(m["z_mm"][1])
+        x0, x1 = float(m["x_mm"][0]), float(m["x_mm"][1])
+        gap = [float(v) for v in (m.get("merge_gap_x_mm") or [0, 0])]
+        # +Y 쪽은 통으로. 루프는 -Y 에서 합류하므로 막지 않는다.
+        rail("/World/MainRail_spawn_near", x0, x1, y, y + th, z0, z1)
+        # -Y 쪽은 합류 창만 비운다
+        rail("/World/MainRail_spawn_far0", x0, gap[0], -y - th, -y, z0, z1)
+        rail("/World/MainRail_spawn_far1", gap[1], x1, -y - th, -y, z0, z1)
+
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)
 
-# ══ [8] 검증 ════════════════════════════════════════════════════════════════
+# ══ [10] 검증 ════════════════════════════════════════════════════════════════
 say("\n" + "=" * 74)
 say("=== 검증 ===")
 for z, p in sorted(JUNC.items()):

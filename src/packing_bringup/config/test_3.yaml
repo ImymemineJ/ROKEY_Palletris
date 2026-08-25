@@ -70,6 +70,50 @@ conveyor:
     /World/ConveyorTrack_01/ConveyorBeltGraph: 0.5    # A02 커브
     /World/ConveyorTrack_02/ConveyorBeltGraph: 0.3    # X -2967~-2064 (+Y)
 
+  # ── 순환 루프 고침 (2026-08-25 실측) ─────────────────────────────────────
+  # 박스가 리턴 벨트에서 멈추던 것. 원인이 **6 개**였고 전부 실측으로 갈랐다.
+  # 근거와 순서는 `setup_test3_scene.py` [9] 주석에 있다.
+  loop:
+    # 커브의 direction 은 진행 방향이 아니라 **회전축**이고, 부호가 반대면
+    # 박스가 커브 입구에서 선다 (실측: -37 → X -3620 정지 / +37 → 커브 완주).
+    curve_dir:
+      /World/ConveyorTrack_01: [0, 0, 37]
+    # ★ 직선 조각의 direction 은 `_local_axis` 환산을 **믿으면 안 된다.**
+    #   `_02` 롤러는 로컬축 길이가 0.472 / 1.000 / 1.040 로 심하게 비균등해서
+    #   환산이 (1,0,0) 을 주는데 그건 월드 +X 다 — 박스를 벨트 밖으로 민다.
+    #   실측: (1,0,0) dx +698 dy -1 (낙하) / (0,1,0) dy +444 (정상).
+    straight_dir:
+      /World/ConveyorTrack_02: [0, 1, 0]
+    # 프레임이 롤러면 위 366~413 mm 솟아 조각 이음매에서 **벽**이 된다.
+    # 본선 스폰 조각도 포함한다 — 그 옆벽(Y +-575.5)이 루프의 합류를 막았다.
+    frames_off:
+      - /World/ConveyorTrack_01
+      - /World/ConveyorTrack_02
+      - /World/ConveyorTrack_04
+      - /World/ConveyorTrack_05
+      - /World/ConveyorTrack
+    # `_01` 롤러면이 769.5 로 30.5 mm 낮았다. 들어갈 땐 떨어지고 나올 땐 못 올라온다.
+    level_to_ref:
+      - /World/ConveyorTrack_01
+    # `Rail_C_far` 가 Y -790 에 서서 루프 입구를 막았다. 본선 끝까지만 남긴다.
+    rail_c_far_end_x_mm: -21700
+    # 프레임을 끄면 옆가드도 사라진다 — 커브 출구에서 박스가 +X 로 빠져 떨어졌다.
+    guard_rail:
+      name: /World/LoopRail_01out
+      y_mm: [-2300, -400]
+      thickness_mm: 20
+      z_mm: [800, 950]
+    # 본선 스폰 구간의 옆가드. 프레임을 끈 대신 세운다.
+    # -Y 쪽은 루프가 합류하는 창(merge_gap)만 비운다.
+    main_rail:
+      x_mm: [-6101, -12]
+      merge_gap_x_mm: [-2900, -2000]
+      # ★ 790 은 씬의 기존 `Rail_A/B/C_*` 와 같은 값이다. 480(본선 롤러 폭)에 붙이면
+      #   5호(480x380)가 yaw 15도로 틀어질 때 Y 폭이 562 가 되어 레일을 스친다.
+      y_mm: 790
+      thickness_mm: 20
+      z_mm: [800, 950]
+
   # ★ 코너 커브 조각. 팔레트가 셀(+Y)에서 합류(+X)로 **이 조각을 따라 돈다**.
   #   반출이 회전 반지름을 여기서 재서 정한다 — 하드코딩하지 않는다.
   curve_prim:
@@ -331,6 +375,14 @@ cameras:
     B: /World/CamPick_B/Camera
     C: /World/CamPick_C/Camera
 
+  # ★ 스폰부 카메라 (2026-08-25 신설). 색상 판정 -> 배송지 라우팅에 쓸 자리다.
+  #   위치는 `setup_test3_scene.py` [8] 이 계산한다 — 여기에 좌표를 안 박는다:
+  #     X = conveyor.spawn_point_mm[0]      (스폰 지점)
+  #     Y = 0                                (본선 중심. 스폰 y -66 + 지터 +-150)
+  #     Z = CamPick_A 의 월드 높이           (벨트면이 같은 800 이라 시야 폭도 같다)
+  #   광학값(초점거리·조리개·클리핑)도 CamPick_A 에서 복사한다. 지어내지 않는다.
+  spawn_prim: /World/CamSpawn/Camera
+
 # ── 투입 ────────────────────────────────────────────────────────────────────
 boxes:
   # ★ 배송지 (QR 이 싣는 값). 크기와 **독립**으로 뽑는다.
@@ -339,13 +391,18 @@ boxes:
   #     싣고 그 값으로 라우팅한다. QR 텍스처와 판독은 트랙 D(인식) 몫이다.
   dests: ["SEOUL", "BUSAN", "DAEJEON"]
 
-  # (구) 1 차 색상 판정용 색표. **지금은 안 쓴다** — QR 로 바뀌면서 박스 색을
-  #   하나로 통일했기 때문이다(`spawner.LINE_COLOR`). 되돌릴 때만 켠다.
-  #   ⚠ 켜려면 데모의 배송지 배정을 색 배정으로 되돌리고 routing 도 by_color 로 바꾼다.
-  # colors:
-  #   red:   [1.0, 0.15, 0.15]
-  #   green: [0.15, 0.9, 0.25]
-  #   blue:  [0.2, 0.35, 1.0]
+  # ★ 색표 (2026-08-25 되살림). 박스를 **배송지에 따라** 칠한다.
+  #   배송지 -> 존 -> 색 은 `routing.by_dest` 와 `routing.by_color` 두 표를
+  #   이어 붙여 유도한다 (SEOUL -> A -> red). 네 번째 표를 만들지 않는다 —
+  #   진리원이 둘이 되면 한쪽만 고치는 사고가 난다.
+  #   ⚠ 라우팅은 그대로 `by_dest` 다. 색은 **카메라가 읽을 대상**일 뿐이고,
+  #     배송지는 채점용 ground truth 로 남는다 (프림의 `box_dest`).
+  #   값은 채도를 최대로 둔다 — HSV 색상(H)만으로 가르려면 회색기가 없어야 한다.
+  #   0.15 씩 섞여 있던 옛 값은 S 가 0.85 로 떨어져 조명에 따라 흔들린다.
+  colors:
+    red:   [0.90, 0.03, 0.03]
+    green: [0.03, 0.70, 0.08]
+    blue:  [0.03, 0.10, 0.90]
 
   stage1:
     # ★ 12 -> 20 s. test1-1 은 간선이 한 존 전용이라 12 s 로 충분했다.

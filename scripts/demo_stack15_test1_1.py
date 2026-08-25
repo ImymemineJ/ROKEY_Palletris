@@ -2436,6 +2436,30 @@ def on_step(dt):
                                   else int(cfg["boxes"].get("random_seed", 42)))
                 for bid in ids:
                     specs[bid]["dest"] = _dr.choice(_dests)
+                # ★ 배송지에 맞는 **색**도 같이 칠한다 (2026-08-25).
+                #   스폰 카메라가 읽을 대상이다. 색 -> 배송지 판정을 붙이기 전까지는
+                #   그림만 바뀌고 라우팅은 그대로 `by_dest` 를 쓴다.
+                #   표를 새로 만들지 않고 `by_dest` + `by_color` 를 이어 유도한다:
+                #     SEOUL -> (by_dest) A -> (by_color 역방향) red
+                _z2c = {}
+                for _c, _z in (ROUTE.get("by_color") or {}).items():
+                    _z2c.setdefault(str(_z), str(_c))
+                _pal = set((cfg["boxes"].get("colors") or {}).keys())
+                _d2c = {str(d): _z2c.get(str(z))
+                        for d, z in (ROUTE.get("by_dest") or {}).items()
+                        if _z2c.get(str(z)) in _pal}
+                if _d2c:
+                    for bid in ids:
+                        _c = _d2c.get(specs[bid].get("dest"))
+                        if _c:
+                            specs[bid]["color"] = _c
+                    log("박스 색      %s (배송지에서 유도)"
+                        % ", ".join("%s=%s" % kv for kv in sorted(_d2c.items())))
+                else:
+                    # 색표가 비었거나 존이 안 맞으면 조용히 넘기지 않는다 —
+                    # 전부 기본색이 되어 카메라가 아무것도 못 가른다.
+                    log("!! 박스 색을 못 정했다 (boxes.colors %s · by_color %s)"
+                        % (sorted(_pal), ROUTE.get("by_color")))
             log("박스      %d 개  %s" % (N,
                 ["%s/%s" % (t["name"], specs[b].get("dest", "-"))
                  for b, t in zip(ids, fed)]))
