@@ -28,7 +28,6 @@
     x = 0~7500   main 컨베이어 / 7500~10000 픽업 구간 / 10000 스토퍼
 """
 import os
-import sys
 
 import omni.usd
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics
@@ -40,36 +39,57 @@ SHOW_PALLET = True    # 팔레트 3장을 참고용으로 그린다 (물리 없�
 # ══════════════════════════════════════════════════════════════════════════
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ★ 저장소 위치 — **여기만 맞으면 된다**
+#
+#   Script Editor 는 붙여넣기라 `__file__` 이 없고, `os.getcwd()` 가 Isaac 설치
+#   폴더다. 그래서 자동 탐색이 실패한다 (`No module named 'packing_common'`).
+#   저장소를 다른 데 뒀으면 이 줄만 고칠 것.
+# ══════════════════════════════════════════════════════════════════════════
+WS_ROOT = "~/palletris_ws"
+
+REL_CONFIG = os.path.join("src", "packing_bringup", "config", "system.yaml")
+
+
 def load_spec():
-    """`system.yaml` 을 읽는다 (`packing_common.config` 사용).
+    """`system.yaml` 을 읽는다. **`packing_common` 을 import 하지 않는다.**
 
-    Isaac 내장 파이썬(3.11)은 ROS 워크스페이스(3.12)를 안 보므로 경로를 붙여 준다.
-    Script Editor 는 `__file__` 이 없을 수 있어 cwd 에서도 훑는다.
+    ★ 전에는 `packing_common.config.load()` 를 썼는데 Script Editor 에서
+      `No module named 'packing_common'` 로 죽었다 — 붙여넣기라 `__file__` 이 없고
+      cwd 가 Isaac 설치 폴더라 저장소를 못 찾는다.
+      그 함수가 하는 일은 결국 `yaml.safe_load` 하나뿐이라(config.py:load) 여기서 직접 한다.
     """
-    starts = [os.getcwd()]
-    if "__file__" in globals():
-        starts.insert(0, os.path.dirname(os.path.realpath(__file__)))
-    for start in starts:
-        d = start
-        for _ in range(8):
-            cand = os.path.join(d, "src", "packing_common")
-            if os.path.isdir(cand):
-                if cand not in sys.path:
-                    sys.path.insert(0, cand)
-                break
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-    try:
-        from packing_common.config import load
-        return load()
-    except Exception as e:                       # noqa: BLE001
-        raise RuntimeError(
-            f"system.yaml 을 못 읽었다 ({e}).\n"
-            "  환경변수로 알려 줄 것:  PALLETRIS_CONFIG=~/palletris_ws/src/"
-            "packing_bringup/config/system.yaml") from e
+    import yaml                                  # Isaac 내장 파이썬에 들어 있다
 
+    tried = []
+    def cands():
+        yield os.path.join(os.path.expanduser(WS_ROOT), REL_CONFIG)
+        env = os.environ.get("PALLETRIS_CONFIG")
+        if env:
+            yield os.path.expanduser(env)
+        starts = [os.getcwd()]
+        if "__file__" in globals():
+            starts.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        for start in starts:
+            d = start
+            for _ in range(8):
+                yield os.path.join(d, REL_CONFIG)
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+
+    for c in cands():
+        if os.path.isfile(c):
+            print(f"[INFO] system.yaml: {c}")
+            with open(c, encoding="utf-8") as f:
+                return yaml.safe_load(f)
+        tried.append(c)
+
+    raise RuntimeError(
+        "system.yaml 을 못 찾았다.\n"
+        f"  → 이 파일 위쪽의 WS_ROOT 를 실제 저장소 경로로 고칠 것 (지금: {WS_ROOT})\n"
+        "  찾아본 곳:\n    " + "\n    ".join(list(dict.fromkeys(tried))[:8]))
 
 CFG = load_spec()
 CONV = CFG["conveyor"]
