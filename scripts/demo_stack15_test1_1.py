@@ -755,6 +755,9 @@ _PU_CROSS = (None if not _PU_CROSS
              else (min(_PU_CROSS) / 1000.0, max(_PU_CROSS) / 1000.0))
 
 
+_STUCK_SINCE = {}                      # box_id -> 픽업 구간에서 처음 본 시각
+
+
 def _stuck_box(link, ids):
     """픽업 구간에 들어와 있는데 `pickup_check` 가 못 잡는 박스 중 **가장 앞선 것**.
 
@@ -843,6 +846,21 @@ ROUTE = cfg.get("routing") or {}
 ROUTE_ON = bool(ROUTE) and os.environ.get("PL_ROUTE", "1") not in ("", "0")
 
 
+def _route_map():
+    """분류 기준 -> (표, 박스에서 열쇠를 뽑는 함수).
+
+    ★ 2026-08-25 부터 기본은 **색**이다. 예전 크기 기준(`by_type`)은 색표가 없는
+      설정에서만 쓴다 — test1-1 처럼 색을 안 쓰는 씬을 위한 하위호환이다.
+    """
+    bc = ROUTE.get("by_color")
+    if bc:
+        return ({str(k): str(v) for k, v in bc.items()},
+                lambda sp: sp.get("color"))
+    bt = ROUTE.get("by_type") or {}
+    return ({str(k): str(v) for k, v in bt.items()},
+            lambda sp: sp.get("name"))
+
+
 def router_thread(specs, ids):
     """색(=크기)으로 목적지 존을 정하고, 그 분기점에서 본선을 +Y 로 꺾는다.
 
@@ -857,7 +875,7 @@ def router_thread(specs, ids):
     """
     import sim_link as SL
     link = SL.SimLink(port=PORT)
-    by_type = {str(k): str(v) for k, v in (ROUTE.get("by_type") or {}).items()}
+    kind_of, key_of = _route_map()
     jx = {k: (v[0] / 1000.0, v[1] / 1000.0)
           for k, v in (ROUTE.get("junction_x_mm") or {}).items()}
     mseg = ROUTE.get("main_seg") or {}
@@ -874,7 +892,8 @@ def router_thread(specs, ids):
     # ★ 꺾은 채로 두면 그 조각 위의 뒤차가 전부 옆으로 밀린다. 실측 2026-08-24:
     #   복귀를 안 시켰더니 박스 6 개가 분기점에 뭉쳐 라인이 막혔다.
     DIV_TIMEOUT_S = float(os.environ.get("PL_DIV_TIMEOUT", "45"))
-    log("   [라우팅] 켬 — %s" % ", ".join("%s->%s" % kv for kv in sorted(by_type.items())))
+    log("   [라우팅] 켬 — %s" % ", ".join("%s->%s" % kv
+                                              for kv in sorted(kind_of.items())))
     try:
         while not _S["done"]:
             poses = {}
@@ -885,7 +904,7 @@ def router_thread(specs, ids):
                 if r.get("ok"):
                     poses[bid] = r["pos_m"]
             for bid, p in list(poses.items()):
-                z = by_type.get(specs[bid]["name"])
+                z = kind_of.get(key_of(specs[bid]))
                 if z is None or z not in jx or z not in mseg:
                     continue
                 lo, hi = jx[z]
@@ -942,8 +961,9 @@ def router_thread(specs, ids):
                     _S["diverting"] = _S.get("diverting", 0) + 1
                     # 계량이 세워 뒀을 수 있으니 이 조각만 직접 돌린다.
                     link.call(cmd="set_velocity", seg=seg, mps=BELT_MPS)
-                    log("   [라우팅] %s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
-                        % (bid, specs[bid]["name"], z, p[0]))
+                    log("   [라우팅] %s %-5s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
+                        % (bid, specs[bid].get("color", "-"),
+                           specs[bid]["name"], z, p[0]))
                 else:
                     log("   [라우팅] !! set_direction %s -> %r" % (seg, r))
             time.sleep(0.15)
@@ -990,10 +1010,11 @@ def spawner_thread(specs, ids):
                     log("   [투입] 백압 대기 %.0f s (버퍼 %d 대기 중)"
                         % (held, BUFFER_CAP))
             t = specs[bid]
-            r = link.call(cmd="spawn_box", box_id=bid, type=t["name"], yaw_deg=0)
+            r = link.call(cmd="spawn_box", box_id=bid, type=t["name"], yaw_deg=0,
+                          color=t.get("color"))
             st = link.call(cmd="spawn_status")
-            log("   [투입] %-9s %-3s  (라인 위 %s 개)"
-                % (bid, t["name"], st.get("on_belt", "?")))
+            log("   [투입] %-9s %-5s %-3s  (라인 위 %s 개)"
+                % (bid, t.get("color", "-"), t["name"], st.get("on_belt", "?")))
             if not r.get("ok"):
                 log("   [투입] !! spawn_box %s -> %r" % (bid, r))
     except Exception as e:
@@ -1099,7 +1120,7 @@ def worker(specs, ids):
         link.call(cmd="set_velocity", seg="main", mps=BELT_MPS)
         if ROUTE_ON:
             # 라우팅은 박스를 세 지선으로 나눠 보내므로 셋 다 돌아야 한다.
-            for _z in sorted(set((ROUTE.get("by_type") or {}).values())):
+            for _z in sorted(set(_route_map()[0].values())):
                 link.call(cmd="set_velocity", seg="%s_pickup" % _z.lower(),
                           mps=BELT_MPS)
         else:
@@ -1164,36 +1185,53 @@ def worker(specs, ids):
         while i < len(targets) and not _S["done"]:
             # ── 다음 박스가 스토퍼에 설 때까지 ──────────────
             pick, t0, nag = None, time.time(), 0.0
-            stuck_done = skipped = False
+            skipped = False
+            t_scan = 0.0
             while time.time() - t0 < ARRIVE_TIMEOUT_S and not _S["done"]:
                 c = link.call(cmd="pickup_check", zone=ZONE)
                 if c.get("present"):
                     pick = c
+                    _STUCK_SINCE.clear()
                     break
                 # ★ 낀 박스 탈출로. 픽업 구간에 박스가 **있는데** present 가 안 되면
                 #   그 박스는 기울었거나 물리가 틀어진 것이다. 지우고 계속 간다.
                 #   안 지우면 뒤차가 계속 밀려 라인이 통째로 굳는다.
-                if not stuck_done and time.time() - t0 > STUCK_S:
-                    stuck_done = True
+                #
+                #   ⚠ 타이머는 **그 박스가 구간에 머문 시간**이다. 처음에는 "작업자가
+                #     기다린 시간" 으로 쟀는데, 그러면 앞 박스를 오래 기다린 뒤 막
+                #     들어온 멀쩡한 박스가 즉시 지워진다 (실측 2026-08-25: BOX00008 이
+                #     진입 7 s 만에 지워졌다). 지선을 3 m 달리는 데만 6 s 가 걸린다.
+                now = time.time()
+                if now - t_scan >= 1.0:
+                    t_scan = now
                     sb = _stuck_box(link, ids)
-                    if sb is not None:
+                    if sb is None:
+                        _STUCK_SINCE.clear()
+                    else:
                         sid, spos = sb
-                        rr = link.call(cmd="despawn_box", box_id=sid)
-                        log("   !! %s 가 픽업 구간(%s %.2f m)에 %.0f s 째 끼어 있는데 "
-                            "집을 수 없다 — 지우고 계속한다 (%s)"
-                            % (sid, "xyz"[_PU_AX], spos[_PU_AX], STUCK_S,
-                               "ok" if rr.get("ok") else rr))
-                        _S["rows"].append(
-                            {"id": sid, "type": specs.get(sid, {}).get("name", "?"),
-                             "res": "STUCK", "err": (float("nan"),) * 3,
-                             "wall": time.time() - t0, "wait": time.time() - t0,
-                             "knock": 0.0, "who": "-", "kvec": (0.0, 0.0, 0.0),
-                             "near_mm": 0.0, "far_mm": 0.0, "place": None})
-                        if sid in targets:
-                            # 이 박스는 이 존 몫이었다. 처리한 것으로 세고 넘어간다.
-                            i += 1
-                            skipped = True
-                            break
+                        for k in [k for k in _STUCK_SINCE if k != sid]:
+                            del _STUCK_SINCE[k]
+                        held = now - _STUCK_SINCE.setdefault(sid, now)
+                        if held > STUCK_S:
+                            del _STUCK_SINCE[sid]
+                            rr = link.call(cmd="despawn_box", box_id=sid)
+                            log("   !! %s 가 픽업 구간(%s %.2f m)에 %.0f s 째 "
+                                "그대로인데 집을 수 없다 — 지우고 계속한다 (%s)"
+                                % (sid, "xyz"[_PU_AX], spos[_PU_AX], held,
+                                   "ok" if rr.get("ok") else rr))
+                            _S["rows"].append(
+                                {"id": sid,
+                                 "type": specs.get(sid, {}).get("name", "?"),
+                                 "res": "STUCK", "err": (float("nan"),) * 3,
+                                 "wall": held, "wait": now - t0,
+                                 "knock": 0.0, "who": "-",
+                                 "kvec": (0.0, 0.0, 0.0),
+                                 "near_mm": 0.0, "far_mm": 0.0, "place": None})
+                            if sid in targets:
+                                # 이 존 몫이었다. 처리한 것으로 세고 넘어간다.
+                                i += 1
+                                skipped = True
+                                break
                 # 안 오면 어디에 있는지 주기적으로 찍는다. 이게 없으면 타임아웃
                 # 났을 때 "안 왔다" 는 사실만 남고 원인을 못 찾는다
                 # (2026-08-23 15번째가 180 s 동안 안 와서 겪었다).
@@ -1612,19 +1650,31 @@ def on_step(dt):
                     "상자 구성은 사양 seed 그대로다.")
             ids = [BOX_ID_FMT % i for i in range(N)]
             specs = {bid: dict(t) for bid, t in zip(ids, fed)}
-            log("박스      %d 개  %s" % (N, [t["name"] for t in fed]))
+            # ★ 색은 크기와 **독립**으로 뽑는다 (2026-08-25).
+            #   분류 기준이 크기 -> 색으로 바뀌었으므로, 한 존의 팔레트에는 그 색의
+            #   3·4·5 호가 섞여 들어와야 패커가 실제로 일한다.
+            #   재현성을 위해 박스 구성과 같은 seed 를 쓴다.
+            _colors = sorted((cfg["boxes"].get("colors") or {}).keys())
+            if _colors:
+                import random as _rnd
+                _cr = _rnd.Random(int(SEED) if SEED is not None
+                                  else int(cfg["boxes"].get("random_seed", 42)))
+                for bid in ids:
+                    specs[bid]["color"] = _cr.choice(_colors)
+            log("박스      %d 개  %s" % (N,
+                ["%s/%s" % (t["name"], specs[b].get("color", "-"))
+                 for b, t in zip(ids, fed)]))
             # ★ 라우팅을 켜면 **이 존 색깔의 박스만** 이 로봇의 몫이다.
             #   나머지는 다른 지선으로 가서 그 존의 로봇을 기다린다 (1 존만 돌리는
             #   실행에서는 지선에 그대로 선다). 목표 개수를 N 으로 두면 남의 박스를
             #   기다리다 늘 실패로 끝난다.
-            _by_t = {str(k): str(v) for k, v in (ROUTE.get("by_type") or {}).items()}
-            if ROUTE_ON and _by_t:
-                _S["targets"] = [b for b in ids
-                                 if _by_t.get(specs[b]["name"]) == ZONE]
+            _map, _key = _route_map()
+            if ROUTE_ON and _map:
+                _S["targets"] = [b for b in ids if _map.get(_key(specs[b])) == ZONE]
                 _other = len(ids) - len(_S["targets"])
                 log("존 %s 몫  %d 개 (%s)  · 다른 존으로 %d 개"
                     % (ZONE, len(_S["targets"]),
-                       ",".join(k for k, v in sorted(_by_t.items()) if v == ZONE),
+                       ",".join(k for k, v in sorted(_map.items()) if v == ZONE),
                        _other))
             else:
                 _S["targets"] = list(ids)
