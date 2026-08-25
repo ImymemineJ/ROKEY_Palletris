@@ -60,10 +60,22 @@
 
 ## 4. 실시간으로 보려면
 
+**ROS 모드 (기본).** 관제탑·로봇이 돌고 있으면 뷰어만 띄우면 붙는다 —
+`/robot/event` 의 실측 pose 와 `/zone_<z>/status` 를 듣는다.
+
+```bash
+ros2 run packing_algo live_view --ros-args -p use_sim_time:=true -p zone:=b
+```
+
+⚠ **로봇보다 먼저 띄울 것.** 지난 이벤트는 다시 오지 않으므로 늦게 띄우면
+그 전에 놓인 박스가 화면에 없다 (관제탑 집계와 어긋나면 화면에 경고가 뜬다).
+
+**파일 모드.** ROS 없이 알고리즘만 확인할 때.
+
 ```bash
 ros2 run packing_algo algo_service_node --ros-args \
     -p use_sim_time:=true -p snapshot_path:=/tmp/algo_state.json
-ros2 run packing_algo live_view -p /tmp/algo_state.json -z b
+python3 -m packing_algo.live_view --source file -p /tmp/algo_state.json -z b
 ```
 
 위 그림과 같은 화면이 실시간으로 갱신된다. Isaac 창 옆에 띄워 두고 본다.
