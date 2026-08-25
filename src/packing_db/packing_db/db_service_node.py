@@ -52,7 +52,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from packing_common.config import find_config, load
-from packing_msgs.msg import BoxInfo, ZoneStatus
+from packing_db.metrics import collect, fmt_rate
+from packing_msgs.msg import BoxInfo, MetricsSummary, ZoneStatus
 from packing_msgs.srv import (DiverterRequest, GetBoxInfo, MarkPlaced, RegisterBox,
                               SetStatus, VerifyBox, ZoneQueue)
 
@@ -119,12 +120,19 @@ class DbService(Node):
         #   버퍼 잔량·예상 여유시간을 직접 계산하던 옛 방식은 관제탑과 계산이
         #   어긋나면 조용히 잘못 보낸다. 판단 주체를 관제탑 하나로 몰아 둔다.
         self._accepting = {}                     # zone(대문자) → bool
+        # ★ fill_rate·max_height_mm 은 DB 가 모른다 — heightmap 을 가진 algo 만 안다.
+        #   유일한 유입 경로가 관제탑의 ZoneStatus 다. 여기서 받아 지표에 얹는다.
+        self._zone_cache = {}                    # zone → (fill_rate, max_height_mm)
+        self._metrics_zone = str(self.cfg["boxes"]["stage1"]["zone"]).upper()
         for z in self.cfg["zones"]["list"]:
             self.create_subscription(
                 ZoneStatus, f"/zone_{z.lower()}/status",
                 self._on_zone_status, 10, callback_group=cb)
 
-        self.create_timer(10.0, self._log_metrics, callback_group=cb)
+        # ★ /metrics/summary — 전용 타입이다. JSON 문자열이 아니다 (CLAUDE.md §11).
+        self.pub_metrics = self.create_publisher(MetricsSummary, "/metrics/summary", 10)
+        self.create_timer(1.0, self._publish_metrics, callback_group=cb)
+        self._log_every, self._log_n = 10, 0
         self.get_logger().info(
             f"db_service_node 준비 — {self.db_path} · master {n} 행 · "
             f"max_retry {self._max_retry}")
@@ -201,7 +209,9 @@ class DbService(Node):
             f"SELECT {column} FROM recirculation WHERE box_id=?", (box_id,)).fetchone()[0]
 
     def _on_zone_status(self, msg):
-        self._accepting[msg.zone.upper()] = bool(msg.accepting)
+        z = msg.zone.upper()
+        self._accepting[z] = bool(msg.accepting)
+        self._zone_cache[z] = (float(msg.fill_rate), int(msg.max_height_mm))
 
     # ══════════════════════════════════════════════════════════════
     # /db/register_box  — cam1 판독 결과. 여기서 boxes_sorted 행이 처음 생긴다
@@ -417,25 +427,42 @@ class DbService(Node):
         return res
 
     # ══════════════════════════════════════════════════════════════
-    # 지표 — 새 인터페이스에 metrics 토픽 타입이 없으므로 로그로만 낸다.
-    #        타입을 지어내지 않는다 (CLAUDE.md §11).
+    # 지표 — /metrics/summary 로 1 Hz 발행 (작업명세서 §8.6)
+    #   쿼리는 packing_db.metrics 에 있다. scripts/report.py 가 같은 것을 쓴다 —
+    #   복붙하면 실시간 화면과 최종 보고서의 숫자가 갈린다.
     # ══════════════════════════════════════════════════════════════
-    def _log_metrics(self):
-        q = self.db.execute
-        total = q("SELECT COUNT(*) FROM boxes_master").fetchone()[0]
-        # ★ 분모가 boxes_master 다. boxes_sorted 를 분모로 쓰면 등록된 박스만
-        #   세게 되어 인식률이 언제나 100 % 로 나온다 (명세서 §8.6 의 함정).
-        scanned = q("SELECT COUNT(DISTINCT box_id) FROM box_events "
-                    "WHERE status='SCANNED'").fetchone()[0]
-        placed = q("SELECT COUNT(*) FROM boxes_sorted WHERE status='PLACED'").fetchone()[0]
-        failed = q("SELECT COUNT(*) FROM boxes_sorted "
-                   "WHERE status='PICK_FAILED'").fetchone()[0]
-        cyc = q("SELECT AVG(placed_at - picked_at) FROM boxes_sorted "
-                "WHERE status='PLACED' AND picked_at IS NOT NULL").fetchone()[0]
-        self.get_logger().info(
-            f"[지표] 인식 {scanned}/{total} · 적재 {placed} · 픽실패 {failed} · "
-            f"사이클 {cyc:.1f}s" if cyc else
-            f"[지표] 인식 {scanned}/{total} · 적재 {placed} · 픽실패 {failed}")
+    def _publish_metrics(self):
+        try:
+            m = collect(self.db, self._metrics_zone)
+        except Exception as e:                      # noqa: BLE001
+            # 지표 하나 때문에 노드가 죽으면 안 된다 (CLAUDE.md §9).
+            self.get_logger().error(f"지표 계산 실패: {e}")
+            return
+
+        fill, maxh = self._zone_cache.get(self._metrics_zone, (0.0, 0))
+        msg = MetricsSummary(
+            stamp=self.get_clock().now().to_msg(),
+            elapsed_s=float(m["elapsed_s"]),
+            total_boxes=m["total_boxes"], scanned_count=m["scanned_count"],
+            placed_count=m["placed_count"], pick_failed_count=m["pick_failed_count"],
+            rejected_count=m["rejected_count"], queue_len=m["queue_len"],
+            recognition_rate=float(m["recognition_rate"]),
+            place_success_rate=float(m["place_success_rate"]),
+            cycle_avg_s=float(m["cycle_avg_s"]),
+            robot_idle_rate=float(m["robot_idle_rate"]),
+            fill_rate=fill, max_height_mm=maxh, zone=self._metrics_zone.lower())
+        self.pub_metrics.publish(msg)
+
+        # 로그는 10 번에 한 번만. 1 Hz 로 찍으면 다른 로그가 안 보인다.
+        self._log_n += 1
+        if self._log_n % self._log_every == 0:
+            self.get_logger().info(
+                f"[지표] 인식 {m['scanned_count']}/{m['total_boxes']} "
+                f"({fmt_rate(m['recognition_rate'])}) · 적재 {m['placed_count']} "
+                f"· 성공률 {fmt_rate(m['place_success_rate'])} "
+                f"· 사이클 {fmt_rate(m['cycle_avg_s'], pct=False)}s "
+                f"· 유휴 {fmt_rate(m['robot_idle_rate'])} "
+                f"· 충전율 {fill * 100:.1f}% · 최고 {maxh}mm")
 
     def destroy_node(self):
         try:

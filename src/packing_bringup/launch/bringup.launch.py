@@ -19,9 +19,18 @@ Isaac(Action Graph)이 내는 것은 여기서 안 띄운다 — /clock · /tf �
   rclpy 가 콜백 예외를 삼켜서 **에러 한 줄 없이** 박스가 영영 안 온다.
   노드를 손으로 띄우면 매번 붙여야 하니 launch 한 곳에서 건다.
 
-⚠ use_sim_time:=true 인데 /clock 발행자가 없으면 ROS 시계가 0 에 멈춘다.
-  Isaac 없이 ROS 그래프만 돌려볼 때는 use_sim_time:=false 로 두거나,
-  scripts/verify_ros_graph.py 처럼 /clock 을 내주는 대역을 같이 띄운다.
+⚠⚠ use_sim_time:=true 인데 /clock 발행자가 없으면 **모든 타이머가 멎는다.**
+  타임스탬프만 0 이 되는 게 아니다 — ROS 시계가 0 에 멈춰 create_timer 가
+  영원히 안 뜬다. 실측으로 확인했다:
+    · ZoneStatus 2 Hz 발행 안 됨
+    · /metrics/summary 1 Hz 발행 안 됨
+    · ★ 관제탑의 로봇 20초 타임아웃 감시도 안 돎 — 로봇이 응답을 안 해도
+      영원히 기다린다. "예외 처리(크래시 없음)" 가 통째로 무력해진다.
+  노드는 멀쩡히 살아 있고 에러도 안 난다. 그래서 원인 찾기가 제일 어렵다.
+
+  → Isaac(Action Graph)을 **먼저** 띄우고 이 launch 를 올린다.
+  → Isaac 없이 ROS 그래프만 볼 때는 use_sim_time:=false.
+  → scripts/verify_ros_graph.py 는 /clock 을 스스로 내주므로 true 로 둬도 된다.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction
