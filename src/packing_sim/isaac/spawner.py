@@ -54,7 +54,7 @@ PHYS_MAT_PATH = LOOKS_ROOT + "/PhysicsMaterial"          # 씬 빌더가 만든�
 #   곳이 없으므로 전부 한 색으로 낸다. 종류(3·4·5호)는 치수와 무게로 이미 구분되고,
 #   `box_type` 속성으로도 씬에서 읽을 수 있다 (§5.5 ground truth).
 #   종류별 색은 stage 2 에서 존 A/B/C 로 갈라 보낼 때 되살릴 것이라 지우지 않는다.
-LINE_COLOR = (1.0, 0.15, 0.15)            # 라인 색 — 빨강
+LINE_COLOR = (1.0, 0.15, 0.15)            # 색을 안 준 박스의 기본 — 빨강
 LINE_MAT = LOOKS_ROOT + "/BoxLine"
 # --- stage 2 (존 분류) 용. 지금은 안 쓴다 ---------------------------------
 # BOX_SLUG = {"3호": "No3", "4호": "No4", "5호": "No5"}
@@ -77,6 +77,18 @@ LABEL_LIFT_M = 0.001                      # 윗면에서 1 mm 띄운다 (z-fight
 #   USD 의 st 원점(좌하)과 PNG 원점(좌상)이 달라서 한 번 뒤집어 주는 것이 기본이다.
 #   씬에서 라벨이 육안으로는 멀쩡한데 cam1 이 못 읽으면 **먼저 이 값을 뒤집어 볼 것.**
 LABEL_FLIP_V = True
+
+# ── 분류 (2026-08-25) ──────────────────────────────────────
+# ★ 분류 기준이 **색 -> QR(배송지)** 로 바뀌었다.
+#   그래서 박스 색은 **하나로 통일**한다 (LINE_COLOR). 목적지는 프림의 `box_dest`
+#   속성이 ground truth 이고, 실물에서는 QR 이 그 값을 싣는다.
+#   색 기능(`boxes.colors` · spawn 의 color 인자)은 지우지 않고 남겨 둔다 —
+#   1 차 색상 판정으로 되돌릴 수 있어야 한다 (CLAUDE.md §6: 1 차 색상 · 2 차 QR).
+#   색표를 안 주면 아무도 색을 안 쓰고 전부 LINE_COLOR 다.
+DEFAULT_COLORS = {"red": (1.0, 0.15, 0.15),
+                  "green": (0.15, 0.9, 0.25),
+                  "blue": (0.2, 0.35, 1.0)}
+COLOR_MAT_FMT = LOOKS_ROOT + "/Box_%s"
 # 스토퍼 앞 이 거리 안에 박스 **앞면**이 오고 거의 멎으면 픽업 대기로 본다.
 PICKUP_MARGIN_M = 0.060                   # 트랙A 가이드 §A6~A8 의 60 mm
 PICKUP_VEL_MPS = 0.01                     # |vx| < 1 cm/s
@@ -102,7 +114,7 @@ def _yaw_deg(quat):
 
 
 class Spawner:
-    def __init__(self, stage, cfg, mainq, zone="B", log=print):
+    def __init__(self, stage, cfg, mainq, zone="B", log=print, zones=None):
         self.stage = stage
         self.cfg = cfg
         # ★ USD 쓰기(스폰·디스폰)는 메인 스레드에서. mainq.py docstring 참조.
@@ -114,11 +126,44 @@ class Spawner:
         self.types = {t["name"]: t for t in cfg["boxes"]["types"]}
         sp = cfg["conveyor"]["spawn_point_mm"]
         self.spawn_xyz_m = [v / 1000.0 for v in sp]
-        self.stopper_x_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        # ★ 픽업 축 (2026-08-24 추가). test1-1 은 벨트가 **+X** 로 흘러 스토퍼가
+        #   x=10000 에 있지만, 셀마다 메인 라인에서 **+Y** 로 갈라지는 지선을 쓰는
+        #   배치(test_3)도 있다. 축을 설정으로 받아 아래 판정이 pos[axis] 를 보게 한다.
+        #   기본이 "x" 라 이 키가 없는 기존 씬은 동작이 하나도 안 바뀐다.
+        #   ⚠ 두 축 모두 **진행이 증가 방향**(+X / +Y)이라는 전제다. 감소 방향
+        #     라인이 생기면 부호까지 파라미터로 빼야 한다.
+        _ax = str(cfg["conveyor"].get("pickup_axis", "x")).lower()
+        if _ax not in ("x", "y"):
+            raise ValueError("conveyor.pickup_axis 는 x | y 여야 한다: %r" % _ax)
+        self.axis = 0 if _ax == "x" else 1
+        self.axis_name = _ax
+        # 스토퍼/픽업 구간은 **위 축을 따라** 잰 값이다 (키 이름은 옛 것을 유지한다).
+        self.stopper_pos_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
         # 픽업 판정 구간. **위쪽 경계가 없으면 팔레트에 놓인 박스가 다시 잡힌다** —
         # 아래 `_refresh` 주석의 실측 참조.
-        self.pickup_x0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
+        self.pickup_p0_m = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
         self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
+        # ★ 가로축 창 (2026-08-24 추가). 지선이 여러 갈래인 배치(test_3)에서는
+        #   진행축만 봐서는 **어느 지선에 있는 박스인지** 구분이 안 된다.
+        #   실측: 존 A 로 돌렸는데 존 B(X -12.9)·C(X -18.9) 지선에 놓인 박스를
+        #   집으려다 IK_FAIL 3 연발이 났다. 이 창이 없으면 그 일이 다시 난다.
+        #   키가 없으면 제한 없음 — test1-1 은 지선이 하나라 동작이 안 바뀐다.
+        #
+        # ★ 다존 (2026-08-25). 로봇 3 대를 동시에 돌리려면 픽업 감지가 **존마다**
+        #   따로 있어야 한다. `zones` 를 주면 그만큼 창을 만든다. 안 주면 `zone`
+        #   하나뿐이라 기존 동작이 하나도 안 바뀐다 (test1-1 기준선 보호).
+        self.zones = [str(z) for z in (zones or [zone])]
+        if zone not in self.zones:
+            self.zones.insert(0, zone)
+        _xtab = (cfg["zones"].get("pickup_cross_mm") or {})
+        self.cross_axis = 1 - self.axis
+        self.cross_by_zone = {}
+        for _z in self.zones:
+            _c = _xtab.get(_z)
+            self.cross_by_zone[_z] = ((min(_c) / 1000.0, max(_c) / 1000.0)
+                                      if _c else None)
+        # 기본 존 창 — 이름을 유지해 기존 코드가 그대로 돈다.
+        self.cross_range_m = self.cross_by_zone.get(zone)
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
         # ── QR 라벨 설정. 없거나 꺼져 있으면 라벨 없이 그냥 돈다 ──
         _qr = (cfg.get("recognition") or {}).get("qr") or {}
@@ -133,6 +178,11 @@ class Spawner:
             _dir = os.path.join(_ws, _dir)
         self.label_dir = _dir
         self._label_warned = False
+        # 색표. 설정에 없으면 **색을 아예 안 쓴다** — 박스는 전부 LINE_COLOR 다.
+        #   (QR 분류로 바뀌면서 색은 통일했다. DEFAULT_COLORS 는 되돌릴 때 참고용.)
+        _cols = cfg["boxes"].get("colors") or {}
+        self.colors = {str(k): tuple(float(v) for v in rgb)
+                       for k, rgb in _cols.items()}
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
         # 원점은 **모서리**이고 z 는 **상면**이다 (작업명세서 §3.3).
         _po = cfg["zones"]["pallet_origin_world_mm"][zone]
@@ -155,11 +205,17 @@ class Spawner:
         self.lost = []                     # 라인을 벗어난 박스 (물리 파탄)
         self._snap = {}                    # box_id -> {"pos_m", "yaw_deg", "vel_mps"}
         self._pickup = {"present": False, "box_id": "", "pose": None}
+        self._pickup_by_zone = {}
 
         self._ensure_roots()
-        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 x %.3f~%.3f · 벨트 상면 %.3f "
-                  "· 경로 %s"
-                  % (self.spawn_xyz_m, self.pickup_x0_m, self.stopper_x_m,
+        self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
+                  "· 벨트 상면 %.3f · 경로 %s"
+                  % (self.spawn_xyz_m, self.axis_name, self.pickup_p0_m,
+                     self.stopper_pos_m,
+                     ("" if self.cross_range_m is None
+                      else " · %s %.3f~%.3f" % ("xyz"[self.cross_axis],
+                                                self.cross_range_m[0],
+                                                self.cross_range_m[1])),
                      self.belt_top_m, BOX_ROOT))
 
     # ── 등록 ────────────────────────────────────────────────
@@ -202,7 +258,7 @@ class Spawner:
         from pxr import UsdGeom as _UG
         cache = _UG.XformCache()
         snap = {}
-        best = None
+        best = {}          # zone -> (box_id, entry)  ★ 존마다 따로 고른다
         lost = []
         for box_id, rec in list(self.boxes.items()):
             prim = self.stage.GetPrimAtPath(rec["path"])
@@ -244,16 +300,29 @@ class Spawner:
             #    2) 앞면이 스토퍼 마진 안 — 실제로 벽에 닿아 섰다
             #    3) 밑면이 벨트 상면 — 집혀서 들린 것과 라인 밖으로 떨어진 것을 제외한다
             #    여기에 원래의 "거의 정지" 가 더해진다.
-            w, h = rec["dims"][0], rec["dims"][2]
-            front = pos[0] + w / 2.0
-            in_zone = self.pickup_x0_m <= pos[0] <= self.stopper_x_m
-            at_stopper = front > self.stopper_x_m - w / 2.0 - PICKUP_MARGIN_M
+            # ★ 진행방향 폭은 축에 따라 다르다. dims = (w, d, h) 이고 스폰 yaw 가 0
+            #   이므로 +X 진행이면 w(=dims[0]), +Y 진행이면 d(=dims[1]) 가 진행방향이다.
+            #   즉 dims[axis] 로 쓰면 두 축 모두 맞는다.
+            a = self.axis
+            w, h = rec["dims"][a], rec["dims"][2]
+            front = pos[a] + w / 2.0
+            on_line = self.pickup_p0_m <= pos[a] <= self.stopper_pos_m
+            at_stopper = front > self.stopper_pos_m - w / 2.0 - PICKUP_MARGIN_M
             on_belt = abs(pos[2] - (self.belt_top_m + h / 2.0)) < PICKUP_Z_TOL_M
-            if (in_zone and at_stopper and on_belt
-                    and abs(entry["vel_mps"][0]) < PICKUP_VEL_MPS):
+            if not (on_line and at_stopper and on_belt
+                    and abs(entry["vel_mps"][a]) < PICKUP_VEL_MPS):
+                continue
+            # ★ 어느 존의 지선인지 가른다. 창이 없으면(test1-1) 모든 존이 받는다.
+            for _z in self.zones:
+                cr = self.cross_by_zone.get(_z)
+                if cr is not None:
+                    c = pos[self.cross_axis]
+                    if not (cr[0] <= c <= cr[1]):
+                        continue
                 # 여러 개가 줄 서면 **가장 앞선 것**이 집힐 차례다
-                if best is None or pos[0] > best[1]["pos_m"][0]:
-                    best = (box_id, entry)
+                cur = best.get(_z)
+                if cur is None or pos[a] > cur[1]["pos_m"][a]:
+                    best[_z] = (box_id, entry)
         for box_id, pos in lost:
             self.boxes.pop(box_id, None)
             self.lost.append(box_id)
@@ -261,12 +330,17 @@ class Spawner:
                       "물리가 터진 것이다 (관통 또는 큐 과압축)."
                       % (box_id, [round(v, 1) for v in pos]))
         self._snap = snap
-        if best is None:
-            self._pickup = {"present": False, "box_id": "", "pose": None}
-        else:
-            box_id, e = best
-            self._pickup = {"present": True, "box_id": box_id,
-                            "pose": {"pos_m": e["pos_m"], "yaw_deg": e["yaw_deg"]}}
+        pk = {}
+        for _z in self.zones:
+            b = best.get(_z)
+            if b is None:
+                pk[_z] = {"present": False, "box_id": "", "pose": None}
+            else:
+                box_id, e = b
+                pk[_z] = {"present": True, "box_id": box_id,
+                          "pose": {"pos_m": e["pos_m"], "yaw_deg": e["yaw_deg"]}}
+        self._pickup_by_zone = pk
+        self._pickup = pk[self.zone]
 
     # ── 소켓 핸들러 ─────────────────────────────────────────
     def h_spawn_box(self, req):
@@ -283,7 +357,12 @@ class Spawner:
         if box_id in self.boxes:
             return {"ok": False, "error": "이미 있는 box_id %s" % box_id}
         yaw = float(req.get("yaw_deg", self.default_yaw))
-        return self.mainq.run(lambda: self._spawn(box_id, tname, yaw))
+        color = req.get("color")
+        if color is not None and color not in self.colors:
+            return {"ok": False, "error": "모르는 color %r (있는 것: %s)"
+                    % (color, sorted(self.colors))}
+        dest = req.get("dest")
+        return self.mainq.run(lambda: self._spawn(box_id, tname, yaw, color, dest))
 
     def h_despawn_box(self, req):
         box_id = req.get("box_id")
@@ -307,9 +386,9 @@ class Spawner:
           안 비우면 패커가 **없어진 박스 위에** 다음 자리를 잡는다.
         """
         zone = (req or {}).get("zone", self.zone)
-        if zone != self.zone:
+        if zone not in self.zones:
             return {"ok": False, "error": "이 스포너는 존 %s 다 (요청 %s)"
-                    % (self.zone, zone), "removed": 0}
+                    % (",".join(self.zones), zone), "removed": 0}
         return self.mainq.run(self._swap_pallet)
 
     def h_spawn_status(self, req=None):
@@ -321,13 +400,23 @@ class Spawner:
         """
         on_belt = queue = 0
         for box_id, e in self._snap.items():
-            x, _y, z = e["pos_m"]
+            a = self.axis
+            p_axis, z = e["pos_m"][a], e["pos_m"][2]
             rec = self.boxes.get(box_id)
             if rec is None:
                 continue
             if abs(z - (self.belt_top_m + rec["dims"][2] / 2.0)) > PICKUP_Z_TOL_M:
                 continue                       # 벨트 위가 아니다 (팔레트·그리퍼·라인 밖)
-            if 0.0 <= x <= self.stopper_x_m:
+            if 0.0 <= p_axis <= self.stopper_pos_m:
+                # ★ 픽업 구간 계수도 **자기 지선만** 센다. 지선이 여러 갈래인
+                #   배치에서 남의 지선 박스를 세면 백압이 잘못 걸려, 이 존은
+                #   비어 있는데도 투입이 막힌다.
+                if (self.cross_range_m is not None
+                        and p_axis >= self.pickup_p0_m
+                        and not (self.cross_range_m[0]
+                                 <= e["pos_m"][self.cross_axis]
+                                 <= self.cross_range_m[1])):
+                    continue
                 on_belt += 1
                 # ★ **뒷면**이 경계를 넘어야 픽업 구간에 든 것으로 센다.
                 #   중심으로 세면 안 된다 — 박스가 경계에 걸친 순간 이미 1로 세어져
@@ -335,7 +424,7 @@ class Spawner:
                 #   위에 있어서 **멈춘 롤러가 붙잡는다.** b_pickup 이 밀어도 안
                 #   움직여 라인이 통째로 굳는다 (2026-08-23 실측: 5호가 x=7.59 에서
                 #   165 s 동안 정지, 처리 2/11).
-                if x - rec["dims"][0] / 2.0 >= self.pickup_x0_m:
+                if p_axis - rec["dims"][a] / 2.0 >= self.pickup_p0_m:
                     queue += 1                 # 픽업 구간 = 사양의 버퍼
         # ★ 스폰 지점이 비었는가. `main` 을 세워 두는 계량(metering) 운전에서는
         #   앞차가 안 빠진 채 다음 박스를 내면 **같은 자리에 겹쳐 스폰된다.**
@@ -373,10 +462,12 @@ class Spawner:
           KeyError 가 안 나야 한다.
         """
         zone = (req or {}).get("zone", self.zone)
-        if zone != self.zone:
+        if zone not in self.zones:
             return {"present": False, "box_id": "", "pose": None,
-                    "error": "이 스포너는 존 %s 다 (요청 %s)" % (self.zone, zone)}
-        return dict(self._pickup)
+                    "error": "이 스포너가 아는 존은 %s 다 (요청 %s)"
+                             % (",".join(self.zones), zone)}
+        return dict(self._pickup_by_zone.get(zone) or
+                    {"present": False, "box_id": "", "pose": None})
 
     def h_get_box_pose(self, req):
         box_id = req.get("box_id")
@@ -404,8 +495,10 @@ class Spawner:
             self._log("[spawner] 물리 머티리얼을 새로 만들었다 %s (정지 %.2f · 운동 %.2f)"
                       " — 씬 빌더를 다시 돌리는 편이 낫다"
                       % (PHYS_MAT_PATH, self.mu_s, self.mu_d))
-        # 라인이 하나라 머티리얼도 하나다 (위 BOX_COLOR 주석 참고).
-        for mp, rgb in ((LINE_MAT, LINE_COLOR),):
+        # 기본 색 하나 + 분류용 색 머티리얼들.
+        _mats = [(LINE_MAT, LINE_COLOR)]
+        _mats += [(COLOR_MAT_FMT % c, rgb) for c, rgb in sorted(self.colors.items())]
+        for mp, rgb in _mats:
             if self.stage.GetPrimAtPath(mp):
                 continue
             mat = UsdShade.Material.Define(self.stage, mp)
@@ -416,14 +509,15 @@ class Spawner:
             sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
             mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
 
-    def _spawn(self, box_id, tname, yaw_deg):
+    def _spawn(self, box_id, tname, yaw_deg, color=None, dest=None):
         t = self.types[tname]
         dims = (t["w_mm"] / 1000.0, t["d_mm"] / 1000.0, t["h_mm"] / 1000.0)
         mass = t["mass_g"] / 1000.0
         x, y, z_bottom = self.spawn_xyz_m
         pos = (x, y, z_bottom + dims[2] / 2.0)          # ★ 밑면 -> 중심 (§5.5)
         path = BOX_PRIM_FMT % box_id
-        self._make_box(path, tname, dims, pos, yaw_deg, mass, box_id)
+        self._make_box(path, tname, dims, pos, yaw_deg, mass, box_id, color,
+                       dest)
         # ★ 프림을 지우지 않으므로 같은 경로가 이미 있을 수 있다 — 그 프림은
         #   `_detach` 로 **콜라이더가 꺼지고 키네마틱에 보이지도 않는** 상태다
         #   (despawn 또는 park_all 을 거친 것). 그대로 두면 스폰은 됐는데 벨트를
@@ -438,11 +532,12 @@ class Spawner:
             if _rb:
                 _rb.CreateKinematicEnabledAttr(False)
             UsdGeom.Imageable(_prim).MakeVisible()
-        self.boxes[box_id] = {"path": path, "dims": dims, "type": tname}
+        self.boxes[box_id] = {"path": path, "dims": dims, "type": tname,
+                              "color": color, "dest": dest}
         self.spawned += 1
-        self._log("[spawner] %s %s %dx%dx%d mm %.1f kg yaw %+.0f -> %s"
-                  % (box_id, tname, t["w_mm"], t["d_mm"], t["h_mm"], mass,
-                     yaw_deg, path))
+        self._log("[spawner] %s %s dest=%s %dx%dx%d mm %.1f kg yaw %+.0f -> %s"
+                  % (box_id, tname, dest or "-", t["w_mm"], t["d_mm"],
+                     t["h_mm"], mass, yaw_deg, path))
         return {"ok": True}
 
     def _detach(self, prim):
@@ -615,7 +710,8 @@ class Spawner:
         UsdShade.MaterialBindingAPI.Apply(m.GetPrim())
         UsdShade.MaterialBindingAPI(m.GetPrim()).Bind(mat)
 
-    def _make_box(self, path, tname, dims, pos, yaw_deg, mass, box_id):
+    def _make_box(self, path, tname, dims, pos, yaw_deg, mass, box_id,
+                  color=None, dest=None):
         """치수를 지오메트리에 굽는다 — `xformOp:scale` 을 안 쓴다.
 
         `spawn_feeder._make_box` 와 같은 형상이다. 거기 주석대로 scale 자체는
@@ -636,7 +732,8 @@ class Spawner:
                                           1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7])
         mesh.CreateExtentAttr([Gf.Vec3f(-hx, -hy, -hz), Gf.Vec3f(hx, hy, hz)])
         mesh.CreateSubdivisionSchemeAttr("none")     # 없으면 모서리가 둥글어진다
-        mesh.CreateDisplayColorAttr([Gf.Vec3f(*LINE_COLOR)])
+        # displayColor 도 같이 준다 — 머티리얼을 못 찾는 뷰어에서도 색이 보인다.
+        mesh.CreateDisplayColorAttr([Gf.Vec3f(*self.colors.get(color, LINE_COLOR))])
 
         xf = UsdGeom.Xformable(prim)
         xf.ClearXformOpOrder()
@@ -661,8 +758,13 @@ class Spawner:
         # ground truth 조회용 (§5.5). DB 가 없어도 씬만으로 id 를 되찾을 수 있다.
         prim.CreateAttribute("box_id", Sdf.ValueTypeNames.String).Set(box_id)
         prim.CreateAttribute("box_type", Sdf.ValueTypeNames.String).Set(tname)
+        # ★ ground truth. 색은 1 차(HSV) 판정용, dest 는 2 차(QR) 판정용이다.
+        #   인식이 이 값을 맞히는지 대조한다.
+        prim.CreateAttribute("box_color", Sdf.ValueTypeNames.String).Set(color or "")
+        prim.CreateAttribute("box_dest", Sdf.ValueTypeNames.String).Set(dest or "")
 
-        mat = UsdShade.Material(self.stage.GetPrimAtPath(LINE_MAT))
+        _mp = COLOR_MAT_FMT % color if color in self.colors else LINE_MAT
+        mat = UsdShade.Material(self.stage.GetPrimAtPath(_mp))
         if mat:
             UsdShade.MaterialBindingAPI.Apply(prim)
             UsdShade.MaterialBindingAPI(prim).Bind(mat)

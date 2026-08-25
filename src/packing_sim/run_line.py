@@ -15,7 +15,8 @@ import os
 
 from isaacsim import SimulationApp
 
-import config as C
+from _cfgload import C          # ★ `import config` 는 Isaac 안에서 cv2 의
+                                #   config.py 를 잡는다. _cfgload docstring 참고.
 
 simulation_app = SimulationApp({"headless": C.HEADLESS})
 

@@ -81,10 +81,8 @@ class RosServices:
                                   z_mm=int(actual["z_mm"]),
                                   yaw_deg=float(actual.get("yaw_deg", 0.0))))), "update_heightmap")
         self.n.fill_rate = res.fill_rate
+        self.n.max_height_mm = res.max_height_mm     # ZoneStatus 로 그대로 중계한다
         self.n.placed_count = res.placed_count
-        # ★ 새 ZoneStatus 가 max_height_mm 을 싣는다. 계획값이 아니라 algo 가
-        #   실측 pose 로 갱신한 뒤 돌려준 값이라 그대로 중계하면 된다.
-        self.n.max_height_mm = res.max_height_mm
         return res.ok, f"{res.fill_rate * 100:.1f}%"
 
     def cancel_plan(self, zone, box_id):
@@ -139,8 +137,9 @@ class Orchestrator(Node):
         self.cycle = Cycle(self.link, self.svc, self.cfg, self.zone, log=self.get_logger().info)
 
         self.state, self.finished = "IDLE", False
+        self.accepting = True                        # §3-2: false = 더 보내지 마라
         self.fill_rate, self.placed_count = 0.0, 0
-        self.max_height_mm = 0
+        self.max_height_mm = 0                       # UpdateHeightmap 응답에서 받는다
         self.placed = self.dropped = self.failed = 0
         self.create_timer(0.5, self.on_status, callback_group=cb)
         self.get_logger().info(f"orchestrator 시작 — zone={self.zone} · 박스 {self.total}개 · "
@@ -148,7 +147,7 @@ class Orchestrator(Node):
 
     # ── 소켓 호출은 전부 여기를 지난다 ──
     def sim(self, _slow=None, **req):
-        """★ 끊겨도 죽지 않는다. state="BLOCKED" 로 떨어뜨리고 재연결에 맡긴다.
+        """★ 끊겨도 죽지 않는다. accepting=false 로 떨어뜨리고 재연결에 맡긴다.
 
         Cycle.run() 안쪽은 cycle.py 가 예외를 잡아 주지만, **사이클 밖**(spawn_box ·
         pickup_check · despawn_box · set_velocity)은 맨몸이었다. 거기서 예외가 나면
@@ -161,12 +160,14 @@ class Orchestrator(Node):
         try:
             return self.link.call_slow(_slow, **req) if _slow else self.link.call(**req)
         except (OSError, ConnectionError, ValueError) as e:
-            self.get_logger().error(f"Isaac 소켓 끊김({e}) — state=BLOCKED, 재연결 시도")
+            self.get_logger().error(f"Isaac 소켓 끊김({e}) — accepting=false, 재연결 시도")
             try:
                 self.link.close()
             except OSError:
                 pass
-            self.link, self.state = None, "BLOCKED"
+            # ★ "BLOCKED" 는 §3-2 의 state 값이 아니다 (7상태뿐). 못 받는다는 건
+            #   state 가 아니라 **accepting=false** 로 알린다 — 중재자는 그 칸만 본다.
+            self.link, self.accepting = None, False
             return {}
 
     def ensure_link(self):
@@ -181,7 +182,7 @@ class Orchestrator(Node):
             # ★ Cycle 을 새로 만들지 않는다. _stack_top_m(누적 적재 최상단, 42690a9)이
             #   0 으로 돌아가면 재연결 뒤 첫 이송이 적재물 높이를 잊고 기둥을 지나간다.
             self.link = self.svc.link = self.cycle.link = link
-            self.state = "IDLE"
+            self.state, self.accepting = "IDLE", True
             self.get_logger().info("Isaac 소켓 재연결 — 사이클 재개")
         return self.link is not None
 
@@ -190,8 +191,8 @@ class Orchestrator(Node):
         try:
             self._loop()
         except Exception as e:                       # noqa: BLE001 — 조용히 죽지 않게
-            self.state = "BLOCKED"
-            self.get_logger().error(f"워커 스레드 중단: {e!r} — state=BLOCKED 로 남깁니다")
+            self.accepting = False
+            self.get_logger().error(f"워커 스레드 중단: {e!r} — accepting=false 로 남깁니다")
 
     def _loop(self):
         log = self.get_logger()
@@ -233,7 +234,10 @@ class Orchestrator(Node):
                 self.failed += 1
                 continue
 
-            self.state = "BUSY"
+            # ★ §3-2 의 7상태만 쓴다. 사이클 알맹이는 Cycle 안에 있어 여기서
+            #   PICKING/PLACING/UPDATING 을 나눠 볼 수 없다 — 대표값 하나로 둔다.
+            #   (세분화는 소켓을 걷어낸 진짜 ROS 관제탑에서 한다. §2)
+            self.state = "PICKING"
             res = self.cycle.run(box_id, pick)      # ★ 알맹이는 전부 Cycle 이 한다
             self.state = "IDLE"
 
@@ -271,28 +275,27 @@ class Orchestrator(Node):
         return None
 
     def finish(self, why):
-        # ★ ZoneStatus.state 는 "IDLE"|"BUSY"|"BLOCKED"|"PALLET_FULL" 뿐이다.
-        #   "DONE" 은 계약에 없는 값이라 중재자가 해석하지 못한다.
-        self.state = "PALLET_FULL" if why == "PALLET_FULL" else "IDLE"
+        # ★ ZoneStatus.state 는 관제탑 7상태다 (CLAUDE.md §3-2):
+        #   IDLE|FETCHING|PLANNING|PICKING|PLACING|UPDATING|DONE.
+        #   옛 계약("BUSY"|"BLOCKED"|"PALLET_FULL")은 폐기됐다. 끝났으면 DONE 이고,
+        #   "더 보내지 마라"는 state 가 아니라 **accepting=false** 로 알린다.
+        self.state = "DONE"
+        self.accepting = False
         self.finished = True
         self.get_logger().info(
             f"═══ 종료 ({why}) — 적재 {self.placed} · 버림 {self.dropped} · 실패 {self.failed} "
             f"· 적재율 {self.fill_rate * 100:.1f}% ═══")
 
     def on_status(self):
-        # ★ ZoneStatus 개편 (CLAUDE.md §3-2) 반영.
-        #   buffer_cap · est_free_time_s 는 사라졌다 — 중재자가 그 둘을 보고 계산하던
-        #   것을 이제 accepting 한 칸이 대신한다. "더 보내도 되나"만 알면 되기 때문이다.
         self.pub_status.publish(ZoneStatus(
-            zone=self.zone,
+            zone=self.zone.lower(),                  # §3-2 는 소문자 "a"|"b"|"c"
             state=self.state,
-            queue_len=0,                              # TODO(트랙 D): /db/zone_queue 중계
+            queue_len=0,                             # TODO(트랙 D): /db/zone_queue 중계
             placed_count=int(self.placed),
             rejected_count=int(self.dropped),
             fill_rate=float(self.fill_rate),
             max_height_mm=int(self.max_height_mm),
-            # 끝났거나 팔레트가 찼으면 더 받지 않는다.
-            accepting=(not self.finished) and self.state != "PALLET_FULL",
+            accepting=bool(self.accepting),
             stamp=self.get_clock().now().to_msg()))
 
 

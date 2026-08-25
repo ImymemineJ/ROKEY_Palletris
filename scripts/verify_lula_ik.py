@@ -99,7 +99,8 @@ def start_log(path):
     return tee
 
 
-def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False, asset=None):
+def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False, asset=None,
+             base_dy_mm=0.0):
     """h2017 을 씬에 올리고 Lula 를 물린다. **SimulationApp 이 이미 떠 있어야 한다.**
 
     반환 네임스페이스: world, art, lula, ik, base(m), ready(rad), hz, grip(m), cfg,
@@ -112,6 +113,10 @@ def bring_up(zone="B", ee=EE_FRAME, prim=PRIM, ground=True, render=False, asset=
     hz = cfg["physics"]["scene"]["time_steps_per_second"]
     grip = cfg["robot"]["gripper_length_mm"] / 1000.0
     base = np.array(cfg["zones"]["robot_base_world_mm"][zone], dtype=float) / 1000.0
+    # `base_dy_mm` 은 로봇을 월드 Y 로 미는 감도용 인자다 (장변 이격 조정).
+    # ★ 여기서 더해야 한다 — 아래 set_world_pose 가 world.reset() **앞**이라야
+    #   Lula 의 베이스 포즈와 씬이 어긋나지 않는다 (docstring 2번).
+    base = base + np.array([0.0, base_dy_mm / 1000.0, 0.0])
 
     asset = Path(asset) if asset else ASSET
     if not asset.exists():

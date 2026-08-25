@@ -1,14 +1,11 @@
-# orchestrator → algo.  놓은 뒤 heightmap 을 갱신한다.
-# ★ 반드시 실측 pose. 계획 pose 를 되보내면 오차가 누적돼
-#   알고리즘은 840mm 로 끝났다고 믿는데 실제 더미가 트럭 내치를 넘는다.
 string    zone
 string    box_id
 int32     size_w_mm
 int32     size_d_mm
 int32     size_h_mm
-PlacePose actual_pose
+PlacePose actual_pose      # ★ 실측 pose. 계획값을 되보내면 오차가 누적된다 (§3-4 규약 3번)
 ---
-bool      ok           # false = yaw 오차 5° 초과 경고. 로그만 남기고 진행
-float32   fill_rate
+bool      ok               # false = yaw 오차 초과 경고. B 는 로그만 남기고 계속 진행
+float32   fill_rate        # 분모는 실제 최고높이
 int32     placed_count
-int32     max_height_mm
+int32     max_height_mm    # ★ 관제탑이 ZoneStatus.max_height_mm 를 채우는 유일한 경로

@@ -3,7 +3,7 @@ project(packing_msgs)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Project Palletris 공용 인터페이스
-#  메시지 7 + 서비스 15 = 22개.
+#  메시지 8 + 서비스 17 = 25개.
 #  ★ 아래 목록에서 하나라도 빠지면 그 타입만 조용히 생성되지 않고,
 #    다른 사람이 import 할 때가 되어서야 에러가 난다. 반드시 전부 나열할 것.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14,7 +14,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED) # ZoneStatus.msg 의 Time
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  # ── 메시지 7 ──
+  # ── 메시지 8 ──
   "msg/PlacePose.msg"
   "msg/BoxInfo.msg"
   "msg/BoxAtPickup.msg"
@@ -22,6 +22,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotEvent.msg"
   "msg/ZoneStatus.msg"
   "msg/MetricsSummary.msg"
+  # ★ main 에서 옴 — §3 표에는 없지만 Isaac Action Graph 쪽에서 쓸 수 있어
+  #   남겨 둔다 (트랙 A 미결). 지우려면 트랙 A 확인 후.
+  "msg/SpawnEvent.msg"
 
   # ── /db/* 7 + /diverter/* 2 = 9 ──
   "srv/RegisterBox.srv"

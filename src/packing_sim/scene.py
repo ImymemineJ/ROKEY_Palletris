@@ -10,7 +10,8 @@ from __future__ import annotations
 import numpy as np
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
-import config as C
+from _cfgload import C          # ★ `import config` 는 Isaac 안에서 cv2 의
+                                #   config.py 를 잡는다. _cfgload docstring 참고.
 
 
 # ─────────────────────────────────────────────────────────────

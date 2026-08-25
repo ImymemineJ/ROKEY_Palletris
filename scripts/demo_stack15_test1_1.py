@@ -3,6 +3,20 @@
     cd ~/isaacsim && ./isaac-sim.sh --no-window \
         --exec /home/rokey/palletris_ws/scripts/demo_stack15_test1_1.py
 
+## 시작은 사람이 누른다 (창이 있는 실행)
+
+씬이 뜨고 카메라 창까지 준비되면 멈춰 서서 **Play 를 기다린다.** 이 드라이버는
+물리 스텝 콜백으로만 도니까, Play 가 안 눌리면 부팅 카운터부터 안 돈다.
+창이 없는 실행(게이트·검증)은 누를 사람이 없어 자동으로 누른다. `PL_AUTOPLAY` 로
+어느 쪽이든 강제할 수 있다.
+
+  ⚠ **일시정지와 Stop 은 아직 못 이어간다.** 둘 다 그 실행을 거기서 끝낸다 —
+    Stop 은 물리 뷰를 무효화해 로봇·그리퍼 핸들을 죽이고 쌓아 둔 팔레트도 되감고,
+    일시정지는 이 드라이버의 타이머가 전부 **벽시계**라(스폰 간격·도착 180 s·
+    사이클 120 s·워치독 900 s) 물리만 멈춘 사이에 시계가 계속 가서 타임아웃이 터진다.
+    둘 다 고치려면 타이머를 시뮬 시간으로 옮기고(일시정지) 수명주기를 재초기화
+    가능하게(Stop) 만들어야 한다 — 별건이다.
+
 ## 화면 둘 (시연, demo 모드)
 
     view2  Isaac 창 안에 두 번째 뷰포트가 자동으로 뜬다 — **벨트 위 하향 카메라**
@@ -89,10 +103,34 @@ import demo_stack15 as D                                 # B5 산출물 그대�
 
 STAGE = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/project_1/test1-1.usd")
 PORT = int(os.environ.get("PL_PORT", "8797"))            # 8765=sim_main · 8798=B5 · 8799=B4
-ROBOT_PRIM = "/World/robot"
+# ★ 로봇 프림을 환경변수로 받는다 (2026-08-24). test1-1 은 로봇이 한 대라
+#   "/World/robot" 하나면 됐지만, 셀이 셋인 씬(test_3)은 robot_A/B/C 다.
+#   이 드라이버는 여전히 **한 번에 한 대**만 돌린다 — 어느 대를 돌릴지만 고른다.
+ROBOT_PRIM = os.environ.get("PL_ROBOT_PRIM", "/World/robot")
+# 스토퍼도 같이 받는다 — 셀이 셋인 씬은 Stopper_A/B/C 로 존마다 따로 있다.
+# 존재 확인에만 쓴다 (판정 좌표는 conveyor.stopper_x_mm 이 준다).
+STOPPER_PRIM = os.environ.get("PL_STOPPER_PRIM", "/World/Stopper")
 GRIPPER_PRIM = ROBOT_PRIM + "/SurfaceGripper"
 EE_FRAME = "tool0"
-ZONE = "B"
+# 존도 같이 받는다 — 팔레트 원점이 존별이라 로봇과 짝이 맞아야 한다.
+ZONE = os.environ.get("PL_ZONE", "B")
+# ★ 로봇 여러 대를 **동시에** 돌린다 (2026-08-25). `PL_ZONES=A,B,C` 로 켠다.
+#   안 주면 `PL_ZONE` 하나뿐이라 기존 동작이 하나도 안 바뀐다 (test1-1 기준선).
+#   존마다 로봇·그리퍼 prim 이름은 `<PL_ROBOT_FMT>` 로 만든다.
+ZONES = [z.strip().upper() for z in
+         os.environ.get("PL_ZONES", ZONE).split(",") if z.strip()]
+ROBOT_FMT = os.environ.get("PL_ROBOT_FMT", "/World/robot_%s")
+STOPPER_FMT = os.environ.get("PL_STOPPER_FMT", "/World/Stopper_%s")
+MULTI = len(ZONES) > 1
+
+
+def robot_prim(z):
+    """존 `z` 의 로봇 prim. 단일 존이면 `PL_ROBOT_PRIM` 을 그대로 쓴다."""
+    return (ROBOT_FMT % z) if MULTI else ROBOT_PRIM
+
+
+def stopper_prim(z):
+    return (STOPPER_FMT % z) if MULTI else STOPPER_PRIM
 BOX_ID_FMT = "BOX%05d"
 BOOT_STEPS = 20
 SETTLE_STEPS = 90                                        # READY 수렴 (1.5 s)
@@ -100,6 +138,8 @@ SETTLE_STEPS = 90                                        # READY 수렴 (1.5 s)
 #   튜플을 통째로 갈아끼운다 — 키 두 개를 따로 쓰면 새 박스 id 에 옛 높이가
 #   붙는 순간이 생긴다.
 _CUR = {"box": None}                                     # (box_id, 반높이 m) | None
+# 다존일 때는 존마다 따로 잡는다 — gap_fn 이 자기 존 것만 봐야 한다.
+_CUR_Z = {}
 # ── 운전 모드 ──────────────────────────────────────────────
 # ★ 이 파일 하나로 두 가지를 돌린다. 예전에는 시연 설정을 환경변수 넷으로 손수
 #   붙여야 했는데, 발표 중에 하나만 빠뜨려도 다른 게 돌아간다 — PL_N 을 빼면
@@ -152,6 +192,27 @@ ARRIVE_TIMEOUT_S = 180.0                                 # 다음 박스가 스�
 CYCLE_WALL_S = 120.0
 SETTLE_S = float(os.environ.get("PL_SETTLE", "0.7"))     # 놓은 뒤 재기 전 정착 (B5 는 0.5)
 WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
+# 픽업 구간에 박스가 있는데 이 시간이 지나도 못 집으면 지운다 (아래 `_stuck_box`).
+STUCK_S = float(os.environ.get("PL_STUCK", "75"))
+# ★ 팔레트 1 장에 이만큼 놓으면 **트럭으로 내보내고 끝낸다.** 0 이면 안 내보낸다.
+#   패킹 알고리즘을 아직 안 받았으므로, 지금은 1 개만 놓고 반출까지 보는 것이 목표다.
+PER_PALLET = int(os.environ.get("PL_PER_PALLET", "0"))
+SHIP_TIMEOUT_S = float(os.environ.get("PL_SHIP_TIMEOUT", "180"))
+# 반출 중 적재물이 팔레트 대비 얼마까지 밀려도 "안착" 으로 볼 것인가.
+# 키네마틱으로 얼려 같은 틱에 같은 변위를 주므로 원리상 0 이어야 한다. 5 mm 는
+# bbox 반올림과 렌더 틱 사이 오차를 위한 여유다.
+SHIP_SLIP_TOL_MM = float(os.environ.get("PL_SHIP_SLIP_TOL", "5"))
+# 코너 턴테이블이 90° 를 도는 데 걸리는 시간 [s]. 보여 주기용이라 물리와 무관하다.
+# ★ 2.0 -> 4.0 (2026-08-25 사용자 요청 "너무 빠르다"). 22.5 deg/s 라 눈으로 따라간다.
+TURN_S = float(os.environ.get("PL_TURN_S", "4.0"))
+# ★ **-90 이다.** 셀은 +Y 로 오고 합류는 +X 로 나가므로 커브는 **오른쪽으로** 돈다
+#   (시계방향). +90 으로 두면 발자국은 같아도 팔레트·적재물이 180° 뒤집힌 채 실린다.
+TURN_DEG = -90.0
+# ★ 반출 속도는 라인 속도와 **따로** 둔다. 라인 값은 5호가 스토퍼에 부딪혀 기우는
+#   문제로 묶여 있고, 반출 구간에는 스토퍼가 없기 때문이다.
+#   ★ 1.5 -> 0.5 (2026-08-25 사용자 요청 "너무 빠르다"). 실물 팔레트 컨베이어가
+#     보통 0.2~0.5 m/s 다. 합류 12.6 m 를 25 s 에 간다 (SHIP_TIMEOUT 180 안).
+SHIP_MPS = float(os.environ.get("PL_SHIP_MPS", "0.5"))
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
@@ -169,6 +230,25 @@ def _has_window():
 #   쓰는 바람에 바로 그 다음 측정이 통째로 틀어졌다 (실측: 사이클 12.3 -> 26.0 s).
 #   재현 안 되는 측정을 만드는 종류라 여기서 막는다.
 HOLD = _env("PL_HOLD") not in ("", "0", "false", "no") and _has_window()
+# ★ 자동 Play. **창이 있으면 안 누른다** — 시연에서는 사람이 직접 누르고 싶다.
+#   이 드라이버는 물리 스텝 콜백(`on_step`)으로만 돌아서, Play 가 안 눌리면
+#   부팅 카운터부터가 안 돈다. 즉 "안 누르면 아무 일도 안 일어난다" 가 그대로 성립한다.
+#   창이 없는 실행(게이트·검증·CI)은 누를 사람이 없으니 자동으로 누른다.
+#   PL_AUTOPLAY=1 / 0 으로 어느 쪽이든 강제할 수 있다.
+_ap = os.environ.get("PL_AUTOPLAY")
+AUTOPLAY = (not _has_window()) if _ap is None else (_ap not in ("0", "false", "no"))
+# ★ 창도 없는데 자동 Play 를 끄면 **누를 사람이 없어 영원히 기다린다.**
+#   실측 2026-08-24: 그렇게 띄운 헤드리스 하나가 15분째 살아서 GUI 시연과 GPU 를
+#   나눠 쓰고 있었다 — 어제 knock 이 18 / 67 mm 로 갈렸던 바로 그 원인이다
+#   (`_kitexit` docstring). 조용히 매달려 있느니 여기서 끊는다.
+if not AUTOPLAY and not _has_window():
+    print("\n!! 창이 없는 실행(--no-window)인데 PL_AUTOPLAY=0 이다.", flush=True)
+    print("   Play 를 눌러 줄 사람이 없어서 영원히 기다린다. 그대로 두면 GPU 만 먹는다.",
+          flush=True)
+    print("   창 없이 돌릴 거면 PL_AUTOPLAY 를 빼라 (창 없는 실행은 원래 자동이다).",
+          flush=True)
+    _kitexit.shutdown(3, log=print)
+    raise SystemExit
 PICK_RETRY = int(os.environ.get("PL_PICK_RETRY", "2"))   # 흡착 실패 재시도 횟수
 # ★ 팔 속도. **이 실행에서만** 덮어쓴다 — system.yaml 도 B 코드도 안 건드린다.
 #   왜 필요한가: 이송 구간이 177도를 도는데 박스는 흡착 패드에 강성 100 · 감쇠 0
@@ -196,7 +276,13 @@ METER_MAX = int(os.environ.get("PL_METER", "1"))
 #   없다 — 포인트클라우드 annotator 경로 문제다). 우회로는 이미 있다:
 #   `perception.CameraPerception._pointcloud_world` 가 depth + intrinsics 로
 #   직접 투영한다. 그쪽으로 갈아끼우면 된다.
-CAM = os.environ.get("PL_CAM", "0") not in ("0", "false", "no")
+#   ★ 2026-08-24 기본을 **demo 켬 / gate 끔** 으로 바꿨다. 위 막힌 곳(포인트클라우드
+#     API)은 원인이 Isaac 이 아니라 모듈 이름 충돌이었고 (`_cfgload` docstring),
+#     고친 뒤 5/5 인식 · 종류 5/5 · 중심 오차 최대 6.5 mm 로 돈다. 시연에서 제일
+#     설명하기 좋은 자리라 켜 둔다. 게이트는 끈다 — 판단에 안 쓰는 계측이 사이클에
+#     끼면 베이스라인이 흔들린다.
+_DEFAULTS["PL_CAM"] = ("1", "0")
+CAM = _env("PL_CAM") not in ("0", "false", "no")
 # ★ 화면 둘을 **다른 방식으로** 낸다 (2026-08-24).
 #     view2 (Isaac 두 번째 뷰포트)  = 벨트 위 하향 카메라  /World/CamPick
 #     rqt   (별도 프로세스)          = 그리퍼 손목 카메라  /World/robot/gripper/CamWrist
@@ -212,8 +298,10 @@ CAM = os.environ.get("PL_CAM", "0") not in ("0", "false", "no")
 #   공짜가 아니라 해상도를 낮추고 frameSkipCount 로 발행 주기를 떨군다.
 #   게이트(gate 모드)에서는 둘 다 끈다 — 수치를 재는 실행에 보여주기용 부하를
 #   얹으면 비교가 안 된다.
-CAM_PICK_PRIM = "/World/CamPick/Camera"                    # 벨트 위 하향 (창)
-CAM_WRIST_PRIM = "/World/robot/gripper/CamWrist/Camera"    # 손목 (ROS 토픽)
+# 창(view2)에 띄울 카메라. **실제 값은 설정을 읽은 뒤 아래에서 정해진다** —
+# `cfg` 가 이 줄보다 아래에서 만들어지기 때문이다.
+CAM_PICK_PRIM = "/World/CamPick/Camera"
+CAM_WRIST_PRIM = ROBOT_PRIM + "/gripper/CamWrist/Camera"   # 손목 (ROS 토픽)
 CAMVIEW_RES = (480, 270)          # 창 렌더 해상도. 창 크기와 무관하게 비용을 정한다.
 _DEFAULTS["PL_CAMVIEW"] = ("1", "0")          # demo 만 켠다
 CAMVIEW = _env("PL_CAMVIEW") not in ("0", "false", "no")
@@ -234,9 +322,46 @@ _DEFAULTS["PL_WRISTROS"] = ("1", "0")         # demo 만 켠다
 WRISTROS = _env("PL_WRISTROS") not in ("0", "false", "no")
 
 cfg = _paths.system_config()
+
+
+# ★ 좌표 오버레이 (2026-08-24). system.yaml 은 "모든 숫자의 단일 출처"(철칙 3)이고
+#   팀 4명이 공유한다. 그런데 라인 배치가 근본적으로 다른 씬(test_3 은 지선이 +Y)을
+#   돌리려면 좌표가 통째로 달라야 한다. 원본을 고치면 test1-1 기준 게이트·베이스라인이
+#   전부 무효가 되므로, **실행 시에만 얹는 별도 yaml** 로 푼다.
+#     PL_CONFIG_OVERLAY=src/packing_bringup/config/test_3.yaml
+#   ⚠ 오버레이를 쓴 실행은 **베이스라인이 아니다.** 시작 배너에 그렇게 찍는다.
+def _deep_merge(base, over):
+    """over 의 값으로 base 를 덮는다. dict 는 재귀, 그 외는 통째로 교체."""
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+OVERLAY = os.environ.get("PL_CONFIG_OVERLAY")
+if OVERLAY:
+    import yaml
+    _op = Path(OVERLAY)
+    if not _op.is_absolute():
+        _op = ROOT / _op
+    if not _op.exists():
+        raise SystemExit("PL_CONFIG_OVERLAY 파일이 없다: %s" % _op)
+    _ov = yaml.safe_load(_op.read_text()) or {}
+    _deep_merge(cfg, _ov)
+
+# ★ 존별 카메라 (test_3 는 CamPick_A/B/C). 오버레이를 얹은 **뒤에** 정한다.
+CAM_PICK_PRIM = ((cfg.get("cameras") or {}).get("pick_prim") or {}).get(
+    ZONE, CAM_PICK_PRIM)
 STOPPER_X = cfg["conveyor"]["stopper_x_mm"] / 1000.0
 BELT_MPS = float(cfg["conveyor"]["belt_velocity_mps"])
 ORIGIN_MM = cfg["zones"]["pallet_origin_world_mm"][ZONE]
+# ★ 존별 팔레트 원점. 로봇 3 대를 동시에 돌릴 때 월드 좌표를 만드는 자리에서 쓴다.
+#   ⚠ 로봇 기준 **상대** 배치는 세 존이 똑같다 (원점−베이스 = (−1200, −600) 고정).
+#     그래서 `_az_local`·`_near_worst_mm` 같은 팔 기하 계산은 존을 안 가려도 된다.
+#     존을 가려야 하는 건 **월드 좌표를 만드는 곳**뿐이다.
+ORIGIN_BY_ZONE = dict(cfg["zones"]["pallet_origin_world_mm"])
 S1 = cfg["boxes"]["stage1"]
 BUFFER_CAP = int(cfg["zones"]["buffer_capacity"])        # 픽업 구간에 세울 수 있는 최대
 N = N_BOXES or int(S1["total_count"])
@@ -262,7 +387,14 @@ BOX_H_MM = {t["name"]: float(t["h_mm"]) for t in cfg["boxes"]["types"]}
 #   의 `reject` 훅). 제약을 만족하는 자리가 없으면 예전처럼 잡되 로그에 남긴다:
 #   자리를 못 잡아 PALLET_FULL 을 내는 것보다 knock 을 감수하는 편이 낫다.
 PED_MM = float(cfg["robot"]["pedestal_height_mm"])
-NEAR_LIM_MM = PED_MM - 150.0          # 이보다 높은 근거리 기둥 위는 못 지나간다
+# 이보다 높은 근거리 기둥 위는 못 지나간다. **팔레트 로컬 높이** 다.
+# ★ 진짜 규칙은 "기둥 윗면(월드) <= 페데스탈 상면" 이다. 그래서 팔레트 상면을 뺀다.
+#   test1-1 은 팔레트 상면이 150 이라 900-150 = 750 — **예전 식과 값이 같다**(회귀 없음).
+#   test_3 는 팔레트가 셀 컨베이어 위(950)라 1250-950 = 300 이다. 예전 식(PED-150)이면
+#   1100 이 나오는데, 그러면 기둥 윗면이 월드 2050 으로 팔 베이스보다 800 이나 높다.
+#   실측 2026-08-25: 그 상태에서 560 mm 기둥 위를 팔이 쓸어 BOX00007 을 팔레트 밖으로
+#   떨어뜨렸다 (knock 1452 mm).
+NEAR_LIM_MM = PED_MM - float(ORIGIN_MM[2])
 NEAR_DY_MM = 50.0                     # "로봇 쪽" 으로 칠 최소 y 차 (견본과 동일)
 NEAR_HALF_MM = cfg["pallet"]["depth_mm"] / 2.0   # y < 400 이면 근거리 (견본과 동일)
 # ★ 견본 `build_plan` 의 제약은 **둘**인데 처음에는 (a) 만 이식했다.
@@ -359,7 +491,11 @@ log("씬        %s" % STAGE)
 log("팔레트    원점 %s mm   최대 적재 %s mm" % (ORIGIN_MM, cfg["pallet"]["max_stack_mm"]))
 log("라인      스폰 %s -> 스토퍼 %.3f m   벨트 %.2f m/s"
     % (cfg["conveyor"]["spawn_point_mm"], STOPPER_X, BELT_MPS))
-for p in (ROBOT_PRIM, GRIPPER_PRIM, "/World/Stopper"):
+_chk_prims = []
+for _z in ZONES:
+    _chk_prims += [robot_prim(_z), robot_prim(_z) + "/SurfaceGripper",
+                   stopper_prim(_z)]
+for p in _chk_prims:
     ok = stage.GetPrimAtPath(p).IsValid()
     log("  %-28s %s" % (p, "있음" if ok else "!! 없음"))
     if not ok:
@@ -374,7 +510,10 @@ log("-" * 78)
 if CAMVIEW and stage.GetPrimAtPath(CAM_PICK_PRIM).IsValid():
     try:
         from omni.kit.viewport.utility import create_viewport_window
-        _vw = create_viewport_window("벨트 카메라 (RSD455 하향)",
+        # ★ 제목은 ASCII 만 쓴다. Kit 의 창 제목 폰트에 한글 글리프가 없어서
+        #   "벨트 카메라 (RSD455 하향)" 이 `?? ??? (RSD455 ??)` 로 찍힌다
+        #   (실측 2026-08-24, 시연 화면 녹화). 로그는 한글이어도 된다 — 터미널이다.
+        _vw = create_viewport_window("view2 - Belt Cam (RSD455 top-down)",
                                      width=560, height=340)
         _vw.viewport_api.set_active_camera(CAM_PICK_PRIM)
         _vw.viewport_api.resolution = CAMVIEW_RES   # 렌더 비용을 창 크기에서 떼어낸다
@@ -398,10 +537,18 @@ def _wrist_cam_to_ros():
       박아 두지 않는 이유: 게이트 실행(gate 모드)은 이 부하가 없어야 하고,
       브릿지가 안 켜진 환경에서 씬을 열면 그래프가 매 틱 에러를 낸다.
 
-    ★ 왜 다음 앱 업데이트에서 만드는가. `enable_extension` 직후에는 브릿지가
-      OmniGraph 노드 타입을 아직 등록 중일 수 있다. 여기는 `--exec` 라
-      `simulation_app.update()` 손잡이가 없어서 (`_kitexit` 과 같은 이유)
-      업데이트 이벤트를 한 번 받고 만든다.
+    ★ 왜 나중에 만드는가. 이유가 둘이다.
+      (1) `enable_extension` 직후에는 브릿지가 OmniGraph 노드 타입을 아직 등록
+          중일 수 있다. 여기는 `--exec` 라 `simulation_app.update()` 손잡이가
+          없어서 (`_kitexit` 과 같은 이유) 업데이트 이벤트를 받아 처리한다.
+      (2) **부팅 프레임에서 만들면 안 된다.** 뷰포트(view2)를 막 띄운 그 프레임에
+          렌더 프로덕트를 하나 더 붙이면 GPU 커맨드 리스트가 엉켜
+              [Error] [gpu.foundation.plugin] make sure to wait for cmdlist
+              completion ... actualSemaphore: 2 expectedSemaphore: 3
+          가 뜬다. 실측 2026-08-24 A/B — 손목ROS 를 끈 실행에는 이 줄이 없고,
+          켠 실행에는 렌더 프로덕트를 만드는 시각(15,135 ms)에 정확히 뜬다.
+          그래서 **Play 를 누르고 렌더가 안정된 뒤**에 만든다. 손해는 없다 —
+          `OnPlaybackTick` 은 어차피 Play 전에는 안 돈다.
     """
     from isaacsim.core.utils.extensions import enable_extension
 
@@ -421,8 +568,11 @@ def _wrist_cam_to_ros():
     _st = {"sub": None, "n": 0}
 
     def _build(_e):
+        # Play 전에는 세지도 않는다. Play 를 누른 뒤 렌더가 자리를 잡고 나서 만든다.
+        if not omni.timeline.get_timeline_interface().is_playing():
+            return
         _st["n"] += 1
-        if _st["n"] < 3:                     # 노드 타입이 등록될 틈을 준다
+        if _st["n"] < 30:                    # 노드 등록 + 첫 렌더 프레임이 지나갈 틈
             return
         try:
             _st["sub"].unsubscribe()
@@ -498,7 +648,14 @@ elif WRISTROS:
     log("손목ROS   %s 가 씬에 없다 — src/packing_sim/run_layout_to_spec.sh 를 다시 돌려라"
         % CAM_WRIST_PRIM)
 
-omni.timeline.get_timeline_interface().play()
+if AUTOPLAY:
+    omni.timeline.get_timeline_interface().play()
+else:
+    log("")
+    log("  >>> 준비 끝. **Play 를 눌러라.**  (자동으로 시작하지 않는다)")
+    log("      일시정지와 Stop 은 아직 못 이어간다 — 누르면 그 실행은 거기서 끝이다.")
+    log("      예전처럼 자동으로 시작하려면  PL_AUTOPLAY=1")
+    log("")
 
 
 def setup():
@@ -516,22 +673,55 @@ def setup():
         log("★ 팔 속도 %s 로 이 실행에서만 덮어썼다 (사양 %s). 베이스라인 아님."
             % (SPEED, _paths.system_config()["robot"].get("joint_speed_scale", 0.5)))
 
-    art = SingleArticulation(prim_path=ROBOT_PRIM, name="h2017")
-    art.initialize()
-
     tmp = tempfile.mkdtemp(prefix="h2017_lula_")
     urdf, _n, missing = IMP.make_abs_urdf(tmp)
     if missing:
         raise RuntimeError("메시 없음: %s" % missing[:3])
-    lula = mg.LulaKinematicsSolver(robot_description_path=str(_paths.DESCRIPTOR),
-                                   urdf_path=str(urdf))
-    pos, quat = art.get_world_pose()
-    lula.set_robot_base_pose(np.array(pos), np.array(quat))
-    log("로봇      베이스 %s mm  EE %s"
-        % ([round(float(v) * 1000) for v in pos], EE_FRAME))
 
     q = MQ.MainQueue(timeout_s=float(cfg["service"]["timeout_s"]) * 0.8)
-    sp = SP.Spawner(stage, cfg, q, zone=ZONE)
+    # ★ 스포너는 **하나**다. 스폰은 한 라인에서 하고, 픽업 감지만 존별로 나뉜다.
+    sp = SP.Spawner(stage, cfg, q, zone=ZONE, zones=ZONES)
+
+    # ── 존마다 팔 한 벌 ─────────────────────────────────────
+    # ★ URDF 는 한 번만 만든다. 로봇 3 대가 같은 기종이라 서술자를 공유해도 되고,
+    #   Lula 솔버만 대마다 따로 둔다 (베이스 자세가 다르다).
+    _ARMS = {}
+    for _z in ZONES:
+        _a = SingleArticulation(prim_path=robot_prim(_z), name="h2017_%s" % _z)
+        _a.initialize()
+        _l = mg.LulaKinematicsSolver(robot_description_path=str(_paths.DESCRIPTOR),
+                                     urdf_path=str(urdf))
+        _p, _q4 = _a.get_world_pose()
+        _l.set_robot_base_pose(np.array(_p), np.array(_q4))
+        _ARMS[_z] = {"art": _a, "lula": _l, "rm": None,
+                     "prim": robot_prim(_z)}
+        log("로봇 %s    베이스 %s mm  EE %s  (%s)"
+            % (_z, [round(float(v) * 1000) for v in _p], EE_FRAME, robot_prim(_z)))
+    art = _ARMS[ZONES[0]]["art"]
+    lula = _ARMS[ZONES[0]]["lula"]
+
+    def _gap_mm_for(zn):
+        """존 `zn` 의 흡착면~박스 윗면 간극 [mm]. 아래 `_gap_mm` 주석 참조."""
+        def _f():
+            cur = _CUR_Z.get(zn) if MULTI else _CUR["box"]
+            if cur is None:
+                return None
+            bid, half_h = cur
+            e = sp._snap.get(bid)
+            if e is None:
+                return None
+            _a = _ARMS[zn]["art"]
+            _l = _ARMS[zn]["lula"]
+            _r = _ARMS[zn]["rm"]
+            if _r is None:
+                return None
+            q6 = np.asarray(_a.get_joint_positions()[:6], dtype=float)
+            fk_p, fk_R = _l.compute_forward_kinematics(EE_FRAME, q6)
+            zax = np.asarray(fk_R)[:, 2]
+            face = np.asarray(fk_p, dtype=float) + zax * _r.grip_len
+            c = np.asarray(e["pos_m"], dtype=float)
+            return (float(np.dot(c - face, zax)) - half_h) * 1000.0
+        return _f
 
     def _gap_mm():
         """흡착면~박스 윗면 간극 [mm]. 못 재면 None.
@@ -559,14 +749,26 @@ def setup():
         c = np.asarray(e["pos_m"], dtype=float)
         return (float(np.dot(c - face, zax)) - half_h) * 1000.0
 
-    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM,
-                        gap_fn=_gap_mm)
+    for _z in ZONES:
+        _ARMS[_z]["rm"] = RM.RobotMotion(
+            _ARMS[_z]["art"], _ARMS[_z]["lula"], cfg, ee=EE_FRAME,
+            gripper_path=(robot_prim(_z) + "/SurfaceGripper") if MULTI
+            else GRIPPER_PRIM,
+            gap_fn=_gap_mm_for(_z) if MULTI else _gap_mm)
+    rm = _ARMS[ZONES[0]]["rm"]
+    _S["arms"] = _ARMS
     cc = conveyor_ctl.ConveyorCtl(stage, cfg, q)
 
     if CAM:
         import camera_pick
-        cam = camera_pick.PickCamera(stage, cfg, q)
-        _S["cam"] = cam
+        # ★ 카메라도 **존마다** 있어야 한다. 하나만 두고 3 존 박스를 다 재면 존 A
+        #   카메라가 존 B·C 지선을 보게 되어 중심 오차가 11.5 m 로 나온다
+        #   (실측 2026-08-25: 종류 맞춤 1/3).
+        _CAMS = {}
+        for _z in ZONES:
+            _CAMS[_z] = camera_pick.PickCamera(stage, cfg, q, zone=_z)
+        _S["cams"] = _CAMS
+        _S["cam"] = _CAMS[ZONES[0]]
 
     try:
         server = SS.SimServer(port=PORT)
@@ -582,12 +784,196 @@ def setup():
         log("     게이트 수치가 실행마다 달라진다. 게이트는 하나씩 돌려라.")
         _kitexit.shutdown(3, log=log)
         raise SystemExit
-    server.register({"ping": lambda r: {"ok": True}})
+    def _h_prim_bbox(req):
+        """{"cmd":"prim_bbox","path":"/World/Pallet_A"} -> {"min_m":[..],"max_m":[..]}
+
+        ★ 팔레트 이송을 지켜보려고 넣었다. 박스가 아니라 `get_box_pose` 로는 못 본다.
+          USD 에서 읽는다 — `SingleRigidPrim` 을 만들면 시뮬레이션 뷰가 무효화되는
+          사고가 있었다 (spawner._refresh 주석).
+        """
+        path = req.get("path")
+
+        def _rd():
+            from pxr import Usd as _U, UsdGeom as _UG
+            pr = stage.GetPrimAtPath(path)
+            if not pr or not pr.IsValid():
+                return {"ok": False, "error": "없는 prim %s" % path}
+            bb = _UG.BBoxCache(_U.TimeCode.Default(),
+                               [_UG.Tokens.default_, _UG.Tokens.render,
+                                _UG.Tokens.proxy])
+            r = bb.ComputeWorldBound(pr).ComputeAlignedRange()
+            if r.IsEmpty():
+                return {"ok": False, "error": "bbox 가 비었다 %s" % path}
+            a, b = r.GetMin(), r.GetMax()
+            return {"ok": True,
+                    "min_m": [float(a[0]), float(a[1]), float(a[2])],
+                    "max_m": [float(b[0]), float(b[1]), float(b[2])]}
+        return q.run(_rd)
+
+    def _h_set_kinematic(req):
+        """{"cmd":"set_kinematic","paths":[..],"on":true} -> {"ok":..,"n":..}
+
+        ★ 왜 필요한가. 팔레트 이송은 USD 좌표를 직접 쓴다(`move_prim`). 그런데 그 위
+          박스는 **동적 강체**라 좌표를 써도 PhysX 가 매 스텝 자기 상태로 되돌린다.
+          즉 팔레트만 빠져나가고 박스는 제자리에 남아 벨트 위로 떨어진다
+          (2026-08-25 사용자 관측: "팔레트에 놓았는데 박스가 안착 안 하고 움직임").
+          그래서 반출 직전에 적재물을 **키네마틱으로 얼려** 팔레트와 한 몸으로 옮긴다.
+          실물로 치면 스트레치 랩으로 감아 통째로 옮기는 것과 같다.
+        """
+        paths = req.get("paths") or ([req["path"]] if req.get("path") else [])
+        on = bool(req.get("on", True))
+
+        def _wr():
+            from pxr import UsdPhysics as _UP
+            n = 0
+            for pa in paths:
+                pr = stage.GetPrimAtPath(pa)
+                if not pr or not pr.IsValid():
+                    continue
+                rb = _UP.RigidBodyAPI(pr)
+                if not rb:
+                    continue
+                at = rb.GetKinematicEnabledAttr()
+                if not at:
+                    at = rb.CreateKinematicEnabledAttr(on, True)
+                at.Set(on)
+                n += 1
+            return {"ok": True, "n": n}
+        return q.run(_wr)
+
+    def _h_rotate_prim(req):
+        """{"cmd":"rotate_prim","paths":[..],"center_m":[cx,cy],"deg":d} -> {"ok":..}
+
+        ★ 코너 턴테이블용. 팔레트를 **월드 Z 축** 기준으로 `center_m` 둘레로 돌린다.
+          1톤 트럭 적재함은 2800 이고 팔레트 Y 변은 1200 이라 3장(3600)이 안 들어간다.
+          코너에서 90° 돌리면 그 치수가 800 이 되어 2400 으로 들어간다
+          (CLAUDE.md 작업명세서 §3.2 · 팀 결정 2026-08-25).
+
+        ★ prim 의 op 는 [translate, orient, scale] 이고 로컬 원점이 물체 중심이다.
+          월드 회전 Rz 를 얹으려면 **둘 다** 손봐야 한다:
+              translate' = c + Rz * (translate - c)      (자리를 원둘레로 옮기고)
+              orient'    = orient * Rz                   (자세도 같이 돌린다)
+          translate 만 돌리면 팔레트가 자세는 그대로인 채 원을 그리며 미끄러진다.
+        """
+        paths = req.get("paths") or ([req["path"]] if req.get("path") else [])
+        c = req.get("center_m") or [0.0, 0.0]
+        deg = float(req.get("deg") or 0.0)
+
+        def _wr():
+            import math as _m
+            from pxr import Gf as _Gf, UsdGeom as _UG
+            rad = _m.radians(deg)
+            ca, sa = _m.cos(rad), _m.sin(rad)
+            qz = _Gf.Quatd(_m.cos(rad / 2.0), _Gf.Vec3d(0, 0, _m.sin(rad / 2.0)))
+            miss = []
+            for pa in paths:
+                pr = stage.GetPrimAtPath(pa)
+                if not pr or not pr.IsValid():
+                    miss.append(pa)
+                    continue
+                ops = {o.GetOpName(): o
+                       for o in _UG.Xformable(pr).GetOrderedXformOps()}
+                t = ops.get("xformOp:translate")
+                if t is None:
+                    miss.append(pa)
+                    continue
+                v = t.Get()
+                dx, dy = float(v[0]) - c[0], float(v[1]) - c[1]
+                t.Set(_Gf.Vec3d(c[0] + dx * ca - dy * sa,
+                                c[1] + dx * sa + dy * ca, float(v[2])))
+                o = ops.get("xformOp:orient")
+                if o is not None:
+                    q = o.Get()
+                    # ★ 원래 타입(Quatf/Quatd)을 지켜야 한다. 섞으면 Set 이 거부한다.
+                    cls = type(q)
+                    qd = _Gf.Quatd(float(q.GetReal()),
+                                   _Gf.Vec3d(*[float(x) for x in q.GetImaginary()]))
+                    n = qd * qz
+                    o.Set(cls(float(n.GetReal()),
+                              type(q.GetImaginary())(*[float(x)
+                                                       for x in n.GetImaginary()])))
+            return {"ok": not miss, "missing": miss}
+        return q.run(_wr)
+
+    def _h_move_prim(req):
+        """{"cmd":"move_prim","paths":[..],"d_m":[dx,dy,dz]} -> {"ok":..}
+
+        ★ 팔레트 이송용. 팔레트는 **키네마틱** 이라 좌표로 옮긴다 — 동적 강체로 두면
+          롤러 사이로 22 mm 가라앉아 배치 Z 오차가 허용을 넘고, 컨베이어 표면속도로는
+          아예 안 움직였다 (실측 2026-08-25).
+        ★ `paths` 로 여러 개를 받는다. 팔레트와 그 위 적재물을 **같은 틱에 같은 변위**로
+          옮겨야 한다 — 한 번에 하나씩 부르면 호출 사이에 틱이 끼어 화물이 밀린다.
+        ⚠ A47 벨트가 씬에 들어오면 이 자리를 그 벨트로 바꾼다.
+        """
+        paths = req.get("paths") or ([req["path"]] if req.get("path") else [])
+        d = req.get("d_m") or [0.0, 0.0, 0.0]
+
+        def _wr():
+            from pxr import Gf as _Gf, UsdGeom as _UG
+            miss = []
+            for pa in paths:
+                pr = stage.GetPrimAtPath(pa)
+                if not pr or not pr.IsValid():
+                    miss.append(pa)
+                    continue
+                xf = _UG.Xformable(pr)
+                op = None
+                for o in xf.GetOrderedXformOps():
+                    if o.GetOpName() == "xformOp:translate":
+                        op = o
+                        break
+                if op is None:
+                    miss.append(pa)
+                    continue
+                v = op.Get()
+                op.Set(_Gf.Vec3d(float(v[0]) + float(d[0]),
+                                 float(v[1]) + float(d[1]),
+                                 float(v[2]) + float(d[2])))
+            return {"ok": not miss, "missing": miss}
+        return q.run(_wr)
+
+    server.register({"ping": lambda r: {"ok": True},
+                     "prim_bbox": _h_prim_bbox,
+                     "move_prim": _h_move_prim,
+                     "rotate_prim": _h_rotate_prim,
+                     "set_kinematic": _h_set_kinematic})
     server.register(sp.handlers())
     server.register(cc.handlers())
-    server.register(rm.handlers())
+    if MULTI:
+        # ★ 로봇이 여러 대면 핸들러 이름이 겹친다. 요청의 `zone` 을 보고 그 존의
+        #   `RobotMotion` 으로 넘긴다. `cycle.py` 는 안 고친다 — 존을 자동으로
+        #   채우는 `ZoneLink` 래퍼를 씌우면 요청에 zone 이 늘 실려 온다.
+        _HT = {z: _ARMS[z]["rm"].handlers() for z in ZONES}
+
+        def _mk(cmd):
+            def _h(req):
+                z = str((req or {}).get("zone") or ZONES[0]).upper()
+                t = _HT.get(z)
+                if t is None:
+                    return {"ok": False, "accepted": False,
+                            "error": "모르는 존 %s (있는 것: %s)"
+                                     % (z, ",".join(ZONES))}
+                return t[cmd](req)
+            return _h
+        server.register({c: _mk(c) for c in _HT[ZONES[0]]})
+        log("소켓      존 디스패치 켬 — %s" % ", ".join(ZONES))
+    else:
+        server.register(rm.handlers())
     if _S.get("cam"):
-        server.register(_S["cam"].handlers())
+        if MULTI:
+            _CH = {z: c.handlers() for z, c in (_S.get("cams") or {}).items()}
+
+            def _mkc(cmd):
+                def _h(req):
+                    z = str((req or {}).get("zone") or ZONES[0]).upper()
+                    t = _CH.get(z)
+                    if t is None:
+                        return {"ok": False, "error": "모르는 존 %s" % z}
+                    return t[cmd](req)
+                return _h
+            server.register({c: _mkc(c) for c in _CH[ZONES[0]]})
+        else:
+            server.register(_S["cam"].handlers())
     log("소켓      127.0.0.1:%d   cmd %d 개" % (PORT, len(server.cmds())))
 
     # ★ READY 로 순간이동. 안 하면 첫 이동이 179 deg 라 구간 예산(20 s)을 넘겨
@@ -595,15 +981,22 @@ def setup():
     import yaml
     from isaacsim.core.utils.types import ArticulationAction
     ready = np.array(yaml.safe_load(_paths.DESCRIPTOR.read_text())["default_q"], dtype=float)
-    art.set_joint_positions(ready)
-    art.set_joint_velocities(np.zeros(6))
+    for _z in ZONES:
+        _ARMS[_z]["art"].set_joint_positions(ready)
+        _ARMS[_z]["art"].set_joint_velocities(np.zeros(6))
     _S["ready_action"] = ArticulationAction(joint_positions=ready)
     _S["ready_q"] = ready                                # 감긴 팔을 되돌릴 때 쓴다
     log("자세      READY 로 순간이동 %s deg" % np.round(np.degrees(ready), 1).tolist())
 
     # ★ Camera.initialize() 는 **타임라인이 돌기 시작한 뒤**여야 한다. setup() 은
     #   부팅 20스텝 뒤라 이미 Play 상태다.
-    if _S.get("cam") and not _S["cam"].start():
+    for _z, _c in list((_S.get("cams") or {}).items()):
+        if not _c.start():
+            log("   [카메라] 존 %s 시작 실패 — 이 존은 인식 없이 간다" % _z)
+            (_S.get("cams") or {}).pop(_z, None)
+    if not (_S.get("cams") or {}):
+        _S["cam"] = None
+    elif _S.get("cam") is not None and ZONES[0] not in (_S.get("cams") or {}):
         _S["cam"] = None
 
     _S.update(rm=rm, sp=sp, cc=cc, q=q, server=server, art=art)
@@ -643,6 +1036,44 @@ def _line_state(link, ids):
     return "라인 %s개 · %s" % (st.get("on_belt", "?"), " ".join(out) if out else "비었다")
 
 
+# ★ 픽업 구간 판정 (아래 "낀 박스" 탈출로가 쓴다). `spawner` 의 판정과 같은 기준이다.
+_PU_AX = 0 if str(cfg["conveyor"].get("pickup_axis", "x")).lower() == "x" else 1
+_PU_P0 = cfg["conveyor"]["pickup_range_mm"][0] / 1000.0
+_PU_P1 = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+_PU_CROSS = (cfg["zones"].get("pickup_cross_mm") or {}).get(ZONE)
+_PU_CROSS = (None if not _PU_CROSS
+             else (min(_PU_CROSS) / 1000.0, max(_PU_CROSS) / 1000.0))
+
+
+_STUCK_SINCE = {}                      # box_id -> 픽업 구간에서 처음 본 시각
+
+
+def _stuck_box(link, ids):
+    """픽업 구간에 들어와 있는데 `pickup_check` 가 못 잡는 박스 중 **가장 앞선 것**.
+
+    ★ 왜 필요한가. 흡착이 실패하면 박스가 살짝 기운 채 남는다. 그러면 `spawner` 의
+      "벨트 위인가"(z 허용오차) 판정을 못 넘어 영영 `present` 가 안 되고, 사이클은
+      집으러 오지 않는데 뒤차는 계속 밀려온다 — 라인이 통째로 굳는다
+      (실측 2026-08-24: BOX00005 가 132 s 동안 스토퍼 앞을 막았다).
+      CLAUDE.md §5 의 `NO_FEASIBLE_POSE` 와 같은 결로, **지우고 계속** 간다.
+    """
+    best = None
+    for bid in ids:
+        r = link.call(cmd="get_box_pose", box_id=bid)
+        if not r.get("ok"):
+            continue
+        pos = r["pos_m"]
+        if not (_PU_P0 <= pos[_PU_AX] <= _PU_P1):
+            continue
+        if _PU_CROSS is not None:
+            c = pos[1 - _PU_AX]
+            if not (_PU_CROSS[0] <= c <= _PU_CROSS[1]):
+                continue
+        if best is None or pos[_PU_AX] > best[1][_PU_AX]:
+            best = (bid, pos)
+    return best
+
+
 class LineServices(D.OnlineServices):
     """B5 의 온라인 서비스 그대로 + **벨트만 진짜로 세운다.**
 
@@ -671,17 +1102,33 @@ class LineServices(D.OnlineServices):
 
 
 def meter_thread():
-    """`main` 을 여닫아 픽업 구간에 한 대씩만 들여보낸다. **자기 소켓을 쓴다.**
+    """픽업 구간에 한 대씩만 들여보낸다. **자기 소켓을 쓴다.**
 
-    판단은 `spawn_status.queue` 하나로 한다 — 픽업 구간(7500~10000)에서 벨트
-    높이에 있는 박스 수다. 그리퍼가 박스를 들어 올리는 순간 z 가 바뀌어 이 수가
-    떨어지므로, **집자마자** 다음 박스가 출발한다. 사이클이 끝날 때까지 안 기다린다.
+    ★ 2026-08-25 에 방식을 바꿨다. 예전에는 픽업 구간이 차면 **본선(`main`)을
+      통째로 세웠다.** 그래서 팔이 집는 동안 라인 전체가 멎었고(사용자 관측),
+      로봇 3 대를 동시에 돌리면 한 존이 집는 사이 나머지 두 존이 굶는다.
+
+      지금은 본선을 **안 세운다.** 대신 라우팅이 "그 존 픽업 구간이 찼으면
+      **안 꺾는다**" 로 계량한다 — 안 꺾인 박스는 순환 루프를 한 바퀴 돌고
+      다시 온다. 실제 물류 라인의 recirculation 과 같은 동작이다.
+
+    ★ 그래서 이 스레드가 하는 일은 이제 **본선을 계속 돌려 두는 것** 뿐이다.
+      (`PL_METER=0` 이면 아예 안 뜬다.)
     """
     import sim_link as SL
     link = SL.SimLink(port=PORT)
     _S["meter_link"] = link
-    running = None                                       # 마지막으로 건 상태
+    running = None
     try:
+        if ROUTE_ON:
+            # ★ 라우팅이 본선을 직접 여닫는다 (`router_thread` 의 "본선 혼잡 제어").
+            #   여기서 또 건드리면 둘이 싸운다.
+            log("   [계량] 본선 제어는 라우팅이 한다 — 계량은 손 뗀다")
+            return
+        # ── 라우팅이 없을 때(test1-1 등): 예전대로 본선을 여닫는다 ──
+        # ★ 이 경로를 남겨 둬야 한다. 분기가 없으면 박스가 지선으로 **직진**하므로
+        #   "안 꺾고 한 바퀴 돌린다" 라는 계량 수단 자체가 없다. 여기서 본선을
+        #   안 세우면 픽업 구간에 박스가 줄줄이 밀려든다 (test1-1 기준선 회귀).
         while not _S["done"]:
             st = link.call(cmd="spawn_status")
             want = st.get("queue", 0) < METER_MAX
@@ -695,6 +1142,225 @@ def meter_thread():
             time.sleep(0.2)
     except Exception as e:
         log("   [계량] !! %r" % (e,))
+
+
+# ── 위치변환 레일 (색상 라우팅) ────────────────────────────────────────────
+ROUTE = cfg.get("routing") or {}
+ROUTE_ON = bool(ROUTE) and os.environ.get("PL_ROUTE", "1") not in ("", "0")
+
+
+def _route_map():
+    """분류 기준 -> (표, 박스에서 열쇠를 뽑는 함수).
+
+    ★ 2026-08-25: 기본은 **배송지(QR)** 다. 우선순위 by_dest > by_color > by_type.
+      - `by_dest`  2 차 사양. QR 이 배송지를 싣는다. 박스 색은 하나로 통일한다.
+      - `by_color` 1 차 사양(HSV). 되돌릴 수 있게 남겨 둔다.
+      - `by_type`  크기 기준. 색도 QR 도 없는 씬을 위한 하위호환.
+    """
+    bd = ROUTE.get("by_dest")
+    if bd:
+        return ({str(k): str(v) for k, v in bd.items()},
+                lambda sp: sp.get("dest"))
+    bc = ROUTE.get("by_color")
+    if bc:
+        return ({str(k): str(v) for k, v in bc.items()},
+                lambda sp: sp.get("color"))
+    bt = ROUTE.get("by_type") or {}
+    return ({str(k): str(v) for k, v in bt.items()},
+            lambda sp: sp.get("name"))
+
+
+def router_thread(specs, ids):
+    """배송지로 목적지 존을 정하고, 그 분기점의 **소터**로 박스를 지선에 밀어넣는다.
+
+    ★ 소터 방식 (2026-08-25, `routing.use_sorter: true`).
+      분기 조각이 `ConveyorBelt_A47` 이면 조각 안에 소터가 있다. 소터는 자기
+      `IsaacConveyor` 를 가진 **독립 컨베이어**라, 소터만 +Y 로 돌리면 그 위의
+      박스가 지선으로 밀려 올라가고 **뒤차는 본선을 그대로 흘러온다.**
+      배타 구간이 소터 폭(1491.7 mm)뿐이다.
+
+    ★ (구) 조각 꺾기 (`use_sorter: false`, A23 씬).
+      본선 조각 **전체(6925 mm)** 의 표면속도를 옆으로 돌린다. 그래서 그 조각에
+      박스가 둘 이상이면 못 꺾고, 안 꺾인 박스는 순환 루프를 돌아 다시 와서 더
+      몰린다. 투입 간격을 20 s 까지 벌려야 했던 이유가 이것이다.
+
+    ★ 어느 쪽이든 "밀리는 구간에 목표 박스만 있을 때" 꺾는 것은 같다. 다른 것은
+      그 구간이 6925 mm 냐 1491.7 mm 냐다.
+    """
+    import sim_link as SL
+    link = SL.SimLink(port=PORT)
+    kind_of, key_of = _route_map()
+    jx = {k: (v[0] / 1000.0, v[1] / 1000.0)
+          for k, v in (ROUTE.get("junction_x_mm") or {}).items()}
+    mseg = ROUTE.get("main_seg") or {}
+    segx = {k: (min(v) / 1000.0, max(v) / 1000.0)
+            for k, v in (ROUTE.get("main_seg_x_mm") or {}).items()}
+    y_done = float(ROUTE.get("divert_done_y_mm", 1200)) / 1000.0
+    _mly = ROUTE.get("main_line_y_mm") or [-500, 500]
+    y_lo, y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
+    thru = list(ROUTE.get("thru_world", [-1, 0, 0]))
+    div = list(ROUTE.get("divert_world", [0, 1, 0]))
+    # ── 소터 ──────────────────────────────────────────
+    use_sorter = bool(ROUTE.get("use_sorter")) and bool(ROUTE.get("sorter_x_mm"))
+    _sx_mm = ROUTE.get("sorter_x_mm") or {}
+    guard = float(ROUTE.get("sorter_guard_mm", 1200)) / 1000.0
+    # ★ 배타 구간. 소터 구간 + **상류(+X)** 여유. 본선이 -X 로 흐르므로 뒤차는
+    #   X 가 큰 쪽에서 온다. 꺾는 동안 여기 들어오는 박스도 같이 밀린다.
+    sortx = {k: (min(v) / 1000.0, max(v) / 1000.0 + guard)
+             for k, v in _sx_mm.items()}
+
+    def turn(zone, seg, want_div):
+        """분류 명령. 소터가 있으면 소터만, 없으면 본선 조각을 꺾는다.
+
+        ★ 꺾을 때 속도를 같이 준다. 계량이 소터를 세워 뒀을 수 있는데, 소터가
+          서 있으면 박스가 지선으로 안 밀릴 뿐 아니라 **본선 롤러의 구멍 위에서
+          그대로 멈춘다** (A47 은 소터 자리에 본선 롤러가 없다).
+        """
+        if use_sorter:
+            kw = {"cmd": "set_sorter", "zone": zone, "divert": bool(want_div)}
+            if want_div:
+                kw["mps"] = BELT_MPS
+            return link.call(**kw)
+        return link.call(cmd="set_direction", seg=seg,
+                         world=(div if want_div else thru))
+    # ★ 존별 계량. 그 존 픽업 구간이 차 있으면 **안 꺾는다** — 안 꺾인 박스는
+    #   순환 루프를 돌고 다시 온다. 본선을 세우지 않으므로 로봇 3 대가 서로
+    #   굶기지 않는다 (`meter_thread` 주석 참조).
+    _cross = (cfg["zones"].get("pickup_cross_mm") or {})
+    _pr = cfg["conveyor"].get("pickup_range_mm") or [0, 0]
+    pk_y = (min(_pr) / 1000.0, max(_pr) / 1000.0)
+    pk_x = {k: (min(v) / 1000.0, max(v) / 1000.0) for k, v in _cross.items()}
+
+    def zone_load(zn, allpos):
+        """`zn` 픽업 구간(지선)에 있는 박스 수."""
+        r = pk_x.get(zn)
+        if r is None:
+            return 0
+        return sum(1 for q in allpos.values()
+                   if r[0] <= q[0] <= r[1] and pk_y[0] <= q[1] <= pk_y[1])
+
+    state = {}                      # box_id -> "divert" | "done"
+    t_div = {}                      # box_id -> 꺾기 시작한 시각
+    t_log = {}                      # box_id -> 마지막 진행 로그 시각
+    # ★ 꺾은 채로 두면 그 조각 위의 뒤차가 전부 옆으로 밀린다. 실측 2026-08-24:
+    #   복귀를 안 시켰더니 박스 6 개가 분기점에 뭉쳐 라인이 막혔다.
+    DIV_TIMEOUT_S = float(os.environ.get("PL_DIV_TIMEOUT", "45"))
+    log("   [라우팅] 켬 (%s) — %s"
+        % ("소터 · 배타 구간 %.0f mm" % ((max(_sx_mm["A"]) - min(_sx_mm["A"]))
+                                        + guard * 1000)
+           if use_sorter else "조각 꺾기",
+           ", ".join("%s->%s" % kv for kv in sorted(kind_of.items()))))
+    try:
+        while not _S["done"]:
+            # ★ **done 박스도** 읽는다. 지선에 올라탄 박스가 곧 그 존의 부하다.
+            #   예전처럼 건너뛰면 존이 꽉 차 있어도 계속 꺾어 보낸다.
+            allpos = {}
+            for bid in ids:
+                r = link.call(cmd="get_box_pose", box_id=bid)
+                if r.get("ok"):
+                    allpos[bid] = r["pos_m"]
+            poses = {b: q for b, q in allpos.items() if state.get(b) != "done"}
+            for bid, p in list(poses.items()):
+                z = kind_of.get(key_of(specs[bid]))
+                if z is None or z not in jx or z not in mseg:
+                    continue
+                lo, hi = jx[z]
+                seg = mseg[z]
+                if p[1] >= y_done:                       # 지선에 올라탔다
+                    if state.get(bid) == "divert":
+                        turn(z, seg, False)
+                        _S["diverting"] = max(0, _S.get("diverting", 1) - 1)
+                        log("   [라우팅] %s 지선 %s 진입 (Y %.2f m) — 본선 복귀"
+                            % (bid, z, p[1]))
+                    state[bid] = "done"
+                    continue
+                if state.get(bid) == "divert":
+                    # 진행을 1 초마다 남긴다. 어디서 걸리는지 봐야 고칠 수 있다.
+                    now = time.time()
+                    if now - t_log.get(bid, 0.0) >= 1.0:
+                        t_log[bid] = now
+                        log("   [라우팅]   %s 이동 중  X %.2f  Y %.3f  (%.0f s)"
+                            % (bid, p[0], p[1], now - t_div.get(bid, now)))
+                    if now - t_div.get(bid, 0.0) > DIV_TIMEOUT_S:
+                        turn(z, seg, False)
+                        _S["diverting"] = max(0, _S.get("diverting", 1) - 1)
+                        state[bid] = "done"
+                        log("   [라우팅] !! %s 가 %.0f s 안에 지선 %s 에 못 올라탔다 "
+                            "(Y %.2f m) — 본선 복귀"
+                            % (bid, DIV_TIMEOUT_S, z, p[1]))
+                    continue
+                # ★ 박스가 지선 폭 안에 **완전히** 들어왔을 때만 꺾는다.
+                #   가장 큰 5호가 480 mm 라 240 을 물린다. 예전엔 분기점 경계에서
+                #   바로 꺾어 몸통 일부가 레일 밑으로 들어가 걸렸다 (실측 X -18.89).
+                if not (lo + 0.25 <= p[0] <= hi - 0.25):
+                    continue
+                # ★ 본선 위에 있을 때만. 순환 루프(Y -5.1)를 지나는 박스는 X 가
+                #   분기점과 맞아도 그 조각 위에 없다 — 꺾어 봐야 안 움직인다.
+                if not (y_lo <= p[1] <= y_hi):
+                    continue
+                # 같은 조각 위에 다른 박스가 있으면 지나갈 때까지 기다린다.
+                # 꺾으면 그 **조각 전체**가 옆으로 흐른다. 조각 위에 다른 박스가
+                # 하나라도 있으면 기다린다 (분기점 주변만 보면 놓친다).
+                # ★ 소터면 **소터 구간 + 상류 여유** 만 비면 된다 (1491.7+1200).
+                #   조각 꺾기면 조각 전체(6925)가 비어야 한다.
+                slo, shi = (sortx.get(z) if use_sorter else None) \
+                    or segx.get(z, (lo - 3.5, hi + 3.5))
+                # ★ "같은 조각 위" 도 **본선 띠 안**이어야 한다. 순환 루프(Y -5.1)를
+                #   도는 박스는 X 가 겹쳐도 이 조각에 없다. 띠를 안 보면 루프에 박스가
+                #   하나라도 있는 한 영원히 안 꺾는다 (실측 2026-08-24: BOX00008 ·
+                #   BOX00010 이 180 s 동안 못 들어와 중단).
+                busy = [b2 for b2, q in poses.items()
+                        if b2 != bid and y_lo <= q[1] <= y_hi
+                        and slo <= q[0] <= shi]
+                if busy:
+                    continue
+                # ★ 존 계량. 이미 그 존 지선에 METER_MAX 대가 있으면 안 꺾는다.
+                #   박스는 루프를 한 바퀴 돌고 돌아온다 — 본선을 세우지 않는다.
+                if METER_MAX > 0 and zone_load(z, allpos) >= METER_MAX:
+                    if time.time() - t_log.get("z" + z, 0.0) >= 10.0:
+                        t_log["z" + z] = time.time()
+                        log("   [라우팅] 존 %s 가 차 있다 (%d 대) — %s 는 한 바퀴 돈다"
+                            % (z, zone_load(z, allpos), bid))
+                    continue
+                r = turn(z, seg, True)
+                if r.get("ok"):
+                    state[bid] = "divert"
+                    t_div[bid] = time.time()
+                    _S["diverting"] = _S.get("diverting", 0) + 1
+                    # 계량이 세워 뒀을 수 있으니 이 조각만 직접 돌린다.
+                    link.call(cmd="set_velocity", seg=seg, mps=BELT_MPS)
+                    log("   [라우팅] %s %-8s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
+                        % (bid, key_of(specs[bid]) or "-",
+                           specs[bid]["name"], z, p[0]))
+                else:
+                    log("   [라우팅] !! 분류 명령 실패 (존 %s · %s) -> %r"
+                        % (z, seg, r))
+            # ── 본선 혼잡 제어 ──────────────────────────────
+            # ★ 배타 구간에 박스가 둘 이상이면 그 사이 아무도 못 꺾고, 안 꺾인
+            #   박스는 순환 루프를 돌아 다시 와서 더 몰린다 (실측 2026-08-25:
+            #   조각 꺾기 시절 세 박스가 45 s 동안 한 번도 안 꺾였다).
+            #   그래서 **어느 구간이든 2 개 이상이면 투입을 잡는다.**
+            #   ⚠ 옛 계량처럼 "픽업 구간이 찼으면 정지" 가 아니다. 그건 한 로봇이
+            #     집는 동안 나머지 두 대를 굶겼다. 이 기준은 로봇과 무관하다.
+            #   ★ 소터에서는 그 구간이 6925 -> 2692 mm 로 줄어 훨씬 덜 걸린다.
+            crowd = 0
+            for _z2, _sx in (sortx if use_sorter else segx).items():
+                n = sum(1 for q in allpos.values()
+                        if y_lo <= q[1] <= y_hi and _sx[0] <= q[0] <= _sx[1])
+                crowd = max(crowd, n)
+            # ⚠ **본선을 세우면 안 된다.** 세우면 그 조각의 박스도 못 빠져나가서
+            #   붐빔이 영영 안 풀린다 (실측 2026-08-25: `[본선] 정지 (최대 2 개)`
+            #   에서 그대로 굳었다). 본선은 계속 돌리고 **투입**을 잡는다 —
+            #   이미 라인에 있는 박스는 흘러서 분기점을 지나거나 루프로 빠진다.
+            hold = crowd >= 2
+            if hold != bool(_S.get("hold_spawn")):
+                _S["hold_spawn"] = hold
+                log("   [투입] %s (%s 최대 %d 개)"
+                    % ("보류 — 본선이 붐빈다" if hold else "재개",
+                       "소터 구간" if use_sorter else "분기 조각", crowd))
+            time.sleep(0.15)
+    except Exception as e:
+        log("   [라우팅] !! %r" % (e,))
 
 
 def spawner_thread(specs, ids):
@@ -721,6 +1387,12 @@ def spawner_thread(specs, ids):
                 t_wait = time.time()
                 while not _S["done"]:
                     st = link.call(cmd="spawn_status")
+                    # ★ 분기 조각이 붐비면 새 박스를 안 넣는다. 조각 전체가 옆으로
+                    #   흐르는 꺾기 방식이라 조각에 둘 이상이면 못 꺾고, 안 꺾인
+                    #   박스가 루프를 돌아 다시 와서 더 몰린다.
+                    if _S.get("hold_spawn"):
+                        time.sleep(0.5)
+                        continue
                     # ★ 계량 운전에서는 `main` 이 서 있는 동안 앞차가 스폰점 근처에
                     #   그대로 남는다. 그때 다음 박스를 내면 **겹쳐 스폰된다.**
                     #   벨트가 계속 돌 때는 12 s 뒤 6 m 밖이라 없던 문제다.
@@ -736,29 +1408,310 @@ def spawner_thread(specs, ids):
                     log("   [투입] 백압 대기 %.0f s (버퍼 %d 대기 중)"
                         % (held, BUFFER_CAP))
             t = specs[bid]
-            r = link.call(cmd="spawn_box", box_id=bid, type=t["name"], yaw_deg=0)
+            r = link.call(cmd="spawn_box", box_id=bid, type=t["name"], yaw_deg=0,
+                          color=t.get("color"), dest=t.get("dest"))
             st = link.call(cmd="spawn_status")
-            log("   [투입] %-9s %-3s  (라인 위 %s 개)"
-                % (bid, t["name"], st.get("on_belt", "?")))
+            log("   [투입] %-9s %-8s %-3s  (라인 위 %s 개)"
+                % (bid, t.get("dest", t.get("color", "-")), t["name"],
+                   st.get("on_belt", "?")))
             if not r.get("ok"):
                 log("   [투입] !! spawn_box %s -> %r" % (bid, r))
     except Exception as e:
         log("   [투입] !! %r" % (e,))
 
 
-def worker(specs, ids):
-    """머리 쪽. 소켓으로만 말한다."""
+def ship_pallet(link, zone, log, cargo_ids=None):
+    """팔레트를 셀 컨베이어 -> 합류 라인 -> 트럭으로 보낸다.
+
+    ★ 순서가 있다. 셀은 +Y, 합류는 +X 다. 둘을 같이 돌리면 코너에서 대각선으로
+      밀려 라인에 낀다. **셀로 코너까지 보낸 뒤 셀을 세우고** 합류를 돌린다.
+
+    ★ 팔레트는 키네마틱이라 좌표로 옮긴다 (`move_prim` 주석 참조).
+
+    ★ **적재물도 같이 옮긴다.** 팔레트만 옮기면 그 위 박스는 동적 강체라 PhysX 가
+      제자리에 붙들어, 팔레트가 밑에서 빠져나가고 박스는 벨트 위로 떨어진다
+      (2026-08-25 사용자 관측). 그래서 반출 직전에 적재물을 키네마틱으로 얼리고
+      팔레트와 **같은 틱에 같은 변위**로 민다. 도착 뒤에도 풀지 않는다 — 팔레트가
+      적재함 문턱에 걸쳐 서기 때문에 지금 풀면 그대로 미끄러진다.
+      A47 벨트가 들어오면 이 이송을 그 벨트로 바꾼다.
+    """
+    z = zone.lower()
+    pal = os.environ.get("PL_PALLET_PRIM", "/World/Pallet_%s" % zone)
+    cargo = ["/World/boxes/%s" % b for b in (cargo_ids or [])]
+    mps = SHIP_MPS
+
+    def bb(path=None):
+        r = link.call(cmd="prim_bbox", path=path or pal)
+        return (r["min_m"], r["max_m"]) if r.get("ok") else (None, None)
+
+    a0, b0 = bb()
+    if a0 is None:
+        log("   [반출] !! 팔레트 %s 를 못 읽는다 — 건너뛴다" % pal)
+        return None
+    log("   [반출] 시작 — %s  X %.2f~%.2f  Y %.2f~%.2f"
+        % (pal, a0[0], b0[0], a0[1], b0[1]))
+
+    # ★ 적재물을 얼린다. 얼리기 **전에** 팔레트 대비 상대위치를 재 둔다 — 도착 뒤
+    #   같은 값이 나와야 "안착한 채로 실려갔다" 고 말할 수 있다.
+    rel0 = {}
+    for c in cargo:
+        ca, cbx = bb(c)
+        if ca is None:
+            continue
+        rel0[c] = [(ca[i] + cbx[i]) / 2.0 - (a0[i] + b0[i]) / 2.0 for i in range(3)]
+    if cargo:
+        r = link.call(cmd="set_kinematic", paths=cargo, on=True)
+        log("   [반출] 적재물 %d 개 고정 (키네마틱 %s)"
+            % (len(rel0), r.get("n", "?")))
+
+    ma, mb = bb("/World/MergeLine_%s/Rollers" % zone)
+    if ma is None:
+        log("   [반출] !! 합류 라인을 못 읽는다")
+        return None
+    y_target = (ma[1] + mb[1]) / 2.0
+    ta, tb = bb("/World/Truck_Bed")
+    x_bed = ta[0] if ta is not None else -2.4
+
+    def glide(d, label):
+        """정렬 이동을 **반출 속도로 흘려보낸다.**
+
+        ★ 한 틱에 옮기면 팔레트가 순간이동한다. 실측 2026-08-25: 커브 진입
+          중심선으로 맞추느라 368 mm 를 한 번에 옮겼더니 화면에서 팔레트가
+          그 자리에서 사라졌다 나타난다 (사용자 관측 "갑자기 순간이동").
+          벨트 위 물건은 그렇게 안 움직인다.
+        """
+        n = math.hypot(d[0], d[1])
+        if n < 0.001:
+            return
+        secs = max(0.25, n / mps if mps > 0 else 0.25)
+        steps = max(3, int(secs / 0.05))
+        for _ in range(steps):
+            link.call(cmd="move_prim", paths=[pal] + cargo,
+                      d_m=[d[0] / steps, d[1] / steps, d[2] / steps])
+            time.sleep(secs / steps)
+        log("   [반출]   %s [%+.0f %+.0f] mm (%.1f s)"
+            % (label, d[0] * 1000, d[1] * 1000, secs))
+
+    def run_axis(seg, axis, target, mode, label):
+        """`axis` 방향으로 목표까지 민다. 반환: 도달 여부.
+
+        `mode`  "mid" = 중심 기준 · "min" = **뒤쪽 끝** 기준.
+        ★ 적재함은 "앞머리가 닿으면" 이 아니라 **뒤쪽 끝까지 들어가야** 실린 것이다.
+          앞머리(max) 기준으로 멈추면 팔레트가 문턱에 걸쳐 선다 (2026-08-25 실측:
+          X -3.19~-2.39, 적재함 -2.40~-0.80 — 10 mm 만 얹혀 있었다).
+        """
+        link.call(cmd="set_velocity", seg=seg, mps=mps)
+        t0 = prev = time.time()
+        last = 0.0
+        hit = False
+        while time.time() - t0 < SHIP_TIMEOUT_S and not _S["done"]:
+            now = time.time()
+            d = [0.0, 0.0, 0.0]
+            d[axis] = mps * (now - prev)
+            prev = now
+            link.call(cmd="move_prim", paths=[pal] + cargo, d_m=d)
+            a, b = bb()
+            if a is None:
+                break
+            cur = a[axis] if mode == "min" else (a[axis] + b[axis]) / 2.0
+            if now - last >= 2.0:
+                last = now
+                log("   [반출]   %s  %.2f -> %.2f" % (label, cur, target))
+            if cur >= target:
+                hit = True
+                break
+            time.sleep(0.03)
+        link.call(cmd="set_velocity", seg=seg, mps=0.0)
+        return hit
+
+    # ── 커브 코너를 **따라간다** ─────────────────────────────────
+    # ★★ 2026-08-25. 제자리에서 90° 돌리는 것을 그만둔다 — 씬에 코너 커브
+    #   (`ConveyorBelt_A02`)가 들어왔으므로, 팔레트는 **그 벨트를 따라 돌면 된다.**
+    #   실물 커브 컨베이어가 하는 일이 정확히 이것이다: 진행하면서 방향이 바뀐다.
+    #
+    #   이전 방식들이 왜 안 됐는지 (전부 실측):
+    #     들어서 돌리기      리프트 장치가 씬에 없다 — 팔레트가 혼자 떠올랐다
+    #     코너에서 제자리    회전 대각선 1442 > 합류 프레임 1000 -> 옆 레인을
+    #                       220~260 mm 파고든다. 세 대가 동시에 반출하므로
+    #                       팔레트끼리도 겹칠 수 있다
+    #     셀 위에서 제자리   프레임 안에는 들어가지만 **돌리는 장치가 없다**
+    #
+    #   호는 이렇게 잡는다. 셀 중심선(X=cx0)을 +Y 로 들어와 합류 중심선(Y=y_merge)을
+    #   +X 로 나간다. 오른쪽으로 도는 90° 이므로 회전 중심은 (cx0+R, y_merge-R) 이고
+    #   팔레트 중심은 그 원을 각도 180° -> 90° 로 지난다.
+    #   **R 은 커브 조각 bbox 에서 잰다** — 호가 커브 밖으로 나가면 안 된다.
+    arc = (cfg["conveyor"].get("curve_arc") or {}).get(zone)
+    if not arc:
+        log("   [반출] !! 존 %s 의 curve_arc 설정이 없다 — 호를 못 그린다" % zone)
+        return None
+    cenx = float(arc["center_mm"][0]) / 1000.0
+    ceny = float(arc["center_mm"][1]) / 1000.0
+    R = float(arc["radius_mm"]) / 1000.0
+    # 팔레트 반치수 — 씬에서 잰다 (설정과 어긋나도 씬이 맞다)
+    p0a, p0b = bb()
+    half_w = (p0b[0] - p0a[0]) / 2.0                 # 진입할 때 가로(X) 반치수
+    half_l = (p0b[1] - p0a[1]) / 2.0                 # 진입할 때 세로(Y) 반치수
+    # ★ 이 호로 돌 때 팔레트가 벨트 안에 있나 — **재서 남긴다.**
+    #   안쪽은 짧은 변 중앙이, 바깥쪽은 **모서리**가 제일 멀리 나간다.
+    r_in = R - half_w
+    r_out = math.hypot(R + half_w, half_l)
+    cvp = (cfg["conveyor"].get("curve_prim") or {}).get(zone, "")
+    log("   [반출]   호  중심 (%.2f, %.2f) · 반지름 %.0f mm  ->  팔레트 안쪽 %.0f · "
+        "바깥 모서리 %.0f mm  (벨트 %s)"
+        % (cenx, ceny, R * 1000, r_in * 1000, r_out * 1000,
+           cvp.rsplit("/", 1)[-1]))
+
+    # ① 진입 중심선(X = 중심 - R)으로 옮기고, 셀을 따라 +Y 로 진입점까지
+    ax, ay = cenx - R, ceny
+    pa, pb = bb()
+    dx = ax - (pa[0] + pb[0]) / 2.0
+    glide([dx, 0.0, 0.0], "호 진입 중심선으로")
+    ok1 = run_axis("%s_cell" % z, 1, ay, "mid", "셀 이송  Y")
+    if not ok1:
+        log("   [반출] !! 셀 구간에서 시간 초과")
+    # ② 진입점으로 정확히 맞춘다 (이송은 스텝 단위라 조금 넘겨 선다)
+    pa, pb = bb()
+    d = [ax - (pa[0] + pb[0]) / 2.0, ay - (pa[1] + pb[1]) / 2.0, 0.0]
+    glide(d, "커브 진입점 정렬")
+
+    # 호를 따라간다. 매 스텝 **제자리에서 조금 돌리고 다음 호점으로 옮긴다.**
+    # ★ 속도는 **반출 속도 그대로**다 (2026-08-25 사용자 요청 "커브 돌 때 느리게").
+    #   호 길이 = R x pi/2 를 mps 로 나눠 걸리는 시간을 정한다 — 직선 구간과
+    #   같은 속도로 도니까 코너에서만 빨라지거나 느려지지 않는다.
+    #   TURN_S 는 **하한**으로만 쓴다 (너무 짧은 호에서 순간이동처럼 보이지 않게).
+    ccx, ccy = ax, ay
+    arc_len = R * math.pi / 2.0
+    dur = max(TURN_S, arc_len / mps if mps > 0 else TURN_S)
+    steps = max(12, int(dur / 0.08))
+    log("   [반출]   호 길이 %.0f mm · %.1f s (%.2f m/s) · %d 스텝"
+        % (arc_len * 1000, dur, arc_len / dur, steps))
+    link.call(cmd="set_velocity", seg="%s_curve" % z, mps=mps)
+    for i in range(1, steps + 1):
+        if _S["done"]:
+            break
+        phi = math.radians(180.0 - 90.0 * (float(i) / steps))
+        link.call(cmd="rotate_prim", paths=[pal] + cargo,
+                  center_m=[ccx, ccy], deg=TURN_DEG / steps)
+        tx = cenx + R * math.cos(phi)
+        ty = ceny + R * math.sin(phi)
+        link.call(cmd="move_prim", paths=[pal] + cargo,
+                  d_m=[tx - ccx, ty - ccy, 0.0])
+        ccx, ccy = tx, ty
+        time.sleep(dur / steps)
+    pa, pb = bb()
+    log("   [반출]   커브 통과 — X %.2f~%.2f (%.0f) · Y %.2f~%.2f (%.0f)"
+        % (pa[0], pb[0], (pb[0] - pa[0]) * 1000,
+           pa[1], pb[1], (pb[1] - pa[1]) * 1000))
+
+    # ★ 합류 롤러 한가운데로 Y 정렬한다. 셀 이송은 목표를 조금 넘겨 멈추므로
+    #   (스텝 단위) 그대로 두면 수십 mm 어긋난 채 롤러에 앉는다.
+    ma2, mb2 = bb("/World/MergeLine_%s/Rollers" % zone)
+    if ma2 is not None:
+        pa, pb = bb()
+        dy = (ma2[1] + mb2[1]) / 2.0 - (pa[1] + pb[1]) / 2.0
+        glide([0.0, dy, 0.0], "합류 롤러에 Y 정렬")
+
+    pa, pb = bb()
+    # ★ 커브를 돌고 나면 적재함을 가로지르는 치수(Y)가 1200 이 아니라 **800** 이어야
+    #   한다. 그래야 세 장이 1톤 적재함 2800 에 들어간다.
+    turned = abs((pb[0] - pa[0]) - 1.2) < 0.05 and abs((pb[1] - pa[1]) - 0.8) < 0.05
+    log("   [반출]   커브 뒤 자세  X %.0f · Y %.0f mm   %s"
+        % ((pb[0] - pa[0]) * 1000, (pb[1] - pa[1]) * 1000,
+           "가로 800 확보" if turned else "!! 방향이 안 맞는다"))
+
+    ok2 = run_axis("%s_merge" % z, 0, x_bed, "min", "적재 X뒤끝")
+    a, b = bb()
+    if a is None:
+        return None
+    log("   [반출] 끝 — 팔레트 X %.2f~%.2f · Y %.2f~%.2f · 적재함 %.2f~%.2f  %s"
+        % (a[0], b[0], a[1], b[1], x_bed, (tb[0] if tb is not None else x_bed + 1.6),
+           "완전히 실림" if ok2 else "!! 미도착"))
+
+    # ★ 적재물이 팔레트를 따라왔는지 **실측**한다. 상대위치가 그대로면 안착이다.
+    #   ⚠ 코너에서 90° 돌았으므로 상대위치도 **같이 돌아야** 정상이다. 안 돌리고
+    #     비교하면 멀쩡히 실려 간 박스가 675 mm 미끄러진 것으로 나온다
+    #     (실측 2026-08-25 — 지표가 틀린 것이지 박스가 움직인 게 아니었다).
+    _rad = math.radians(TURN_DEG if turned else 0.0)
+    _c, _s = math.cos(_rad), math.sin(_rad)
+    slip_mm = 0.0
+    for c, r0 in rel0.items():
+        ca, cbx = bb(c)
+        if ca is None:
+            log("   [반출]   !! %s 를 잃었다" % c.rsplit("/", 1)[-1])
+            slip_mm = max(slip_mm, 9999.0)
+            continue
+        r1 = [(ca[i] + cbx[i]) / 2.0 - (a[i] + b[i]) / 2.0 for i in range(3)]
+        exp = [r0[0] * _c - r0[1] * _s, r0[0] * _s + r0[1] * _c, r0[2]]
+        dmm = [(r1[i] - exp[i]) * 1000.0 for i in range(3)]
+        n = max(abs(v) for v in dmm)
+        slip_mm = max(slip_mm, n)
+        log("   [반출]   %s 팔레트 대비 이동 [%+.1f %+.1f %+.1f] mm  %s"
+            % (c.rsplit("/", 1)[-1], dmm[0], dmm[1], dmm[2],
+               "안착" if n <= SHIP_SLIP_TOL_MM else "!! 미끄러짐"))
+    return {"min_m": a, "max_m": b, "reached": bool(ok1 and ok2), "bed_x": x_bed,
+            "slip_mm": slip_mm, "cargo": len(rel0)}
+
+
+_PKM_LOCK = threading.Lock()
+_PKM_CACHE = {}
+
+
+def _packer_module():
+    """패킹 모듈을 **한 번만** 동적 로드한다.
+
+    ★ 워커 3 개가 동시에 `D._load_packer_module()` 을 부르면 두 번째·세 번째가
+      **반쯤 초기화된 모듈**을 받는다 (실측 2026-08-25:
+      `AttributeError: module '_packing_hm' has no attribute 'HeightmapPacker'`
+      로 존 A·B 워커가 시작하자마자 죽었다). 락으로 감싸고 결과를 캐시한다.
+    """
+    with _PKM_LOCK:
+        if "m" not in _PKM_CACHE:
+            _PKM_CACHE["m"] = D._load_packer_module()
+        return _PKM_CACHE["m"]
+
+
+class ZoneLink(object):
+    """요청에 `zone` 을 **자동으로** 채워 주는 `SimLink` 껍데기.
+
+    ★ 이게 있어서 `cycle.py` 를 한 줄도 안 고치고 로봇 3 대를 돌린다. 사이클이
+      보내는 모든 명령에 자기 존이 실려 가고, 서버 쪽 디스패처가 그 존의
+      `RobotMotion` 으로 넘긴다. 이미 zone 을 넣어 보내는 명령(`pickup_check`)은
+      `setdefault` 라 덮이지 않는다.
+    """
+
+    def __init__(self, link, zone):
+        self._l = link
+        self._z = zone
+
+    def call(self, **kw):
+        kw.setdefault("zone", self._z)
+        return self._l.call(**kw)
+
+    def call_slow(self, budget_s, **kw):
+        kw.setdefault("zone", self._z)
+        return self._l.call_slow(budget_s, **kw)
+
+    def __getattr__(self, n):
+        return getattr(self._l, n)
+
+
+def worker(specs, ids, zone=None):
+    """머리 쪽. 소켓으로만 말한다. `zone` 을 주면 그 로봇만 돌린다."""
     import cycle as CY
     import sim_link as SL
     _S["CY"] = CY                                        # report() 가 좌표 변환에 쓴다
+    zone = (zone or ZONE).upper()
 
     try:
-        link = SL.SimLink(port=PORT)
+        # ★ 스레드마다 소켓을 따로 판다. `SimLink` 는 스레드 안전이 아니다.
+        link = ZoneLink(SL.SimLink(port=PORT), zone) if MULTI \
+            else SL.SimLink(port=PORT)
+        _S.setdefault("links", {})[zone] = link
         _S["link"] = link
 
         by_id = {bid: LinkPrim(link, bid) for bid in ids}
         hm, pal = cfg["heightmap"], cfg["pallet"]
-        PKM = D._load_packer_module()
+        PKM = _packer_module()
 
         class ArmAwarePacker(PKM.HeightmapPacker):
             """기하만 아는 패커에 **팔 사정**을 술어로 얹는다 (위 상수 주석 참고)."""
@@ -833,18 +1786,51 @@ def worker(specs, ids):
                 wall_margin=0.0, enforce_load_order=True,
                 descent_halo=D.DESCENT_HALO_MM / 1000.0)
 
-        vision = D.PalletVision(by_id, specs, ORIGIN_MM)
+        origin_mm = ORIGIN_BY_ZONE.get(zone, ORIGIN_MM)
+        vision = D.PalletVision(by_id, specs, origin_mm)
         svc = LineServices(link, specs, factory, vision, D.CLEARANCE_MM,
                            log=lambda *a: log("           ", *a), verbose=VERBOSE)
-        cyc = CY.Cycle(link, svc, cfg, zone=ZONE, log=lambda *a: log("   [cycle]", *a))
+        cyc = CY.Cycle(link, svc, cfg, zone=zone, log=lambda *a: log("   [cycle] %s" % zone, *a))
 
-        # 라인을 돌린다. 이후 정지/재가동은 `cycle.py` 가 b_pickup 만 만진다.
-        link.call(cmd="set_velocity", seg="main", mps=BELT_MPS)
-        link.call(cmd="set_velocity", seg="b_pickup", mps=BELT_MPS)
-        threading.Thread(target=spawner_thread, args=(specs, ids),
-                         daemon=True, name="spawn").start()
-        if METER_MAX > 0:
-            threading.Thread(target=meter_thread, daemon=True, name="meter").start()
+        # 라인을 돌린다. 이후 정지/재가동은 `cycle.py` 가 <존>_pickup 만 만진다.
+        # ★ 존 이름을 붙인다. 예전엔 "b_pickup" 이 박혀 있어서 PL_ZONE=A 로 돌리면
+        #   `cycle.py` 는 a_pickup 을 끄고 켜는데 여기서 켠 것은 b_pickup 이라
+        #   **지선이 영영 안 돌았다** (실측 2026-08-24: 박스가 스폰 자리에 150 s 정지).
+        if zone == ZONES[0]:
+            link.call(cmd="set_velocity", seg="main", mps=BELT_MPS)
+            _S["main_on"] = True
+            # ★ 순환 루프와 코너 커브도 같이 돌린다 (2026-08-25).
+            #   루프는 분기점을 지나친 박스가 돌아오는 길이다 — 안 켜면 그 박스가
+            #   라인 끝에 쌓여 뒤를 막는다. 커브는 셀과 합류를 잇는 조각이라
+            #   안 켜면 그 구간이 죽은 벨트로 보인다.
+            #   ⚠ 여기 안 적힌 seg 는 **아무도 안 켠다.** 설정에 seg 를 새로
+            #     만들었으면 이 줄에도 넣어야 한다.
+            # ★ 루프는 여기서 안 켠다 — `conveyor_ctl` 이 시작할 때 원시값으로
+            #   써넣는다 (`belt_velocity_raw`). 배율 환산이 그 조각에서 안 맞는다.
+            for _seg in ("a_curve", "b_curve", "c_curve"):
+                _r = link.call(cmd="set_velocity", seg=_seg, mps=BELT_MPS)
+                if not _r.get("ok"):
+                    log("   [벨트] %s 못 켰다 — %s" % (_seg, _r.get("error")))
+        if ROUTE_ON:
+            # 라우팅은 박스를 세 지선으로 나눠 보내므로 셋 다 돌아야 한다.
+            for _z in sorted(set(_route_map()[0].values())):
+                link.call(cmd="set_velocity", seg="%s_pickup" % _z.lower(),
+                          mps=BELT_MPS)
+        else:
+            link.call(cmd="set_velocity", seg="%s_pickup" % zone.lower(),
+                      mps=BELT_MPS)
+        # ★ 투입·계량·라우팅은 **라인 전체에 하나씩**이다. 워커마다 띄우면 로봇
+        #   3 대일 때 스포너가 3 개가 되어 박스가 3 배로 쏟아진다.
+        #   첫 존이 대표로 띄운다.
+        if zone == ZONES[0]:
+            threading.Thread(target=spawner_thread, args=(specs, ids),
+                             daemon=True, name="spawn").start()
+            if METER_MAX > 0:
+                threading.Thread(target=meter_thread, daemon=True,
+                                 name="meter").start()
+            if ROUTE_ON:
+                threading.Thread(target=router_thread, args=(specs, ids),
+                                 daemon=True, name="route").start()
 
         def recover():
             """실패한 사이클 뒤처리 — **치우거나 다시 하기 전에 반드시 부른다.**
@@ -871,11 +1857,12 @@ def worker(specs, ids):
             #   읽기·판정·되돌리기를 한 덩어리로 메인 스레드에 보낸다 — 그래야 그
             #   사이에 물리가 끼어들지도 않는다.
             def _unwind():
-                q6 = np.asarray(_S["art"].get_joint_positions()[:6], dtype=float)
+                _art = (_S.get("arms") or {}).get(zone, {}).get("art") or _S["art"]
+                q6 = np.asarray(_art.get_joint_positions()[:6], dtype=float)
                 if float(np.max(np.abs(q6))) <= 2.0 * math.pi:
                     return {"ok": True, "wound": False}
-                _S["art"].set_joint_positions(_S["ready_q"])
-                _S["art"].set_joint_velocities(np.zeros(6))
+                _art.set_joint_positions(_S["ready_q"])
+                _art.set_joint_velocities(np.zeros(6))
                 return {"ok": True, "wound": True,
                         "deg": np.round(np.degrees(q6), 0).tolist()}
 
@@ -893,14 +1880,58 @@ def worker(specs, ids):
         pallets = 1
         t_all = time.time()
         i = 0
-        while i < len(ids) and not _S["done"]:
+        targets = (_S.get("targets_by_zone") or {}).get(zone) \
+            or _S.get("targets") or list(ids)
+        while i < len(targets) and not _S["done"]:
             # ── 다음 박스가 스토퍼에 설 때까지 ──────────────
             pick, t0, nag = None, time.time(), 0.0
+            skipped = False
+            t_scan = 0.0
             while time.time() - t0 < ARRIVE_TIMEOUT_S and not _S["done"]:
-                c = link.call(cmd="pickup_check", zone=ZONE)
+                c = link.call(cmd="pickup_check", zone=zone)
                 if c.get("present"):
                     pick = c
+                    _STUCK_SINCE.clear()
                     break
+                # ★ 낀 박스 탈출로. 픽업 구간에 박스가 **있는데** present 가 안 되면
+                #   그 박스는 기울었거나 물리가 틀어진 것이다. 지우고 계속 간다.
+                #   안 지우면 뒤차가 계속 밀려 라인이 통째로 굳는다.
+                #
+                #   ⚠ 타이머는 **그 박스가 구간에 머문 시간**이다. 처음에는 "작업자가
+                #     기다린 시간" 으로 쟀는데, 그러면 앞 박스를 오래 기다린 뒤 막
+                #     들어온 멀쩡한 박스가 즉시 지워진다 (실측 2026-08-25: BOX00008 이
+                #     진입 7 s 만에 지워졌다). 지선을 3 m 달리는 데만 6 s 가 걸린다.
+                now = time.time()
+                if now - t_scan >= 1.0:
+                    t_scan = now
+                    sb = _stuck_box(link, ids)
+                    if sb is None:
+                        _STUCK_SINCE.clear()
+                    else:
+                        sid, spos = sb
+                        for k in [k for k in _STUCK_SINCE if k != sid]:
+                            del _STUCK_SINCE[k]
+                        held = now - _STUCK_SINCE.setdefault(sid, now)
+                        if held > STUCK_S:
+                            del _STUCK_SINCE[sid]
+                            rr = link.call(cmd="despawn_box", box_id=sid)
+                            log("   !! %s 가 픽업 구간(%s %.2f m)에 %.0f s 째 "
+                                "그대로인데 집을 수 없다 — 지우고 계속한다 (%s)"
+                                % (sid, "xyz"[_PU_AX], spos[_PU_AX], held,
+                                   "ok" if rr.get("ok") else rr))
+                            _S["rows"].append(
+                                {"id": sid,
+                                 "type": specs.get(sid, {}).get("name", "?"),
+                                 "res": "STUCK", "err": (float("nan"),) * 3,
+                                 "wall": held, "wait": now - t0,
+                                 "knock": 0.0, "who": "-",
+                                 "kvec": (0.0, 0.0, 0.0),
+                                 "near_mm": 0.0, "far_mm": 0.0, "place": None})
+                            if sid in targets:
+                                # 이 존 몫이었다. 처리한 것으로 세고 넘어간다.
+                                i += 1
+                                skipped = True
+                                break
                 # 안 오면 어디에 있는지 주기적으로 찍는다. 이게 없으면 타임아웃
                 # 났을 때 "안 왔다" 는 사실만 남고 원인을 못 찾는다
                 # (2026-08-23 15번째가 180 s 동안 안 와서 겪었다).
@@ -908,19 +1939,22 @@ def worker(specs, ids):
                     nag = time.time() - t0
                     log("   ...대기 %.0f s — %s" % (nag, _line_state(link, ids)))
                 time.sleep(0.05)
+            if skipped:
+                continue
             if pick is None:
-                log("   !! %d 번째 박스가 %.0f s 안에 스토퍼에 안 왔다 — 중단"
-                    % (i + 1, ARRIVE_TIMEOUT_S))
+                log("   !! %d/%d 번째 박스가 %.0f s 안에 스토퍼에 안 왔다 — 중단"
+                    % (i + 1, len(targets), ARRIVE_TIMEOUT_S))
                 log("      마지막 라인 상태: %s" % _line_state(link, ids))
                 _S["stalled"] = True
                 break
             bid = pick["box_id"]
             t = specs[bid]
             _CUR["box"] = (bid, t["h_mm"] / 2000.0)      # gap_fn 이 읽는다
+            _CUR_Z[zone] = _CUR["box"]
             wait_s = time.time() - t0
 
             log("\n[%2d/%d] %-9s %-3s %s mm %.0f kg   대기 %.1f s   앞면 %.4f m"
-                % (i + 1, len(ids), bid, t["name"],
+                % (i + 1, len(targets), bid, t["name"],
                    [t["w_mm"], t["d_mm"], t["h_mm"]], t["mass_g"] / 1000.0, wait_s,
                    pick["pose"]["pos_m"][0] + t["w_mm"] / 2000.0))
 
@@ -946,11 +1980,16 @@ def worker(specs, ids):
 
             # ── 사이클 한 바퀴 — 실물 cycle.py 그대로 ───────
             tc = time.time()
-            _S["cyc_t0"], _S["cyc_id"] = tc, bid     # 메인 스레드가 감시한다 (on_step)
+            # 메인 스레드가 감시한다 (on_step). ★ 존별로 담는다 — 로봇이 여러
+            # 대면 한 리스트에 덮어써서 남의 사이클 시간을 재게 된다.
+            _S.setdefault("cyc", {})[zone] = (tc, bid)
+            _S["cyc_t0"], _S["cyc_id"] = tc, bid
             res = cyc.run(bid, pick["pose"])
             wall = time.time() - tc
             _S["cyc_t0"] = None
+            _S.setdefault("cyc", {}).pop(zone, None)
             _CUR["box"] = None                           # 사이클 밖에서 옛 박스로 재지 않는다
+            _CUR_Z[zone] = None
 
             # ── 놓은 뒤 정착 ────────────────────────────────
             # ★ B5 견본(`demo_stack15.main`)은 사이클이 끝난 뒤 SETTLE_S 만큼 물리를
@@ -971,7 +2010,7 @@ def worker(specs, ids):
             place = dict(svc.last) if (res == "PLACED" and svc.last) else None
             err = np.array([float("nan")] * 3)
             if place is not None:
-                want = np.asarray(CY.pallet_place_to_world(place, t["h_mm"], ORIGIN_MM))
+                want = np.asarray(CY.pallet_place_to_world(place, t["h_mm"], origin_mm))
                 got = by_id[bid].get_world_pose()[0]
                 err = (got - want) * 1000.0
             knock, who, kvec = 0.0, "-", np.zeros(3)
@@ -1003,12 +2042,28 @@ def worker(specs, ids):
                 if place is not None:
                     on_pallet.append(dict(place, type=t["name"], id=bid))
 
-            _S["rows"].append({"id": bid, "type": t["name"], "res": res, "err": err,
+            _S["rows"].append({"zone": zone,
+                               "id": bid, "type": t["name"], "res": res, "err": err,
                                "wall": wall, "wait": wait_s, "knock": knock, "who": who,
                                "kvec": kvec, "near_mm": near_mm, "far_mm": far_mm,
                                "place": place})
             log("       %-11s 오차 [%+.1f %+.1f %+.1f] mm   %.1f s   knock %.1f mm (%s)"
                 % (res, err[0], err[1], err[2], wall, knock, who))
+
+            # ★ 팔레트 1 장에 정해진 수만큼 놓았으면 트럭으로 내보내고 끝낸다.
+            if PER_PALLET > 0 and res == "PLACED":
+                _done_n = len([w for w in _S["rows"]
+                               if w["res"] == "PLACED"
+                               and w.get("zone", zone) == zone])
+                if _done_n >= PER_PALLET:
+                    log("   [반출] 팔레트에 %d 개 — 트럭으로 보낸다" % _done_n)
+                    _cargo = [w["id"] for w in _S["rows"]
+                              if w["res"] == "PLACED"
+                              and w.get("zone", zone) == zone]
+                    _S.setdefault("ships", {})[zone] = ship_pallet(
+                        link, zone, log, _cargo)
+                    _S["ship"] = _S["ships"][zone]
+                    break
 
             # ── PALLET_FULL 은 **팔레트를 갈아서** 푼다 (사양 경로) ──
             # 트랙B 가이드 상태도: "PALLET_FULL: /sim/set_spawn_enabled(false)
@@ -1022,7 +2077,7 @@ def worker(specs, ids):
                 log("       팔레트가 찼다 — 사양 경로로 교체한다 "
                     "(스폰 정지 -> swap_pallet -> algo reset -> 재가동)")
                 link.call(cmd="set_spawn_enabled", enabled=False)
-                sw = link.call(cmd="swap_pallet", zone=ZONE)
+                sw = link.call(cmd="swap_pallet", zone=zone)
                 svc.reset_pallet()
                 link.call(cmd="set_spawn_enabled", enabled=True)
                 if not sw.get("ok"):
@@ -1086,14 +2141,18 @@ def worker(specs, ids):
                 fell_on_pallet = False
                 if pr.get("ok"):
                     _bx, _by, _bz = pr["pos_m"]
-                    fell_on_pallet = (PALLET_X[0] <= _bx <= PALLET_X[1]
-                                      and PALLET_Y[0] <= _by <= PALLET_Y[1]
-                                      and _bz >= PALLET_TOP_M - 0.05)
+                    _px = (origin_mm[0] / 1000.0,
+                           (origin_mm[0] + cfg["pallet"]["width_mm"]) / 1000.0)
+                    _py = (origin_mm[1] / 1000.0,
+                           (origin_mm[1] + cfg["pallet"]["depth_mm"]) / 1000.0)
+                    fell_on_pallet = (_px[0] <= _bx <= _px[1]
+                                      and _py[0] <= _by <= _py[1]
+                                      and _bz >= origin_mm[2] / 1000.0 - 0.05)
                 if fell_on_pallet:
                     log("       !! 팔레트 위에 떨어졌다 (%.3f %.3f %.3f) — 개별 despawn "
                         "대신 팔레트를 갈아낸다" % tuple(pr["pos_m"]))
                     link.call(cmd="set_spawn_enabled", enabled=False)
-                    sw = link.call(cmd="swap_pallet", zone=ZONE)
+                    sw = link.call(cmd="swap_pallet", zone=zone)
                     svc.reset_pallet()
                     link.call(cmd="set_spawn_enabled", enabled=True)
                     if sw.get("ok"):
@@ -1122,9 +2181,21 @@ def worker(specs, ids):
         _S["result"] = {"wall": time.time() - t_all, "pallets": pallets}
     except BaseException:
         import traceback
-        _S["result"] = {"trace": traceback.format_exc()}
+        _tb = traceback.format_exc()
+        # ★ **즉시** 찍는다. 존이 여럿이면 마지막 워커가 `_S["result"]` 를 덮어써서
+        #   먼저 죽은 존의 traceback 이 통째로 사라진다 (실측 2026-08-25: 존 A·B 가
+        #   시작 직후 끝났는데 로그에 아무 흔적이 없었다).
+        log("   !! [존 %s] 워커가 죽었다\n%s" % (zone, _tb))
+        _S.setdefault("traces", {})[zone] = _tb
+        _S["result"] = {"trace": _tb}
     finally:
-        _S["done"] = True
+        # ★ 존이 여럿이면 **전부** 끝나야 시나리오가 끝난다. 한 대가 먼저 끝났다고
+        #   done 을 세우면 나머지 로봇의 소켓이 닫혀 traceback 으로 죽는다.
+        _S["workers_left"] = _S.get("workers_left", len(ZONES)) - 1
+        if _S["workers_left"] <= 0:
+            _S["done"] = True
+        else:
+            log("   [존 %s] 끝. 남은 로봇 %d 대" % (zone, _S["workers_left"]))
 
 
 def report():
@@ -1138,13 +2209,13 @@ def report():
         "  (뽑힌 그대로 — 실제 라인 조건)"))
     if "trace" in r:
         log("!! 예외\n" + r["trace"])
-    log("  #  박스       종류  결과         오차 XY / Z [mm]   대기 s  사이클 s  knock mm")
+    log("  #  존 박스       종류  결과         오차 XY / Z [mm]   대기 s  사이클 s  knock mm")
     log("-" * 78)
     for i, w in enumerate(rows, 1):
         exy = float(np.linalg.norm(w["err"][:2]))
         cell = ("%6.1f / %+6.1f" % (exy, w["err"][2])) if np.isfinite(exy) else "     -  /     - "
-        log("%3d  %-10s %-4s  %-11s %s   %6.1f   %6.1f   %7.1f"
-            % (i, w["id"], w["type"], w["res"], cell,
+        log("%3d  %s  %-10s %-4s  %-11s %s   %6.1f   %6.1f   %7.1f"
+            % (i, w.get("zone", ZONE), w["id"], w["type"], w["res"], cell,
                w["wait"], w["wall"], w["knock"]))
     log("-" * 78)
 
@@ -1152,8 +2223,19 @@ def report():
     bypassed = [w for w in rows if w["res"] == "PALLET_FULL"]
     failed = [w for w in rows if w["res"] not in ("PLACED", "PALLET_FULL")]
     ok = bool(placed)
+    # ★ 분모는 **이 존 몫**이다. 라우팅을 켜면 남의 배송지 박스는 다른 지선으로 간다.
+    #   팔레트당 개수를 정했으면(PL_PER_PALLET) 그만큼만 놓고 반출하므로 그 수가 분모다.
+    # ★ 존이 여럿이면 **존별 목표의 합**이다. 한 존 몫만 세면 3 대가 각자 1 개를
+    #   놓았는데 "3 / 1" 처럼 나온다.
+    if MULTI:
+        _target_n = sum(len(v) for v in (_S.get("targets_by_zone") or {}).values()) or N
+    else:
+        _target_n = len(_S.get("targets") or []) or N
+    if PER_PALLET > 0:
+        # 반출을 켜면 로봇 한 대가 PER_PALLET 개만 놓고 끝낸다 -> 존 수만큼.
+        _target_n = min(_target_n, PER_PALLET * (len(ZONES) if MULTI else 1))
     log("처리한 것     %d / %d   (놓음 %d · 우회 %d · 실패 %d)"
-        % (len(rows), N, len(placed), len(bypassed), len(failed)))
+        % (len(rows), _target_n, len(placed), len(bypassed), len(failed)))
     if bypassed:
         log("우회          %s — 이 팔레트에 자리가 없는 박스다. 설계결정서 §7 상"
             % ", ".join("%s(%s)" % (w["id"], w["type"]) for w in bypassed))
@@ -1200,6 +2282,28 @@ def report():
                 "%.1f mm · 윗면 z 최대 %.1f mm"
                 % (len(ce), hit, len(ce), max(cam_exy), max(cam_ez)))
         log("팔레트        %d 판" % r.get("pallets", 1))
+        for _z, _s2 in sorted((_S.get("ships") or {}).items()):
+            if not _s2:
+                continue
+            log("반출 %s        팔레트 X %.0f~%.0f · Y %.0f~%.0f mm -> %s · "
+                "적재물 %d 개 · 이동 %.1f mm %s"
+                % (_z, _s2["min_m"][0] * 1000, _s2["max_m"][0] * 1000,
+                   _s2["min_m"][1] * 1000, _s2["max_m"][1] * 1000,
+                   "실림" if _s2["reached"] else "미도착",
+                   _s2.get("cargo", 0), _s2.get("slip_mm", 0.0),
+                   "안착" if _s2.get("slip_mm", 0.0) <= SHIP_SLIP_TOL_MM
+                   else "!! 미끄러짐"))
+        _sh = _S.get("ship") if not MULTI else None
+        if _sh:
+            log("반출          팔레트 X %.0f~%.0f · Y %.0f~%.0f mm · 적재함 입구 %.0f "
+                "-> %s"
+                % (_sh["min_m"][0] * 1000, _sh["max_m"][0] * 1000,
+                   _sh["min_m"][1] * 1000, _sh["max_m"][1] * 1000,
+                   _sh["bed_x"] * 1000, "완전히 실림" if _sh["reached"] else "미도착"))
+            log("적재물        %d 개 · 팔레트 대비 최대 이동 %.1f mm  %s  (허용 %.0f)"
+                % (_sh.get("cargo", 0), _sh.get("slip_mm", 0.0),
+                   "안착" if _sh.get("slip_mm", 0.0) <= SHIP_SLIP_TOL_MM
+                   else "!! 미끄러짐", SHIP_SLIP_TOL_MM))
         log("벽시계        %.0f s" % r.get("wall", 0.0))
 
         # ── 끝난 뒤 **물리에서 잰** 자리 ────────────────────────────
@@ -1216,9 +2320,11 @@ def report():
                 if q is None or not w["place"]:
                     continue
                 want = np.asarray(_S["CY"].pallet_place_to_world(
-                    w["place"], BOX_H_MM[w["type"]], ORIGIN_MM))
+                    w["place"], BOX_H_MM[w["type"]],
+                    ORIGIN_BY_ZONE.get(w.get("zone", ZONE), ORIGIN_MM)))
                 dv = (q - want) * 1000.0
-                tmm = q[2] * 1000.0 + BOX_H_MM[w["type"]] / 2.0 - ORIGIN_MM[2]
+                tmm = (q[2] * 1000.0 + BOX_H_MM[w["type"]] / 2.0
+                       - ORIGIN_BY_ZONE.get(w.get("zone", ZONE), ORIGIN_MM)[2])
                 top_meas = max(top_meas, tmm)
                 log("     %-10s %-4s   P(%4d,%4d) %4d   [%+5.0f %+5.0f %+5.0f]   %5.0f"
                     % (w["id"], w["type"], w["place"]["x_mm"], w["place"]["y_mm"],
@@ -1231,13 +2337,15 @@ def report():
         #   실패가 아니고(설계결정서 §7), 도착 순서로 15 개가 다 들어가는지는 **패커의
         #   상한** 문제라 이 게이트가 물을 것이 아니다 (eval_pack_online.py 가 답한다).
         #   여기가 물어야 하는 것은 "라인이 15 개를 끝까지 처리했는가" 다.
-        all_handled = len(rows) == N and not failed
+        _tgt = _target_n
+        all_handled = len(rows) == _tgt and not failed
         ok = (all_handled
               and max(exy) < D.PLACE_TOL_XY_MM and max(ez) < D.PLACE_TOL_Z_MM
               and kn < D.KNOCK_WARN_MM
               and max(tops) <= cfg["pallet"]["max_stack_mm"])
         for cond, msg in ((all_handled,
-                           "%d 개를 끝까지 처리해야 한다 (놓거나 우회. BLOCKED 는 실패)" % N),
+                           "%d 개를 끝까지 처리해야 한다 (놓거나 우회. BLOCKED 는 실패)"
+                           % _tgt),
                           (max(exy) < D.PLACE_TOL_XY_MM, "XY 오차 %d mm 안" % D.PLACE_TOL_XY_MM),
                           (max(ez) < D.PLACE_TOL_Z_MM, "Z 오차 %d mm 안" % D.PLACE_TOL_Z_MM),
                           (kn < D.KNOCK_WARN_MM, "knock %d mm 안" % D.KNOCK_WARN_MM),
@@ -1294,12 +2402,15 @@ def on_step(dt):
         # ★ setup() 이 이미 listen 중이다 — 이 창에 들어온 소켓 요청도 살려 둔다.
         #   근거는 verify_b4_test1_1.py 의 같은 자리 주석.
         _S["q"].pump()
-        _S["rm"].step()
+        for _a in (_S.get("arms") or {}).values():
+            _a["rm"].step()
+            _a["art"].apply_action(_S["ready_action"])   # 안 걸면 옛 목표로 튄다
         _S["sp"].step()
-        _S["art"].apply_action(_S["ready_action"])       # 안 걸면 옛 목표로 튄다
         if _S["n"] >= SETTLE_STEPS:
-            log("자세      수렴 %s deg"
-                % np.round(np.degrees(_S["art"].get_joint_positions()[:6]), 1).tolist())
+            log("자세      수렴 %s"
+                % {_z: np.round(np.degrees(
+                    _a["art"].get_joint_positions()[:6]), 1).tolist()
+                   for _z, _a in (_S.get("arms") or {}).items()})
             if SEED is not None:
                 _c = dict(cfg)
                 _c["boxes"] = dict(cfg["boxes"], random_seed=int(SEED))
@@ -1313,25 +2424,63 @@ def on_step(dt):
                     "상자 구성은 사양 seed 그대로다.")
             ids = [BOX_ID_FMT % i for i in range(N)]
             specs = {bid: dict(t) for bid, t in zip(ids, fed)}
-            log("박스      %d 개  %s" % (N, [t["name"] for t in fed]))
+            # ★ 배송지는 크기와 **독립**으로 뽑는다 (2026-08-25).
+            #   QR 이 배송지를 싣고, 그 값이 목적지 존을 정한다. 그래서 한 존의
+            #   팔레트에는 **그 배송지의 3·4·5 호가 섞여** 들어온다 — 그래야 패커가
+            #   실제로 일한다 (한 가지 크기만 오면 최적화라고 할 게 없다).
+            #   재현성을 위해 박스 구성과 같은 seed 를 쓴다.
+            _dests = list(cfg["boxes"].get("dests") or [])
+            if _dests:
+                import random as _rnd
+                _dr = _rnd.Random(int(SEED) if SEED is not None
+                                  else int(cfg["boxes"].get("random_seed", 42)))
+                for bid in ids:
+                    specs[bid]["dest"] = _dr.choice(_dests)
+            log("박스      %d 개  %s" % (N,
+                ["%s/%s" % (t["name"], specs[b].get("dest", "-"))
+                 for b, t in zip(ids, fed)]))
+            # ★ 라우팅을 켜면 **이 존 색깔의 박스만** 이 로봇의 몫이다.
+            #   나머지는 다른 지선으로 가서 그 존의 로봇을 기다린다 (1 존만 돌리는
+            #   실행에서는 지선에 그대로 선다). 목표 개수를 N 으로 두면 남의 박스를
+            #   기다리다 늘 실패로 끝난다.
+            _map, _key = _route_map()
+            _tz = {}
+            for _z in ZONES:
+                if ROUTE_ON and _map:
+                    _tz[_z] = [b for b in ids if _map.get(_key(specs[b])) == _z]
+                    log("존 %s 몫  %d 개 (%s)  · 나머지 %d 개"
+                        % (_z, len(_tz[_z]),
+                           ",".join(k for k, v in sorted(_map.items()) if v == _z),
+                           len(ids) - len(_tz[_z])))
+                else:
+                    _tz[_z] = list(ids)
+            _S["targets_by_zone"] = _tz
+            _S["targets"] = _tz[ZONES[0]]                # 단일 존 하위 호환
             log("-" * 78)
             _S["phase"] = "run"
             _S["t0"] = time.time()
-            threading.Thread(target=worker, args=(specs, ids),
-                             daemon=True, name="stack15").start()
+            _S["workers_left"] = len(ZONES)
+            # ★ 존마다 워커 한 벌. 각자 자기 소켓·자기 팔·자기 팔레트를 쓴다.
+            for _z in ZONES:
+                threading.Thread(target=worker, args=(specs, ids, _z),
+                                 daemon=True, name="stack15_%s" % _z).start()
         return
     _S["q"].pump()
-    _S["rm"].step()                                      # ★ world.step() 앞, 메인 스레드
+    # ★ world.step() 앞, 메인 스레드. 팔이 여러 대면 전부 한 스텝씩 돌린다.
+    for _a in (_S.get("arms") or {}).values():
+        _a["rm"].step()
     _S["sp"].step()
     # ★ 사이클 하나가 굳으면 워치독(900 s)까지 아무도 안 끊는다. CYCLE_WALL_S 를
     #   선언만 해 두고 안 쓰고 있었다. 여기서 실제로 쓴다 — 굳은 사이클은 그 자리에서
     #   끊고 그때까지의 결과라도 남긴다.
-    if _S.get("cyc_t0") and time.time() - _S["cyc_t0"] > CYCLE_WALL_S:
-        log("   !! %s 사이클이 %.0f s 를 넘겼다 — 중단하고 결과를 낸다"
-            % (_S.get("cyc_id"), CYCLE_WALL_S))
-        _S["cyc_t0"] = None
-        _S["stalled"] = True
-        _S["done"] = True
+    # ★ 존별로 본다. 한 대가 멈췄다고 전체를 끝내지 않는다 — 다른 로봇은 계속 돈다.
+    _now = time.time()
+    for _z, _c in list((_S.get("cyc") or {}).items()):
+        if _now - _c[0] > CYCLE_WALL_S:
+            log("   !! [존 %s] %s 사이클이 %.0f s 를 넘겼다"
+                % (_z, _c[1], CYCLE_WALL_S))
+            _S.setdefault("cyc", {}).pop(_z, None)
+            _S["stalled"] = True
     if _S["done"] or time.time() - _S["t0"] > WATCHDOG_S:
         # ★ `_S["done"]` 을 먼저 세운다. 워치독(WATCHDOG_S)으로 들어오면 예전에는
         #   이게 False 라 워커·투입·계량 스레드가 계속 돌았고, 그 사이 report() 가
@@ -1366,27 +2515,94 @@ def _on_timeline(e):
     _S["phase"] = "done"                   # on_step 이 죽은 핸들을 안 만진다
     print("\n" + "!" * 78, flush=True)
     print("Stop 을 눌렀다 — 이 드라이버는 여기서 끝난다.", flush=True)
-    print("  Play 를 다시 눌러도 안 움직인다. Stop 이 물리 뷰를 무효화해서", flush=True)
-    print("  부팅 때 잡은 로봇·그리퍼 핸들이 죽었기 때문이다 (재초기화 경로 없음).", flush=True)
+    print("  Play 를 다시 눌러도 **박스가 더 안 나온다.** Stop 이 물리 뷰를", flush=True)
+    print("  무효화해서 부팅 때 잡은 로봇·그리퍼 핸들이 죽었고, 재초기화 경로가", flush=True)
+    print("  없어서 스폰 루프가 다시 안 돈다. 쌓아 둔 팔레트도 Stop 이 되감아서", flush=True)
+    print("  남지 않는다 — 즉 Stop 뒤에 볼 것은 없다.", flush=True)
     print("  다시 보려면 **창을 닫고** 다시 실행해라:", flush=True)
     print("      cd ~/palletris_ws && ./scripts/run_demo.sh", flush=True)
-    # ★ Stop 은 박스들을 **스폰 당시 USD 좌표**로 되돌린다 — 팔레트에 쌓인 것까지
-    #   전부 스폰 지점에 겹쳐 선다. 그대로 Play 하면 벨트(OmniGraph 라 이 드라이버와
-    #   무관하게 돈다)가 그것들을 실어 나가서, 안 나왔던 박스가 갑자기 움직이는
-    #   것처럼 보인다. 여기서 좌표 자체를 라인 밖으로 적어 화면을 비운다.
-    sp = _S.get("sp")
-    if sp is not None:
+    print("!" * 78 + "\n", flush=True)
+    # ★ 박스 정리는 **이 콜백 안에서 하면 안 된다.**
+    #   Stop 은 Play 때 잡아 둔 초기 자세를 USD 에 **되써 넣는다.** 여기서 먼저
+    #   좌표를 옮겨 봐야 그 되쓰기가 덮어버린다 — 실측 2026-08-24: Stop 뒤 화면에
+    #   박스가 스폰 지점에 전부 겹쳐 서 있고, Play 를 누르면 벨트(OmniGraph 라
+    #   이 드라이버와 무관하게 돈다)가 그 더미를 실어 날라 "안 나온 박스가 여러 개
+    #   쏟아지는" 것처럼 보였다.
+    #   그래서 **되쓰기가 끝난 뒤**(다음 앱 업데이트 몇 틱 뒤) 옮긴다.
+    #   한 번으로 안 끝날 수 있어 두 번 친다 — park_all 은 멱등이다.
+    _pk = {"sub": None, "n": 0}
+
+    def _park_later(_ev):
+        _pk["n"] += 1
+        if _pk["n"] not in (3, 12):
+            if _pk["n"] > 12:
+                try:
+                    _pk["sub"].unsubscribe()
+                except Exception:
+                    pass
+            return
+        sp = _S.get("sp")
+        if sp is None:
+            return
         try:
-            print("  박스 프림 %d 개를 라인 밖으로 치웠다 (Stop 이 스폰 좌표로 "
-                  "되돌리는 것을 막는다)." % sp.park_all(), flush=True)
+            n = sp.park_all()
+            if _pk["n"] == 3:
+                print("  박스 프림 %d 개를 라인 밖으로 치웠다 "
+                      "(Stop 의 자세 되쓰기 뒤에)." % n, flush=True)
         except Exception as _e:
             print("  박스 정리 실패: %r" % (_e,), flush=True)
-    print("!" * 78 + "\n", flush=True)
+
+    _pk["sub"] = (omni.kit.app.get_app().get_update_event_stream()
+                  .create_subscription_to_pop(_park_later,
+                                              name="palletris-park-after-stop"))
+    _S["park_sub"] = _pk["sub"]
 
 
 _S["timeline_sub"] = (omni.timeline.get_timeline_interface()
                       .get_timeline_event_stream()
                       .create_subscription_to_pop(_on_timeline, name="palletris-stop"))
 
-_S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
-log("Play — 부팅 대기...\n")
+
+# ── 물리 스텝 구독 ────────────────────────────────────────
+# ★ **Play 뒤에 붙여야 한다.** `subscribe_physics_step_events` 는 그 시점의 물리
+#   시뮬레이션에 붙는데, Play 전에는 그 시뮬레이션이 아직 없다. 그래서 정지 상태에서
+#   구독해 두면 나중에 Play 를 눌러도 콜백이 안 들어온다 — 이 드라이버는 전부
+#   `on_step` 으로 도니까 **아무 일도 안 일어난다.**
+#   실측 2026-08-24: 수동 Play 를 넣으면서 이 순서가 깨졌다. 예전 판은 스크립트가
+#   `timeline.play()` 를 먼저 부르고 여기까지 앱 업데이트 없이 내려와서 우연히
+#   "Play -> 구독" 순서가 지켜지고 있었다. 자동 Play 를 빼자 그 순서가 사라졌다.
+#   증상: 씬은 뜨고 Play 를 눌러도 박스가 안 나오고 소켓 서버도 안 열린다.
+def _sub_physx(_why):
+    if _S.get("physx_sub") is not None:
+        return
+    _S["physx_sub"] = get_physx_interface().subscribe_physics_step_events(on_step)
+    log("물리      스텝 구독 (%s)" % _why)
+
+
+if AUTOPLAY:
+    _sub_physx("자동 Play")
+    log("Play 중 — 부팅 대기...\n")
+else:
+    # 사람이 Play 를 누르는 순간 붙인다. Stop -> Play 로 다시 눌러도 중복 구독은 안 한다.
+    try:
+        _PLAY_EVT = int(omni.timeline.TimelineEventType.PLAY)
+    except Exception:                      # API 이름이 바뀌면 즉시 구독으로 물러선다
+        _PLAY_EVT = None
+        _sub_physx("PLAY 이벤트를 못 잡아 즉시 구독")
+
+    if _PLAY_EVT is not None:
+        def _on_play(e):
+            if e.type != _PLAY_EVT:
+                return
+            _sub_physx("Play 눌림")
+            try:
+                _S["play_sub"].unsubscribe()   # 한 번이면 된다
+            except Exception:
+                pass
+            _S["play_sub"] = None
+
+        _S["play_sub"] = (omni.timeline.get_timeline_interface()
+                          .get_timeline_event_stream()
+                          .create_subscription_to_pop(_on_play,
+                                                      name="palletris-play"))
+    log("Play 를 기다린다...\n")
