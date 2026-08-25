@@ -21,5 +21,10 @@ setup(
     #   여기 있던 'orchestrator' 엔트리포인트는 2026-08-26 폐기했다 —
     #   소켓(8765) 시대의 껍데기였고, ROS 2 판이 그 자리를 가져갔다.
     #   근거: docs/2026-08-26_관제탑_이중화_해소.md
-    entry_points={'console_scripts': []},
+    entry_points={
+        'console_scripts': [
+            # 관제탑(RobotCmd) ↔ Cycle(move_ee) 어댑터
+            'robot_node = packing_robot.robot_node:main',
+        ],
+    },
 )
