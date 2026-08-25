@@ -1,7 +1,63 @@
 # 트랙 C → 트랙 B 인계 (2026-08-25, 정정인 → 김병직)
 
-`colcon build --symlink-install && source install/setup.bash` 다시 하세요.
-`packing_bringup/config/system.yaml` 이 바뀌었습니다 (heightmap 섹션만).
+---
+
+## 0. 받아서 돌리는 법
+
+```bash
+cd ~/palletris_ws
+git fetch origin
+git merge origin/track/algo          # 또는 PR 로 main 에 넣은 뒤 main 을 받기
+colcon build --symlink-install
+source install/setup.bash
+```
+
+알고리즘 노드를 띄웁니다 (**`use_sim_time:=true` 필수** — §3-4 규약 1번):
+
+```bash
+export ROS_DOMAIN_ID=115
+ros2 run packing_algo algo_service_node --ros-args -p use_sim_time:=true
+```
+
+정상이면 이렇게 뜹니다:
+
+```
+[INFO] algo_service_node 준비 — 구역 ['A','B','C'] · heightmap (120, 80) (셀 10mm) · max_stack 1300mm
+```
+
+붙기 전에 서비스만 따로 확인하려면 (실측 확인 완료):
+
+```bash
+ros2 service call /algo/plan_placement packing_msgs/srv/PlanPlacement \
+  "{zone: 'B', box_id: 'T1', size_w_mm: 480, size_d_mm: 380, size_h_mm: 340}"
+#  -> ok=True, pose=(x_mm=240, y_mm=610, z_mm=0, yaw_deg=0.0), message='OK'
+
+ros2 service call /algo/update_heightmap packing_msgs/srv/UpdateHeightmap \
+  "{zone: 'B', box_id: 'T1', size_w_mm: 480, size_d_mm: 380, size_h_mm: 340,
+    actual_pose: {x_mm: 240, y_mm: 610, z_mm: 0, yaw_deg: 0.0}}"
+#  -> ok=True, fill_rate=0.19, placed_count=1, max_height_mm=340
+
+ros2 service call /algo/reset_heightmap packing_msgs/srv/ResetHeightmap "{zone: 'B'}"
+```
+
+서비스 경로 4개: `/algo/plan_placement` · `/algo/update_heightmap` ·
+`/algo/cancel_plan` · `/algo/reset_heightmap`
+
+> ⚠ **`/algo/reset` 이 아니라 `/algo/reset_heightmap` 입니다.**
+> srv 타입도 `ResetZone` → `ResetHeightmap` 으로 바뀌었습니다 (§3-3 에 맞춤).
+
+### ⚠ 이 브랜치에는 알고리즘만 있는 게 아닙니다
+
+`track/algo` 를 받으면 같이 딸려 옵니다. **알고리즘 노드가 `ResetHeightmap` 을
+쓰기 때문에 떼어낼 수가 없습니다.**
+
+| 딸려 오는 것 | 무엇 |
+|---|---|
+| `packing_msgs/` 전체 | `BoxAtPickup` 이 `geometry_msgs/Pose` 를 버리고 mm 정수로 · `ResetZone` → `ResetHeightmap` · `RobotCmd`/`RobotEvent` 신규 · `BoxInfo`/`ZoneStatus` 필드 확정 (CLAUDE.md §3 최종본에 맞춤) |
+| **`packing_robot/orchestrator.py`** | **김병직님 파일인데 제가 고쳤습니다.** 위 msg 변경에 맞추느라 그랬습니다 — `ZoneStatus.max_height_mm` 중계 추가, `state="BLOCKED"` 제거(§3-2 의 7상태에 없는 값이라) → `accepting=false` 로. **직접 보시고 마음에 안 들면 되돌려 주세요.** |
+| `packing_vision/`, `packing_sim/isaac/ros_graph.py` | 신규 |
+
+**팀 4명 전원 재빌드입니다.** 옛 필드 이름을 쓰는 코드는 깨집니다.
 
 ---
 
