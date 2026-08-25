@@ -155,6 +155,60 @@ STAGE_COLS = 5
 PARK_XY = (14.5, -3.0)
 
 
+PHYS_MAT_PATH = "/World/Looks/PhysicsMaterial"          # spawner.py 와 같은 경로
+
+
+def _phys_material(stage, cfg):
+    """`system.yaml` 의 마찰을 담은 물리 머티리얼. 없으면 만든다 (spawner.py:370 과 동일).
+
+    ★ 이게 없으면 박스가 PhysX **기본 마찰**로 돌고 `physics.material` 0.6/0.5 는
+      아무데도 안 걸린다. 스택이 서느냐 미끄러지느냐를 직접 가르는 값이다.
+    """
+    from pxr import UsdGeom, UsdPhysics, UsdShade
+    if not stage.GetPrimAtPath("/World/Looks"):
+        UsdGeom.Scope.Define(stage, "/World/Looks")
+    prim = stage.GetPrimAtPath(PHYS_MAT_PATH)
+    if not prim:
+        m = cfg["physics"]["material"]
+        pm = UsdShade.Material.Define(stage, PHYS_MAT_PATH)
+        api = UsdPhysics.MaterialAPI.Apply(pm.GetPrim())
+        api.CreateStaticFrictionAttr(float(m["static_friction"]))
+        api.CreateDynamicFrictionAttr(float(m["dynamic_friction"]))
+        api.CreateRestitutionAttr(0.0)
+        prim = pm.GetPrim()
+    return prim
+
+
+def _apply_physics(stage, prim, cfg, rigid=True):
+    """`spawner.py` 가 박스마다 거는 물리 속성을 그대로 건다.
+
+    ★ 왜 필요한가 — 이 데모는 스포너를 안 거치고 `verify_suction.make_box` 로 씬을
+      직접 만든다. 그 함수는 콜라이더·리지드바디·질량만 걸고 **솔버 반복수·오프셋·
+      물리 머티리얼을 안 건다.** 그래서 데모 박스만 PhysX 기본값으로 돌았다:
+      solverPositionIterationCount 기본(4) vs 규정 24. 놓고 난 박스가 접촉을 다 풀지
+      못해 여러 스텝에 걸쳐 **조금씩 미끄러진다** (CLAUDE.md §9 "쌓은 박스가 저절로
+      무너진다"). 2026-08-25 실측: #14 에서 BOX00012 가 70.7 mm 흘렀는데 팔은 그
+      근처에 없었다.
+
+    ★ 솔버 반복수는 **박스마다** 건다. PhysicsScene 에 걸면 무시된다 (spawner.py:30).
+    """
+    from pxr import PhysxSchema, UsdShade
+    ph = cfg["physics"]
+    col = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+    col.CreateRestOffsetAttr(ph["collider"]["rest_offset_mm"] / 1000.0)
+    col.CreateContactOffsetAttr(ph["collider"]["contact_offset_mm"] / 1000.0)
+    if rigid:
+        rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        rb.CreateSolverPositionIterationCountAttr(
+            int(ph["rigid_body"]["solver_position_iterations"]))
+        rb.CreateSolverVelocityIterationCountAttr(
+            int(ph["rigid_body"]["solver_velocity_iterations"]))
+    mat = _phys_material(stage, cfg)
+    UsdShade.MaterialBindingAPI.Apply(prim)
+    UsdShade.MaterialBindingAPI(prim).Bind(
+        UsdShade.Material(mat), UsdShade.Tokens.weakerThanDescendants, "physics")
+
+
 def _link_dists(rm, lo, hi):
     """지금 자세에서 **링크별로** 피해 박스 AABB 까지의 최소거리 [mm]. 가까운 순.
 
@@ -905,6 +959,12 @@ def main():
         VS.make_belt(stage, belt_z, pick_x - 0.35, 0.0, size=(1.2, 1.0))
         VS.make_pallet(stage, origin, cfg)
         VS.make_pedestal(stage, S.base, cfg)
+        # ★ 마찰은 **양쪽 면**의 머티리얼로 정해진다. 박스에만 걸고 팔레트·벨트를
+        #   기본값으로 두면 1층이 규정 마찰로 안 선다.
+        for _p in ("/World/TestPallet", VS.BELT):
+            _pr = stage.GetPrimAtPath(_p)
+            if _pr:
+                _apply_physics(stage, _pr, cfg, rigid=False)
 
         from pxr import Gf, UsdGeom
         COLOR = {"3호": (0.86, 0.42, 0.20), "4호": (0.78, 0.66, 0.36),
@@ -921,6 +981,7 @@ def main():
                                b["mass_g"] / 1000.0)
             UsdGeom.Gprim(prim).GetDisplayColorAttr().Set(
                 [Gf.Vec3f(*COLOR.get(b["name"], (0.85, 0.25, 0.20)))])
+            _apply_physics(stage, prim, cfg)          # ★ 솔버 반복수·오프셋·마찰
             ids.append(bid)
             dims_m.append(dm)
             specs[bid] = b
@@ -945,6 +1006,12 @@ def main():
         print("ZONE    %s   base %s mm   팔레트 원점 %s mm"
               % (a.zone, list(np.round(S.base * 1000).astype(int)), origin))
         print("박스    %d 개  %s" % (len(ids), [b["name"] for b in fed]))
+        _ph = cfg["physics"]
+        print("물리    솔버 %d/%d · 오프셋 rest %.0f · contact %.0f mm · 마찰 %.2f/%.2f"
+              % (_ph["rigid_body"]["solver_position_iterations"],
+                 _ph["rigid_body"]["solver_velocity_iterations"],
+                 _ph["collider"]["rest_offset_mm"], _ph["collider"]["contact_offset_mm"],
+                 _ph["material"]["static_friction"], _ph["material"]["dynamic_friction"]))
 
         # ── 몸: robot_motion + 소켓 서버 대역 ───────────────
         cur = {"rp": rps[0], "half_h": dims_m[0][2] / 2.0}
