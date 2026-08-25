@@ -254,3 +254,48 @@ def test_zone_lock_exists():
         i = src.index(cb)
         body = src[i:i + 1400]
         assert "with self.lock[" in body, f"{cb} 이 락 없이 패커를 만진다"
+
+
+def test_no_feasible_pose_는_정말_자리가_없을_때만():
+    """★ `plan()` 이 "자리 없다"고 답했으면 정말로 없어야 한다.
+
+    예전 결함(2026-08-25): 지지율을 **점수 상위 topk(50)개만** 검사하고 거기서 다
+    떨어지면 포기했다. 기둥이 높아지면 상위 점수 자리(낮고 벽에 붙은 칸)가 전부
+    좁은 골짜기여서 몰살당하는데, 정작 쓸 만한 자리는 51등 밖에 있었다.
+    실측(시드 6): 3호가 놓일 수 있는 칸이 803개인데 `NO_FEASIBLE_POSE` 를 냈다.
+
+    왜 심각한가: `NO_FEASIBLE_POSE` 는 §7 계약상 "이 박스만 자리가 없다" 는 뜻이라
+    관제탑이 박스를 리턴 라인으로 되돌린다. 멀쩡히 놓을 수 있는 박스가 한 바퀴 더 돈다.
+    """
+    pk = HeightmapPacker(CFG)
+    rb = random.Random(6)                    # 이 결함이 제일 크게 났던 시드
+    dry = 0
+    for k in range(200):
+        w, d, h = rb.choice(BOXES)
+        ok, _, _, msg = pk.plan(f"B{k}", w, d, h)
+        if not ok:
+            pk.cancel(f"B{k}")
+            dry += 1
+            if msg == "PALLET_FULL" or dry >= 20:
+                break
+            continue
+        dry = 0
+        pose = pk.plans[f"B{k}"][0]
+        pk.update(f"B{k}", w, d, h, dict(pose))
+
+    # 끝난 상태에서 각 박스 종류마다: plan 이 거절했으면 전수조사로도 자리가 없어야 한다
+    for w, d, h in BOXES:
+        ok, _, _, _ = pk.plan("PROBE", w, d, h)
+        pk.cancel("PROBE")
+        if ok:
+            continue
+        for yaw in (0, 90):
+            ww, dd = (w, d) if yaw == 0 else (d, w)
+            wc, dc = ww // pk.cell, dd // pk.cell
+            bz = pk._base_z(wc, dc)
+            cand = (bz + h <= pk.max_stack) & pk._corridor_ok(wc, dc, bz, h)
+            for i, j in zip(*np.nonzero(cand)):
+                sup = pk._support_ratio(int(i), int(j), wc, dc, int(bz[i, j]))
+                assert sup < pk.min_sup, (
+                    f"{ww}x{dd}x{h}: plan 은 자리가 없다는데 ({i},{j}) 에 "
+                    f"z={bz[i, j]} 지지 {sup:.2f} 로 놓을 수 있다")

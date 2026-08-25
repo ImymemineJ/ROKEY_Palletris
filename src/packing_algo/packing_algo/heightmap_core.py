@@ -152,19 +152,39 @@ class HeightmapPacker:
             level = 1.0 - np.abs(bz + h_mm - self._ring_max(wc, dc)) / self.max_stack
             score = np.where(cand, base_score + self.w_wall * wall + self.w_far * far
                              + self.w_level * level - self.tie_eps * order, -np.inf)
-            # ③ 지지율: 상위 K개만 정밀 계산 (전 후보는 너무 비쌈 — 명세서 §7.9)
-            flat = np.argsort(score, axis=None)[::-1][: self.topk]
-            for idx in flat:
-                i, j = np.unravel_index(idx, score.shape)
-                if not cand[i, j]: continue
-                sup = self._support_ratio(i, j, wc, dc, int(bz[i, j]))
-                if sup < self.min_sup: continue
-                s = (self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
-                     + self.w_wall * wall[i, j] + self.w_far * far[i, j]
-                     + self.w_level * level[i, j])
-                key = (s, -order[i, j])                      # 동점 → 위 order 기준
-                if best is None or key > best[0]:
-                    best = (key, i, j, int(bz[i, j]), yaw, w, d)
+            # ③ 지지율: 점수 상위부터 정밀 계산 (전 후보는 너무 비쌈 — 명세서 §7.9)
+            #
+            # ★ 2026-08-25. 예전엔 상위 topk(50)개만 보고 거기서 다 떨어지면 **포기**했다.
+            #   그게 "자리가 있는데 없다고 답하는" 버그였다. 실측(시드 6, 13개 적재 시점):
+            #     3호   높이·통로 4336칸 · 그중 지지까지 통과 803칸  → plan 은 NO_FEASIBLE_POSE
+            #     4호   3924칸 · 388칸                              → plan 은 NO_FEASIBLE_POSE
+            #     5호   3139칸 ·  65칸                              → plan 은 NO_FEASIBLE_POSE
+            #   기둥이 높아지면 점수 상위(= 낮고 벽에 붙은 자리)가 전부 좁은 골짜기라
+            #   지지율에서 몰살당한다. 정작 쓸 만한 자리는 51등 밖에 있었다.
+            #   실제 시스템에서는 멀쩡히 놓을 수 있는 박스가 리턴 라인으로 되돌려진다 (§7).
+            #
+            #   그래서 **한 칸도 못 찾았을 때만** 창을 넓힌다. 상위 50개에서 찾으면
+            #   비용은 예전과 똑같고, 못 찾을 때만 값을 치른다.
+            ranked = np.argsort(score, axis=None)[::-1]
+            n_cand = int(cand.sum())
+            lo, k = 0, self.topk
+            found = False
+            while lo < n_cand:
+                for idx in ranked[lo:k]:
+                    i, j = np.unravel_index(idx, score.shape)
+                    if not cand[i, j]: continue
+                    sup = self._support_ratio(i, j, wc, dc, int(bz[i, j]))
+                    if sup < self.min_sup: continue
+                    found = True
+                    s = (self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
+                         + self.w_wall * wall[i, j] + self.w_far * far[i, j]
+                         + self.w_level * level[i, j])
+                    key = (s, -order[i, j])                  # 동점 → 위 order 기준
+                    if best is None or key > best[0]:
+                        best = (key, i, j, int(bz[i, j]), yaw, w, d)
+                if found:
+                    break                                    # 이 창 안에서 최선을 골랐다
+                lo, k = k, min(k * 4, n_cand)                # 빈손이면 넓혀서 다시
         if best is None:
             # ③ 이 박스만 못 놓은 건지(NO_FEASIBLE_POSE), 팔레트가 정말 끝난 건지(PALLET_FULL) 구분
             return False, None, 0.0, "PALLET_FULL" if self._is_pallet_full() else "NO_FEASIBLE_POSE"
