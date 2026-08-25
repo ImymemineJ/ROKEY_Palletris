@@ -824,6 +824,10 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--render-every", type=int, default=1, metavar="N",
+                    help="N 스텝에 한 번만 화면을 그린다. **물리는 한 스텝도 안 바뀐다** — "
+                         "결과가 비트 단위로 같다. 2~4 면 벽시계가 짧아지고 화면이 그만큼 "
+                         "빨라 보인다. 궤적을 바꾸는 --vel 과 다르다")
     ap.add_argument("--hm", action="append", metavar="KEY=VAL",
                     help="heightmap 가중치를 **계획용 사본에만** 덮어쓴다. 여러 번 쓸 수 있다. "
                          "예: --hm w_wall=0.0 --hm w_far=0.0 --hm w_height=1.2. "
@@ -1173,6 +1177,12 @@ def main():
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
         parked, rejected = [], set()                      # 라인 밖으로 치운 것 / 그중 §5 거부
         # 이미 놓인 박스가 처음 밀리는 순간 (--diag-knock). 사이클마다 초기화한다.
+        _nt = [0]                                         # 렌더 솎기용 스텝 카운터
+        if a.render_every < 1:
+            raise SystemExit("--render-every 는 1 이상이어야 한다")
+        if a.render_every > 1:
+            print("렌더    %d 스텝에 1번만 그린다 (물리는 그대로 — 결과 동일)"
+                  % a.render_every)
         kw = {"hit": None, "n": 0}
         KNOCK_TRIP_MM = 1.0                               # 이 이상 움직이면 "밀렸다" 로 본다
         j5 = [1e9, -1e9]                                  # 손목 감김 추적 (아래 주석)
@@ -1213,7 +1223,10 @@ def main():
             rm.step()
             pos, quat = cur["rp"].get_world_pose()
             cur["pose"] = ([float(v) for v in pos], _yaw_of(quat))
-            S.world.step(render=S.render)
+            # ★ 렌더만 건너뛴다. `world.step` 은 매번 부르므로 물리 스텝 수는 그대로다 —
+            #   결과가 비트 단위로 같다. 궤적을 바꾸는 --vel 과 여기가 다르다.
+            _nt[0] += 1
+            S.world.step(render=S.render and (_nt[0] % a.render_every == 0))
             _j5(S, j5)
             if realtime:
                 # 남은 시간만 잔다. 이미 늦었으면 안 잔다 (따라잡기를 시도하지 않는다 —
