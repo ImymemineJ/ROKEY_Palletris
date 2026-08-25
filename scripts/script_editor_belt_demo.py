@@ -4,14 +4,14 @@
     ▸ 붙여넣고 Ctrl+Enter ▸ ▶ Play
 
     ┌───────────────────────────────────────────────────────────────┐
-    │  손댈 곳은 아래 두 줄뿐이다 (바로 밑에 있다)                    │
-    │                                                               │
-    │    RUN   = "build"   씬·박스·벨트를 만든다   → 그다음 Play     │
-    │          = "check"   Play 뒤에 실제로 움직였는지 본다           │
+    │  손댈 곳은 아래 한 줄뿐이다 (바로 밑에 있다)                    │
     │                                                               │
     │    DRIVE = "auto"    표면속도 → 안 되면 자동으로 push          │
     │          = "push"    박스 속도를 직접 세팅. 마찰과 무관하게 돈다 │
     └───────────────────────────────────────────────────────────────┘
+
+Play 뒤에 **정말 움직였는지** 보려면 `script_editor_belt_check.py` 를
+Script Editor **새 탭**에 붙여넣고 Ctrl+Enter. (같은 탭이 아니어도 된다)
 
 자세한 설명은 파일 맨 아래 NOTES 를 볼 것.
 """
@@ -21,8 +21,7 @@ import random
 import omni.usd
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
-# ██████████████████████  손댈 곳은 여기 두 줄  ██████████████████████
-RUN = "build"             # "build" (만들기)  |  "check" (Play 뒤 확인)
+# ██████████████████████  손댈 곳은 여기 한 줄  ██████████████████████
 DRIVE = "auto"            # "auto" | "surface" | "push" | "off"
 # ████████████████████████████████████████████████████████████████████
 
@@ -110,42 +109,6 @@ def box_x_mm():
     return sorted(out)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  RUN = "check" — Play 뒤에 실제로 움직였는지만 본다
-# ══════════════════════════════════════════════════════════════════════════
-if RUN == "check":
-    prev = globals().get("_spawn_x") or {}
-    now = box_x_mm()
-    print("\n" + "=" * 62)
-    print("  CHECK — did the boxes move?")
-    print("=" * 62)
-    if not now:
-        print("  no boxes found. Run with RUN='build' first.")
-    else:
-        moved = 0
-        print(f"  {'box':10} {'x now (mm)':>12} {'x spawn':>10} {'moved':>9}  z(mm)")
-        for name, x, z in now:
-            x0 = prev.get(name)
-            dx = (x - x0) if x0 is not None else float("nan")
-            if x0 is not None and abs(dx) > 5:
-                moved += 1
-            print(f"  {name:10} {x:12.0f} "
-                  f"{('%10.0f' % x0) if x0 is not None else '         ?'} "
-                  f"{('%+9.0f' % dx) if x0 is not None else '        ?'}  {z:.0f}")
-        print()
-        if moved:
-            print(f"  ==> {moved}/{len(now)} boxes moved. THE BELT WORKS.")
-        else:
-            print("  ==> NOTHING MOVED.")
-            print("      Fix: scroll to the top, set  DRIVE = \"push\"")
-            print("           then Ctrl+Enter, press Stop, press Play again.")
-            print("           push sets box velocity directly - it ignores friction.")
-    raise SystemExit  # noqa: PLR1722  (Script Editor 에서는 여기서 끝내는 게 맞다)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  RUN = "build"
-# ══════════════════════════════════════════════════════════════════════════
 if not stage.GetPrimAtPath("/World").IsValid():
     UsdGeom.Xform.Define(stage, "/World")
 if not stage.GetPrimAtPath("/World/PhysicsScene").IsValid():
@@ -346,7 +309,11 @@ for i in range(SPAWN_COUNT):
                       SPAWN_MM[1] + rng.uniform(-yj, yj),
                       CFG["boxes"]["spawn_yaw_deg"] + rng.uniform(-wj, wj)))
 
-_spawn_x = {r["box_id"]: r["x"] for r in rows}       # RUN='check' 가 쓴다
+# ★ 스폰 x 를 **스테이지에** 적어 둔다. 확인 스크립트는 다른 탭에서 돌아
+#   이 파일의 전역변수를 못 보기 때문이다. 프림 속성이면 누구나 읽는다.
+for r in rows:
+    pr = stage.GetPrimAtPath(f"{BOXES_GROUP}/{r['box_id']}")
+    pr.CreateAttribute("palletris:spawn_x_mm", Sdf.ValueTypeNames.Int).Set(int(r["x"]))
 
 # ── 벨트 구동 ────────────────────────────────────────────────────
 _sub = globals().get("_belt_sub")
@@ -489,7 +456,7 @@ if mode_used == "off":
     print("  !! belt is NOT driven. Boxes will just sit there.")
 else:
     print("  NEXT: press Play. Boxes should slide +X and stop at the stopper.")
-    print("        Then set RUN='check' at the top and Ctrl+Enter to verify.")
+    print("        To verify, paste script_editor_belt_check.py in a NEW tab.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
