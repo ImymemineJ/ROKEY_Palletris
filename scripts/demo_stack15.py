@@ -155,6 +155,36 @@ STAGE_COLS = 5
 PARK_XY = (14.5, -3.0)
 
 
+def _link_dists(rm, lo, hi):
+    """지금 자세에서 **링크별로** 피해 박스 AABB 까지의 최소거리 [mm]. 가까운 순.
+
+    `robot_motion._arm_clearance` 와 같은 계산인데, 최악값 하나가 아니라 **어느 링크인지**
+    를 남긴다. "박스가 혼자 밀렸다" 와 "팔이 쳤다" 를 가르는 게 이 목록이다.
+    """
+    q = np.asarray(rm.art.get_joint_positions()[:6], dtype=float)
+    lo, hi = np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+    out = []
+    for link, sph in (rm.spheres or {}).items():
+        if link == "base_link":
+            continue
+        try:
+            pos, rot = rm.lula.compute_forward_kinematics(link, q)
+        except Exception:
+            continue
+        pos, rot = np.asarray(pos), np.asarray(rot)
+        best = float("inf")
+        for c, r in sph:
+            w = pos + rot @ np.asarray(c, dtype=float)
+            over = np.maximum(lo - w, w - hi)
+            d = (float(np.linalg.norm(np.maximum(over, 0.0)))
+                 if np.any(over > 0) else float(np.max(over))) - r
+            best = min(best, d)
+        if best < float("inf"):
+            out.append((best * 1000.0, link))
+    out.sort()
+    return out
+
+
 def _park(rp, dm, idx):
     """거부·실패한 박스를 라인 밖으로 옮긴다. `Spawner._despawn` 과 같은 역할이다.
 
@@ -740,6 +770,9 @@ def main():
                          "영상에 터미널이 같이 찍히기 때문. 스레드 경합(PhysX 홍수)은 "
                          "robot_motion 캐시로 근본을 고쳤고, 이 플래그는 기동 시 에셋 "
                          "경고(Unresolved reference 등)까지 마저 감추는 용도다")
+    ap.add_argument("--diag-knock", action="store_true",
+                    help="이미 놓인 박스가 **처음 밀리는 순간**을 잡는다 — 그때의 팔 자세로 "
+                         "링크별 거리를 내서 '팔이 쳤나 / 혼자 움직였나' 를 가른다")
     ap.add_argument("--verbose", action="store_true", help="서비스 호출까지 전부 찍는다")
     ap.add_argument("--log", default=None)
     a = ap.parse_args()
@@ -902,6 +935,7 @@ def main():
             rp.initialize()
             rps.append(rp)
         by_id = dict(zip(ids, rps))
+        _dim_of = dict(zip(ids, dims_m))                  # bid -> [w,d,h] m (--diag-knock)
 
         V.teleport(S, S.ready, steps=int(0.3 * S.hz))
         for _ in range(int(0.7 * S.hz)):
@@ -946,7 +980,9 @@ def main():
         #     대신 **새 move_ee 가 올 때 직전 목표의 도달 결과를 확정**한다. 사이클의
         #     마지막 항목이 곧 배치 하강 바닥이다 (그 뒤 move 는 놓고 나서의 후퇴다).
         diag = {"tgt": None, "face": None, "box": None, "log": []}
-        if a.diag_tcp:
+        # ★ --diag-knock 도 이 훅이 필요하다 — 박스가 밀린 순간이 **어느 구간**인지
+        #   말하려면 그때 진행 중이던 move_ee 목표를 알아야 한다.
+        if a.diag_tcp or a.diag_knock:
             _h_move = handlers["move_ee"]
 
             def h_move_diag(req):
@@ -997,6 +1033,9 @@ def main():
 
         rows, rest = [], {}                               # rest: 놓인 뒤의 기준 자세
         parked, rejected = [], set()                      # 라인 밖으로 치운 것 / 그중 §5 거부
+        # 이미 놓인 박스가 처음 밀리는 순간 (--diag-knock). 사이클마다 초기화한다.
+        kw = {"hit": None, "n": 0}
+        KNOCK_TRIP_MM = 1.0                               # 이 이상 움직이면 "밀렸다" 로 본다
         j5 = [1e9, -1e9]                                  # 손목 감김 추적 (아래 주석)
 
         # ★ 물리를 **벽시계에 묶는다** — 재현성의 핵심이다.
@@ -1043,6 +1082,26 @@ def main():
                 lag = step_dt - (time.time() - t_step)
                 if lag > 0:
                     time.sleep(lag)
+            if a.diag_knock and kw["hit"] is None:
+                # ★ **이미 놓인** 박스만 본다 (rest). 매달린 박스는 --diag-tcp 몫이다.
+                #   첫 1 mm 에서 멈춘다 — 다 밀린 뒤의 자세는 범인을 안 가리킨다.
+                kw["n"] += 1
+                for _pid, _ref in rest.items():
+                    _p = np.asarray(by_id[_pid].get_world_pose()[0], dtype=float)
+                    _d = (_p - _ref) * 1000.0
+                    if float(np.linalg.norm(_d)) <= KNOCK_TRIP_MM:
+                        continue
+                    _w, _d, _h = _dim_of[_pid]
+                    # yaw 90/270 이면 x·y 반폭이 바뀐다. 안 바꾸면 AABB 가 틀려
+                    # 링크 거리가 통째로 어긋난다.
+                    if int(round(abs(_yaw_of(by_id[_pid].get_world_pose()[1])) / 90.0)) % 2:
+                        _w, _d = _d, _w
+                    _hf = np.array([_w, _d, _h], dtype=float) / 2.0
+                    kw["hit"] = (kw["n"], _pid, [float(v) for v in _d],
+                                 [float(v) for v in rm.suction_pose()],
+                                 _link_dists(rm, _p - _hf, _p + _hf)[:3],
+                                 list(diag["tgt"]) if diag["tgt"] else None)
+                    break
             if a.diag_tcp:
                 # 현재 흡착면(FK)과 **매달린 박스 중심**을 갱신한다.
                 # 짝짓기는 h_move_diag 가 한다 (소켓 스레드는 이 값을 읽기만 한다).
@@ -1079,6 +1138,7 @@ def main():
             cur["rp"], cur["half_h"], cur["bid"] = rp, dm[2] / 2.0, bid
             cur["pose"] = None                            # 이번 스텝 tick 이 채운다
             diag["log"].clear()                           # 사이클마다 초기화 (--diag-tcp)
+            kw["hit"], kw["n"] = None, 0                  # 사이클마다 초기화 (--diag-knock)
             for _ in range(int(0.3 * S.hz)):
                 tick()
 
@@ -1157,6 +1217,25 @@ def main():
                          "sim_s": steps0 / S.hz, "knock": knock, "who": who})
             print("       %s  오차 [%+.1f %+.1f %+.1f] mm  %.1f s 시뮬  knock %.1f mm (%s)"
                   % (res, err[0], err[1], err[2], steps0 / S.hz, knock, who))
+            if a.diag_knock and kw["hit"]:
+                n0, vid, dmm, face, links, tgt = kw["hit"]
+                print("       ★ 놓인 박스가 처음 밀린 순간: %s 가 스텝 %d (%.2f s) 에 "
+                      "[%+.1f %+.1f %+.1f] mm"
+                      % (vid, n0, n0 / S.hz, dmm[0], dmm[1], dmm[2]))
+                print("         그때 흡착면 %s   진행 중이던 move_ee 목표 %s"
+                      % (np.round(np.array(face), 3),
+                         np.round(np.array(tgt), 3) if tgt else "-"))
+                # ★ 여기가 판정이다. 음수면 **그 링크가 박스 안에 들어가 있다** = 팔이 쳤다.
+                #   전부 넉넉히 양수면 팔은 안 닿았다 = 물리(이웃 접촉·지지 부족)다.
+                print("         링크별 거리  %s"
+                      % "  ".join("%s %+.1f mm" % (ln, dv) for dv, ln in links))
+                if not links:
+                    print("         -> 충돌구체가 안 실렸다. 링크 판정 불가")
+                elif links[0][0] > 20.0:
+                    print("         -> 팔은 %s 가 %.1f mm 로 가장 가깝다. **안 닿았다** — "
+                          "이웃 접촉이나 지지 부족을 봐야 한다" % (links[0][1], links[0][0]))
+                else:
+                    print("         -> **%s 가 쳤다** (%.1f mm)" % (links[0][1], links[0][0]))
             if a.diag_tcp and diag["log"]:
                 tg, fc, bx = diag["log"][-1]
                 tg, fc = np.array(tg, dtype=float), np.array(fc, dtype=float)
