@@ -17,6 +17,7 @@
     ros2 run packing_algo report --seeds 10 --boxes 40    # 빨리 한 번
 """
 import argparse
+import glob
 import os
 import statistics
 
@@ -174,6 +175,12 @@ def main():
     pk, steps = viz.simulate(cfg, n=args.boxes, noise=args.noise,
                              seed_box=seed_show, seed_noise=seed_show + 1000)
     viz.render_video(cfg, steps, os.path.join(out, "01_stack.mp4"), fps=args.fps)
+
+    # ★ 옛 정지화면을 먼저 지운다. 파일 이름에 **적재 개수**가 들어가므로
+    #   (`02_stage_21.png`) 알고리즘이 바뀌어 개수가 달라지면 옛 파일이 남는다.
+    #   그러면 결과 폴더에 서로 다른 판본의 그림이 섞여 무엇이 최신인지 알 수 없다.
+    for old_png in glob.glob(os.path.join(out, "02_stage_*.png")):
+        os.remove(old_png)
 
     # 적재 개수가 목표에 처음 도달한 step 을 고른다 (버림 step 은 개수가 안 는다)
     stages = []
