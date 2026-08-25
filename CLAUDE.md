@@ -467,6 +467,7 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 |---|---|---|
 | `spawn_y_jitter_mm` · `spawn_yaw_jitter_deg` **yaml + `spawner.py` 적용** | 김학민 | 키만 넣으면 아무 일도 안 일어난다 |
 | `sim_server.py` 존치 여부 | 김학민 | 소켓 폐기 후 남아 있다 |
+| **§2 소켓 폐기가 아직 안 끝났다** | 김병직 · 민범진 | 2026-08-25 실측. `packing_robot/sim_link.py` 가 `localhost:8765` 소켓을 그대로 쓰고 `orchestrator.py` 가 그걸 부른다 — 이 때문에 §1 의 **"다중 PC ROS 2 통신"** 이 성립하지 않는다(관제탑이 Isaac 과 같은 PC 여야 함). `packing_vision/vision_node.py` 는 `/vision/detections` 에 `std_msgs/String`+JSON 을 쓴다 — §3-2 는 `BoxAtPickup` 전용 타입을 정했다(§11 금지). **두 파일 다 다른 사람이 작업 중이라 트랙 C 는 손대지 않는다.** 통합할 때 같이 점검할 것. `packing_algo` 는 서비스 4개뿐으로 이미 ROS 전용 |
 | `recognition.enabled: false` → `true` | 팀 | 최종 구현은 인식 포함 |
 | `stage: 1` → `2` 전환 시점 | 팀 | 최종은 3구역 |
 | tf 프레임 이름 규약 | 김학민 | 씬 prim 이름과 일치해야 함 |
