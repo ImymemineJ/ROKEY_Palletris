@@ -19,7 +19,8 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   [8] 스폰부 카메라를 만든다 (광학값은 CamPick 에서 복사)
   [9] 순환 루프 (방향 · 높이 · 프레임 · 레일)
   [10] 팔레트 가이드 벽 (overhang 7.8 고려 · 편도 여유 5)
-  [11] 전부 검증한다
+  [11] ROS 2 브리지 — /clock · /tf
+  [12] 전부 검증한다
 
 ═══ 왜 이렇게 하는가 — 실측으로 얻은 것들 ═══════════════════════════════════
 
@@ -655,10 +656,75 @@ else:
             % (va[4], vb[1], vb[1] - va[4], clr))
         say("       X %.1f~%.1f  Z %.1f~%.1f" % (va[0], va[3], va[2], va[5]))
 
+# ══ [11] ROS 2 브리지 — /clock · /tf ════════════════════════════════════════
+# ★ 실측 2026-08-26: 씬의 OmniGraph 26 개가 **전부 컨베이어**였고 ROS2 브리지
+#   노드가 하나도 없었다. `/clock` 도 `/tf` 도 아무도 안 낸다.
+#   그래서 `ros2 topic info /tf` 가 **Publisher 0 · Subscription 4** 였다 —
+#   관제탑과 인식 노드 넷이 구독만 한 채 영원히 기다린다. 에러는 안 난다.
+#   CLAUDE.md §3-4 규약 1 이 "모든 노드에 use_sim_time" 인데 `/clock` 이 없으면
+#   그 노드들의 시계가 0 에 멈춘다.
+#
+# ★ 프레임 이름은 **prim 이름**이 된다. 그래서 카메라는 `.../Camera` 자식이 아니라
+#   **부모 Xform** 을 넣는다 — 자식은 넷 다 이름이 `Camera` 라 프레임이 겹친다.
+#
+# ⚠ 카메라 이미지(`/cam1/rgb` 등)는 여기서 안 만든다. `ROS2CameraHelper` 는
+#   `renderProductPath` 가 필요한데 그건 런타임에 만들어지는 물건이라 USD 에
+#   그냥 적어 둘 수 없다. 별건으로 남긴다.
+say("\n[11] ROS 2 브리지 — /clock · /tf")
+ROS = (cfg.get("ros") or {})
+if not ROS:
+    say("   설정에 ros 가 없다 — 건너뛴다")
+else:
+    import omni.graph.core as og
+
+    G = str(ROS.get("graph_path", "/World/ROS2Bridge"))
+    tfc = ROS.get("tf") or {}
+    K, C = og.Controller.Keys, og.Controller
+    NS = "isaacsim.ros2.bridge."
+    C.edit(
+        {"graph_path": G, "evaluator_name": "execution"},
+        {K.CREATE_NODES: [("Tick", "omni.graph.action.OnPlaybackTick"),
+                          ("Ctx", NS + "ROS2Context"),
+                          ("Clock", NS + "ROS2PublishClock"),
+                          ("Tf", NS + "ROS2PublishTransformTree")],
+         K.CONNECT: [("Tick.outputs:tick", "Clock.inputs:execIn"),
+                     ("Tick.outputs:tick", "Tf.inputs:execIn"),
+                     ("Ctx.outputs:context", "Clock.inputs:context"),
+                     ("Ctx.outputs:context", "Tf.inputs:context")],
+         # ★ ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
+         K.SET_VALUES: [("Ctx.inputs:useDomainIDEnvVar", True),
+                        ("Clock.inputs:topicName",
+                         str(ROS.get("clock_topic", "/clock"))),
+                        ("Tf.inputs:topicName", str(tfc.get("topic", "/tf")))]})
+
+    # 부모 · 대상 prim 은 **관계**라 SET_VALUES 로 못 넣는다
+    tf_node = st.GetPrimAtPath(G + "/Tf")
+    par = str(tfc.get("parent_prim", "/World"))
+    if st.GetPrimAtPath(par).IsValid():
+        tf_node.GetRelationship("inputs:parentPrim").SetTargets([Sdf.Path(par)])
+    else:
+        chk("tf parentPrim %s" % par, False)
+
+    tgts, miss = [], []
+    for tp in (tfc.get("target_prims") or []):
+        (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
+    tf_node.GetRelationship("inputs:targetPrims").SetTargets(
+        [Sdf.Path(t) for t in tgts])
+
+    say("   그래프 %s" % G)
+    say("   /clock  %s" % st.GetPrimAtPath(G + "/Clock")
+        .GetAttribute("inputs:topicName").Get())
+    say("   /tf     %s  · 부모 프레임 %s"
+        % (tf_node.GetAttribute("inputs:topicName").Get(), par.rsplit("/", 1)[-1]))
+    for t in tgts:
+        say("       -> 프레임 %s" % t.rsplit("/", 1)[-1])
+    for t in miss:
+        chk("tf 대상 %s" % t, False, "씬에 없다")
+
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)
 
-# ══ [11] 검증 ════════════════════════════════════════════════════════════════
+# ══ [12] 검증 ════════════════════════════════════════════════════════════════
 say("\n" + "=" * 74)
 say("=== 검증 ===")
 for z, p in sorted(JUNC.items()):

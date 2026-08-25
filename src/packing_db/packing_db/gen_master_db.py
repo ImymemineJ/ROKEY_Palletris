@@ -139,7 +139,14 @@ def main():
 
     cfg = load(a.config)
     db_path = os.path.expanduser(a.db_path) if a.db_path else _default_db_path()
+    # ★ 설치본에서는 이 파일이 lib/python3.12/site-packages/packing_db/ 에 있고
+    #   schema.sql 은 share/packing_db/ 에 깔린다. 같은 폴더에 없다
+    #   (실측 2026-08-26: FileNotFoundError 로 죽었다). ament 인덱스로 찾는다.
     schema = os.path.join(os.path.dirname(os.path.realpath(__file__)), "schema.sql")
+    if not os.path.isfile(schema):
+        from ament_index_python.packages import get_package_share_directory
+        schema = os.path.join(get_package_share_directory("packing_db"),
+                              "schema.sql")
 
     rows = build(cfg, db_path, schema)
     zc = {}

@@ -418,6 +418,29 @@ boxes:
     #   8 s 는 그 두 배 남짓 — 라인이 살아 보이면서 대기가 안 쌓이는 값이다.
     spawn_interval_s: 8
 
+# ── ROS 2 브리지 (2026-08-26 신설) ──────────────────────────────────────────
+# ★ 실측으로 드러난 것: 씬에 OmniGraph 가 26 개 있는데 **전부 컨베이어**고
+#   ROS2 브리지 노드가 **하나도 없었다.** /clock · /tf · 카메라 이미지를 아무도
+#   안 내고 있었다 — 평가 항목 §13 "ROS2 연동 (clock · 이미지 · tf)" 이 미구현.
+#   그래서 관제탑·인식 노드가 전부 구독만 한 채 영원히 기다린다 (에러는 안 난다).
+ros:
+  graph_path: /World/ROS2Bridge
+  clock_topic: /clock
+  tf:
+    topic: /tf
+    # 프레임 이름은 **prim 이름**이 된다 (ROS2PublishTransformTree 규칙).
+    # 그래서 카메라는 `Camera` 자식이 아니라 **부모 Xform** 을 넣는다 —
+    # 자식은 넷 다 이름이 `Camera` 라 프레임이 충돌한다.
+    parent_prim: /World
+    target_prims:
+      - /World/CamSpawn
+      - /World/CamPick_A
+      - /World/CamPick_B
+      - /World/CamPick_C
+      - /World/robot_A
+      - /World/robot_B
+      - /World/robot_C
+
 # ── 트럭 ──────────────────────────────────────────────────────────────
 truck:
   # 1톤 트럭 적재함. 작업명세서 §3.2 가 정본이다 — 임의로 넓히면 상차가 성립 안 한다.
