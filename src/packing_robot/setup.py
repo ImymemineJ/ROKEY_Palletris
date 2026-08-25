@@ -14,12 +14,12 @@ setup(
     zip_safe=True,
     maintainer='정정인 (초안 · 소유: 김병직)',
     maintainer_email='jungji0913@khu.ac.kr',
-    description='로봇 제어 / orchestrator (트랙 B)',
+    description='로봇 제어 — cycle · fk · gripper (트랙 B)',
     license='Apache-2.0',
     tests_require=['pytest'],
-    entry_points={
-        'console_scripts': [
-            'orchestrator = packing_robot.orchestrator:main',
-        ],
-    },
+    # ★ 관제탑은 palletris_orchestrator 하나다 (CLAUDE.md §8).
+    #   여기 있던 'orchestrator' 엔트리포인트는 2026-08-26 폐기했다 —
+    #   소켓(8765) 시대의 껍데기였고, ROS 2 판이 그 자리를 가져갔다.
+    #   근거: docs/2026-08-26_관제탑_이중화_해소.md
+    entry_points={'console_scripts': []},
 )

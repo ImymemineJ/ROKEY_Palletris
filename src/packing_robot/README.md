@@ -48,9 +48,15 @@ H2017 IK · 흡착 그리퍼 · 오케스트레이터.
 (소켓 핸들러 6개 — A 패키지 안이지만 **B 소유**). 씬 쪽 짝(`sim_main.py`·`sim_server.py`·
 `spawner.py`·`conveyor_ctl.py`)도 들어와 `test1-1.usd` 위에서 프로토콜 15개가 돈다.
 
-**아직 없는 것:** `packing_robot/orchestrator.py`(cycle.py 를 감싸는 rclpy 노드),
-`packing_sim/packing_sim/sim_bridge_node.py`, `packing_msgs`(msg 5 + srv 15),
-그리고 `src/` 전체에 ROS 패키지 매니페스트(`package.xml`)가 아직 하나도 없다.
+**아직 없는 것 (2026-08-26 기준):** `RobotCmd`↔`Cycle` 어댑터 노드.
+관제탑(`palletris_orchestrator`)은 `PICK`/`PLACE`/`HOME`/`STOP` 이라는 **사이클 단위**로
+말하는데 `cycle.py` 는 `move_ee`/`grasp`/`release` 라는 **동작 단위**로 말한다.
+그 사이를 메우는 노드가 아직 없다 — 소켓 → ROS 2 전환의 본체다.
+설계: [docs/2026-08-26_관제탑_이중화_해소.md](../../docs/2026-08-26_관제탑_이중화_해소.md) §3
+
+**해소된 것:** `packing_msgs`(msg + srv) · `package.xml` 은 들어왔다.
+`packing_robot/orchestrator.py` 는 **만들지 않는다** — 관제탑은
+`palletris_orchestrator/orchestrator_node.py` 하나다 (CLAUDE.md §8).
 
 ## 저장소 루트의 관련 스크립트
 
