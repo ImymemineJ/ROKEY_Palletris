@@ -64,6 +64,73 @@ GAP_FIX_TOL_MM = 0.5             # 실측 간극이 목표에서 이보다 벗�
 #     (최악 -100.5 -> -203.5). 400 이 측정된 최선이다.
 TRANSIT_LIFT_MM = float(os.environ.get("PL_TRANSIT_LIFT_MM", "0"))
 
+# ★★ 협곡 낙하 (2026-08-25, 김병직 제안).
+#
+#   왜: 통로 규칙이 존재하는 이유는 **팔이 박스를 따라 내려가야 하기 때문**이다.
+#   협곡 입구 높이에서 흡착을 풀면 팔은 안 내려가도 된다 — 박스는 사방이 벽이라
+#   스스로 자리를 잡는다. 실제 팔레타이징에서 마지막 칸에 쓰는 방법이다.
+#
+#   왜 지금: 계획을 조여서 협곡을 피하는 쪽은 한계를 봤다 (2026-08-25 Isaac, 시드 7).
+#     통로 반경 200 일괄 : 팔 걸림 **0회** · knock 0.8mm · 그러나 **적재 22개**
+#     2단 250/271        : 적재 25개 · 그러나 걸림 1회 · knock 14.8mm
+#   안전과 적재율을 반경 하나로 동시에 만족시키는 값이 없다.
+#
+#   ⚠ 무겁게 떨어뜨리면 스택을 친다. **가벼운 박스만** 허용하고 낙하도 짧게 자른다.
+#     3호가 3 kg 이라 그것만 대상이 된다 (4호 5 · 5호 9 kg).
+#   ⚠ 근거 없음 — 화면으로 확인해야 하는 종류다 (CLAUDE.md §10-3).
+#   기본 0 = 꺼짐. 켜려면 `PL_DROP_KG=3.5`.
+DROP_MAX_KG = float(os.environ.get("PL_DROP_KG", "0"))
+# ★★ 예측형 낙하(_drop_face_m)는 **기본 꺼짐**이다 (2026-08-25 실측으로 기각).
+#   둘레 최고높이(rim)로 "여기는 못 내려간다" 를 미리 판단하는데, **크게 과대평가**한다.
+#   같은 실행 안에 반증이 있다:
+#     협곡 700 mm -> 상한에 걸려 그냥 내려갔는데 **안 닿았고** 오차 [+0.3 +0.4] mm
+#     협곡 480 mm -> 미리 떨궈서 오차 [+10.9 -22.3] mm 로 흩어졌다
+#   그리퍼 몸통(Ø245)은 슬롯에 들어가고, 걸리는 것은 **한참 위의 팔뚝**이다.
+#   rim 만 봐서는 그 높이를 알 수 없다 — 접촉 감지가 정확히 안다 (robot_motion CONTACT_*).
+#   -> 그래서 한때 껐다가, **반경을 좁히는 쪽으로 되살렸다** (2026-08-25 김병직 판단).
+#      480 mm 에서 떨군 건 방식이 틀려서가 아니라 **둘레를 250 mm 나 봐서** 멀리 있는
+#      높은 기둥까지 "입구" 로 쳤기 때문이다. 반경을 130 으로 좁히면 실제로 슬롯을
+#      막는 가까운 벽만 보고, 낙하 지점이 그만큼 내려온다.
+#      끄려면 `PL_DROP_PREDICT=0`.
+DROP_PREDICT = os.environ.get("PL_DROP_PREDICT", "1") not in ("0", "", "off")
+DROP_MAX_MM = float(os.environ.get("PL_DROP_MM", "500"))   # 낙하 상한
+#   ⚠ 300 으로 잡았더니 실측 협곡 **480 mm** 가 전부 걸러졌다 (시드 7, 10·11번).
+#     걸러진 결과가 오차 40.7 mm · knock 31.5 mm 라 떨어뜨리는 편이 나았다.
+#     다만 3 kg 이 480 mm 면 착지 속도가 3 m/s 다 — 화면으로 확인할 것.
+DROP_CLEAR_MM = 10.0             # 그리퍼 길이 한계에 두는 안전 여유
+#   ⚠ 둘레를 볼 반경. **20 으로 잡았다가 낙하가 한 번도 안 걸렸다** (2026-08-25 실측).
+#     실제로 팔이 걸린 벽이 발자국에서 145 mm 밖에 있었는데 20 으로는 안 보인다 —
+#     통로 검사가 반경 122 로 못 봤던 것과 같은 실수다. 팔은 손목 부근이 폭 320 이라
+#     그만큼 밖까지 봐야 한다. 과하게 잡아도 손해가 없다 — 입구가 낮으면 낙하거리가
+#     저절로 0 에 가까워져 예전 동작과 같아진다.
+#   ★ 반경 이력 (전부 실측): 20 -> 낙하가 **한 번도 안 걸렸다** (벽이 145mm 밖).
+#     250 -> 걸리긴 하는데 **480~490 mm 위에서** 떨궈 너무 높았다 (오차 -22.3 mm).
+#     둘레를 넓게 볼수록 더 높은 벽을 "입구"로 잡아 낙하 지점이 올라간다.
+#     -> 그리퍼 몸통 반경(122)에 맞춰 **130** 으로 좁힌다. 실제로 슬롯을 막는
+#        가까운 벽만 보고, 멀리 있는 높은 기둥은 입구로 안 친다.
+RIM_MARGIN_MM = float(os.environ.get("PL_DROP_RIM_MM", "130"))
+
+# ★★ 반응형 낙하 (2026-08-25, 김병직 제안 "팔뚝이 닿는 걸 인식해서 그때 흡착을 푼다").
+#
+#   위 기하 판정(_drop_face_m)은 **예측**이라 반경을 맞춰야 하고, 실제로 두 번 틀렸다
+#   (통로 122 · 둘레 20 — 둘 다 실제 벽 145mm 를 못 봤다). 반응형은 그 튜닝이 없다.
+#
+#   신호는 이미 있다: 팔이 걸리면 수렴이 멈추고 `정착 XX mm — 더 안 줄어 종료` 가 뜬다.
+#   그 순간 흡착면 위치를 `motion_status.face_m` 으로 읽을 수 있다.
+#
+#   ⚠ **가로로 밀린 것과 세로로 못 내려간 것을 반드시 가른다.** 실측에서 걸린 사례는
+#     오차 [+7.9, +49.4, 0] — 세로가 아니라 **가로로 49mm** 밀린 것이었다. 그 자리에서
+#     놓으면 박스가 슬롯을 빗나가 떨어진다. 가로 오차가 작을 때만 낙하로 본다.
+DROP_STALL_MM = 10.0             # 목표보다 이만큼 이상 높이 멈췄으면 "걸린 것"
+DROP_LAT_MM = 15.0               # 이 안으로 들어와야 놓는다 (슬롯을 빗나가면 안 된다)
+# ★ 가로 오차는 **원인이 아니라 증상**이다 (2026-08-25 실측). 팔이 벽을 밀면서 옆으로
+#   29.5 mm 밀려났고, 그 오차 때문에 낙하가 거부됐다 — 막으려던 충돌이 거부 사유를
+#   만드는 자기모순이다. 거부한 결과가 오차 40.7 mm · knock 31.5 mm 로 더 나빴다.
+#   -> 포기하지 말고 **위로 올려 가로를 되잡은 뒤** 떨어뜨린다. 조금만 올리면 벽을
+#      벗어나 같은 XY 가 그냥 잡힌다 (바로 위 높이는 같은 XY 로 문제없이 지나갔다).
+DROP_RECENTER_MM = 60.0          # 한 번에 이만큼 올려서 다시 XY 를 잡는다
+DROP_RECENTER_N = 4              # 최대 몇 번까지 (60 x 4 = 240 mm)
+
 
 def pallet_place_to_world(place, h_mm, origin_mm):
     """PlacePose(밑면) → 월드 박스 **중심** (m). 작업명세서 §3.3 그대로.
@@ -144,6 +211,12 @@ class Cycle:
         #   지금 들고 있는 박스는 여기 없다 — 놓고 난 뒤에 넣는다.
         self._obstacles = []
         self.approach_m = cfg["robot"]["approach_offset_mm"] / 1000.0
+        # ★ 낙하 판정용 질량표. 치수 -> kg. yaml 이 정본이라 여기 숫자를 안 적는다.
+        self._mass_kg = {}
+        for b in cfg["boxes"]["types"]:
+            self._mass_kg[(b["w_mm"], b["d_mm"], b["h_mm"])] = b["mass_g"] / 1000.0
+        self.grip_len_m = cfg["robot"]["gripper_length_mm"] / 1000.0
+        self._last_put_yaw = 0.0
         self.belt_seg = "%s_pickup" % zone.lower()
         self.belt_mps = float(cfg["conveyor"]["belt_velocity_mps"])
         self.grasp_budget_s = float(cfg["robot"]["suction"]["retry_interval_s"]) + 3.0
@@ -157,6 +230,111 @@ class Cycle:
         #   메시지에 `stack_top_mm` 이 실려 오면 그것과도 max 를 취하므로 둘 다 산다.
         #   ⚠ 팔레트를 갈면 리셋해야 한다 -> `reset_stack()`
         self._stack_top_m = 0.0
+
+    def _rim_m(self, cx, cy, w, d):
+        """놓을 자리 **둘레**에서 가장 높은 이웃 상면 [m]. 이웃이 없으면 None.
+
+        발자국을 RIM_MARGIN 만큼 부풀려 겹치는 장애물만 본다. 바로 밑에서 받쳐 주는
+        박스도 여기 들어오는데, 그 상면은 새 박스 밑면과 같아서 판정에 영향이 없다.
+        """
+        hw = w / 2000.0 + RIM_MARGIN_MM / 1000.0
+        hd = d / 2000.0 + RIM_MARGIN_MM / 1000.0
+        top = None
+        for lo, hi in self._obstacles:
+            if hi[0] < cx - hw or lo[0] > cx + hw:
+                continue
+            if hi[1] < cy - hd or lo[1] > cy + hd:
+                continue
+            top = float(hi[2]) if top is None else max(top, float(hi[2]))
+        return top
+
+    def _drop_face_m(self, cx, cy, w, d, h, put_top):
+        """협곡이면 **떨어뜨릴** 흡착면 높이 [m], 아니면 None.
+
+        -> (흡착면 z, 낙하거리 m) / None
+        """
+        if DROP_MAX_KG <= 0 or not DROP_PREDICT:
+            return None
+        kg = self._mass_kg.get((w, d, h))
+        if kg is None or kg > DROP_MAX_KG:
+            return None                       # 무거운 건 안 떨어뜨린다 (조용히 — 흔하다)
+        rim = self._rim_m(cx, cy, w, d)
+        if rim is None:
+            return None
+        # 팔이 따라 내려갈 수 있는 벽 높이 = 내 윗면 + 그리퍼 길이. 그 위면 협곡이다.
+        if rim <= put_top + self.grip_len_m:
+            return None
+        bottom = put_top - h / 1000.0         # 원래 놓으려던 박스 밑면
+        # ★ 놓는 높이는 **박스 윗면**으로 정한다 (2026-08-25 김병직 요청 "더 낮출 수 없나").
+        #   예전엔 박스 **밑면**을 입구 위 10 mm 에 뒀는데, 그럴 이유가 없다 —
+        #   그리퍼 몸통(Ø245)은 슬롯 안으로 들어간다. `_corridor_ok` 주석의 근거 그대로:
+        #     "박스 윗면부터 그리퍼 길이(150)까지는 몸통만 지나가고, 그 몸통은 모든
+        #      박스 발자국 안에 들어간다 (3호 반폭 125 > 몸통 반경 122.5)"
+        #   못 들어가는 건 플랜지 **위**의 손목이다. 그러니 박스 윗면을 `rim - 150` 까지
+        #   내려도 된다. 실측 480 mm 짜리가 이 계산으로 약 120 mm 가 된다.
+        rel_top = rim - self.grip_len_m + DROP_CLEAR_MM / 1000.0
+        rel_bottom = rel_top - h / 1000.0
+        if rel_bottom <= bottom:
+            return None                       # 그냥 끝까지 내려갈 수 있다
+        drop = rel_bottom - bottom
+        if drop <= 0:
+            return None
+        if drop > DROP_MAX_MM / 1000.0:
+            # ★ 걸러진 것도 남긴다 — 낙하가 "안 걸린" 건지 "막힌" 건지 로그로 갈린다.
+            self._log("[cycle] 협곡 %.0f mm — 낙하 상한 %.0f 초과, 그냥 내려간다"
+                      % (drop * 1000, DROP_MAX_MM))
+            return None
+        return rel_top + GRASP_GAP_MM / 1000.0, drop
+
+    def _stall_drop_ok(self, cx, cy, w, d, h, tgt_face_z, err):
+        """걸려서 멈춘 자리에서 **놓아도 되나**. -> True 면 낙하로 처리하고 계속 간다.
+
+        `err` 가 None 이면 도착은 했는데 잔차가 남은 경우다 (기록만 남긴다).
+        """
+        if DROP_MAX_KG <= 0:
+            return False
+        st = self.link.call(cmd="motion_status") or {}
+        face = st.get("face_m")
+        if not face or len(face) != 3:
+            return False
+        lat = ((float(face[0]) - cx) ** 2 + (float(face[1]) - cy) ** 2) ** 0.5
+        short = float(face[2]) - tgt_face_z          # + 면 목표보다 높이 멈춘 것
+        if short < DROP_STALL_MM / 1000.0:
+            return False                             # 걸린 게 아니다
+        kg = self._mass_kg.get((w, d, h), 99.0)
+        if kg > DROP_MAX_KG:
+            self._log("[cycle] 걸림 %.0f mm 인데 낙하 불가 — %.1f kg 은 무겁다"
+                      % (short * 1000, kg))
+            return False
+        # ★ 가로로 밀렸으면 **위로 올려 되잡는다** (위 DROP_RECENTER 주석).
+        z_now = float(face[2])
+        for _ in range(DROP_RECENTER_N):
+            if lat <= DROP_LAT_MM / 1000.0:
+                break
+            z_now += DROP_RECENTER_MM / 1000.0
+            self._log("[cycle] 가로 %.1f mm 밀림 — %.0f mm 올려 되잡는다"
+                      % (lat * 1000, DROP_RECENTER_MM))
+            try:
+                self._move([cx, cy, z_now], self._last_put_yaw)
+            except MotionError:
+                pass                      # 못 가도 아래에서 **실제 위치**로 다시 판단한다
+            st = self.link.call(cmd="motion_status") or {}
+            face = st.get("face_m") or face
+            lat = ((float(face[0]) - cx) ** 2 + (float(face[1]) - cy) ** 2) ** 0.5
+            z_now = float(face[2])
+        short = z_now - tgt_face_z
+        if lat > DROP_LAT_MM / 1000.0:
+            self._log("[cycle] %.0f mm 올려도 가로 %.1f mm — 슬롯을 빗나간다, 포기"
+                      % (DROP_RECENTER_MM * DROP_RECENTER_N, lat * 1000))
+            return False
+        if short > DROP_MAX_MM / 1000.0:
+            self._log("[cycle] 걸림 %.0f mm 인데 낙하 불가 — 상한 %.0f 초과"
+                      % (short * 1000, DROP_MAX_MM))
+            return False
+        self._log("[cycle] 팔뚝 걸림 감지 (%.0f mm 남음 · 가로 %.1f mm · %.1f kg) "
+                  "— 그 자리에서 놓는다%s"
+                  % (short * 1000, lat * 1000, kg, "" if err is None else "  [%s]" % err))
+        return True
 
     def reset_stack(self):
         """팔레트를 갈았다 — 누적해 온 적재 최상단을 버린다."""
@@ -249,6 +427,7 @@ class Cycle:
         put_top = cz + h / 2000.0
         # ★ 손목을 먼 쪽으로 180° 돌리지 않는다 — nearest_equiv_yaw 주석 참조.
         put_yaw = nearest_equiv_yaw(place.get("yaw_deg", 0.0), pick_yaw)
+        self._last_put_yaw = put_yaw          # 되잡기 이동이 같은 손목 자세를 쓴다
 
         # ★ 상승 -> **가로 이송** -> 하강. 세 구간이다 (§2.5).
         #   집자마자 배치 상공으로 바로 가면 관절공간 직선이 대각선을 그어서, 매달린
@@ -276,14 +455,42 @@ class Cycle:
         #   정본은 check_place_plan.py:176 `carry_bottom = max(obstacle, top) + safe_mm`
         #   즉 h_safe(흡착면) = ... + safe + h 다. 152행 transit 은 이미 그렇게 돼 있었다.
         self._move([cx, cy, put_top + self.approach_m + h / 1000.0], put_yaw, TRANSIT_TOL_MM)
-        self._move([cx, cy, put_top + GRASP_GAP_MM / 1000.0], put_yaw)
+        # ★ 협곡이면 입구에서 놓아 **떨어뜨린다** (위 DROP_* 주석). 팔이 안 내려가므로
+        #   팔뚝이 벽에 걸릴 일이 없다. 꺼져 있거나 조건이 안 맞으면 None 이라 예전 그대로다.
+        drop = self._drop_face_m(cx, cy, w, d, h, put_top)
+        tgt_face_z = put_top + GRASP_GAP_MM / 1000.0
+        if drop is not None:
+            face_z, dist = drop
+            self._log("[cycle] 협곡 낙하 %.0f mm (%.1f kg) — 입구에서 놓는다"
+                      % (dist * 1000, self._mass_kg.get((w, d, h), 0.0)))
+            self._move([cx, cy, face_z], put_yaw)
+        else:
+            # ★ 여기서 팔뚝이 벽에 걸릴 수 있다. 걸리면 `IK_FAIL` 이 오는데, 그때
+            #   박스는 이미 **슬롯 바로 위**에 있다 — 버리지 말고 놓을 수 있는지 본다.
+            try:
+                self._move([cx, cy, tgt_face_z], put_yaw)
+            except MotionError as e:
+                if not self._stall_drop_ok(cx, cy, w, d, h, tgt_face_z, str(e)):
+                    raise
+            else:
+                self._stall_drop_ok(cx, cy, w, d, h, tgt_face_z, None)
 
         # TCP 정지 대기 · damping 스파이크 · settle 은 robot_motion 안에서 돈다 (§6.5)
         if not self._release():
             self._log("[cycle] release 실패")
             self._abort(box_id)
             return "BLOCKED"
-        self._move([cx, cy, put_top + self.approach_m], put_yaw, TRANSIT_TOL_MM)
+        # ★ 후퇴는 **절대 내려가지 않는다** (2026-08-25 김병직 지적).
+        #   `put_top + approach` 로 고정하면, 협곡 입구에서 떨어뜨렸을 때 팔이 이미
+        #   그보다 위에 있어서 **놓고 나서 협곡 안으로 다시 내려간다.** §10-3 과 같은
+        #   부류의 버그다 — 갈 때는 최상단을 넘는데 올 때만 안 넘던 그것.
+        #   지금 흡착면 높이 · 방금 놓은 박스 상면 · 누적 최상단, 셋 중 가장 높은 곳으로.
+        retreat_z = max(put_top + self.approach_m, self._stack_top_m + self.approach_m)
+        _st = self.link.call(cmd="motion_status") or {}
+        _f = _st.get("face_m")
+        if _f and len(_f) == 3:
+            retreat_z = max(retreat_z, float(_f[2]))
+        self._move([cx, cy, retreat_z], put_yaw, TRANSIT_TOL_MM)
 
         # 6) **실제** pose 로 갱신한다 — 계획값이 아니라 (§7.6)
         actual = self._actual_place(box_id, h) or place
