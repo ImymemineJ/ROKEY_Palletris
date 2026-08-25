@@ -1,4 +1,5 @@
-string zone
+# 2차 전용.  중재자 → db.  구역 대기 물량 조회.
+string  zone
 ---
-int32  count
-int32  placed_count
+int32   count
+int32   placed_count

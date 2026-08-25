@@ -1,4 +1,6 @@
+# orchestrator → db.  적재 완료 기록.  실측 pose 를 남긴다.
 string    box_id
-PlacePose pose
+string    zone
+PlacePose actual_pose  # ★ 계획 pose 가 아니라 실측값
 ---
 bool      ok

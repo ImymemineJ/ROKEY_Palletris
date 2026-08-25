@@ -1,4 +1,6 @@
-string box_id
+# orchestrator → db.  집기 직전에 눈앞 박스의 제원을 조회한다.
+# ★ 순서를 신뢰하지 않고 매번 조회하므로 2차 재순환에도 안 깨진다.
+string  box_id
 ---
-bool    found
+bool    found          # false → 집지 않고 BLOCKED 처리
 BoxInfo info

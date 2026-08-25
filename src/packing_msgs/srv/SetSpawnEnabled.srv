@@ -1,3 +1,4 @@
-bool enabled
+# orchestrator → 씬.  스폰 on/off. 시나리오 종료 시 끈다.
+bool    enabled
 ---
-bool ok
+bool    ok

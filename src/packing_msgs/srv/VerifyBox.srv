@@ -1,5 +1,6 @@
-string box_id
+# 2차 전용.  detector_line2 → db.  카메라2 가 읽은 ID 를 DB 와 대조.
+string  box_id
+string  qr_payload
 ---
-bool   found
-string zone
-int32  retry_count
+bool    match
+string  registered_id

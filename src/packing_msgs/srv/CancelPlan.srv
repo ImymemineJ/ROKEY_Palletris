@@ -1,4 +1,6 @@
-string zone
-string box_id
+# orchestrator → algo.  계획을 폐기한다.
+# ★ 모든 이탈 경로에서 호출. 빠뜨리면 그 자리가 영원히 예약된 채 남는다.
+string  zone
+string  box_id
 ---
-bool   ok
+bool    ok
