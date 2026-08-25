@@ -2,8 +2,14 @@
 """Palletris ROS 2 그래프 기동.
 
     ros2 launch packing_bringup bringup.launch.py
-    ros2 launch packing_bringup bringup.launch.py zone:=b use_sim_time:=false
+    ros2 launch packing_bringup bringup.launch.py use_sim_time:=false
     ros2 launch packing_bringup bringup.launch.py vision:=false      # 인식 끄고
+
+    # ★ 기본값은 stage 2 (3구역, system.yaml stage:2 와 짝). 예전 1구역(B만) 으로
+    #   돌리려면 zones · pick_cam_ns 를 같이 좁혀야 한다 — 하나만 바꾸면
+    #   관제탑과 인식 노드가 서로 다른 /pick_cam_* 토픽을 봐서 아무것도 안 온다.
+    ros2 launch packing_bringup bringup.launch.py \
+        zone:=b zones:="['b']" pick_cam_ns:="['/pick_cam']"
 
 띄우는 것 (Isaac 밖의 rclpy 노드 전부)
     algo_service_node    /algo/*        4개   (트랙 C)
@@ -57,22 +63,28 @@ def generate_launch_description():
     log_level = LaunchConfiguration("log_level")
 
     args = [
+        # ★ zone(단수)은 zones 가 비었을 때만 쓰는 폴백이다 — 관제탑이 zones 를
+        #   우선한다 (orchestrator_node._init_cycles). 기본은 zones 가 채워져
+        #   있으니 실제로는 안 쓰인다.
         DeclareLaunchArgument("zone", default_value="b",
-                              description="관제탑이 맡을 구역. stage 1 은 b 하나다"),
+                              description="zones 가 비었을 때만 쓰는 폴백 구역"),
         # ★ 구역 인식은 **구역마다 프로세스를 따로** 띄운다 (CLAUDE.md §8 "3").
         #   관제탑과 다르다 — 관제탑은 상태머신이라 하나여야 명령이 안 겹치지만,
         #   인식은 이미지 추론이라 한 프로세스에 몰면 파이썬 GIL 때문에 세 구역이
         #   줄을 서서 돈다. 프로세스를 나눠야 코어를 실제로 나눠 쓴다.
-        #   stage 2 예:
-        #     zones:="['a','b','c']"
-        #     pick_cam_ns:="['/pick_cam_a','/pick_cam_b','/pick_cam_c']"
+        #   1구역(stage 1)으로 좁히려면:
+        #     zone:=b zones:="['b']" pick_cam_ns:="['/pick_cam']"
         #   ⚠ 두 목록의 **순서와 개수가 짝**이어야 한다. 어긋나면 다른 구역
         #     카메라로 좌표를 낸다 — 아래 _zone_detectors 가 시작할 때 막는다.
+        #   ⚠ system.yaml 의 stage 값과 반드시 맞춰야 한다 — 하네스
+        #     (verify_ros_graph.py)는 stage 를 보고 카메라 토픽을 정하는데
+        #     여기 기본값과 어긋나면 관제탑이 다른 이름의 토픽을 구독해
+        #     이미지가 하나도 안 온다 (2026-08-25 실측 발견).
         DeclareLaunchArgument(
-            "zones", default_value="['b']",
-            description="인식 노드가 볼 구역 목록. stage 2 는 ['a','b','c']"),
+            "zones", default_value="['a','b','c']",
+            description="인식 노드가 볼 구역 목록. system.yaml stage:2 와 짝"),
         DeclareLaunchArgument(
-            "pick_cam_ns", default_value="['/pick_cam']",
+            "pick_cam_ns", default_value="['/pick_cam_a','/pick_cam_b','/pick_cam_c']",
             description="zones 와 같은 순서의 픽업 카메라 네임스페이스"),
         DeclareLaunchArgument("use_sim_time", default_value="true",
                               description="규약 1. Isaac 없이 돌릴 때만 false"),

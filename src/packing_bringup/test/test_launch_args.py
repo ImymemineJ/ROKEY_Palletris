@@ -53,12 +53,19 @@ def test_declared_arguments_cover_multizone():
         assert need in names, f"launch 인자 {need!r} 가 없다"
 
 
-def test_default_is_single_zone():
-    """기본값은 1구역이어야 한다 — 씬에 픽업 카메라가 아직 한 대뿐이다."""
+def test_default_is_three_zone():
+    """기본값은 3구역이어야 한다 — system.yaml stage:2(최종 구현)와 짝.
+
+    ★ 2026-08-25: 기본값이 1구역이던 시절, system.yaml 만 stage:2 로 바뀌고
+      여기는 안 바뀐 채 남아 관제탑이 /pick_cam 을, 하네스가 /pick_cam_a·b·c
+      를 발행해 아무 이미지도 안 오는 사고가 있었다. 이 테스트가 그 재발을 막는다.
+      (⚠ 씬에 물리 픽업 카메라가 실제로 3대 놓였는지는 트랙 A 확인 필요 —
+      안 놓였으면 Isaac 실기동에서는 여전히 zones:=['b'] 로 좁혀 써야 한다.)
+    """
     m = _mod()
     ld = m.generate_launch_description()
     dflt = {getattr(e, "name", None): e for e in ld.entities
             if getattr(e, "name", None) in ("zones", "pick_cam_ns")}
     for k, e in dflt.items():
         txt = "".join(getattr(s, "text", "") for s in e.default_value)
-        assert len(m._as_list(txt)) == 1, f"{k} 기본값이 1개가 아니다: {txt!r}"
+        assert len(m._as_list(txt)) == 3, f"{k} 기본값이 3개가 아니다: {txt!r}"
