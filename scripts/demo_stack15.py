@@ -869,6 +869,11 @@ def main():
 
     _paths.check()
     cfg = _paths.system_config()
+    if a.seed is not None:
+        # ★ 여기서 걸어야 한다. `manifest()` 가 **이 cfg** 로 박스 목록을 뽑는데,
+        #   아래 `_paths.system_config` 패치는 이 줄보다 뒤에 설치돼서 안 먹는다.
+        #   2026-08-25 실측으로 밟았다 — 시드 42/7/99 세 실행의 박스 목록이 동일했다.
+        cfg["boxes"]["random_seed"] = int(a.seed)
     DIMS_G.update({t["name"]: t["h_mm"] for t in cfg["boxes"]["types"]})
     n = a.boxes if a.boxes is not None else int(cfg["boxes"]["stage1"]["total_count"])
 
