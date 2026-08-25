@@ -9,13 +9,26 @@ class HeightmapPacker:
     def __init__(self, cfg):
         hm_cfg = cfg["heightmap"]; pal = cfg["pallet"]
         self.cell = hm_cfg["cell_mm"]                       # 10
-        self.W = pal["width_mm"]  // self.cell              # 80  (Px)
-        self.D = pal["depth_mm"]  // self.cell              # 120 (Py)
+        self.W = pal["width_mm"]  // self.cell              # 120 (Px, 월드 +X)
+        self.D = pal["depth_mm"]  // self.cell              # 80  (Py, 월드 +Y = 로봇 쪽)
         self.hm = np.zeros((self.W, self.D), dtype=np.int32)
         self.max_stack = pal["max_stack_mm"]                # ★ G1 전까지 이 값만 바꿔가며 실험
         self.w_h, self.w_s = hm_cfg["w_height"], hm_cfg["w_support"]
         self.w_wall = hm_cfg.get("w_wall", 0.0)             # 벽 밀착도 (0 이면 기존 동작)
         self.w_far = hm_cfg.get("w_far", 0.0)               # 로봇에서 먼 쪽 우선 (0 이면 기존 동작)
+        # ★ 평면 유지 항. 새 박스 **윗면**이 이웃 최고높이와 같으면 1, 벌어질수록 0.
+        #   왜 필요한가: 이 팔레트에서 표면은 "조금 울퉁불퉁"해지지 않는다. 박스 높이가
+        #   210/280/340 뿐이라 단차는 늘 60mm 이상 — **평평 아니면 절벽**이다.
+        #   실측(시드 30): 계획 실패 26.6 회 중 19.6 회가 지지율 미달이고, 그때도
+        #   높이·통로로는 셀의 27% 가 아직 남아 있었다. 즉 자리는 있는데 **딛을 수가**
+        #   없다. 지지율 하한을 0.7 -> 0.5 로 낮추면 +3.7%p 가 나오지만 그건 공짜가
+        #   아니다 — 최악 49% 의 바닥이 1m 깊이 위에 뜬다(외팔보). 그래서 사후에
+        #   완화하는 대신 **절벽을 처음부터 안 만드는** 쪽으로 풀었다.
+        #   ⚠ 값이 작아야 한다. 0.1 이상은 튜닝 시드에서만 오르고 검증 시드에서 사라진다
+        #     (0.15/ring8: 튜닝 61.5% -> 검증 58.7%). 0.05 는 링 2/4/8 셀 어디서나
+        #     같이 오른다(검증 61.1/61.3/61.0%) — 과적합이 아니라는 신호다.
+        self.w_level = hm_cfg.get("w_level", 0.0)           # 평면 유지 (0 이면 기존 동작)
+        self.ring = hm_cfg.get("level_ring_cells", 4)       # 이웃으로 볼 바깥 셀 수
         self.tol = hm_cfg["support_tol_mm"]                 # 10 (= cell_mm! 5로 줄이지 말 것)
         # ★ 구 등방 halo. 아래 arm_* 로 대체됐고, robot 섹션이 없는 축약 cfg 에서만 쓴다.
         self.clr = hm_cfg["gripper_clearance_mm"] // self.cell   # 3셀
@@ -71,6 +84,17 @@ class HeightmapPacker:
         start = w // 2
         return np.take(mf, np.arange(start, start + a.shape[axis] - w + 1), axis=axis)
 
+    def _ring_max(self, wc, dc):
+        """발자국을 ring 셀만큼 부풀린 영역의 최고높이. shape 는 _base_z 와 같다.
+
+        팔레트 **밖**은 0 으로 채운다 — 가장자리 배치에서 "바깥은 낮다"가 되어
+        level 항이 벽 쪽을 깎는데, 그건 `w_wall` 이 이미 반대로 밀고 있어 상쇄된다.
+        (바깥을 무시하도록 고치면 벽 밀착이 과해져 검증 시드에서 오히려 내려갔다.)
+        """
+        c = self.ring
+        pad = np.pad(self.hm, c, mode="constant", constant_values=0)
+        return self._sliding_max(self._sliding_max(pad, wc + 2 * c, 0), dc + 2 * c, 1)
+
     def _base_z(self, wc, dc):
         """모든 배치 시작셀 (i,j)에 대한 밑면 높이 = 점유영역 최대. shape (W-wc+1, D-dc+1)"""
         return self._sliding_max(self._sliding_max(self.hm, wc, 0), dc, 1)
@@ -122,8 +146,12 @@ class HeightmapPacker:
             #   제대로 된 가중치가 필요하고, 다행히 적재율 손해가 없다
             #   (w_far 0.2 에서 팔 넘김 2.2 회 · 적재율 66.3% 로 오히려 소폭 상승).
             far = (jj + dc) / self.D                    # 먼 쪽일수록 1 에 가깝다
+            # ★ 평면 유지: 내 윗면(bz+h)이 이웃 최고높이와 얼마나 맞나. 같으면 1.
+            #   `_corridor_ok` 와 같은 팽창 최대필터지만 반경이 다르다 — 저긴 팔 굵기(12셀),
+            #   여긴 "붙어 있다고 볼 거리"(4셀). 같은 값을 재사용하면 안 된다.
+            level = 1.0 - np.abs(bz + h_mm - self._ring_max(wc, dc)) / self.max_stack
             score = np.where(cand, base_score + self.w_wall * wall + self.w_far * far
-                             - self.tie_eps * order, -np.inf)
+                             + self.w_level * level - self.tie_eps * order, -np.inf)
             # ③ 지지율: 상위 K개만 정밀 계산 (전 후보는 너무 비쌈 — 명세서 §7.9)
             flat = np.argsort(score, axis=None)[::-1][: self.topk]
             for idx in flat:
@@ -132,7 +160,8 @@ class HeightmapPacker:
                 sup = self._support_ratio(i, j, wc, dc, int(bz[i, j]))
                 if sup < self.min_sup: continue
                 s = (self.w_h * (1 - bz[i, j] / self.max_stack) + self.w_s * sup
-                     + self.w_wall * wall[i, j] + self.w_far * far[i, j])
+                     + self.w_wall * wall[i, j] + self.w_far * far[i, j]
+                     + self.w_level * level[i, j])
                 key = (s, -order[i, j])                      # 동점 → 위 order 기준
                 if best is None or key > best[0]:
                     best = (key, i, j, int(bz[i, j]), yaw, w, d)
