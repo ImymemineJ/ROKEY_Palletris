@@ -62,6 +62,15 @@ BELT_GRAPH = {
 }
 VEL_VAR = "graph:variable:Velocity"
 
+# ★ 소터(ConveyorBelt_A47)의 속도는 그래프 **변수**가 아니라 `SorterSpeed`
+#   ConstantFloat 노드에 들어 있다. 본선(`graph:variable:Velocity`)과 경로가
+#   다르므로 따로 다룬다. 값은 `conveyor.sorters` 로 씬마다 준다 (test1-1 은 없다).
+SORTER_GRAPH = "ActionGraph"          # <sorter>/ActionGraph
+SORTER_NODE = "conveyor_belt"         # IsaacConveyor 노드
+SORTER_SPEED = "SorterSpeed"          # ConstantFloat — inputs:value 가 속도
+SORTER_REROUTE = "reroute"            # ConstantBool — 애셋의 분류 스위치
+SORTER_PHYSICS = "Sorter_physics"     # conveyorPrim
+
 # ConveyorBelt_A05 롤러 1 스케일당 길이 (m). layout_to_spec_test1_1.py 와 같은 상수다.
 ROLLER_LEN_PER_SCALE = 1.98724
 
@@ -119,7 +128,42 @@ class ConveyorCtl:
             self._log("[conveyor_ctl] !! seg %r 은 쓸 수 있는 조각이 없다" % seg)
             del self.graphs[seg]
 
-    def _measure_gain(self, gpath):
+        # ── 소터 (ConveyorBelt_A47) ────────────────────────
+        # ★ 왜 본선과 따로인가. 소터는 분기 조각 안의 **독립 컨베이어**다.
+        #   본선 롤러에는 로컬 X 1651~2555 (월드 약 1571 mm) 구멍이 있고 그
+        #   자리를 소터가 받친다 — 그래서 소터를 안 돌리면 라인이 막힌다.
+        #   대신 꺾이는 범위가 본선 조각(6925 mm)이 아니라 소터 구간뿐이라,
+        #   분류하는 동안 뒤차가 본선을 그대로 흘러온다.
+        # 기본 진행/분류 방향 — 부르는 쪽이 world 를 안 주면 이걸 쓴다.
+        _rt = cfg.get("routing") or {}
+        self.thru_world = list(_rt.get("thru_world") or [-1, 0, 0])
+        self.divert_world = list(_rt.get("divert_world") or [0, 1, 0])
+        # ★ 소터는 **본선의 일부**다 (본선 롤러에 소터 자리만큼 구멍이 있다).
+        #   그래서 이 seg 의 속도를 바꿀 때 소터 속도도 같이 따라간다.
+        #   방향은 안 건드린다 — 분류 중에 본선을 잠깐 세웠다 켜도 하던 분류가
+        #   그대로 이어져야 하기 때문이다.
+        self.sorter_follow_seg = str(cfg["conveyor"].get("sorter_follow_seg")
+                                     or "main")
+        self.sorters = {}
+        self.sorter_gain = {}
+        for zn, spath in (cfg["conveyor"].get("sorters") or {}).items():
+            g = spath + "/" + SORTER_GRAPH
+            node = self.stage.GetPrimAtPath(g + "/" + SORTER_NODE)
+            conv = self.stage.GetPrimAtPath(spath + "/" + SORTER_PHYSICS)
+            if not node or not node.IsValid() or not conv or not conv.IsValid():
+                self._log("[conveyor_ctl] !! 소터 %s (%s) 가 씬에 없다" % (zn, spath))
+                continue
+            gain = self._measure_gain(g, SORTER_NODE)
+            if gain is None:
+                continue
+            self.sorters[str(zn)] = spath
+            self.sorter_gain[str(zn)] = gain
+            self._log("[conveyor_ctl] 소터 %-2s %-44s 진행 %s 배율 %.4f "
+                      "(SorterSpeed %.4f = %.2f m/s)"
+                      % (zn, spath, self._axis.get(g, "?"), gain,
+                         self.nominal / gain, self.nominal))
+
+    def _measure_gain(self, gpath, node_name="ConveyorNode"):
         """그래프가 미는 롤러의 **진행방향 배율**.
 
         `IsaacConveyor` 는 direction 을 conveyorPrim 의 **로컬 축**으로 해석하고,
@@ -132,9 +176,9 @@ class ConveyorCtl:
         검산 — test1-1 본선: |(1,0,0) x M| = 2.3390 = 옛 scale.x. 일치한다.
         """
         from pxr import UsdGeom
-        node = self.stage.GetPrimAtPath(gpath + "/ConveyorNode")
+        node = self.stage.GetPrimAtPath(gpath + "/" + node_name)
         if not node or not node.IsValid():
-            self._log("[conveyor_ctl] !! %s 에 ConveyorNode 가 없다" % gpath)
+            self._log("[conveyor_ctl] !! %s 에 %s 가 없다" % (gpath, node_name))
             return None
         tg = node.GetRelationship("inputs:conveyorPrim").GetTargets()
         if not tg:
@@ -166,7 +210,8 @@ class ConveyorCtl:
     # ── 핸들러 ──────────────────────────────────────────────
     def handlers(self):
         return {"set_velocity": self.h_set_velocity,
-                "set_direction": self.h_set_direction}
+                "set_direction": self.h_set_direction,
+                "set_sorter": self.h_set_sorter}
 
     def h_set_velocity(self, req):
         """{"cmd":"set_velocity","seg":"b_pickup","mps":0.0} -> {"ok":..,"actual":..}
@@ -226,20 +271,112 @@ class ConveyorCtl:
             roll = self.stage.GetPrimAtPath(tg[0]) if tg else None
             if not roll or not roll.IsValid():
                 return {"ok": False, "error": "%s 의 conveyorPrim 이 없다" % gpath}
-            M = UsdGeom.XformCache().GetLocalToWorldTransform(roll) \
-                .ExtractRotationMatrix()
-            # 월드 -> 로컬. M 에 스케일이 섞여 있어 각 축을 정규화한 뒤 투영한다.
-            loc = []
-            for k in range(3):
-                row = [float(M[k][j]) for j in range(3)]
-                n = (row[0] ** 2 + row[1] ** 2 + row[2] ** 2) ** 0.5 or 1.0
-                loc.append(sum(wv[j] * row[j] for j in range(3)) / n)
-            i = max(range(3), key=lambda k: abs(loc[k]))
-            out = [0.0, 0.0, 0.0]
-            out[i] = 1.0 if loc[i] > 0 else -1.0
             from pxr import Gf
-            node.GetAttribute("inputs:direction").Set(Gf.Vec3f(*out))
+            node.GetAttribute("inputs:direction").Set(
+                Gf.Vec3f(*self._local_axis(roll, wv)))
         return {"ok": True, "world": wv}
+
+    @staticmethod
+    def _local_axis(roll, wv):
+        """월드 방향 `wv` 를 `roll` 의 **로컬 단위축**으로 환산한다.
+
+        `IsaacConveyor.inputs:direction` 은 conveyorPrim 의 로컬축이다.
+        월드행렬에 스케일이 섞여 있으므로 각 축을 정규화한 뒤 투영하고,
+        가장 큰 성분 하나만 남긴다 (벨트는 축 방향으로만 민다).
+        """
+        from pxr import UsdGeom
+        M = UsdGeom.XformCache().GetLocalToWorldTransform(roll) \
+            .ExtractRotationMatrix()
+        loc = []
+        for k in range(3):
+            row = [float(M[k][j]) for j in range(3)]
+            n = (row[0] ** 2 + row[1] ** 2 + row[2] ** 2) ** 0.5 or 1.0
+            loc.append(sum(wv[j] * row[j] for j in range(3)) / n)
+        i = max(range(3), key=lambda k: abs(loc[k]))
+        out = [0.0, 0.0, 0.0]
+        out[i] = 1.0 if loc[i] > 0 else -1.0
+        return out
+
+    def h_set_sorter(self, req):
+        """{"cmd":"set_sorter","zone":"A","divert":true} -> {"ok":..,"world":[..]}
+
+        ★ 소터로 분류한다. `set_direction` 과 무엇이 다른가:
+
+          `set_direction` 은 **본선 조각 전체(6925 mm)** 의 표면속도를 꺾는다.
+          그래서 그 조각 위에 박스가 둘이면 못 꺾고, 못 꺾인 박스는 순환 루프를
+          돌아 다시 와서 더 몰린다. 투입 간격을 20 s 까지 벌려야 했던 이유다.
+
+          소터는 분기 조각 안의 **독립 컨베이어**라 꺾이는 범위가 소터 구간
+          (약 1492 mm) 뿐이다. 분류하는 동안 뒤차는 본선을 그대로 흘러온다.
+
+        ★ 왜 애셋의 `reroute` 스위치를 안 쓰나. A47 안에 분류 배선이
+          반쯤 들어 있는데(`reroute`->`to_float`->x90°->`rotate_vector`)
+          **`rotate_vector` 의 출력이 어디에도 연결돼 있지 않다.** 그래서
+          `reroute` 를 켜도 아무 일이 안 난다. 끊긴 사슬을 잇는 대신
+          `inputs:direction` 을 직접 쓴다 — 본선에서 이미 검증된 경로다.
+          `reroute` 는 애셋 상태가 어긋나 보이지 않게 같이 맞춰만 둔다.
+
+        `mps` 를 주면 속도도 같이 바꾼다 (안 주면 건드리지 않는다).
+        """
+        zn = str(req.get("zone"))
+        if zn not in self.sorters:
+            return {"ok": False, "error": "unknown zone %r (있는 것: %s)"
+                    % (zn, sorted(self.sorters))}
+        div = bool(req.get("divert"))
+        w = req.get("world")
+        if w is None:
+            w = self.divert_world if div else self.thru_world
+        try:
+            wv = [float(w[0]), float(w[1]), float(w[2])]
+        except (TypeError, ValueError, IndexError, KeyError):
+            return {"ok": False, "error": "bad world %r" % (w,)}
+        if wv == [0.0, 0.0, 0.0]:
+            return {"ok": False, "error": "world 가 영벡터다"}
+        mps = req.get("mps")
+        if mps is not None:
+            try:
+                mps = float(mps)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "bad mps %r" % (mps,)}
+        return self.mainq.run(lambda: self.set_sorter(zn, div, wv, mps))
+
+    def set_sorter(self, zn, div, wv, mps=None):
+        """**메인 스레드 전용.** USD 쓰기는 여기서만 한다."""
+        from pxr import Gf
+        spath = self.sorters.get(zn)
+        if not spath:
+            return {"ok": False, "error": "unknown zone %r" % (zn,)}
+        g = spath + "/" + SORTER_GRAPH
+        node = self.stage.GetPrimAtPath(g + "/" + SORTER_NODE)
+        conv = self.stage.GetPrimAtPath(spath + "/" + SORTER_PHYSICS)
+        if not node or not node.IsValid() or not conv or not conv.IsValid():
+            return {"ok": False, "error": "소터 %s 의 노드/컨베이어가 없다" % zn}
+        node.GetAttribute("inputs:direction").Set(
+            Gf.Vec3f(*self._local_axis(conv, wv)))
+        rr = self.stage.GetPrimAtPath(g + "/" + SORTER_REROUTE)
+        if rr and rr.IsValid():
+            a = rr.GetAttribute("inputs:value")
+            if a:
+                a.Set(bool(div))
+        if mps is not None:
+            sp = self.stage.GetPrimAtPath(g + "/" + SORTER_SPEED)
+            if not sp or not sp.IsValid():
+                return {"ok": False, "error": "소터 %s 에 %s 가 없다"
+                        % (zn, SORTER_SPEED)}
+            sp.GetAttribute("inputs:value").Set(mps / self.sorter_gain[zn])
+        return {"ok": True, "zone": zn, "divert": div, "world": wv}
+
+    def set_sorter_velocity(self, zn, mps):
+        """**메인 스레드 전용.** 속도만 바꾼다 (방향은 그대로)."""
+        spath = self.sorters.get(zn)
+        if not spath:
+            return {"ok": False, "error": "unknown zone %r" % (zn,)}
+        sp = self.stage.GetPrimAtPath(
+            spath + "/" + SORTER_GRAPH + "/" + SORTER_SPEED)
+        if not sp or not sp.IsValid():
+            return {"ok": False, "error": "소터 %s 에 %s 가 없다" % (zn, SORTER_SPEED)}
+        sp.GetAttribute("inputs:value").Set(mps / self.sorter_gain[zn])
+        return {"ok": True, "actual": mps}
 
     # ── 내부. **메인 스레드 전용** ──────────────────────────
     def set_velocity(self, seg, mps):
@@ -260,12 +397,32 @@ class ConveyorCtl:
                         "actual": 0.0}
             # ★ 그래프 변수 하나만 쓴다. 실측으로 이게 정확하다 (위 주석).
             attr.Set(mps / self.gain[gpath])
+        # ★★ 본선을 켜면 소터도 켠다. 안 그러면 소터가 0 으로 서 있고, 소터
+        #   자리에는 본선 롤러가 **없어서** 박스가 거기서 그냥 멎는다
+        #   (실측 2026-08-25: BOX00000 이 X -6.89 에서 90 s 정지, 뒤로 2 개가
+        #   줄섰다. `run_all` 을 고쳤지만 데모는 seg 별로 켜서 안 불렸다).
+        if seg == self.sorter_follow_seg:
+            for zn in self.sorters:
+                self.set_sorter_velocity(zn, mps)
         return {"ok": True, "actual": mps}
 
     def stop_all(self):
         for seg in self.graphs:
             self.set_velocity(seg, 0.0)
+        # ★ 소터도 같이 세운다. 안 세우면 본선이 멎은 뒤에도 소터 구간의 박스만
+        #   혼자 흘러가 분기점을 지나쳐 버린다.
+        for zn in self.sorters:
+            self.set_sorter_velocity(zn, 0.0)
 
     def run_all(self):
         for seg in self.graphs:
             self.set_velocity(seg, self.nominal)
+        # ★ 소터를 반드시 같이 돌린다. 본선 롤러에는 소터 자리에 구멍이 있어
+        #   소터가 서 있으면 **라인이 거기서 막힌다** (실측 2026-08-25: 박스가
+        #   X -6.62 에서 165 s 정지).
+        # ★★ 방향도 같이 세운다. A47 애셋의 기본 direction 은 로컬 (1,0,0) =
+        #   월드 **+X** 인데 이 라인은 -X 로 흐른다. 속도만 켜면 소터가 본선과
+        #   맞서 밀어 박스가 소터 위에서 멎는다 (실측 2026-08-25: BOX00000 이
+        #   X -7.11 에서 75 s 정지, 뒤로 3 개가 줄섰다).
+        for zn in self.sorters:
+            self.set_sorter(zn, False, self.thru_world, self.nominal)

@@ -123,8 +123,15 @@ def main():
         # 셀 -> 합류
         chk("셀 끝 = 합류 시작 (Y)", abs(cb[4] - mb[1]) < 3,
             "셀 %.0f · 합류 %.0f" % (cb[4], mb[1]))
-        chk("셀 시작 = 합류 시작 (X)", abs(cb[0] - mb[0]) < 3,
-            "셀 %.0f · 합류 %.0f" % (cb[0], mb[0]))
+        # ★ 예전엔 "셀 시작 X == 합류 시작 X" 를 봤다. 셀 롤러를 784.5 -> 1300 으로
+        #   **-X 쪽으로만** 넓히면서(프레임이 페데스탈을 덮지 않게) 이 등식이 깨졌다.
+        #   깨져도 반출은 정상이다 — 실제로 필요한 조건은 두 가지다:
+        #     (1) 합류 라인이 셀 위에서 시작할 것 (팔레트가 셀에서 합류로 넘어간다)
+        #     (2) 합류 라인이 팔레트를 X 로 온전히 받칠 것
+        chk("합류 시작이 셀 X 안", cb[0] - 1 <= mb[0] <= cb[3] + 1,
+            "셀 %.0f~%.0f · 합류 시작 %.0f" % (cb[0], cb[3], mb[0]))
+        chk("합류가 팔레트를 X 로 받친다", mb[0] - 1 <= pb[0] and pb[3] <= mb[3] + 1,
+            "합류 %.0f~%.0f · 팔레트 %.0f~%.0f" % (mb[0], mb[3], pb[0], pb[3]))
         # 지선 <-> pickup_cross_mm
         spur = box({"A": "/World/ConveyorTrack_09/Rollers_01",
                     "B": "/World/ConveyorTrack_08/Rollers_01",
@@ -151,16 +158,27 @@ def main():
     bed = box("/World/Truck_Bed")
     chk("적재함 prim 있음", bed is not None)
     if bed:
+        # ★ 코너 턴테이블에서 90° 돌리면 적재함을 **가로지르는** 치수가 팔레트의
+        #   depth(1200)가 아니라 width(800)로 바뀐다. 그래야 3 장이 1톤 규격
+        #   2800 에 들어간다 (3 x 800 = 2400). 안 돌리면 3600 이라 못 들어간다.
+        turn = bool(pal.get("turntable_before_truck"))
+        cross = pal["width_mm"] if turn else pal["depth_mm"]
+        print("     팔레트 회전 %s -> 적재함 가로 치수 %.0f mm"
+              % ("함(턴테이블)" if turn else "안 함", cross))
         ys = []
         for z in "ABC":
             mb = box(merges[z])
-            ys.append(((mb[1] + mb[4]) / 2.0 - pal["depth_mm"] / 2.0,
-                       (mb[1] + mb[4]) / 2.0 + pal["depth_mm"] / 2.0))
+            ys.append(((mb[1] + mb[4]) / 2.0 - cross / 2.0,
+                       (mb[1] + mb[4]) / 2.0 + cross / 2.0))
         span = max(y[1] for y in ys) - min(y[0] for y in ys)
         chk("팔레트 3 장이 적재함 안",
             bed[1] - 1 <= min(y[0] for y in ys)
             and max(y[1] for y in ys) <= bed[4] + 1,
             "3 장 %.0f · 적재함 %.0f" % (span, bed[4] - bed[1]))
+        # ★ 1톤 트럭 규격. 작업명세서 §3.2 의 2800 이 정본이다.
+        want_bed = float((cfg.get("truck") or {}).get("bed_len_mm", 2800))
+        chk("적재함 = 1톤 규격", abs((bed[4] - bed[1]) - want_bed) < 3,
+            "%.0f (규격 %.0f)" % (bed[4] - bed[1], want_bed))
         ys.sort()
         overlap = [i for i in range(len(ys) - 1) if ys[i][1] > ys[i + 1][0] + 1]
         chk("팔레트끼리 안 겹친다", not overlap)
@@ -168,6 +186,56 @@ def main():
             mb = box(merges[z])
             chk("합류 %s 가 적재함까지" % z, abs(mb[3] - (-2400.0)) < 5,
                 "%.0f" % mb[3])
+
+    # ── 소터 ────────────────────────────────────────────────────
+    # ★ 왜 게이트에 넣나. A47 의 본선 롤러에는 소터 자리만큼 **구멍**이 있다.
+    #   소터 높이가 어긋나거나 속도가 0 이면 라인이 거기서 막히는데, 씬만 보면
+    #   멀쩡해 보인다 (실측 2026-08-25: 세 번 연속 이걸로 막혔다).
+    srt = (cfg["conveyor"].get("sorters") or {})
+    rt = cfg.get("routing") or {}
+    if srt:
+        print("")
+        print("=== 소터 ===")
+        want_x = rt.get("sorter_x_mm") or {}
+        for z in "ABC":
+            sp = srt.get(z)
+            if not sp:
+                chk("소터 %s 설정" % z, False, "없다")
+                continue
+            sb = box(sp)
+            jb = box(sp.rsplit("/", 1)[0] + "/Rollers")
+            chk("소터 %s prim" % z, sb is not None)
+            if sb is None or jb is None:
+                continue
+            # 롤러면과 같은 높이여야 한다. 7 mm 만 높아도 박스가 턱에 걸린다.
+            chk("소터 %s 윗면 = 본선 롤러" % z, abs(sb[5] - jb[5]) < 0.5,
+                "%.1f (롤러 %.1f)" % (sb[5], jb[5]))
+            # 설정의 소터 구간이 실제 bbox 와 맞는지 — 어긋나면 라우터가
+            # 엉뚱한 X 에서 꺾어 박스가 소터 밖에서 옆으로 밀린다.
+            w = want_x.get(z)
+            chk("소터 %s 구간 = 설정" % z,
+                w is not None and abs(sb[0] - min(w)) < 3
+                and abs(sb[3] - max(w)) < 3,
+                "실측 %.0f~%.0f · 설정 %s" % (sb[0], sb[3], w))
+            g = sp + "/ActionGraph"
+            nd = st.GetPrimAtPath(g + "/conveyor_belt")
+            chk("소터 %s IsaacConveyor" % z, nd.IsValid())
+            if not nd.IsValid():
+                continue
+            tg = [str(x) for x in
+                  nd.GetRelationship("inputs:conveyorPrim").GetTargets()]
+            chk("소터 %s conveyorPrim" % z, tg == [sp + "/Sorter_physics"], "%s" % tg)
+            # ★ 애셋 기본은 로컬 (1,0,0) = 월드 +X 인데 이 라인은 -X 로 흐른다.
+            #   그대로면 소터가 본선과 맞서 밀어 박스가 소터 위에서 멎는다.
+            d = nd.GetAttribute("inputs:direction").Get()
+            chk("소터 %s direction = 본선 진행" % z,
+                d is not None and tuple(d) == (-1.0, 0.0, 0.0), "%s" % (d,))
+            sv = st.GetPrimAtPath(g + "/SorterSpeed").GetAttribute("inputs:value")
+            chk("소터 %s SorterSpeed != 0" % z,
+                sv is not None and abs(sv.Get() or 0.0) > 1e-6,
+                "%.4f" % (sv.Get() if sv else 0.0))
+        chk("라우팅이 소터를 쓴다", bool(rt.get("use_sorter")),
+            "use_sorter=%r" % rt.get("use_sorter"))
 
     print("")
     print("=" * 70)

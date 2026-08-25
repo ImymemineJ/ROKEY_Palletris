@@ -80,6 +80,15 @@ class PickCamera:
             raise ValueError("conveyor.pickup_axis 는 x | y 여야 한다: %r" % _ax)
         self.axis = 0 if _ax == "x" else 1
         self.stopper_pos_m = conv["stopper_x_mm"] / 1000.0
+        # ★ ROI 의 **스토퍼 쪽 끝**을 어디서 자를지. 기본 +20 mm 는 스토퍼 면을 조금
+        #   넘겨 자른다 — test1-1 처럼 스토퍼가 100 mm(상면 900)로 낮아 절대 최고점이
+        #   될 수 없을 때는 문제가 없다.
+        #   ⚠ test_3 은 스토퍼를 300 mm(상면 1100)로 올렸다. 그러면 스토퍼 상면이
+        #     3호(1010)·4호(1080) 박스보다 **높아서** zmax 를 차지하고, 윗면 밴드가
+        #     스토퍼 윗면 조각이 된다 (2026-08-25 실측: 종류 맞춤 0/1 · 중심 오차
+        #     486 mm · 윗면 z 오차 **정확히 91 mm** = 1100 − 1010). 그래서 test_3 은
+        #     스토퍼 면 **앞**에서 자른다.
+        self.roi_far_m = float(conv.get("cam_roi_far_margin_mm", 20.0)) / 1000.0
         bt = cfg["boxes"]["types"]
         self.h_max_m = max(t["h_mm"] for t in bt) / 1000.0
         self.w_max_m = max(t["w_mm"] for t in bt) / 1000.0
@@ -182,7 +191,8 @@ class PickCamera:
         a = self.axis
         p0 = self.stopper_pos_m - self.w_max_m - 0.05
         m = ((pts[:, 2] > z0) & (pts[:, 2] < z1)
-             & (pts[:, a] > p0) & (pts[:, a] < self.stopper_pos_m + 0.02))
+             & (pts[:, a] > p0)
+             & (pts[:, a] < self.stopper_pos_m + self.roi_far_m))
         roi = pts[m]
         if len(roi) < MIN_PTS:
             return {"ok": False, "error": "박스가 안 보인다",

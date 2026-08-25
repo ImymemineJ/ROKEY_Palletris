@@ -91,7 +91,7 @@ def _yaw_deg(quat):
 
 
 class Spawner:
-    def __init__(self, stage, cfg, mainq, zone="B", log=print):
+    def __init__(self, stage, cfg, mainq, zone="B", log=print, zones=None):
         self.stage = stage
         self.cfg = cfg
         # ★ USD 쓰기(스폰·디스폰)는 메인 스레드에서. mainq.py docstring 참조.
@@ -125,12 +125,22 @@ class Spawner:
         #   실측: 존 A 로 돌렸는데 존 B(X -12.9)·C(X -18.9) 지선에 놓인 박스를
         #   집으려다 IK_FAIL 3 연발이 났다. 이 창이 없으면 그 일이 다시 난다.
         #   키가 없으면 제한 없음 — test1-1 은 지선이 하나라 동작이 안 바뀐다.
-        _cross = (cfg["zones"].get("pickup_cross_mm") or {}).get(zone)
+        #
+        # ★ 다존 (2026-08-25). 로봇 3 대를 동시에 돌리려면 픽업 감지가 **존마다**
+        #   따로 있어야 한다. `zones` 를 주면 그만큼 창을 만든다. 안 주면 `zone`
+        #   하나뿐이라 기존 동작이 하나도 안 바뀐다 (test1-1 기준선 보호).
+        self.zones = [str(z) for z in (zones or [zone])]
+        if zone not in self.zones:
+            self.zones.insert(0, zone)
+        _xtab = (cfg["zones"].get("pickup_cross_mm") or {})
         self.cross_axis = 1 - self.axis
-        if _cross:
-            self.cross_range_m = (min(_cross) / 1000.0, max(_cross) / 1000.0)
-        else:
-            self.cross_range_m = None
+        self.cross_by_zone = {}
+        for _z in self.zones:
+            _c = _xtab.get(_z)
+            self.cross_by_zone[_z] = ((min(_c) / 1000.0, max(_c) / 1000.0)
+                                      if _c else None)
+        # 기본 존 창 — 이름을 유지해 기존 코드가 그대로 돈다.
+        self.cross_range_m = self.cross_by_zone.get(zone)
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
         # 색표. 설정에 없으면 **색을 아예 안 쓴다** — 박스는 전부 LINE_COLOR 다.
         #   (QR 분류로 바뀌면서 색은 통일했다. DEFAULT_COLORS 는 되돌릴 때 참고용.)
@@ -159,6 +169,7 @@ class Spawner:
         self.lost = []                     # 라인을 벗어난 박스 (물리 파탄)
         self._snap = {}                    # box_id -> {"pos_m", "yaw_deg", "vel_mps"}
         self._pickup = {"present": False, "box_id": "", "pose": None}
+        self._pickup_by_zone = {}
 
         self._ensure_roots()
         self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
@@ -211,7 +222,7 @@ class Spawner:
         from pxr import UsdGeom as _UG
         cache = _UG.XformCache()
         snap = {}
-        best = None
+        best = {}          # zone -> (box_id, entry)  ★ 존마다 따로 고른다
         lost = []
         for box_id, rec in list(self.boxes.items()):
             prim = self.stage.GetPrimAtPath(rec["path"])
@@ -259,17 +270,23 @@ class Spawner:
             a = self.axis
             w, h = rec["dims"][a], rec["dims"][2]
             front = pos[a] + w / 2.0
-            in_zone = self.pickup_p0_m <= pos[a] <= self.stopper_pos_m
-            if in_zone and self.cross_range_m is not None:
-                c = pos[self.cross_axis]
-                in_zone = self.cross_range_m[0] <= c <= self.cross_range_m[1]
+            on_line = self.pickup_p0_m <= pos[a] <= self.stopper_pos_m
             at_stopper = front > self.stopper_pos_m - w / 2.0 - PICKUP_MARGIN_M
             on_belt = abs(pos[2] - (self.belt_top_m + h / 2.0)) < PICKUP_Z_TOL_M
-            if (in_zone and at_stopper and on_belt
+            if not (on_line and at_stopper and on_belt
                     and abs(entry["vel_mps"][a]) < PICKUP_VEL_MPS):
+                continue
+            # ★ 어느 존의 지선인지 가른다. 창이 없으면(test1-1) 모든 존이 받는다.
+            for _z in self.zones:
+                cr = self.cross_by_zone.get(_z)
+                if cr is not None:
+                    c = pos[self.cross_axis]
+                    if not (cr[0] <= c <= cr[1]):
+                        continue
                 # 여러 개가 줄 서면 **가장 앞선 것**이 집힐 차례다
-                if best is None or pos[a] > best[1]["pos_m"][a]:
-                    best = (box_id, entry)
+                cur = best.get(_z)
+                if cur is None or pos[a] > cur[1]["pos_m"][a]:
+                    best[_z] = (box_id, entry)
         for box_id, pos in lost:
             self.boxes.pop(box_id, None)
             self.lost.append(box_id)
@@ -277,12 +294,17 @@ class Spawner:
                       "물리가 터진 것이다 (관통 또는 큐 과압축)."
                       % (box_id, [round(v, 1) for v in pos]))
         self._snap = snap
-        if best is None:
-            self._pickup = {"present": False, "box_id": "", "pose": None}
-        else:
-            box_id, e = best
-            self._pickup = {"present": True, "box_id": box_id,
-                            "pose": {"pos_m": e["pos_m"], "yaw_deg": e["yaw_deg"]}}
+        pk = {}
+        for _z in self.zones:
+            b = best.get(_z)
+            if b is None:
+                pk[_z] = {"present": False, "box_id": "", "pose": None}
+            else:
+                box_id, e = b
+                pk[_z] = {"present": True, "box_id": box_id,
+                          "pose": {"pos_m": e["pos_m"], "yaw_deg": e["yaw_deg"]}}
+        self._pickup_by_zone = pk
+        self._pickup = pk[self.zone]
 
     # ── 소켓 핸들러 ─────────────────────────────────────────
     def h_spawn_box(self, req):
@@ -328,9 +350,9 @@ class Spawner:
           안 비우면 패커가 **없어진 박스 위에** 다음 자리를 잡는다.
         """
         zone = (req or {}).get("zone", self.zone)
-        if zone != self.zone:
+        if zone not in self.zones:
             return {"ok": False, "error": "이 스포너는 존 %s 다 (요청 %s)"
-                    % (self.zone, zone), "removed": 0}
+                    % (",".join(self.zones), zone), "removed": 0}
         return self.mainq.run(self._swap_pallet)
 
     def h_spawn_status(self, req=None):
@@ -404,10 +426,12 @@ class Spawner:
           KeyError 가 안 나야 한다.
         """
         zone = (req or {}).get("zone", self.zone)
-        if zone != self.zone:
+        if zone not in self.zones:
             return {"present": False, "box_id": "", "pose": None,
-                    "error": "이 스포너는 존 %s 다 (요청 %s)" % (self.zone, zone)}
-        return dict(self._pickup)
+                    "error": "이 스포너가 아는 존은 %s 다 (요청 %s)"
+                             % (",".join(self.zones), zone)}
+        return dict(self._pickup_by_zone.get(zone) or
+                    {"present": False, "box_id": "", "pose": None})
 
     def h_get_box_pose(self, req):
         box_id = req.get("box_id")
