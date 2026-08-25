@@ -38,7 +38,7 @@ pick_korean_font()
 COLORS = {210: "#4C9AFF", 280: "#FFAB00", 340: "#36B37E"}
 
 
-def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7):
+def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7, packer_cls=None):
     """박스를 하나씩 plan → update 하면서 매 단계 스냅샷을 남긴다.
 
     ★ NO_FEASIBLE_POSE 는 '이 박스만' 자리가 없다는 뜻이므로 그 박스만 버리고 계속 간다.
@@ -49,7 +49,9 @@ def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7):
       박스 등장 순서까지 바뀐다 (TS-006).
     """
     boxes = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in cfg["boxes"]["types"]]
-    pk = HeightmapPacker(cfg)
+    # ★ 베이스라인도 같은 함수로 돌린다. 두 패커를 **같은 시퀀스**에 먹여야
+    #   나란히 놓은 영상이 "전략 차이" 를 보여준다 (다른 시퀀스면 운 차이가 섞인다).
+    pk = (packer_cls or HeightmapPacker)(cfg)
     rb, rn = random.Random(seed_box), random.Random(seed_noise)
     steps = []
     placed = skipped = 0
@@ -166,6 +168,59 @@ def render_video(cfg, steps, out_path, fps=2, hold=6):
 
     anim = animation.FuncAnimation(fig, frame, frames=len(steps) + hold, blit=False)
     anim.save(out_path, writer=animation.FFMpegWriter(fps=fps, bitrate=2400))
+    plt.close(fig)
+    return out_path
+
+
+def render_compare_video(cfg, steps_a, steps_b, out_path,
+                        name_a="제안 (heightmap)", name_b="베이스라인 (순차)",
+                        fps=2, hold=8):
+    """두 패커를 **같은 박스 시퀀스**로 나란히 재생한다.
+
+    왜 필요한가: 표의 "+19.1%p" 는 숫자일 뿐이라 무엇이 달라서 그런지 안 보인다.
+    같은 순서로 같은 박스를 먹였을 때 한쪽은 가장자리부터 층을 펴고 다른 쪽은
+    좌하단에 쌓기만 하는 것을 나란히 놓으면 그게 그대로 보인다.
+
+    ★ 길이가 다르다. 먼저 끝난 쪽은 **마지막 화면을 유지**한다 — 짧은 쪽을 늘리려고
+      단계를 늘리면 없던 배치를 지어내는 것이 된다.
+    """
+    n = max(len(steps_a), len(steps_b)) + hold
+    fig = plt.figure(figsize=(12.6, 6.4))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], hspace=0.34, wspace=0.06,
+                          left=0.02, right=0.98, top=0.88, bottom=0.10)
+    axL = fig.add_subplot(gs[0, 0], projection="3d")
+    axR = fig.add_subplot(gs[0, 1], projection="3d")
+    axF = fig.add_subplot(gs[1, :])
+    title = fig.suptitle("", fontsize=12)
+    fa = [s["fill"] * 100 for s in steps_a]
+    fb = [s["fill"] * 100 for s in steps_b]
+
+    def frame(f):
+        ka = min(f, len(steps_a) - 1)
+        kb = min(f, len(steps_b) - 1)
+        sa, sb = steps_a[ka], steps_b[kb]
+        for ax, st_, nm, done in ((axL, sa, name_a, f >= len(steps_a)),
+                                  (axR, sb, name_b, f >= len(steps_b))):
+            draw_boxes3d(ax, st_["placed"], cfg)
+            ax.set_title(f"{nm}   적재 {st_['n_ok']}개 · 버림 {st_['n_skip']}개\n"
+                         f"적재율 {st_['fill'] * 100:.1f}%  최고 {int(st_['hm'].max())}mm"
+                         + ("   — 끝" if done else ""), fontsize=9.5)
+        axF.clear()
+        axF.plot(range(1, ka + 2), fa[:ka + 1], color="#2a78d6", lw=2, label=name_a)
+        axF.plot(range(1, kb + 2), fb[:kb + 1], color="#eb6834", lw=2, label=name_b)
+        axF.axhline(70, color="#52514E", lw=1.1, ls=(0, (5, 4)))
+        axF.text(1, 71.5, "목표 70%", color="#52514E", fontsize=8)
+        axF.set_xlim(1, max(len(steps_a), len(steps_b)))
+        axF.set_ylim(0, 90)
+        axF.set_xlabel("투입한 박스 수", fontsize=9)
+        axF.set_ylabel("적재율 (%)", fontsize=9)
+        axF.grid(alpha=0.3); axF.set_axisbelow(True)
+        axF.legend(fontsize=8, loc="lower right", framealpha=0.9)
+        title.set_text("같은 박스 · 같은 순서 — 전략만 다르다")
+        return []
+
+    anim = animation.FuncAnimation(fig, frame, frames=n, blit=False)
+    anim.save(out_path, writer=animation.FFMpegWriter(fps=fps, bitrate=2600))
     plt.close(fig)
     return out_path
 

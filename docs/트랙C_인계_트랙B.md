@@ -1,0 +1,185 @@
+# 트랙 C → 트랙 B 인계 (2026-08-25, 정정인 → 김병직)
+
+---
+
+## 0. 받아서 돌리는 법
+
+```bash
+cd ~/palletris_ws
+git fetch origin
+git merge origin/track/algo          # 또는 PR 로 main 에 넣은 뒤 main 을 받기
+colcon build --symlink-install
+source install/setup.bash
+```
+
+알고리즘 노드를 띄웁니다 (**`use_sim_time:=true` 필수** — §3-4 규약 1번):
+
+```bash
+export ROS_DOMAIN_ID=115
+ros2 run packing_algo algo_service_node --ros-args -p use_sim_time:=true
+```
+
+정상이면 이렇게 뜹니다:
+
+```
+[INFO] algo_service_node 준비 — 구역 ['A','B','C'] · heightmap (120, 80) (셀 10mm) · max_stack 1300mm
+```
+
+붙기 전에 서비스만 따로 확인하려면 (실측 확인 완료):
+
+```bash
+ros2 service call /algo/plan_placement packing_msgs/srv/PlanPlacement \
+  "{zone: 'B', box_id: 'T1', size_w_mm: 480, size_d_mm: 380, size_h_mm: 340}"
+#  -> ok=True, pose=(x_mm=240, y_mm=610, z_mm=0, yaw_deg=0.0), message='OK'
+
+ros2 service call /algo/update_heightmap packing_msgs/srv/UpdateHeightmap \
+  "{zone: 'B', box_id: 'T1', size_w_mm: 480, size_d_mm: 380, size_h_mm: 340,
+    actual_pose: {x_mm: 240, y_mm: 610, z_mm: 0, yaw_deg: 0.0}}"
+#  -> ok=True, fill_rate=0.19, placed_count=1, max_height_mm=340
+
+ros2 service call /algo/reset_heightmap packing_msgs/srv/ResetHeightmap "{zone: 'B'}"
+```
+
+서비스 경로 4개: `/algo/plan_placement` · `/algo/update_heightmap` ·
+`/algo/cancel_plan` · `/algo/reset_heightmap`
+
+> ⚠ **`/algo/reset` 이 아니라 `/algo/reset_heightmap` 입니다.**
+> srv 타입도 `ResetZone` → `ResetHeightmap` 으로 바뀌었습니다 (§3-3 에 맞춤).
+
+### ⚠ 이 브랜치에는 알고리즘만 있는 게 아닙니다
+
+`track/algo` 를 받으면 같이 딸려 옵니다. **알고리즘 노드가 `ResetHeightmap` 을
+쓰기 때문에 떼어낼 수가 없습니다.**
+
+| 딸려 오는 것 | 무엇 |
+|---|---|
+| `packing_msgs/` 전체 | `BoxAtPickup` 이 `geometry_msgs/Pose` 를 버리고 mm 정수로 · `ResetZone` → `ResetHeightmap` · `RobotCmd`/`RobotEvent` 신규 · `BoxInfo`/`ZoneStatus` 필드 확정 (CLAUDE.md §3 최종본에 맞춤) |
+| **`packing_robot/orchestrator.py`** | **김병직님 파일인데 제가 고쳤습니다.** 위 msg 변경에 맞추느라 그랬습니다 — `ZoneStatus.max_height_mm` 중계 추가, `state="BLOCKED"` 제거(§3-2 의 7상태에 없는 값이라) → `accepting=false` 로. **직접 보시고 마음에 안 들면 되돌려 주세요.** |
+| `packing_vision/`, `packing_sim/isaac/ros_graph.py` | 신규 |
+
+**팀 4명 전원 재빌드입니다.** 옛 필드 이름을 쓰는 코드는 깨집니다.
+
+---
+
+## 1. ★ 관제탑 동작이 바뀝니다 — `NO_FEASIBLE_POSE` 가 줄어듭니다
+
+`plan()` 이 **자리가 있는데 없다고 답하고 있었습니다.** 실측(시드 6, 13개 적재 시점):
+
+```
+3호 340x250x210 : 놓을 수 있는 칸 803개  ->  plan() 은 NO_FEASIBLE_POSE
+4호 410x310x280 :              388개  ->  plan() 은 NO_FEASIBLE_POSE
+5호 480x380x340 :               65개  ->  plan() 은 NO_FEASIBLE_POSE
+```
+
+지지율을 점수 상위 50개만 검사하고 거기서 다 떨어지면 포기했기 때문입니다.
+기둥이 높아지면 상위 점수 자리가 전부 좁은 골짜기라 몰살당하는데, 쓸 만한 자리는
+51등 밖에 있었습니다.
+
+**그동안 리턴 라인으로 되돌려진 박스 중 상당수가 사실 놓을 수 있는 박스였습니다.**
+`retry_count` 통계를 보고 계셨다면 다시 보셔야 합니다.
+
+고쳤습니다 (`11842e5`). 회귀 테스트도 넣었습니다.
+
+**부수 효과:** `plan()` 응답이 1.2ms -> 2.7ms. 여전히 §7.9 기준(200ms) 안입니다.
+
+---
+
+## 2. ★ 로봇에 요구하는 배치 정밀도 (변동 없음)
+
+> **놓는 순간 오차: 위치 ±5mm · yaw ±5° 이내**
+
+| 오차 | 적재율 손해 |
+|---|---|
+| 위치 ±3mm | 0 |
+| 위치 ±10mm | 0 (대신 가장자리 걸침 8.5회) |
+| yaw ±3° | 0 |
+| **yaw ±5°** | **0** |
+| yaw ±8° | −1.8%p |
+| yaw ±15° | −7.1%p |
+
+- **yaw 가 아픕니다.** `yaw_tol_deg`(5°)를 넘으면 축정렬 격자에 못 넣어 외접
+  사각형(AABB)으로 부풀려 기록합니다 — 그 박스가 실제보다 넓은 자리를 먹습니다.
+- **위치는 적재율엔 관대하지만 재현성엔 5mm 입니다.** `update()` 가 10mm 격자로
+  반올림하므로 ±5mm(셀의 절반)를 넘으면 그때부터 계획이 갈라집니다.
+  실측: ±3mm 까지는 계획이 **완전히 동일**, ±5mm 는 9.9번째, ±10mm 는 3.9번째에서 갈립니다.
+
+---
+
+## 3. 확인 부탁드릴 것 — 지지율 0.7 이 안전한가
+
+`min_support_ratio` 0.7 에서도 **최악 29.7% 의 바닥이 뜨고 최대 깊이가 1050mm** 입니다.
+0.5 로 낮추면 적재율이 +3.7%p 오르지만 최악 49% 가 1m 위에 뜹니다 — 그건 안 씁니다.
+
+**0.7 에서 Isaac 으로 실제로 넘어지는지 봐 주세요.** 넘어지면 0.7 도 올려야 합니다.
+
+---
+
+## 4. 참고 — 팀 판단이 필요한 것 2개
+
+### (a) 발표에 어느 적재율을 쓸지
+
+이번 수정으로 두 지표가 **반대로** 움직였습니다.
+
+| | 개수 | 적재율(실제높이) | 적재율(용량) | 최고높이 |
+|---|---|---|---|---|
+| 어제 | 21.2 | 58.5% | 55.9% | 1239mm |
+| 오늘 | **22.4** | 59.9% | **58.9%** | 1278mm |
+
+실제높이 기준은 **분모가 실제 최고높이**라 더미가 높아지면 분모도 커집니다.
+팔레트 한 칸은 어차피 1300 까지 쓰므로 1239 -> 1278 은 손해가 아닙니다.
+**용량 기준이 이번 변화를 맞게 보여 줍니다.**
+
+### (b) `plan() < 200ms` 기준을 유지할지 (§7.9)
+
+"앞보기"(후보 몇 개를 놓아 보고 다음 박스들을 굴려 본 뒤 고르기)를 만들어 뒀는데
+**적재율은 +1.2%p 오르지만 §7.9 를 깹니다.**
+
+| 설정 | 평균 | 95% | 최악 | 200ms |
+|---|---|---|---|---|
+| 꺼짐 (현재) | 2ms | 7ms | 22ms | OK |
+| k4/r3/d4 | 57ms | 206ms | 407ms | 초과 |
+| k4/r3/d8 | 131ms | 436ms | 719ms | 초과 |
+
+중앙값은 9ms 입니다(후보가 1개뿐이면 앞보기가 안 돕니다). 꼬리만 깁니다.
+시간 예산으로 잘라 내는 방법은 **쓰면 안 됩니다** — 결과가 기계 속도에 따라 달라져
+평가 항목 "재현성(Play/Stop)" 이 깨집니다.
+
+**지금은 꺼 뒀습니다** (`lookahead: {k: 1}` — 끄면 예전 그리디와 한 배치도 다르지
+않다는 테스트가 있습니다). 관제탑 타임아웃이 2.0초니 719ms 도 사실 여유가 있는데,
+제 수용기준을 제가 낮춰 통과시키는 건 아니라고 봐서 팀에 넘깁니다.
+켜기로 하면 `system.yaml` 에서 `k: 4, rollouts: 3, depth: 8` 로 바꾸면 됩니다.
+
+---
+
+## 5. 오늘 알고리즘이 나아진 것
+
+| | 어제 | 오늘 |
+|---|---|---|
+| 적재율 (실제높이) | 58.5% | 59.9% |
+| 적재율 (용량) | 55.9% | **58.9%** (+3.0%p) |
+| 적재 개수 | 21.2 | **22.4** |
+| **최악 시드** | 42.0% | **49.2%** (+7.2%p) |
+| 시드 간 편차 | ±6.1 | **±4.7** |
+| 베이스라인 대비 | +17.8%p | **+19.1%p** |
+
+운 나쁜 시드에서 팔레트가 반만 차고 끝나던 게 사라졌습니다.
+
+**목표 70% 까지는 −10%p 남았고, 배치 규칙 쪽 길은 전부 막혔습니다.**
+통로 규칙을 빼면 71.6% 가 나오지만 그건 팔이 못 가는 자리를 세는 것이고,
+진짜 충돌검사(`verify_link_clearance.py`)를 붙여 확인해 보니
+**검사기가 현행 배치의 99% 를 승인합니다** — 통로 규칙이 이미 맞게 잡혀 있습니다.
+근거는 `트러블슈팅.md` TS-029 ~ TS-032 에 전부 있습니다.
+
+---
+
+## 6. 결과물
+
+`docs/트랙C_결과/` — `ros2 run packing_algo report` 한 번이면 다시 나옵니다.
+
+| 파일 | |
+|---|---|
+| `01_stack.mp4` | 적재 과정 |
+| `05_compare.mp4` | **제안 vs 베이스라인 나란히** (같은 박스·같은 순서) |
+| `02_stage_*.png` | 단계별 정지화면 — Isaac 화면과 비교용 |
+| `03_compare_baseline.*` | 시드 30개 비교표 |
+| `04_robustness.*` | 위 2번 표의 근거 |
