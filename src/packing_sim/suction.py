@@ -26,7 +26,8 @@ import numpy as np
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics
 from usd.schema.isaac import robot_schema
 
-import config as C
+from _cfgload import C          # ★ `import config` 는 Isaac 안에서 cv2 의
+                                #   config.py 를 잡는다. _cfgload docstring 참고.
 
 FLT_MAX = 3.4028235e38
 
