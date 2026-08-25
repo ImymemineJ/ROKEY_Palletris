@@ -10,7 +10,7 @@
 #   PL_ZONE=B ./scripts/run_test3.sh       한 대만 돌릴 때 어느 로봇인지
 #   PL_TURN_S=8 ./scripts/run_test3.sh     코너 회전을 더 느리게 (기본 4 s)
 #   PL_SHIP_MPS=1.0 ./scripts/run_test3.sh 팔레트 반출 속도 (기본 0.5 m/s)
-#   PL_SHIP_LIFT=1 ./scripts/run_test3.sh  회전할 때 들었다 내리기 (기본: 제자리 회전)
+#   PL_TURN_S=8 ./scripts/run_test3.sh     커브를 더 느리게 돌기 (기본 4 s)
 #   PL_METER=2 ./scripts/run_test3.sh      한 존 지선에 허용할 박스 수 (기본 1)
 #
 # ★ 코너에서 팔레트를 **제자리로** 90° 돌린다. 1톤 트럭 적재함 2800 에 팔레트

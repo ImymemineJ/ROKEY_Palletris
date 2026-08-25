@@ -134,6 +134,23 @@ class ConveyorCtl:
         #   자리를 소터가 받친다 — 그래서 소터를 안 돌리면 라인이 막힌다.
         #   대신 꺾이는 범위가 본선 조각(6925 mm)이 아니라 소터 구간뿐이라,
         #   분류하는 동안 뒤차가 본선을 그대로 흘러온다.
+        # ── 배율을 안 먹이는 벨트 (원시값) ────────────────
+        # ★ 왜 필요한가. 배율 환산(`_measure_gain`)이 안 맞는 조각이 있다.
+        #   실측 2026-08-25: 순환 루프 `/World/ConveyorTrack_05` 는 배율 8.9995 로
+        #   나오는데 그 값으로 환산한 0.0778 을 넣으면 박스가 2 초에 4 mm 밖에
+        #   안 간다. 씬에 원래 있던 0.2 로 두면 약 1.4 m/s 로 잘 흐른다.
+        #   그런 조각은 **환산하지 말고 원시값을 그대로** 써넣는다.
+        #   여기서 한 번 써넣고, 그 뒤로는 아무도 안 건드린다 (루프는 여닫을 일이 없다).
+        for gp, v in (cfg["conveyor"].get("belt_velocity_raw") or {}).items():
+            g = stage.GetPrimAtPath(gp)
+            a2 = g.GetAttribute(VEL_VAR) if (g and g.IsValid()) else None
+            if not a2:
+                self._log("[conveyor_ctl] !! 원시속도: %s 에 %s 가 없다" % (gp, VEL_VAR))
+                continue
+            a2.Set(float(v))
+            self._log("[conveyor_ctl] 원시   %-46s Velocity %.4f (배율 환산 안 함)"
+                      % (gp, float(v)))
+
         # 기본 진행/분류 방향 — 부르는 쪽이 world 를 안 주면 이걸 쓴다.
         _rt = cfg.get("routing") or {}
         self.thru_world = list(_rt.get("thru_world") or [-1, 0, 0])
@@ -191,6 +208,16 @@ class ConveyorCtl:
             self._log("[conveyor_ctl] !! %s 의 conveyorPrim %s 가 씬에 없다 "
                       "(복제 후 관계 미수정)" % (gpath, tg[0]))
             return None
+        # ★★ 커브 벨트(`inputs:curved = True`)는 배율을 먹이면 안 된다.
+        #   커브에서 `direction` 은 진행 방향이 아니라 **회전축**이다 (A02/A11 은
+        #   (0,0,-37) 로 들어 있다). 그대로 이 식에 넣으면 배율이 38.5 로 나와
+        #   0.7 m/s 를 요청했는데 0.018 이 써진다 — 벨트가 사실상 선다.
+        #   커브는 velocity 를 **그대로** 쓴다 (씬에 이미 들어 있는 값과 같은 단위).
+        cv = node.GetAttribute("inputs:curved")
+        if cv and cv.Get() is True:
+            self._axis = getattr(self, "_axis", {})
+            self._axis[gpath] = "커브"
+            return 1.0
         d = node.GetAttribute("inputs:direction").Get()
         if d is None:
             self._log("[conveyor_ctl] !! %s 에 direction 이 없다" % gpath)

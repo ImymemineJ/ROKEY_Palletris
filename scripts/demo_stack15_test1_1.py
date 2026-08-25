@@ -205,18 +205,14 @@ SHIP_SLIP_TOL_MM = float(os.environ.get("PL_SHIP_SLIP_TOL", "5"))
 # 코너 턴테이블이 90° 를 도는 데 걸리는 시간 [s]. 보여 주기용이라 물리와 무관하다.
 # ★ 2.0 -> 4.0 (2026-08-25 사용자 요청 "너무 빠르다"). 22.5 deg/s 라 눈으로 따라간다.
 TURN_S = float(os.environ.get("PL_TURN_S", "4.0"))
-TURN_DEG = 90.0           # 코너에서 도는 각도. 1200 변을 800 으로 바꾸는 값이다.
+# ★ **-90 이다.** 셀은 +Y 로 오고 합류는 +X 로 나가므로 커브는 **오른쪽으로** 돈다
+#   (시계방향). +90 으로 두면 발자국은 같아도 팔레트·적재물이 180° 뒤집힌 채 실린다.
+TURN_DEG = -90.0
 # ★ 반출 속도는 라인 속도와 **따로** 둔다. 라인 값은 5호가 스토퍼에 부딪혀 기우는
 #   문제로 묶여 있고, 반출 구간에는 스토퍼가 없기 때문이다.
 #   ★ 1.5 -> 0.5 (2026-08-25 사용자 요청 "너무 빠르다"). 실물 팔레트 컨베이어가
 #     보통 0.2~0.5 m/s 다. 합류 12.6 m 를 25 s 에 간다 (SHIP_TIMEOUT 180 안).
 SHIP_MPS = float(os.environ.get("PL_SHIP_MPS", "0.5"))
-# 리프트 턴테이블이 올라갔다 내려오는 시간 [s]
-LIFT_S = float(os.environ.get("PL_LIFT_S", "0.6"))
-# ★ **제자리 회전이 기본이다** (2026-08-25 사용자 지시 "위로 올려서 돌리지 말고").
-#   들었다 내리는 리프트 턴테이블로 되돌리려면 PL_SHIP_LIFT=1.
-#   무엇을 포기하는지는 `ship_pallet` 의 회전 구간 주석에 실측으로 적어 뒀다.
-SHIP_LIFT = os.environ.get("PL_SHIP_LIFT", "0") not in ("", "0")
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
@@ -1476,6 +1472,26 @@ def ship_pallet(link, zone, log, cargo_ids=None):
     ta, tb = bb("/World/Truck_Bed")
     x_bed = ta[0] if ta is not None else -2.4
 
+    def glide(d, label):
+        """정렬 이동을 **반출 속도로 흘려보낸다.**
+
+        ★ 한 틱에 옮기면 팔레트가 순간이동한다. 실측 2026-08-25: 커브 진입
+          중심선으로 맞추느라 368 mm 를 한 번에 옮겼더니 화면에서 팔레트가
+          그 자리에서 사라졌다 나타난다 (사용자 관측 "갑자기 순간이동").
+          벨트 위 물건은 그렇게 안 움직인다.
+        """
+        n = math.hypot(d[0], d[1])
+        if n < 0.001:
+            return
+        secs = max(0.25, n / mps if mps > 0 else 0.25)
+        steps = max(3, int(secs / 0.05))
+        for _ in range(steps):
+            link.call(cmd="move_prim", paths=[pal] + cargo,
+                      d_m=[d[0] / steps, d[1] / steps, d[2] / steps])
+            time.sleep(secs / steps)
+        log("   [반출]   %s [%+.0f %+.0f] mm (%.1f s)"
+            % (label, d[0] * 1000, d[1] * 1000, secs))
+
     def run_axis(seg, axis, target, mode, label):
         """`axis` 방향으로 목표까지 민다. 반환: 도달 여부.
 
@@ -1508,108 +1524,100 @@ def ship_pallet(link, zone, log, cargo_ids=None):
         link.call(cmd="set_velocity", seg=seg, mps=0.0)
         return hit
 
-    ok1 = run_axis("%s_cell" % z, 1, y_target, "mid", "셀 이송  Y")
+    # ── 커브 코너를 **따라간다** ─────────────────────────────────
+    # ★★ 2026-08-25. 제자리에서 90° 돌리는 것을 그만둔다 — 씬에 코너 커브
+    #   (`ConveyorBelt_A02`)가 들어왔으므로, 팔레트는 **그 벨트를 따라 돌면 된다.**
+    #   실물 커브 컨베이어가 하는 일이 정확히 이것이다: 진행하면서 방향이 바뀐다.
+    #
+    #   이전 방식들이 왜 안 됐는지 (전부 실측):
+    #     들어서 돌리기      리프트 장치가 씬에 없다 — 팔레트가 혼자 떠올랐다
+    #     코너에서 제자리    회전 대각선 1442 > 합류 프레임 1000 -> 옆 레인을
+    #                       220~260 mm 파고든다. 세 대가 동시에 반출하므로
+    #                       팔레트끼리도 겹칠 수 있다
+    #     셀 위에서 제자리   프레임 안에는 들어가지만 **돌리는 장치가 없다**
+    #
+    #   호는 이렇게 잡는다. 셀 중심선(X=cx0)을 +Y 로 들어와 합류 중심선(Y=y_merge)을
+    #   +X 로 나간다. 오른쪽으로 도는 90° 이므로 회전 중심은 (cx0+R, y_merge-R) 이고
+    #   팔레트 중심은 그 원을 각도 180° -> 90° 로 지난다.
+    #   **R 은 커브 조각 bbox 에서 잰다** — 호가 커브 밖으로 나가면 안 된다.
+    arc = (cfg["conveyor"].get("curve_arc") or {}).get(zone)
+    if not arc:
+        log("   [반출] !! 존 %s 의 curve_arc 설정이 없다 — 호를 못 그린다" % zone)
+        return None
+    cenx = float(arc["center_mm"][0]) / 1000.0
+    ceny = float(arc["center_mm"][1]) / 1000.0
+    R = float(arc["radius_mm"]) / 1000.0
+    # 팔레트 반치수 — 씬에서 잰다 (설정과 어긋나도 씬이 맞다)
+    p0a, p0b = bb()
+    half_w = (p0b[0] - p0a[0]) / 2.0                 # 진입할 때 가로(X) 반치수
+    half_l = (p0b[1] - p0a[1]) / 2.0                 # 진입할 때 세로(Y) 반치수
+    # ★ 이 호로 돌 때 팔레트가 벨트 안에 있나 — **재서 남긴다.**
+    #   안쪽은 짧은 변 중앙이, 바깥쪽은 **모서리**가 제일 멀리 나간다.
+    r_in = R - half_w
+    r_out = math.hypot(R + half_w, half_l)
+    cvp = (cfg["conveyor"].get("curve_prim") or {}).get(zone, "")
+    log("   [반출]   호  중심 (%.2f, %.2f) · 반지름 %.0f mm  ->  팔레트 안쪽 %.0f · "
+        "바깥 모서리 %.0f mm  (벨트 %s)"
+        % (cenx, ceny, R * 1000, r_in * 1000, r_out * 1000,
+           cvp.rsplit("/", 1)[-1]))
+
+    # ① 진입 중심선(X = 중심 - R)으로 옮기고, 셀을 따라 +Y 로 진입점까지
+    ax, ay = cenx - R, ceny
+    pa, pb = bb()
+    dx = ax - (pa[0] + pb[0]) / 2.0
+    glide([dx, 0.0, 0.0], "호 진입 중심선으로")
+    ok1 = run_axis("%s_cell" % z, 1, ay, "mid", "셀 이송  Y")
     if not ok1:
         log("   [반출] !! 셀 구간에서 시간 초과")
-
-    # ── 턴테이블: 코너에서 90° 돌린다 ────────────────────────────
-    # ★ 1톤 트럭 적재함은 2800 이고 팔레트 Y 변은 1200 이라 3장(3600)이 안 들어간다.
-    #   여기서 돌려 그 치수를 800 으로 만든다 -> 3장 2400, 여유 400.
-    #   회전 중심은 **셀 X 중심 x 합류 Y 중심** = 코너판(Corner_*) 한가운데다.
-    # ★ 회전 중심은 **팔레트 자신의 중심**이다. 코너판(=셀 롤러) 중심으로 잡았더니
-    #   셀 롤러를 −X 로 넓힌 뒤로 둘이 249 mm 어긋나서, 팔레트가 제자리에서 도는
-    #   대신 원둘레를 따라 옆으로 밀렸다 (실측 2026-08-25: 회전 후 Y 중심 9150,
-    #   팔레트 자리 8901). 제자리에서 돌리고, 그 뒤 합류 롤러에 맞춰 정렬한다.
+    # ② 진입점으로 정확히 맞춘다 (이송은 스텝 단위라 조금 넘겨 선다)
     pa, pb = bb()
-    cx, cy = (pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0
-    log("   [반출]   회전 전  X %.2f~%.2f (%.0f) · Y %.2f~%.2f (%.0f)"
+    d = [ax - (pa[0] + pb[0]) / 2.0, ay - (pa[1] + pb[1]) / 2.0, 0.0]
+    glide(d, "커브 진입점 정렬")
+
+    # 호를 따라간다. 매 스텝 **제자리에서 조금 돌리고 다음 호점으로 옮긴다.**
+    # ★ 속도는 **반출 속도 그대로**다 (2026-08-25 사용자 요청 "커브 돌 때 느리게").
+    #   호 길이 = R x pi/2 를 mps 로 나눠 걸리는 시간을 정한다 — 직선 구간과
+    #   같은 속도로 도니까 코너에서만 빨라지거나 느려지지 않는다.
+    #   TURN_S 는 **하한**으로만 쓴다 (너무 짧은 호에서 순간이동처럼 보이지 않게).
+    ccx, ccy = ax, ay
+    arc_len = R * math.pi / 2.0
+    dur = max(TURN_S, arc_len / mps if mps > 0 else TURN_S)
+    steps = max(12, int(dur / 0.08))
+    log("   [반출]   호 길이 %.0f mm · %.1f s (%.2f m/s) · %d 스텝"
+        % (arc_len * 1000, dur, arc_len / dur, steps))
+    link.call(cmd="set_velocity", seg="%s_curve" % z, mps=mps)
+    for i in range(1, steps + 1):
+        if _S["done"]:
+            break
+        phi = math.radians(180.0 - 90.0 * (float(i) / steps))
+        link.call(cmd="rotate_prim", paths=[pal] + cargo,
+                  center_m=[ccx, ccy], deg=TURN_DEG / steps)
+        tx = cenx + R * math.cos(phi)
+        ty = ceny + R * math.sin(phi)
+        link.call(cmd="move_prim", paths=[pal] + cargo,
+                  d_m=[tx - ccx, ty - ccy, 0.0])
+        ccx, ccy = tx, ty
+        time.sleep(dur / steps)
+    pa, pb = bb()
+    log("   [반출]   커브 통과 — X %.2f~%.2f (%.0f) · Y %.2f~%.2f (%.0f)"
         % (pa[0], pb[0], (pb[0] - pa[0]) * 1000,
            pa[1], pb[1], (pb[1] - pa[1]) * 1000))
 
-    # ★★ **제자리 회전** (2026-08-25 사용자 지시 "위로 올려서 돌리지 말고").
-    #
-    #   회전 중 팔레트가 쓸고 지나가는 반지름은 반대각선
-    #   sqrt(400^2 + 600^2) = 721 mm 다. 벨트 롤러는 셀 1300 · 합류 784 뿐이고
-    #   프레임 메시는 z 0~1213 까지 서 있으므로, 안 들고 돌리면 회전 중간
-    #   (56.3° 부근에서 최대)에 **팔레트 모서리가 프레임 옆면을 지나간다.**
-    #
-    #   ⚠ 그래도 물리는 안 깨진다. 팔레트도 적재물도 이 구간에서는 **키네마틱**이고
-    #     프레임은 정적이라 PhysX 가 서로 밀지 않는다 — 좌표대로 움직인다.
-    #     포기하는 것은 **보이는 것뿐**이다 (모서리가 프레임을 잠깐 파고든다).
-    #     아래에서 얼마나 겹치는지 재서 로그에 남긴다 — 조용히 넘어가면 안 된다.
-    #   들었다 내리는 옛 동작으로 되돌리려면 PL_SHIP_LIFT=1.
-    def _frame_top():
-        top = 0.0
-        for pth in ("/World/MergeLine_%s" % zone,
-                    (cfg["conveyor"].get("cell_prim") or {}).get(zone, "")):
-            if not pth:
-                continue
-            fa, fb = bb(pth)
-            if fb is not None:
-                top = max(top, fb[2])
-        return top
-
-    # 회전 반경과 프레임 겹침을 **잰다** (들든 안 들든 남긴다)
-    _r = math.hypot((pb[0] - pa[0]) / 2.0, (pb[1] - pa[1]) / 2.0)
-    _ov = []
-    for _lbl, _pth, _ax in (("합류", "/World/MergeLine_%s" % zone, 1),
-                            ("셀", (cfg["conveyor"].get("cell_prim") or {}).get(zone, ""), 0)):
-        if not _pth:
-            continue
-        _fa, _fb = bb(_pth)
-        if _fa is None:
-            continue
-        _o = max(_fa[_ax] - (([cx, cy][_ax]) - _r), (([cx, cy][_ax]) + _r) - _fb[_ax])
-        if _o > 0.001:
-            _ov.append("%s %+.0f mm" % (_lbl, _o * 1000))
-    log("   [반출]   회전 반경 %.0f mm%s"
-        % (_r * 1000,
-           ("  · 프레임 밖으로 " + " · ".join(_ov)) if _ov else "  · 프레임 안"))
-
-    ftop = _frame_top()
-    lift = max(0.0, ftop + 0.03 - pa[2]) if SHIP_LIFT else 0.0
-    if lift > 0:
-        _n = max(1, int(LIFT_S / 0.04))
-        for _ in range(_n):
-            link.call(cmd="move_prim", paths=[pal] + cargo, d_m=[0, 0, lift / _n])
-            time.sleep(0.04)
-        log("   [반출]   리프트 +%.0f mm (프레임 상단 %.0f mm 위로)"
-            % (lift * 1000, ftop * 1000))
-    else:
-        log("   [반출]   제자리 회전 (리프트 없음 · 밑면 z %.0f mm 유지)"
-            % (pa[2] * 1000))
-
-    # 한 번에 90° 를 꺾으면 순간이동처럼 보인다. TURN_S 에 걸쳐 나눠 돌린다.
-    steps = max(1, int(TURN_S / 0.04))
-    for _ in range(steps):
-        if _S["done"]:
-            break
-        link.call(cmd="rotate_prim", paths=[pal] + cargo,
-                  center_m=[cx, cy], deg=TURN_DEG / steps)
-        time.sleep(0.04)
-
-    # ★ 내리기 전에 합류 롤러 한가운데로 Y 정렬한다. 셀 이송은 목표를 조금 넘겨
-    #   멈추므로(스텝 단위) 그대로 두면 수십 mm 어긋난 채 롤러에 앉는다.
+    # ★ 합류 롤러 한가운데로 Y 정렬한다. 셀 이송은 목표를 조금 넘겨 멈추므로
+    #   (스텝 단위) 그대로 두면 수십 mm 어긋난 채 롤러에 앉는다.
     ma2, mb2 = bb("/World/MergeLine_%s/Rollers" % zone)
     if ma2 is not None:
         pa, pb = bb()
         dy = (ma2[1] + mb2[1]) / 2.0 - (pa[1] + pb[1]) / 2.0
-        if abs(dy) > 0.001:
-            link.call(cmd="move_prim", paths=[pal] + cargo, d_m=[0.0, dy, 0.0])
-            log("   [반출]   합류 롤러에 Y 정렬 %+.0f mm" % (dy * 1000))
+        glide([0.0, dy, 0.0], "합류 롤러에 Y 정렬")
 
-    if lift > 0:
-        _n = max(1, int(LIFT_S / 0.04))
-        for _ in range(_n):
-            link.call(cmd="move_prim", paths=[pal] + cargo, d_m=[0, 0, -lift / _n])
-            time.sleep(0.04)
-        log("   [반출]   내림 -%.0f mm" % (lift * 1000))
     pa, pb = bb()
+    # ★ 커브를 돌고 나면 적재함을 가로지르는 치수(Y)가 1200 이 아니라 **800** 이어야
+    #   한다. 그래야 세 장이 1톤 적재함 2800 에 들어간다.
     turned = abs((pb[0] - pa[0]) - 1.2) < 0.05 and abs((pb[1] - pa[1]) - 0.8) < 0.05
-    log("   [반출]   회전 후  X %.2f~%.2f (%.0f) · Y %.2f~%.2f (%.0f)   %s"
-        % (pa[0], pb[0], (pb[0] - pa[0]) * 1000,
-           pa[1], pb[1], (pb[1] - pa[1]) * 1000,
-           "가로 800 확보" if turned else "!! 회전이 안 먹었다"))
+    log("   [반출]   커브 뒤 자세  X %.0f · Y %.0f mm   %s"
+        % ((pb[0] - pa[0]) * 1000, (pb[1] - pa[1]) * 1000,
+           "가로 800 확보" if turned else "!! 방향이 안 맞는다"))
 
     ok2 = run_axis("%s_merge" % z, 0, x_bed, "min", "적재 X뒤끝")
     a, b = bb()
@@ -1791,6 +1799,18 @@ def worker(specs, ids, zone=None):
         if zone == ZONES[0]:
             link.call(cmd="set_velocity", seg="main", mps=BELT_MPS)
             _S["main_on"] = True
+            # ★ 순환 루프와 코너 커브도 같이 돌린다 (2026-08-25).
+            #   루프는 분기점을 지나친 박스가 돌아오는 길이다 — 안 켜면 그 박스가
+            #   라인 끝에 쌓여 뒤를 막는다. 커브는 셀과 합류를 잇는 조각이라
+            #   안 켜면 그 구간이 죽은 벨트로 보인다.
+            #   ⚠ 여기 안 적힌 seg 는 **아무도 안 켠다.** 설정에 seg 를 새로
+            #     만들었으면 이 줄에도 넣어야 한다.
+            # ★ 루프는 여기서 안 켠다 — `conveyor_ctl` 이 시작할 때 원시값으로
+            #   써넣는다 (`belt_velocity_raw`). 배율 환산이 그 조각에서 안 맞는다.
+            for _seg in ("a_curve", "b_curve", "c_curve"):
+                _r = link.call(cmd="set_velocity", seg=_seg, mps=BELT_MPS)
+                if not _r.get("ok"):
+                    log("   [벨트] %s 못 켰다 — %s" % (_seg, _r.get("error")))
         if ROUTE_ON:
             # 라우팅은 박스를 세 지선으로 나눠 보내므로 셋 다 돌아야 한다.
             for _z in sorted(set(_route_map()[0].values())):
