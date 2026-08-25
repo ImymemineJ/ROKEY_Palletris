@@ -55,13 +55,13 @@ PHYS_MAT_PATH = LOOKS_ROOT + "/PhysicsMaterial"          # 씬 빌더가 만든�
 LINE_COLOR = (1.0, 0.15, 0.15)            # 색을 안 준 박스의 기본 — 빨강
 LINE_MAT = LOOKS_ROOT + "/BoxLine"
 
-# ── 색 분류 (2026-08-25) ───────────────────────────────────
-# ★ 분류 기준이 **크기 -> 색** 으로 바뀌었다.
-#   예전에는 3호/4호/5호를 각 존으로 보냈다. 지금은 색이 목적지를 정하고, 한 존의
-#   팔레트에는 **그 색의 3·4·5호가 섞여** 들어온다 (그래야 패커가 실제로 일한다 —
-#   한 가지 크기만 오면 최적화라고 할 게 없다).
-#   색 이름과 RGB 는 `boxes.colors` 로 설정에서 받는다. 없으면 아래 기본값이다.
-#   ⚠ 스폰 색과 **인식 색이 같아야** 한다 (CLAUDE.md §12, 김학민 확인 항목).
+# ── 분류 (2026-08-25) ──────────────────────────────────────
+# ★ 분류 기준이 **색 -> QR(배송지)** 로 바뀌었다.
+#   그래서 박스 색은 **하나로 통일**한다 (LINE_COLOR). 목적지는 프림의 `box_dest`
+#   속성이 ground truth 이고, 실물에서는 QR 이 그 값을 싣는다.
+#   색 기능(`boxes.colors` · spawn 의 color 인자)은 지우지 않고 남겨 둔다 —
+#   1 차 색상 판정으로 되돌릴 수 있어야 한다 (CLAUDE.md §6: 1 차 색상 · 2 차 QR).
+#   색표를 안 주면 아무도 색을 안 쓰고 전부 LINE_COLOR 다.
 DEFAULT_COLORS = {"red": (1.0, 0.15, 0.15),
                   "green": (0.15, 0.9, 0.25),
                   "blue": (0.2, 0.35, 1.0)}
@@ -132,8 +132,9 @@ class Spawner:
         else:
             self.cross_range_m = None
         self.default_yaw = float(cfg["boxes"].get("spawn_yaw_deg", 0.0))
-        # 색표. 설정에 없으면 기본 3 색.
-        _cols = cfg["boxes"].get("colors") or DEFAULT_COLORS
+        # 색표. 설정에 없으면 **색을 아예 안 쓴다** — 박스는 전부 LINE_COLOR 다.
+        #   (QR 분류로 바뀌면서 색은 통일했다. DEFAULT_COLORS 는 되돌릴 때 참고용.)
+        _cols = cfg["boxes"].get("colors") or {}
         self.colors = {str(k): tuple(float(v) for v in rgb)
                        for k, rgb in _cols.items()}
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
@@ -302,7 +303,8 @@ class Spawner:
         if color is not None and color not in self.colors:
             return {"ok": False, "error": "모르는 color %r (있는 것: %s)"
                     % (color, sorted(self.colors))}
-        return self.mainq.run(lambda: self._spawn(box_id, tname, yaw, color))
+        dest = req.get("dest")
+        return self.mainq.run(lambda: self._spawn(box_id, tname, yaw, color, dest))
 
     def h_despawn_box(self, req):
         box_id = req.get("box_id")
@@ -447,14 +449,15 @@ class Spawner:
             sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
             mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
 
-    def _spawn(self, box_id, tname, yaw_deg, color=None):
+    def _spawn(self, box_id, tname, yaw_deg, color=None, dest=None):
         t = self.types[tname]
         dims = (t["w_mm"] / 1000.0, t["d_mm"] / 1000.0, t["h_mm"] / 1000.0)
         mass = t["mass_g"] / 1000.0
         x, y, z_bottom = self.spawn_xyz_m
         pos = (x, y, z_bottom + dims[2] / 2.0)          # ★ 밑면 -> 중심 (§5.5)
         path = BOX_PRIM_FMT % box_id
-        self._make_box(path, tname, dims, pos, yaw_deg, mass, box_id, color)
+        self._make_box(path, tname, dims, pos, yaw_deg, mass, box_id, color,
+                       dest)
         # ★ 프림을 지우지 않으므로 같은 경로가 이미 있을 수 있다 — 그 프림은
         #   `_detach` 로 **콜라이더가 꺼지고 키네마틱에 보이지도 않는** 상태다
         #   (despawn 또는 park_all 을 거친 것). 그대로 두면 스폰은 됐는데 벨트를
@@ -470,10 +473,10 @@ class Spawner:
                 _rb.CreateKinematicEnabledAttr(False)
             UsdGeom.Imageable(_prim).MakeVisible()
         self.boxes[box_id] = {"path": path, "dims": dims, "type": tname,
-                              "color": color}
+                              "color": color, "dest": dest}
         self.spawned += 1
-        self._log("[spawner] %s %s %s %dx%dx%d mm %.1f kg yaw %+.0f -> %s"
-                  % (box_id, tname, color or "-", t["w_mm"], t["d_mm"],
+        self._log("[spawner] %s %s dest=%s %dx%dx%d mm %.1f kg yaw %+.0f -> %s"
+                  % (box_id, tname, dest or "-", t["w_mm"], t["d_mm"],
                      t["h_mm"], mass, yaw_deg, path))
         return {"ok": True}
 
@@ -578,7 +581,7 @@ class Spawner:
         return {"ok": True, "removed": len(on_pallet)}
 
     def _make_box(self, path, tname, dims, pos, yaw_deg, mass, box_id,
-                  color=None):
+                  color=None, dest=None):
         """치수를 지오메트리에 굽는다 — `xformOp:scale` 을 안 쓴다.
 
         `spawn_feeder._make_box` 와 같은 형상이다. 거기 주석대로 scale 자체는
@@ -625,8 +628,10 @@ class Spawner:
         # ground truth 조회용 (§5.5). DB 가 없어도 씬만으로 id 를 되찾을 수 있다.
         prim.CreateAttribute("box_id", Sdf.ValueTypeNames.String).Set(box_id)
         prim.CreateAttribute("box_type", Sdf.ValueTypeNames.String).Set(tname)
-        # ★ 색도 ground truth 로 남긴다. 인식(HSV)이 이 값을 맞히는지 대조한다.
+        # ★ ground truth. 색은 1 차(HSV) 판정용, dest 는 2 차(QR) 판정용이다.
+        #   인식이 이 값을 맞히는지 대조한다.
         prim.CreateAttribute("box_color", Sdf.ValueTypeNames.String).Set(color or "")
+        prim.CreateAttribute("box_dest", Sdf.ValueTypeNames.String).Set(dest or "")
 
         _mp = COLOR_MAT_FMT % color if color in self.colors else LINE_MAT
         mat = UsdShade.Material(self.stage.GetPrimAtPath(_mp))

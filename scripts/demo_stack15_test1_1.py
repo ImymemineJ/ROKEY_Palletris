@@ -175,6 +175,10 @@ SETTLE_S = float(os.environ.get("PL_SETTLE", "0.7"))     # 놓은 뒤 재기 전
 WATCHDOG_S = float(os.environ.get("PL_WATCHDOG", "900"))
 # 픽업 구간에 박스가 있는데 이 시간이 지나도 못 집으면 지운다 (아래 `_stuck_box`).
 STUCK_S = float(os.environ.get("PL_STUCK", "75"))
+# ★ 팔레트 1 장에 이만큼 놓으면 **트럭으로 내보내고 끝낸다.** 0 이면 안 내보낸다.
+#   패킹 알고리즘을 아직 안 받았으므로, 지금은 1 개만 놓고 반출까지 보는 것이 목표다.
+PER_PALLET = int(os.environ.get("PL_PER_PALLET", "0"))
+SHIP_TIMEOUT_S = float(os.environ.get("PL_SHIP_TIMEOUT", "180"))
 VERBOSE = os.environ.get("PL_VERBOSE") not in (None, "", "0")   # 서비스 호출까지 전부
 # ★ 시연용. 결과를 찍은 뒤 **창을 닫지 않는다** — 쌓인 팔레트를 보여줘야 하는데
 #   헤드리스 게이트와 같이 즉시 종료해 버리면 볼 것이 없다. GUI 로 띄울 때만 쓴다.
@@ -344,7 +348,14 @@ BOX_H_MM = {t["name"]: float(t["h_mm"]) for t in cfg["boxes"]["types"]}
 #   의 `reject` 훅). 제약을 만족하는 자리가 없으면 예전처럼 잡되 로그에 남긴다:
 #   자리를 못 잡아 PALLET_FULL 을 내는 것보다 knock 을 감수하는 편이 낫다.
 PED_MM = float(cfg["robot"]["pedestal_height_mm"])
-NEAR_LIM_MM = PED_MM - 150.0          # 이보다 높은 근거리 기둥 위는 못 지나간다
+# 이보다 높은 근거리 기둥 위는 못 지나간다. **팔레트 로컬 높이** 다.
+# ★ 진짜 규칙은 "기둥 윗면(월드) <= 페데스탈 상면" 이다. 그래서 팔레트 상면을 뺀다.
+#   test1-1 은 팔레트 상면이 150 이라 900-150 = 750 — **예전 식과 값이 같다**(회귀 없음).
+#   test_3 는 팔레트가 셀 컨베이어 위(950)라 1250-950 = 300 이다. 예전 식(PED-150)이면
+#   1100 이 나오는데, 그러면 기둥 윗면이 월드 2050 으로 팔 베이스보다 800 이나 높다.
+#   실측 2026-08-25: 그 상태에서 560 mm 기둥 위를 팔이 쓸어 BOX00007 을 팔레트 밖으로
+#   떨어뜨렸다 (knock 1452 mm).
+NEAR_LIM_MM = PED_MM - float(ORIGIN_MM[2])
 NEAR_DY_MM = 50.0                     # "로봇 쪽" 으로 칠 최소 y 차 (견본과 동일)
 NEAR_HALF_MM = cfg["pallet"]["depth_mm"] / 2.0   # y < 400 이면 근거리 (견본과 동일)
 # ★ 견본 `build_plan` 의 제약은 **둘**인데 처음에는 (a) 만 이식했다.
@@ -685,7 +696,67 @@ def setup():
         log("     게이트 수치가 실행마다 달라진다. 게이트는 하나씩 돌려라.")
         _kitexit.shutdown(3, log=log)
         raise SystemExit
-    server.register({"ping": lambda r: {"ok": True}})
+    def _h_prim_bbox(req):
+        """{"cmd":"prim_bbox","path":"/World/Pallet_A"} -> {"min_m":[..],"max_m":[..]}
+
+        ★ 팔레트 이송을 지켜보려고 넣었다. 박스가 아니라 `get_box_pose` 로는 못 본다.
+          USD 에서 읽는다 — `SingleRigidPrim` 을 만들면 시뮬레이션 뷰가 무효화되는
+          사고가 있었다 (spawner._refresh 주석).
+        """
+        path = req.get("path")
+
+        def _rd():
+            from pxr import Usd as _U, UsdGeom as _UG
+            pr = stage.GetPrimAtPath(path)
+            if not pr or not pr.IsValid():
+                return {"ok": False, "error": "없는 prim %s" % path}
+            bb = _UG.BBoxCache(_U.TimeCode.Default(),
+                               [_UG.Tokens.default_, _UG.Tokens.render,
+                                _UG.Tokens.proxy])
+            r = bb.ComputeWorldBound(pr).ComputeAlignedRange()
+            if r.IsEmpty():
+                return {"ok": False, "error": "bbox 가 비었다 %s" % path}
+            a, b = r.GetMin(), r.GetMax()
+            return {"ok": True,
+                    "min_m": [float(a[0]), float(a[1]), float(a[2])],
+                    "max_m": [float(b[0]), float(b[1]), float(b[2])]}
+        return q.run(_rd)
+
+    def _h_move_prim(req):
+        """{"cmd":"move_prim","path":"/World/Pallet_A","d_m":[dx,dy,dz]} -> {"ok":..}
+
+        ★ 팔레트 이송용. 팔레트는 **키네마틱** 이라 좌표로 옮긴다 — 동적 강체로 두면
+          롤러 사이로 22 mm 가라앉아 배치 Z 오차가 허용을 넘고, 컨베이어 표면속도로는
+          아예 안 움직였다 (실측 2026-08-25).
+          위에 얹힌 박스는 접촉 마찰로 같이 끌려간다.
+        ⚠ A47 벨트가 씬에 들어오면 이 자리를 그 벨트로 바꾼다.
+        """
+        path = req.get("path")
+        d = req.get("d_m") or [0.0, 0.0, 0.0]
+
+        def _wr():
+            from pxr import Gf as _Gf, UsdGeom as _UG
+            pr = stage.GetPrimAtPath(path)
+            if not pr or not pr.IsValid():
+                return {"ok": False, "error": "없는 prim %s" % path}
+            xf = _UG.Xformable(pr)
+            op = None
+            for o in xf.GetOrderedXformOps():
+                if o.GetOpName() == "xformOp:translate":
+                    op = o
+                    break
+            if op is None:
+                return {"ok": False, "error": "translate op 이 없다 %s" % path}
+            v = op.Get()
+            op.Set(_Gf.Vec3d(float(v[0]) + float(d[0]),
+                             float(v[1]) + float(d[1]),
+                             float(v[2]) + float(d[2])))
+            return {"ok": True}
+        return q.run(_wr)
+
+    server.register({"ping": lambda r: {"ok": True},
+                     "prim_bbox": _h_prim_bbox,
+                     "move_prim": _h_move_prim})
     server.register(sp.handlers())
     server.register(cc.handlers())
     server.register(rm.handlers())
@@ -849,9 +920,15 @@ ROUTE_ON = bool(ROUTE) and os.environ.get("PL_ROUTE", "1") not in ("", "0")
 def _route_map():
     """분류 기준 -> (표, 박스에서 열쇠를 뽑는 함수).
 
-    ★ 2026-08-25 부터 기본은 **색**이다. 예전 크기 기준(`by_type`)은 색표가 없는
-      설정에서만 쓴다 — test1-1 처럼 색을 안 쓰는 씬을 위한 하위호환이다.
+    ★ 2026-08-25: 기본은 **배송지(QR)** 다. 우선순위 by_dest > by_color > by_type.
+      - `by_dest`  2 차 사양. QR 이 배송지를 싣는다. 박스 색은 하나로 통일한다.
+      - `by_color` 1 차 사양(HSV). 되돌릴 수 있게 남겨 둔다.
+      - `by_type`  크기 기준. 색도 QR 도 없는 씬을 위한 하위호환.
     """
+    bd = ROUTE.get("by_dest")
+    if bd:
+        return ({str(k): str(v) for k, v in bd.items()},
+                lambda sp: sp.get("dest"))
     bc = ROUTE.get("by_color")
     if bc:
         return ({str(k): str(v) for k, v in bc.items()},
@@ -961,8 +1038,8 @@ def router_thread(specs, ids):
                     _S["diverting"] = _S.get("diverting", 0) + 1
                     # 계량이 세워 뒀을 수 있으니 이 조각만 직접 돌린다.
                     link.call(cmd="set_velocity", seg=seg, mps=BELT_MPS)
-                    log("   [라우팅] %s %-5s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
-                        % (bid, specs[bid].get("color", "-"),
+                    log("   [라우팅] %s %-8s %-3s -> 존 %s   X %.2f m 에서 꺾는다"
+                        % (bid, key_of(specs[bid]) or "-",
                            specs[bid]["name"], z, p[0]))
                 else:
                     log("   [라우팅] !! set_direction %s -> %r" % (seg, r))
@@ -1011,14 +1088,86 @@ def spawner_thread(specs, ids):
                         % (held, BUFFER_CAP))
             t = specs[bid]
             r = link.call(cmd="spawn_box", box_id=bid, type=t["name"], yaw_deg=0,
-                          color=t.get("color"))
+                          color=t.get("color"), dest=t.get("dest"))
             st = link.call(cmd="spawn_status")
-            log("   [투입] %-9s %-5s %-3s  (라인 위 %s 개)"
-                % (bid, t.get("color", "-"), t["name"], st.get("on_belt", "?")))
+            log("   [투입] %-9s %-8s %-3s  (라인 위 %s 개)"
+                % (bid, t.get("dest", t.get("color", "-")), t["name"],
+                   st.get("on_belt", "?")))
             if not r.get("ok"):
                 log("   [투입] !! spawn_box %s -> %r" % (bid, r))
     except Exception as e:
         log("   [투입] !! %r" % (e,))
+
+
+def ship_pallet(link, zone, log):
+    """팔레트를 셀 컨베이어 -> 합류 라인 -> 트럭으로 보낸다.
+
+    ★ 순서가 있다. 셀은 +Y, 합류는 +X 다. 둘을 같이 돌리면 코너에서 대각선으로
+      밀려 라인에 낀다. **셀로 코너까지 보낸 뒤 셀을 세우고** 합류를 돌린다.
+
+    ★ 팔레트는 키네마틱이라 좌표로 옮긴다 (`move_prim` 주석 참조). 벨트도 같이
+      돌려 둔다 — 팔레트 위 박스와 라인의 다른 물체가 같은 속도로 흐르게 하려는 것이다.
+      A47 벨트가 들어오면 이 이송을 그 벨트로 바꾼다.
+    """
+    z = zone.lower()
+    pal = os.environ.get("PL_PALLET_PRIM", "/World/Pallet_%s" % zone)
+    mps = BELT_MPS
+
+    def bb(path=None):
+        r = link.call(cmd="prim_bbox", path=path or pal)
+        return (r["min_m"], r["max_m"]) if r.get("ok") else (None, None)
+
+    a0, b0 = bb()
+    if a0 is None:
+        log("   [반출] !! 팔레트 %s 를 못 읽는다 — 건너뛴다" % pal)
+        return None
+    log("   [반출] 시작 — %s  X %.2f~%.2f  Y %.2f~%.2f"
+        % (pal, a0[0], b0[0], a0[1], b0[1]))
+
+    ma, mb = bb("/World/MergeLine_%s/Rollers" % zone)
+    if ma is None:
+        log("   [반출] !! 합류 라인을 못 읽는다")
+        return None
+    y_target = (ma[1] + mb[1]) / 2.0
+    ta, tb = bb("/World/Truck_Bed")
+    x_bed = ta[0] if ta is not None else -2.4
+
+    def run_axis(seg, axis, target, cmp_hi, label):
+        """`axis` 방향으로 목표까지 민다. 반환: 도달 여부."""
+        link.call(cmd="set_velocity", seg=seg, mps=mps)
+        t0 = prev = time.time()
+        last = 0.0
+        hit = False
+        while time.time() - t0 < SHIP_TIMEOUT_S and not _S["done"]:
+            now = time.time()
+            d = [0.0, 0.0, 0.0]
+            d[axis] = mps * (now - prev)
+            prev = now
+            link.call(cmd="move_prim", path=pal, d_m=d)
+            a, b = bb()
+            if a is None:
+                break
+            cur = (a[axis] + b[axis]) / 2.0 if not cmp_hi else b[axis]
+            if now - last >= 2.0:
+                last = now
+                log("   [반출]   %s  %.2f -> %.2f" % (label, cur, target))
+            if cur >= target:
+                hit = True
+                break
+            time.sleep(0.03)
+        link.call(cmd="set_velocity", seg=seg, mps=0.0)
+        return hit
+
+    ok1 = run_axis("%s_cell" % z, 1, y_target, False, "셀 이송  Y")
+    if not ok1:
+        log("   [반출] !! 셀 구간에서 시간 초과")
+    ok2 = run_axis("%s_merge" % z, 0, x_bed, True, "합류 이송 X앞")
+    a, b = bb()
+    if a is None:
+        return None
+    log("   [반출] 끝 — 팔레트 X %.2f~%.2f · Y %.2f~%.2f · 적재함 앞면 %.2f  %s"
+        % (a[0], b[0], a[1], b[1], x_bed, "도착" if ok2 else "!! 미도착"))
+    return {"min_m": a, "max_m": b, "reached": bool(ok1 and ok2), "bed_x": x_bed}
 
 
 def worker(specs, ids):
@@ -1343,6 +1492,14 @@ def worker(specs, ids):
             log("       %-11s 오차 [%+.1f %+.1f %+.1f] mm   %.1f s   knock %.1f mm (%s)"
                 % (res, err[0], err[1], err[2], wall, knock, who))
 
+            # ★ 팔레트 1 장에 정해진 수만큼 놓았으면 트럭으로 내보내고 끝낸다.
+            if PER_PALLET > 0 and res == "PLACED":
+                _done_n = len([w for w in _S["rows"] if w["res"] == "PLACED"])
+                if _done_n >= PER_PALLET:
+                    log("   [반출] 팔레트에 %d 개 — 트럭으로 보낸다" % _done_n)
+                    _S["ship"] = ship_pallet(link, ZONE, log)
+                    break
+
             # ── PALLET_FULL 은 **팔레트를 갈아서** 푼다 (사양 경로) ──
             # 트랙B 가이드 상태도: "PALLET_FULL: /sim/set_spawn_enabled(false)
             #   -> swap_pallet -> /algo/reset -> 재가동".
@@ -1485,8 +1642,11 @@ def report():
     bypassed = [w for w in rows if w["res"] == "PALLET_FULL"]
     failed = [w for w in rows if w["res"] not in ("PLACED", "PALLET_FULL")]
     ok = bool(placed)
-    # ★ 분모는 **이 존 몫**이다. 라우팅을 켜면 남의 색 박스는 다른 지선으로 간다.
+    # ★ 분모는 **이 존 몫**이다. 라우팅을 켜면 남의 배송지 박스는 다른 지선으로 간다.
+    #   팔레트당 개수를 정했으면(PL_PER_PALLET) 그만큼만 놓고 반출하므로 그 수가 분모다.
     _target_n = len(_S.get("targets") or []) or N
+    if PER_PALLET > 0:
+        _target_n = min(_target_n, PER_PALLET)
     log("처리한 것     %d / %d   (놓음 %d · 우회 %d · 실패 %d)"
         % (len(rows), _target_n, len(placed), len(bypassed), len(failed)))
     if bypassed:
@@ -1535,6 +1695,14 @@ def report():
                 "%.1f mm · 윗면 z 최대 %.1f mm"
                 % (len(ce), hit, len(ce), max(cam_exy), max(cam_ez)))
         log("팔레트        %d 판" % r.get("pallets", 1))
+        _sh = _S.get("ship")
+        if _sh:
+            log("반출          팔레트 X %.0f~%.0f · Y %.0f~%.0f mm · 적재함 앞면 %.0f "
+                "-> %s"
+                % (_sh["min_m"][0] * 1000, _sh["max_m"][0] * 1000,
+                   _sh["min_m"][1] * 1000, _sh["max_m"][1] * 1000,
+                   _sh["bed_x"] * 1000, "도착" if _sh["reached"] else "미도착"))
+            log("              (푸셔가 없어 팔레트는 적재함 입구에 걸친 채 멎는다)")
         log("벽시계        %.0f s" % r.get("wall", 0.0))
 
         # ── 끝난 뒤 **물리에서 잰** 자리 ────────────────────────────
@@ -1650,19 +1818,20 @@ def on_step(dt):
                     "상자 구성은 사양 seed 그대로다.")
             ids = [BOX_ID_FMT % i for i in range(N)]
             specs = {bid: dict(t) for bid, t in zip(ids, fed)}
-            # ★ 색은 크기와 **독립**으로 뽑는다 (2026-08-25).
-            #   분류 기준이 크기 -> 색으로 바뀌었으므로, 한 존의 팔레트에는 그 색의
-            #   3·4·5 호가 섞여 들어와야 패커가 실제로 일한다.
+            # ★ 배송지는 크기와 **독립**으로 뽑는다 (2026-08-25).
+            #   QR 이 배송지를 싣고, 그 값이 목적지 존을 정한다. 그래서 한 존의
+            #   팔레트에는 **그 배송지의 3·4·5 호가 섞여** 들어온다 — 그래야 패커가
+            #   실제로 일한다 (한 가지 크기만 오면 최적화라고 할 게 없다).
             #   재현성을 위해 박스 구성과 같은 seed 를 쓴다.
-            _colors = sorted((cfg["boxes"].get("colors") or {}).keys())
-            if _colors:
+            _dests = list(cfg["boxes"].get("dests") or [])
+            if _dests:
                 import random as _rnd
-                _cr = _rnd.Random(int(SEED) if SEED is not None
+                _dr = _rnd.Random(int(SEED) if SEED is not None
                                   else int(cfg["boxes"].get("random_seed", 42)))
                 for bid in ids:
-                    specs[bid]["color"] = _cr.choice(_colors)
+                    specs[bid]["dest"] = _dr.choice(_dests)
             log("박스      %d 개  %s" % (N,
-                ["%s/%s" % (t["name"], specs[b].get("color", "-"))
+                ["%s/%s" % (t["name"], specs[b].get("dest", "-"))
                  for b, t in zip(ids, fed)]))
             # ★ 라우팅을 켜면 **이 존 색깔의 박스만** 이 로봇의 몫이다.
             #   나머지는 다른 지선으로 가서 그 존의 로봇을 기다린다 (1 존만 돌리는
