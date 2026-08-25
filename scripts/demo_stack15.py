@@ -1488,6 +1488,14 @@ def main():
                 print("%3d  %-9s %-4s  (자리 없음 — 버림. 라인 밖으로 치웠다)"
                       % (i, bid, specs[bid]["name"]))
                 continue
+            if bid in parked:
+                # ★ 치운 박스는 **주차 자리**에 있다. 계획 대비 어긋남을 찍으면 수 m 짜리
+                #   숫자가 나오고 "밀림" 표시까지 붙어 진짜 밀린 박스를 가린다.
+                _plan = ("(%4d,%4d) %4d" % (pl["x_mm"], pl["y_mm"], pl["z_mm"])
+                         if pl else "(계획 없음)")
+                print("%3d  %-9s %-4s  %-16s 실패 — 라인 밖으로 치웠다"
+                      % (i, bid, specs[bid]["name"], _plan))
+                continue
             if pl is None:
                 print("%3d  %-9s %-4s  (계획 없음 — 사이클이 배치 전에 끝났다)"
                       % (i, bid, specs[bid]["name"]))
