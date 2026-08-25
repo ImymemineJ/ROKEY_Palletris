@@ -52,7 +52,8 @@ def main():
     # 2. 빌드
     print("\n[빌드]")
     ifaces = sh("ros2 interface list 2>/dev/null | grep -c packing_msgs").strip()
-    check(f"packing_msgs 인터페이스 {ifaces or 0}개", (ifaces.isdigit() and int(ifaces) >= 20),
+    # msg 7 + srv 15 = 22 (CLAUDE.md §3 최종본. RobotCmd·RobotEvent 추가로 20 -> 22)
+    check(f"packing_msgs 인터페이스 {ifaces or 0}개", (ifaces.isdigit() and int(ifaces) >= 22),
           "colcon build --symlink-install (옵션 필수 — 없이 빌드하면 캐시가 깨진다)")
     execs = sh("ros2 pkg executables 2>/dev/null | grep packing")
     for pkg, node in (("packing_algo", "algo_service_node"), ("packing_robot", "orchestrator")):
@@ -102,7 +103,7 @@ def main():
     print("\n[실행 중인 노드]")
     svc = sh("ros2 service list 2>/dev/null")
     algo_up = all(f"/algo/{s}" in svc for s in
-                  ("plan_placement", "update_heightmap", "cancel_plan", "reset"))
+                  ("plan_placement", "update_heightmap", "cancel_plan", "reset_heightmap"))
     check("/algo/* 서비스 4개", algo_up,
           "ros2 run packing_algo algo_service_node 를 먼저 띄운다", warn_only=True)
     topics = sh("ros2 topic list 2>/dev/null")
