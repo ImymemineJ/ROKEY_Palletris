@@ -26,6 +26,7 @@
 | `demo_stack15_test1_1.py` | 김학민 | **15박스 연속 — 실제 라인.** `demo_stack15`(B5)를 컨베이어 위로 옮긴 것. 급송이 없고 도착 순서 그대로 집으므로 온라인 패커를 쓴다. 스폰은 사양 스케줄(`boxes.stage1` 12 s x 15). `PL_N` 으로 개수 축소 |
 | `script_editor_lula.py` | 김병직 | **Isaac Sim GUI 의 Script Editor 에 붙여넣는 스니펫.** `POINT` 만 바꿔 11점 중 하나로 팔을 보낸다 |
 | `read_log.py` | 김병직 | Isaac Script Editor 출력을 터미널에서 읽는다 |
+| `script_editor_attach_qr.py` | 정정인 → **김학민** | **★ 김학민 씬의 박스에 QR 텍스처를 붙인다.** 씬을 열고 Play 로 박스가 나온 뒤 붙여넣고 Ctrl+Enter. 박스를 새로 스폰하지 않고 `/World/boxes/<box_id>` 를 찾아 **`box_dest`(SEOUL·BUSAN·DAEJEON)를 읽고** 그에 맞는 QR 을 윗면에 얹는다. `spawner.py` 규약(`box_id`·`box_type`·`box_dest`)을 그대로 따르고 `box_qr_payload` 를 추가한다(VerifyBox 대조용). 크기는 bbox 실측이라 3·4·5호 자동 대응. 여러 번 돌려도 안전(이미 붙은 건 건너뜀). ⚠ `QR_BY_DEST` 의 `payload` 를 실제 디코딩 값으로 채울 것 |
 | `script_editor_belt_demo.py` | 정정인 | **★ 씬 + QR 박스 + 벨트 구동, 한 번에.** 빈 스테이지에 붙여넣고 Ctrl+Enter → Play. 맨 끝 DIAGNOSIS 블록에 좌표·마찰·구동 모드가 전부 찍힌다. 벨트는 `physxSurfaceVelocity` 로 굴리고 안 먹으면 물리 스텝 콜백(push)으로 자동 전환. 손댈 곳은 `DRIVE` 한 줄 |
 | `script_editor_belt_check.py` | 정정인 | **위 데모의 확인용 — 새 탭에 붙여넣고 Ctrl+Enter.** 박스가 실제로 옮겨졌는지 x·z·vx 로 보고한다. 스폰 x 는 demo 가 프림에 `palletris:spawn_x_mm` 로 적어 두므로 **다른 탭에서도** 비교된다. 씬은 안 건드린다 |
 | `script_editor_test_scene.py` | 정정인 | **최소 테스트 씬 — 씬 담당 없이 혼자 확인용.** `system.yaml` 숫자만으로 도크 바닥(z=0) · 벨트 두 조각(상면 z=800, 폭 1546) · 스토퍼 · 팔레트 3장을 그리고, **벨트를 실제로 굴린다** — `IsaacConveyor` 대신 `physxSurfaceVelocity` 를 정적 콜라이더에 직접 걸어 확장 기능 없이 돌게 했다(원리는 같다, `verify_belt_speed.py` 참조). 빈 스테이지에 붙여넣고 Ctrl+Enter → `script_editor_qr_boxes.py` → Play. ⚠ 로봇 · 카메라 · tf · Action Graph 는 없다 (트랙 A 소관) |
