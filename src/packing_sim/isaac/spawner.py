@@ -41,7 +41,7 @@ USD 를 고치는 일(스폰·디스폰)은 소켓 스레드에서 하면 안 �
 import math
 import os
 
-from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 BOX_ROOT = "/World/boxes"                 # ★ 규칙 5. 소문자다
 BOX_PRIM_FMT = BOX_ROOT + "/%s"
@@ -125,9 +125,20 @@ SPAWN_CLEAR_M = 0.70
 #      system.yaml(공용, 승인 필요)이 아니라 환경변수로 뺐다. 값을 굳히면
 #      test_3.yaml 오버레이로 옮길 것.
 OUTFEED_ON = os.environ.get("PL_OUTFEED", "0") == "1"
-OUTFEED_MPS = float(os.environ.get("PL_OUTFEED_MPS", "0.55"))
+OUTFEED_MPS = float(os.environ.get("PL_OUTFEED_MPS", "1.0"))
 OUTFEED_TRAVEL_M = float(os.environ.get("PL_OUTFEED_TRAVEL_M", "2.4"))
+OUTFEED_HOLD_S = float(os.environ.get("PL_OUTFEED_HOLD_S", "2.0"))
 PALLET_PRIM_FMT = "/World/Pallet_%s"
+# ★ 상차까지 가는 전체 경로 (씬 실측 2026-08-27). ㄱ 자다:
+#     팔레트 -> (+Y) 셀 컨베이어·커브 -> (+X) 팔레트 레인 -> 트럭 적재함
+#   꺾는 y 는 **팔레트 가이드 레일 두 개의 한가운데**로 잡는다 — 레인 폭이
+#   0.83 m 라 가운데로 가야 가이드에 안 걸린다:
+#     A 8.49/9.32 · B 9.49/10.32 · C 10.49/11.32
+#   끝 x 는 **트럭 적재함 한가운데**다 (`Truck_Bed` x -2.4~-0.8, 상면 z 0.8 —
+#   팔레트 밑면과 높이차 0 이라 그대로 밀어 넣으면 된다. CLAUDE.md §4).
+#   좌표를 코드에 박지 않고 **씬에서 재서** 쓴다 — 씬이 바뀌면 따라간다.
+PALLET_GUIDE_FMT = "/World/PalletGuide_%s_%s"    # (zone, lo|hi)
+TRUCK_BED_PRIM = "/World/Truck_Bed"
 LOST_XY_M = 200.0
 LOST_Z_MIN_M = -50.0
 
@@ -719,6 +730,18 @@ class Spawner:
                 return op
         return None
 
+    def _bbox(self, path):
+        """월드 bbox (x0, x1, y0, y1). 프림이 없거나 비면 None."""
+        prim = self.stage.GetPrimAtPath(path)
+        if not (prim and prim.IsValid()):
+            return None
+        rng = UsdGeom.Imageable(prim).ComputeWorldBound(
+            Usd.TimeCode.Default(), "default").ComputeAlignedRange()
+        if rng.IsEmpty():
+            return None
+        mn, mx = rng.GetMin(), rng.GetMax()
+        return (mn[0], mx[0], mn[1], mx[1])
+
     def _outfeed_begin(self, zone, box_ids):
         """팔레트와 그 위 박스를 한 덩어리로 반출 대기열에 넣는다. **메인 스레드 전용.**
 
@@ -735,7 +758,8 @@ class Spawner:
           픽업 후보로 보면 안 된다. 프림 경로는 이 대기열이 들고 있다.
         """
         train = {"zone": zone, "boxes": {}, "moved": 0.0,
-                 "pallet": None, "home": None}
+                 "pallet": None, "home": None,
+                 "phase": "y", "turn_y": None, "end_x": None, "hold": 0.0}
         for box_id in box_ids:
             rec = self.boxes.pop(box_id, None)
             if rec is None:
@@ -760,6 +784,19 @@ class Spawner:
         else:
             self._log("[spawner] ⚠ 반출: 팔레트 프림 %s 를 못 찾았다 — 박스만 내보낸다"
                       % pal_path)
+
+        # ── 상차 경로를 씬에서 잰다 (상수 주석 참조) ──
+        lo = self._bbox(PALLET_GUIDE_FMT % (zone, "lo"))
+        hi = self._bbox(PALLET_GUIDE_FMT % (zone, "hi"))
+        bed = self._bbox(TRUCK_BED_PRIM)
+        if lo and hi and bed:
+            train["turn_y"] = ((lo[2] + lo[3]) + (hi[2] + hi[3])) / 4.0
+            train["end_x"] = (bed[0] + bed[1]) / 2.0
+        else:
+            # 못 재면 예전 동작(직진 2.4 m)으로 물러선다. 데모가 서는 것보다 낫다.
+            self._log("[spawner] ⚠ 반출: 레인·트럭을 못 찾았다 (가이드 %s · 트럭 %s) "
+                      "— 직진 %.1f m 로 대신한다"
+                      % (bool(lo and hi), bool(bed), OUTFEED_TRAVEL_M))
         self._outfeed.append(train)
 
     def _outfeed_step(self, dt):
@@ -772,8 +809,27 @@ class Spawner:
             return
         step = OUTFEED_MPS * dt
         for train in list(self._outfeed):
-            train["moved"] += step
-            done = train["moved"] >= OUTFEED_TRAVEL_M
+            # ── 트럭에 들어간 뒤 잠깐 세워 둔다 (상차 장면) ──
+            if train["phase"] == "hold":
+                train["hold"] += dt
+                if train["hold"] < OUTFEED_HOLD_S:
+                    continue
+                self._outfeed_finish(train)
+                continue
+
+            # ── 이번 틱에 어느 축으로 갈지 ──
+            dx = dy = 0.0
+            if train["turn_y"] is None:            # 경로를 못 쟀다 — 직진
+                dy = step
+                train["moved"] += step
+                done = train["moved"] >= OUTFEED_TRAVEL_M
+            elif train["phase"] == "y":
+                dy = step
+                done = False
+            else:
+                dx = step
+                done = False
+
             for box_id, path in list(train["boxes"].items()):
                 prim = self.stage.GetPrimAtPath(path)
                 if not (prim and prim.IsValid()):
@@ -783,27 +839,54 @@ class Spawner:
                 if op is None:
                     continue
                 t = op.Get()
-                op.Set(Gf.Vec3d(t[0], t[1] + step, t[2]))
+                op.Set(Gf.Vec3d(t[0] + dx, t[1] + dy, t[2]))
+
+            pal_t = None
             if train["pallet"]:
                 pal = self.stage.GetPrimAtPath(train["pallet"])
                 op = self._translate_op(pal) if (pal and pal.IsValid()) else None
                 if op is not None:
                     t = op.Get()
-                    op.Set(Gf.Vec3d(t[0], t[1] + step, t[2]))
-            if not done:
+                    pal_t = Gf.Vec3d(t[0] + dx, t[1] + dy, t[2])
+                    op.Set(pal_t)
+
+            # ── 꺾는 지점·끝 판정은 **팔레트 위치**로 한다 ──
+            if train["turn_y"] is not None and pal_t is not None:
+                if train["phase"] == "y" and pal_t[1] >= train["turn_y"]:
+                    train["phase"] = "x"
+                    self._log("[spawner] 반출 %s — 레인에 올라섰다 (y %.2f) · 트럭으로"
+                              % (train["zone"], pal_t[1]))
+                elif train["phase"] == "x" and pal_t[0] >= train["end_x"]:
+                    train["phase"] = "hold"
+                    self._log("[spawner] 반출 %s — 트럭 적재 완료 (x %.2f)"
+                              % (train["zone"], pal_t[0]))
                 continue
-            # ── 끝까지 갔다 — 박스는 치우고 팔레트는 빈 채로 제자리 ──
-            for box_id, path in train["boxes"].items():
-                self.boxes[box_id] = {"path": path, "dims": (0, 0, 0)}
-                self._despawn(box_id)
-            if train["pallet"] and train["home"] is not None:
-                pal = self.stage.GetPrimAtPath(train["pallet"])
-                op = self._translate_op(pal) if (pal and pal.IsValid()) else None
-                if op is not None:
-                    op.Set(train["home"])
+            if train["turn_y"] is not None and pal_t is None:
+                # 팔레트가 없으면 꺾을 기준이 없다 — 직진 폴백으로 떨어뜨린다
+                train["moved"] += step
+                done = train["moved"] >= OUTFEED_TRAVEL_M
+
+            if done:
+                self._outfeed_finish(train)
+
+    def _outfeed_finish(self, train):
+        """반출 끝 — 박스는 치우고 팔레트는 **빈 채로 제자리**에 돌려놓는다.
+
+        제자리로 돌리는 것이 "빈 팔레트가 새로 들어왔다" 에 해당한다
+        (`_swap_pallet` docstring: 팔레트 프림 자체는 그대로 두는 규약).
+        """
+        for box_id, path in train["boxes"].items():
+            self.boxes[box_id] = {"path": path, "dims": (0, 0, 0)}
+            self._despawn(box_id)
+        if train["pallet"] and train["home"] is not None:
+            pal = self.stage.GetPrimAtPath(train["pallet"])
+            op = self._translate_op(pal) if (pal and pal.IsValid()) else None
+            if op is not None:
+                op.Set(train["home"])
+        if train in self._outfeed:
             self._outfeed.remove(train)
-            self._log("[spawner] 반출 완료 %s — 빈 팔레트를 제자리에 놓았다"
-                      % train["zone"])
+        self._log("[spawner] 반출 완료 %s — 빈 팔레트를 제자리에 놓았다"
+                  % train["zone"])
 
     def _attach_label(self, box_path, box_id, hz):
         """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
