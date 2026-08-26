@@ -10,7 +10,8 @@
                     ├─> [서비스 4종]     Req -> Script -> Res
                     └─> EventGate ─────> ROS2Publisher /zone_<z>/robot/event (RobotEvent)
 
-    `/clock` · `/tf` · 카메라는 **여기서 안 만든다.** 김학민(A)의 기존 그래프 소관이다.
+    `/clock` · `/tf` 는 원래 김학민(A)의 씬 그래프 소관이지만, **씬에 없으면**
+    `build_clock_tf()` 가 런타임에 세운다 (씬에 있으면 비켜선다). 카메라는 안 만든다.
     `/zone_*/box_at_pickup` 도 아니다 — §3-2 에서 **인식 노드(D)** 가 발행한다.
 
 ★★ 실측으로 알아낸 제약 4가지 (TS-022). 순서를 지키지 않으면 조용히 안 된다.
@@ -191,6 +192,110 @@ def srv_fields(name):
     with open(_iface_path("srv", name, "srv")) as f:
         a, _, b = f.read().partition("---")
     return _parse_fields(a), _parse_fields(b)
+
+
+# ── /clock · /tf — 씬에 없으면 우리가 낸다 ─────────────────────────────────
+def build_clock_tf(cfg, log=print):
+    """`/clock` 과 `/tf` 발행 그래프를 **씬에 없을 때만** 세운다.
+
+    ★ 왜 여기 있나 — 원래는 씬(트랙 A) 소관이다. `setup_test3_scene.py [11]` 이
+      같은 그래프를 USD 에 써 넣는다. 그런데 2026-08-26 실측에서 씬의 OmniGraph
+      43 개가 **전부 컨베이어**였다: `/clock` 발행자 0, `/tf` 발행자 0.
+
+      `/clock` 이 없으면 `use_sim_time:=true` 인 노드의 시계가 0 에 멎어
+      **타이머가 하나도 안 뜬다** — 관제탑의 상태 발행도, 로봇 20 초 타임아웃
+      감시도 같이 죽는다. 노드는 살아 있고 에러도 안 난다 (CLAUDE.md §10).
+      씬이 고쳐질 때까지 전 구간이 못 돈다는 뜻이라 런타임에서 메운다.
+
+    ★★ **씬이 이미 내고 있으면 손대지 않는다.** `/clock` 발행자가 둘이면 두 시계가
+      번갈아 나가 tf 조회가 "extrapolation into the future" 로 실패한다. 그래서
+      그래프 경로에 Clock 노드가 있으면 그냥 비켜선다 — 트랙 A 가 씬을 고치는
+      순간 이 함수는 저절로 아무것도 안 하게 된다. 지울 필요가 없다.
+
+    Returns: "scene" (씬이 이미 있다) · "built" (우리가 세웠다) · "skip" (설정 없음)
+    """
+    import omni.usd
+    from pxr import Sdf
+
+    ros = (cfg.get("ros") or {})
+    if not ros:
+        log("[ros_graph] 설정에 ros 가 없다 — /clock·/tf 를 안 만든다")
+        return "skip"
+
+    g = str(ros.get("graph_path", "/World/ROS2Bridge"))
+    st = omni.usd.get_context().get_stage()
+
+    # 씬이 이미 내고 있나. 그래프 경로가 다를 수 있으니 **노드 타입으로** 훑는다.
+    for prim in st.Traverse():
+        if prim.GetTypeName() == "OmniGraphNode":
+            t = prim.GetAttribute("node:type")
+            if t and str(t.Get() or "").endswith("ROS2PublishClock"):
+                log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다"
+                    % prim.GetPath())
+                return "scene"
+
+    K, c = og.Controller.Keys, og.Controller
+    NS = "isaacsim.ros2.bridge."
+    tfc = ros.get("tf") or {}
+    try:
+        c.edit(
+            {"graph_path": g, "evaluator_name": "execution"},
+            {K.CREATE_NODES: [("Tick", "omni.graph.action.OnPlaybackTick"),
+                              ("Ctx", NS + "ROS2Context"),
+                              # ★★ 시간 소스. 이게 없으면 `/clock` 이 **계속 0** 을
+                              #   낸다 (2026-08-26 실측: sec 0 nanosec 0 고정).
+                              #   토픽은 멀쩡히 보이고 발행자 수도 1 이라 "됐다"고
+                              #   착각하기 딱 좋은데, 구독하는 노드들의 시계가
+                              #   0 에 멎어 **타이머가 하나도 안 뜬다** — /clock 이
+                              #   아예 없을 때와 증상이 똑같다 (§10).
+                              ("SimTime", "isaacsim.core.nodes."
+                                          "IsaacReadSimulationTime"),
+                              ("Clock", NS + "ROS2PublishClock"),
+                              ("Tf", NS + "ROS2PublishTransformTree")],
+             K.CONNECT: [("Tick.outputs:tick", "Clock.inputs:execIn"),
+                         ("Tick.outputs:tick", "Tf.inputs:execIn"),
+                         ("SimTime.outputs:simulationTime",
+                          "Clock.inputs:timeStamp"),
+                         ("SimTime.outputs:simulationTime",
+                          "Tf.inputs:timeStamp"),
+                         ("Ctx.outputs:context", "Clock.inputs:context"),
+                         ("Ctx.outputs:context", "Tf.inputs:context")],
+             # ROS_DOMAIN_ID 를 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
+             K.SET_VALUES: [("Ctx.inputs:useDomainIDEnvVar", True),
+                            ("Clock.inputs:topicName",
+                             str(ros.get("clock_topic", "/clock"))),
+                            ("Tf.inputs:topicName",
+                             str(tfc.get("topic", "/tf")))]})
+    except Exception as e:                                      # noqa: BLE001
+        log("[ros_graph] !! /clock·/tf 그래프 생성 실패: %r" % (e,))
+        return "skip"
+
+    # ⚠ 확장이 안 켜져 있으면 노드가 안 만들어진다. 그대로 만지면
+    #   `Accessed invalid null prim` 으로 **죽는다** (setup_test3_scene [11] 실측).
+    tf_node = st.GetPrimAtPath(g + "/Tf")
+    if not tf_node.IsValid() or not st.GetPrimAtPath(g + "/Clock").IsValid():
+        log("[ros_graph] !! ROS2 브리지 노드가 안 만들어졌다 — 확장 미기동.\n"
+            "   LD_LIBRARY_PATH 를 확인할 것 (scripts/run_test3_ros.sh 참고)")
+        return "skip"
+
+    par = str(tfc.get("parent_prim", "/World"))
+    if st.GetPrimAtPath(par).IsValid():
+        tf_node.GetRelationship("inputs:parentPrim").SetTargets([Sdf.Path(par)])
+
+    # ★ 프레임 이름은 **prim 이름**이 된다. 씬에 없는 prim 은 조용히 버린다 —
+    #   넣으면 그래프가 통째로 죽어 /clock 까지 같이 멎는다.
+    tgts, miss = [], []
+    for tp in (tfc.get("target_prims") or []):
+        (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
+    tf_node.GetRelationship("inputs:targetPrims").SetTargets(
+        [Sdf.Path(t) for t in tgts])
+
+    log("[ros_graph] /clock·/tf 를 **우리가** 세웠다 (%s) — 씬에 없어서다.\n"
+        "   프레임 %d 개: %s"
+        % (g, len(tgts), ", ".join(t.rsplit("/", 1)[-1] for t in tgts) or "없음"))
+    if miss:
+        log("   ⚠ 씬에 없어 뺀 prim: %s" % ", ".join(miss))
+    return "built"
 
 
 # ── 1단계: 뼈대. Play 전에 부른다 ───────────────────────────────────────────

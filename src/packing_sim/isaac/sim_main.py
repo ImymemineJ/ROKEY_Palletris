@@ -107,6 +107,15 @@ def main():
                     help="뜨자마자 벨트를 사양 속도로 돌린다")
     ap.add_argument("--no-render", action="store_true",
                     help="렌더를 끈다. ★ 벨트가 안 돈다 — 아래 주석 참조")
+    # ★ 급송 (2026-08-26 김병직). 기본 0 = **꺼짐** — 지금까지 동작 그대로다.
+    #   왜 필요한가: `--ros` 경로에는 **박스를 넣는 주체가 아무도 없다.**
+    #   `spawn_box` 는 요청형 핸들러뿐이고 §3-3 계약에 스폰 서비스가 없다
+    #   (CLAUDE.md flow 1 번 "박스 스폰 — 씬" 이 아직 씬에 없다). 그래서 전 구간을
+    #   띄워도 관제탑이 IDLE 로 영원히 앉아 있는다. 씬이 스스로 낼 때까지의 임시다.
+    ap.add_argument("--spawn-period", type=float, default=0.0, metavar="S",
+                    help="S 초마다 박스 하나 투입 (0 = 안 넣는다)")
+    ap.add_argument("--spawn-count", type=int, default=0, metavar="N",
+                    help="총 N 개까지만 (0 = 무제한)")
     a = ap.parse_args()
 
     import _paths                                       # noqa: E402
@@ -235,7 +244,7 @@ def main():
             kit.update()
             import ros_side
             ros_side.install_services(H)
-            ros_side.build(ZONES)
+            ros_side.build(ZONES, cfg=cfg)   # cfg -> /clock·/tf 도 (씬에 없을 때만)
             ros = [ros_side.RosSide(cfg, z, HZ[z]) for z in ZONES]
 
         world.reset()
@@ -276,6 +285,12 @@ def main():
             import ros_side
             ros_side.wire()
 
+        feeder = None
+        if a.spawn_period > 0:
+            feeder = _Feeder(cfg, sp, a.spawn_period, a.spawn_count)
+            print("[sim_main] 급송 %.1f 초 간격 · %s 개"
+                  % (a.spawn_period, a.spawn_count or "무제한"))
+
         cc.run_all() if a.autorun else cc.stop_all()
         print("[sim_main] 벨트 %s" % ("가동" if a.autorun else "정지 — set_velocity 대기"))
         print("[sim_main] cmd %s" % server.cmds())
@@ -288,6 +303,8 @@ def main():
             for _rm in rms.values():
                 _rm.step()                 # ★ world.step() 앞. 로봇 전부
             sp.step()
+            if feeder is not None:
+                feeder.step(time.time())
             for _r in ros:
                 _r.step()              # ★ 논블로킹. 모션은 워커가 돈다 (§9)
             # ★★ **헤드리스에서도 render=True 로 돈다.**
@@ -304,10 +321,83 @@ def main():
             world.step(render=not a.no_render)
     except KeyboardInterrupt:
         print("\n[sim_main] 종료")
+    except Exception:
+        # ★ 여기서 직접 찍는다. 아래 `kit.close()` 가 **프로세스를 끝내 버려서**
+        #   파이썬이 traceback 을 찍을 기회를 못 얻는다 — 화면에는
+        #   "Simulation App Shutting Down" 한 줄만 남고 종료코드도 0 일 때가 있다.
+        #   원인을 못 보고 씬·오버레이·경로를 헤매게 되는 종류의 침묵이다
+        #   (2026-08-26 실측).
+        import traceback
+        print("\n[sim_main] !! 예외로 종료한다 ------------------------")
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
     finally:
         if server is not None:
             server.close()
         kit.close()
+
+
+class _Feeder:
+    """벨트에 박스를 하나씩 넣는다. **메인 스레드에서만** 돈다.
+
+    ★ 이건 `demo_stack15_test1_1.py` 의 급송 스레드를 옮겨 온 것이 아니다.
+      저쪽은 소켓으로 부르고 백압 판단이 훨씬 두껍다. 여기서는 같은 프로세스라
+      핸들러를 **직접** 부른다 — 소켓도, 스레드도 안 쓴다 (§2 · §9).
+
+    ★ 박스 구성은 `demo_stack15.manifest` 와 **같은 방식**으로 뽑는다
+      (`np.random.default_rng(random_seed).choice`). 그 모듈을 import 하면
+      Isaac 배선 스크립트가 줄줄이 딸려 와서 다섯 줄을 옮겨 적었다.
+      ⚠ `random.Random(seed).choices` 로 바꾸면 **같은 seed 라도 결과가 다르다.**
+
+    ★ 백압 — 라인에 이미 `cap` 개가 있으면 안 넣는다. 사이클이 투입 간격보다
+      길면 큐가 계속 길어지고, 벨트가 뒤에서 밀어 박스끼리 눌리다 솔버가 터진다
+      (2026-08-23 BOX00014 실측: 초속 수 km 로 날아갔다).
+    """
+
+    def __init__(self, cfg, sp, period, total, cap=3, log=print):
+        import numpy as np
+        bx = cfg["boxes"]
+        rng = np.random.default_rng(int(bx.get("random_seed", 42)))
+        pr = np.array(bx["size_distribution"], dtype=float)
+        pr = pr / pr.sum()
+        n = int(total) if total > 0 else 200
+        self.types = [bx["types"][int(i)]["name"]
+                      for i in rng.choice(len(bx["types"]), n, p=pr)]
+        # 배송지는 크기와 **독립**으로 뽑는다 — 한 존에 3·4·5 호가 섞여야
+        # 패커가 실제로 일한다 (demo_stack15_test1_1 의 근거 그대로).
+        import random as _r
+        dests = list(bx.get("dests") or [])
+        dr = _r.Random(int(bx.get("random_seed", 42)))
+        self.dests = [dr.choice(dests) for _ in range(n)] if dests else [None] * n
+        self.h_spawn = sp.handlers()["spawn_box"]
+        self.h_stat = sp.handlers()["spawn_status"]
+        self.period, self.total, self.cap, self.log = float(period), int(total), int(cap), log
+        self.i, self.next_t = 0, 0.0
+
+    def step(self, now):
+        if self.total and self.i >= self.total:
+            return
+        if self.i >= len(self.types) or now < self.next_t:
+            return
+        st = self.h_stat({}) or {}
+        # 스폰 지점이 아직 안 비었으면 **겹쳐 스폰된다.** 다음 틱에 다시 본다.
+        if st.get("on_belt", 0) >= self.cap or not st.get("spawn_clear", True):
+            return
+        bid = "BOX%05d" % self.i
+        kw = {"box_id": bid, "type": self.types[self.i], "yaw_deg": 0}
+        if self.dests[self.i]:
+            kw["dest"] = self.dests[self.i]
+        r = self.h_spawn(kw) or {}
+        if r.get("ok"):
+            self.i += 1
+            self.next_t = now + self.period
+            self.log("[투입] %s %s %s (라인 위 %s)"
+                     % (bid, kw["type"], kw.get("dest", "-"),
+                        (self.h_stat({}) or {}).get("on_belt", "?")))
+        else:
+            self.next_t = now + 1.0          # 실패는 조용히 재시도 (라인이 붐빈다)
 
 
 def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None,
