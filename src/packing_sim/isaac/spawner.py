@@ -124,7 +124,16 @@ SPAWN_CLEAR_M = 0.70
 #    ⚠ 숫자를 코드에 박지 않는 규칙(§4)의 예외가 아니다 — 이건 **연출 파라미터**라
 #      system.yaml(공용, 승인 필요)이 아니라 환경변수로 뺐다. 값을 굳히면
 #      test_3.yaml 오버레이로 옮길 것.
+# ★ 이 연출의 원본은 김학민 `ship_pallet()` 이다 (`scripts/demo_stack15_test1_1.py`,
+#   커밋 `0610a00`·`e8a6c84`). 그쪽은 **소켓**(`move_prim`·`set_kinematic`·
+#   `copy_prim`)으로 demo 하네스에서 돌아 ROS 통합 경로(`sim_main`)에는 안 붙어
+#   있었다 — `/sim/swap_pallet` 은 `_swap_pallet`(제자리 despawn)만 불렀다.
+#   그래서 같은 동작을 **인프로세스로** 옮겨 놓은 것이고, 그가 실측으로 얻은
+#   교훈은 그대로 따랐다: 셀(+Y) 먼저 -> 합류(+X) 순서 · 적재물을 얼려 같은
+#   변위로 이동 · 도착 뒤에도 안 풀기 · 트럭에 사본 남기기.
 OUTFEED_ON = os.environ.get("PL_OUTFEED", "0") == "1"
+# 김학민 정본은 0.5 (실물 팔레트 컨베이어 0.2~0.5 m/s). 여기 1.0 은 2026-08-27
+# 강의실에서 김병직이 화면으로 보고 "속도 괜찮다" 한 값이다. 느리게 하려면 0.5.
 OUTFEED_MPS = float(os.environ.get("PL_OUTFEED_MPS", "1.0"))
 OUTFEED_TRAVEL_M = float(os.environ.get("PL_OUTFEED_TRAVEL_M", "2.4"))
 OUTFEED_HOLD_S = float(os.environ.get("PL_OUTFEED_HOLD_S", "2.0"))
@@ -260,6 +269,7 @@ class Spawner:
         self._pickup = {"present": False, "box_id": "", "pose": None}
         self._pickup_by_zone = {}
         self._outfeed = []                 # 반출 중인 덩어리 (팔레트 + 박스)
+        self._shipped_n = 0                # 트럭에 남긴 팔레트 사본 번호
 
         self._ensure_roots()
         self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
@@ -870,23 +880,38 @@ class Spawner:
                 self._outfeed_finish(train)
 
     def _outfeed_finish(self, train):
-        """반출 끝 — 박스는 치우고 팔레트는 **빈 채로 제자리**에 돌려놓는다.
+        """반출 끝 — **실린 팔레트는 트럭에 남기고**, 빈 팔레트를 제자리에 놓는다.
 
-        제자리로 돌리는 것이 "빈 팔레트가 새로 들어왔다" 에 해당한다
-        (`_swap_pallet` docstring: 팔레트 프림 자체는 그대로 두는 규약).
+        ★ 방법은 김학민 `e8a6c84` 그대로다 (`demo_stack15_test1_1.py` 의
+          `_h_copy_prim`). 원본을 그냥 되돌리면 **트럭 위가 비어서 "상차했다"
+          가 화면에 안 남는다.** 그래서
+            ① 지금 자리(트럭 위)에 `Sdf.CopySpec` 으로 **사본**을 뜨고
+            ② **원본**을 로봇 옆 제자리로 되돌린다
+          순서가 중요하다 — 반대로 하면 사본이 빈 팔레트 자리에 생긴다.
+        ★ 적재물 박스는 despawn 하지 않는다. 이미 트럭 위로 옮겨져 있고,
+          그대로 둬야 "실려 있는" 그림이 남는다. 키네마틱·콜라이더 꺼짐이라
+          물리에 관여하지 않고, `self.boxes`·`_snap` 에서는 이미 빠져 있어
+          다음 사이클이 픽업 후보로 보지도 않는다.
         """
-        for box_id, path in train["boxes"].items():
-            self.boxes[box_id] = {"path": path, "dims": (0, 0, 0)}
-            self._despawn(box_id)
         if train["pallet"] and train["home"] is not None:
             pal = self.stage.GetPrimAtPath(train["pallet"])
-            op = self._translate_op(pal) if (pal and pal.IsValid()) else None
-            if op is not None:
-                op.Set(train["home"])
+            if pal and pal.IsValid():
+                self._shipped_n += 1
+                dst = "/World/PalletShipped_%s_%d" % (train["zone"],
+                                                      self._shipped_n)
+                try:
+                    lay = self.stage.GetEditTarget().GetLayer()
+                    Sdf.CopySpec(lay, Sdf.Path(train["pallet"]),
+                                 lay, Sdf.Path(dst))
+                except Exception as e:      # 사본 실패해도 복귀는 해야 한다
+                    self._log("[spawner] ⚠ 반출: 팔레트 사본 실패 — %s" % e)
+                op = self._translate_op(pal)
+                if op is not None:
+                    op.Set(train["home"])
         if train in self._outfeed:
             self._outfeed.remove(train)
-        self._log("[spawner] 반출 완료 %s — 빈 팔레트를 제자리에 놓았다"
-                  % train["zone"])
+        self._log("[spawner] 반출 완료 %s — 트럭에 팔레트를 남기고 빈 판을 놓았다 "
+                  "(적재물 %d 개)" % (train["zone"], len(train["boxes"])))
 
     def _attach_label(self, box_path, box_id, hz):
         """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
