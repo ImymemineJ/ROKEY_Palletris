@@ -61,23 +61,21 @@ SERVICES = [
     ("set_spawn_enabled", "SetSpawnEnabled", "/sim/set_spawn_enabled"),
     ("swap_pallet",       "SwapPallet",      "/sim/swap_pallet"),
 ]
-# ★ 구역 접두어가 붙는다 — 관제탑이 `/zone_b/robot/cmd` 로 발행한다.
-#   ⚠ 2026-08-26 수정 (김병직): 여기가 `/robot/cmd` 였다. 관제탑은 구역을
-#   인스턴스로 나눠 들고 있어(ZoneCycle) 토픽마다 구역이 붙는데 여기만 안 붙어서
-#   **아무것도 연결되지 않았다.** 그런데 에러가 안 난다 — 관제탑이 명령을 쏘고
-#   20초 타임아웃 뒤 계획을 버리는 것을 무한 반복한다 (CLAUDE.md §10).
-#   RobotCmd 에 구역 칸이 없으므로 구역은 토픽 이름으로만 갈린다.
+# ★ 로봇 토픽은 **구역별**이다 (2026-08-26 정합).
+#   CLAUDE.md §3-2 는 `/robot/cmd` 단수로 적혀 있지만 로봇이 3 대라 관제탑이
+#   `/zone_{a|b|c}/robot/cmd` 로 나눠 쓴다 (`orchestrator_node.py:161-171`).
+#   여기가 단수로 남아 있어서 **관제탑과 Isaac 이 서로 못 만났다** — 에러도 안 난다.
+#   구역 문자는 관제탑과 같게 **소문자**로 맞춘다 (`self.zone = str(zone).lower()`).
+CMD_TOPIC_FMT = "/zone_%s/robot/cmd"
+EVT_TOPIC_FMT = "/zone_%s/robot/event"
+
+
 def cmd_topic(zone):
-    return "/zone_%s/robot/cmd" % str(zone).lower()
+    return CMD_TOPIC_FMT % str(zone).lower()
 
 
 def evt_topic(zone):
-    return "/zone_%s/robot/event" % str(zone).lower()
-
-
-# 하위호환용 기본값 (zone="B"). 새 코드는 위 함수를 쓴다.
-CMD_TOPIC = cmd_topic("B")
-EVT_TOPIC = evt_topic("B")
+    return EVT_TOPIC_FMT % str(zone).lower()
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.
 _OG_TYPE = {
