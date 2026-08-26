@@ -22,6 +22,10 @@ SYSTEM_YAML = ROOT / "src/packing_bringup/config/system.yaml"
 # fk.py 는 packing_robot 패키지 안에 있다. 빌드 전에도 import 되게 붙인다.
 if str(ROBOT / "packing_robot") not in sys.path:
     sys.path.insert(0, str(ROBOT / "packing_robot"))
+if str(ROOT / "src/packing_algo") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src/packing_algo"))
+if str(ROOT / "src/packing_common") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src/packing_common"))
 
 
 def system_config():
