@@ -215,16 +215,24 @@ class RosSide:
             # ★ 결과를 **밀어 넣은 뒤에** 대기 자세로 간다 (2026-08-27 김병직 제안).
             #   관제탑은 이미 다음 단계로 가고, 이동 중 오는 PICK 은 step 이 한 건
             #   보류한다 — 아래 _hold 참조.
-            # ★ 다음 명령이 **이미 와 있으면 생략한다** (2026-08-27 김병직).
-            #   박스가 벌써 도착한 상태에서 대기 자세를 거치면 같은 자리를 두 번
-            #   가는 셈이다 — 보류분이 있으면 바로 그 픽으로 간다.
-            if act == 1 and self._hold is None:
-                try:
-                    self.cycle.park_over_pick()
-                except Exception as e:                          # noqa: BLE001
-                    self.log("[ros_side] 대기 자세 실패 (무시): %r" % (e,))
-            elif act == 1:
-                self.log("[ros_side] 다음 명령 대기중 — 대기 자세 생략")
+            # ★ 다음 박스가 **이미 스토퍼에 와 있으면 생략한다** (2026-08-27 김병직,
+            #   2차 수정). 처음엔 보류 명령(_hold)으로 판정했는데 그걸로는 부족했다 —
+            #   관제탑은 PLACE 결과를 받은 **뒤에야** 계획을 세우고 PICK 을 보내므로,
+            #   박스가 벌써 대기 중이어도 이 시점엔 명령이 아직 없다. 그래서 명령이
+            #   아니라 **박스 실물**(pickup_check 스냅샷, 스레드 안전)을 본다.
+            #   보류분 검사는 그대로 두고 (있으면 당연히 생략) 실물 검사를 더한다.
+            if act == 1:
+                _pk = {}
+                if self._hold is None:
+                    _pk = self.link.call(cmd="pickup_check", zone=self.zone) or {}
+                if self._hold is None and not _pk.get("present"):
+                    try:
+                        self.cycle.park_over_pick()
+                    except Exception as e:                      # noqa: BLE001
+                        self.log("[ros_side] 대기 자세 실패 (무시): %r" % (e,))
+                else:
+                    self.log("[ros_side] 다음 박스 대기중 (%s) — 대기 자세 생략"
+                             % (_pk.get("box_id") or "명령 보류분"))
         finally:
             self._busy.release()
 
