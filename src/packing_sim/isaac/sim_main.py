@@ -202,11 +202,23 @@ def main():
         #   이름에 구역이 없어서 한 표에 몰면 마지막 로봇이 앞의 것을 덮는다 —
         #   A 구역 명령이 C 구역 팔을 움직인다. 소켓은 예전처럼 **첫 구역** 것만
         #   등록한다 (소켓 규약에 구역 칸이 없다. ROS 를 쓰면 구역이 갈린다).
-        cur = {"box": None}
+        # ★★★ `cur` 는 **구역마다 하나**다 (2026-08-26 김학민 리뷰에서 잡힘).
+        #   하나로 두면 로봇 3 대가 같은 칸을 쓴다. `_gap_mm` 이 여기를 읽어
+        #   흡착면~박스 간극을 재는데, 그게 `_grasp_verdict` 3 mm 검사의 **유일한
+        #   입력**이다. 동시에 돌면 두 가지로 깨진다:
+        #     · A 가 집는 중에 C 가 grasp -> A 가 **수십 m 떨어진 C 의 박스**까지
+        #       거리를 잰다 -> 제대로 물었는데 실패 판정
+        #     · C 의 finally 가 먼저 돌면 `cur["box"]=None` -> A 는 간극 검사가
+        #       **통째로 건너뛰어진다.** 박스가 몇 mm 떠서 매달려도 모른다.
+        #   ★ 두 번째가 더 나쁘다 — **에러가 안 난다.** 배치 Z 오차가 0.0 으로
+        #     나와도 검사가 꺼진 채 통과한 것일 수 있다.
+        #   그래서 `cur_z` 를 루프 **안**에서 만들고, 클로저가 아니라
+        #   **기본인자**로 묶는다 (클로저면 마지막 구역 것만 남는다).
         HZ = {}                       # {zone: 그 구역 핸들러 표}
         if not a.no_robot:
             for zi, z in enumerate(ZONES):
-                rm_z = _bring_up_robot(world, stage, cfg, z, spawner=sp, cur=cur,
+                cur_z = {"box": None}          # ← 구역 전용
+                rm_z = _bring_up_robot(world, stage, cfg, z, spawner=sp, cur=cur_z,
                                        prim_path=robot_prim(z, MULTI),
                                        grip_path=gripper_prim(z, MULTI))
                 if rm_z is None:
@@ -215,14 +227,14 @@ def main():
                 _h = dict(rm_z.handlers())
                 _grasp = _h["grasp"]
 
-                def h_grasp(req, _f=_grasp):
+                def h_grasp(req, _f=_grasp, _c=cur_z):
                     bid = (req or {}).get("box_id")
                     rec = sp.boxes.get(bid)
-                    cur["box"] = (bid, rec["dims"][2] / 2.0) if rec else None
+                    _c["box"] = (bid, rec["dims"][2] / 2.0) if rec else None
                     try:
                         return _f(req)
                     finally:
-                        cur["box"] = None   # 사이클 밖에서 옛 박스로 재지 않는다
+                        _c["box"] = None    # 사이클 밖에서 옛 박스로 재지 않는다
 
                 _h["grasp"] = h_grasp
                 HZ[z] = dict(H, **_h)     # 씬 핸들러 + 그 구역 로봇 핸들러
