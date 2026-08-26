@@ -3,7 +3,7 @@
 #
 #   ./scripts/run_test3.sh            존 A · 박스 6 개 · 라우팅 켬
 #   PL_N=33 ./scripts/run_test3.sh        박스 수 바꾸기
-#   PL_PER_PALLET=0 ./scripts/run_test3.sh 반출 없이 계속 쌓기 (알고리즘 붙인 뒤)
+#   PL_PER_PALLET=1 ./scripts/run_test3.sh 한 개만 놓고 반출까지만 보기
 #   PL_ROUTE=0 ./scripts/run_test3.sh      라우팅 끄고 존 A 지선만
 #   PL_AUTOPLAY=1 ./scripts/run_test3.sh   Play 를 자동으로 누르기
 #   PL_ZONES=A ./scripts/run_test3.sh      한 대만 (기본은 A,B,C 세 대 동시)
@@ -31,11 +31,15 @@ export PL_ZONES="${PL_ZONES:-A,B,C}"
 export PL_ROBOT_PRIM="${PL_ROBOT_PRIM:-/World/robot_$PL_ZONE}"
 export PL_STOPPER_PRIM="${PL_STOPPER_PRIM:-/World/Stopper_$PL_ZONE}"
 export PL_MODE="${PL_MODE:-demo}"
-export PL_N="${PL_N:-12}"       # 배송지 3 곳이라 한 존에 약 4 개가 간다
-# ★ 팔레트에 이만큼 놓으면 **트럭으로 내보내고 끝낸다.**
-#   패킹 알고리즘을 아직 안 받았으므로 지금은 1 개만 놓고 반출까지 보는 것이 목표다.
-#   알고리즘이 붙으면 0(반출 안 함) 또는 원하는 수로 바꾼다.
-export PL_PER_PALLET="${PL_PER_PALLET:-1}"
+# ★ 2026-08-26 12 -> 33. 반출을 끄면(PL_PER_PALLET=0) 팔레트를 채워야 적재
+#   알고리즘이 보인다. 배송지 3 곳이라 한 존에 약 11 개가 간다.
+export PL_N="${PL_N:-33}"
+# ★ 팔레트에 이만큼 놓으면 **트럭으로 내보내고 끝낸다.** 0 = 반출 안 하고 계속 쌓기.
+#   ★ 2026-08-26 기본값 1 -> **0.** 1 은 "패킹 알고리즘을 아직 안 받았으니 한 개만
+#     놓고 반출까지 보자" 던 시절의 값이다. 알고리즘(HeightmapPacker)은 이미
+#     붙어 있어서(ArmAwarePacker 가 상속한다) 1 로 두면 최적 적재가 한 개 놓고
+#     끝나 **아예 안 보인다.** 반출만 확인할 때는 PL_PER_PALLET=1 로 되돌린다.
+export PL_PER_PALLET="${PL_PER_PALLET:-0}"
 export PL_ROUTE="${PL_ROUTE:-1}"
 export PL_CAM="${PL_CAM:-1}"          # 픽업 카메라 인식 — test_3 에서 5/5 · 오차 1.5 mm 확인
 export PL_CAMVIEW="${PL_CAMVIEW:-0}"

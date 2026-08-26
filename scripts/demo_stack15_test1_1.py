@@ -411,7 +411,17 @@ NEAR_HALF_MM = cfg["pallet"]["depth_mm"] / 2.0   # y < 400 이면 근거리 (견
 #   실행으로 다시 재야 하는 종류다.
 FAR_SECTOR_DEG = 50.0
 SECTOR_DEG = 25.0                     # 방위각이 이 안이면 같은 통로다 (견본과 동일)
-_AG = os.environ.get("PL_ARM_GUARD", "1")
+# ★★ 2026-08-26 기본값 "1" -> **"0" (해제)**. 2026-08-25 채택 결정이다.
+#   기둥 억제를 푸는 것이 적재율의 가장 큰 레버였다
+#   (docs/2026-08-25_협곡_낙하_채택.md):
+#       기둥 억제 + 낙하 480   64.5%  ·  평균 24.3개
+#       기둥 억제 **해제**     70.9%  ·  평균 26.7개
+#       + 낙하 완화 200        75.5%  ·  평균 28.3개
+#   대신 협곡 입구에서 **놓아 떨어뜨린다** — 팔이 안 내려가므로 걸릴 일이 없다
+#   (PL_DROP_KG · PL_CONTACT_STOP · heightmap.drop_relief_mm).
+#   ⚠ 억제가 막던 실패는 실재한다 (2026-08-23 knock 1401 mm). 되돌리려면
+#     PL_ARM_GUARD=1. 비교 실험은 soft.
+_AG = os.environ.get("PL_ARM_GUARD", "0")
 ARM_GUARD = _AG not in ("0", "false", "no")
 ARM_GUARD_SOFT = _AG == "soft"           # 함정을 만드는 자리도 허용 (비교 실험용)
 
