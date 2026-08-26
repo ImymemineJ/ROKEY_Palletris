@@ -116,6 +116,12 @@ def main():
                     help="S 초마다 박스 하나 투입 (0 = 안 넣는다)")
     ap.add_argument("--spawn-count", type=int, default=0, metavar="N",
                     help="총 N 개까지만 (0 = 무제한)")
+    # ★ 라우팅 (2026-08-26 김병직). `--ros` 경로에는 박스를 **꺾는 주체가 없다** —
+    #   소터를 돌리는 것과 꺾으라고 지시하는 것은 별개고, 지시는 데모 스크립트
+    #   안에만 있었다. 그래서 존 옆을 그냥 지나쳐 순환 루프만 돌았다
+    #   (실측: 12 개 중 존 진입 0 개). router.py docstring 참조.
+    ap.add_argument("--no-route", action="store_true",
+                    help="배송지 분류를 끈다 (기본은 켬)")
     a = ap.parse_args()
 
     import _paths                                       # noqa: E402
@@ -297,6 +303,11 @@ def main():
             import ros_side
             ros_side.wire()
 
+        router = None
+        if not a.no_route:
+            import router as RT
+            router = RT.Router(cfg, sp, cc)
+
         feeder = None
         if a.spawn_period > 0:
             feeder = _Feeder(cfg, sp, a.spawn_period, a.spawn_count)
@@ -315,6 +326,8 @@ def main():
             for _rm in rms.values():
                 _rm.step()                 # ★ world.step() 앞. 로봇 전부
             sp.step()
+            if router is not None:
+                router.step(time.time())   # ★ 논블로킹 (§9). 급송보다 먼저.
             if feeder is not None:
                 feeder.step(time.time())
             for _r in ros:
