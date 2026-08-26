@@ -128,29 +128,13 @@ class RosSide:
         self._done = []                  # 워커가 넣고 step() 이 비운다
         self._done_lk = threading.Lock()
 
-        h = handlers
-        ros_graph.set_handlers(
-            # srv SetVelocity: seg · velocity_mps -> ok · actual_mps
-            # 소켓          : seg · mps          -> ok · actual
-            set_velocity=_svc(h["set_velocity"], ("ok", "actual_mps"),
-                              req_map={"velocity_mps": "mps"},
-                              res_map={"actual": "actual_mps"}),
-            despawn_box=_svc(h["despawn_box"], ("ok",)),
-            set_spawn_enabled=_svc(h["set_spawn_enabled"], ("ok",)),
-            swap_pallet=_svc(h["swap_pallet"], ("ok",)),
-        )
+        # ★ 서비스 핸들러는 **전역 한 벌**이라 여기서 안 건다 — 구역별 인스턴스가
+        #   각자 걸면 마지막 것만 남는다. `install_services()` 를 sim_main 이 한 번 부른다.
 
-    # ── sim_main 이 부르는 3개 ──────────────────────────────
-    def build(self):
-        """그래프를 세운다. **Play 전에** 부른다."""
-        ros_graph.build(zone=self.zone)
-        self.log("[ros_side] 그래프 세움 — %s / %s"
-                 % (ros_graph.cmd_topic(self.zone), ros_graph.evt_topic(self.zone)))
-
-    def wire(self):
-        """동적 필드를 잇는다. **Play + 몇 프레임 뒤**에 부른다 (TS-022 2번)."""
-        ros_graph.wire()
-        self.log("[ros_side] 배선 완료 — 명령 대기")
+    # ── sim_main 이 부르는 것 ───────────────────────────────
+    # ★ `build()`/`wire()` 는 **그래프 전체**에 대해 한 번만 부른다 (아래 모듈 함수).
+    #   구역이 셋이어도 그래프는 하나고 서비스도 한 벌이다 — `ros_graph.build`
+    #   docstring 참조. 구역별 인스턴스는 `step()` 만 각자 돈다.
 
     def step(self):
         """매 틱. **절대 블로킹하지 않는다.**"""
@@ -158,10 +142,10 @@ class RosSide:
         with self._done_lk:
             evs, self._done = self._done, []
         for ev in evs:
-            ros_graph.send_event(**ev)
+            ros_graph.send_event(self.zone, **ev)
 
         # ② 새 명령
-        cmd = ros_graph.take_cmd()
+        cmd = ros_graph.take_cmd(self.zone)
         if cmd is None:
             return
         if not self._busy.acquire(blocking=False):
@@ -203,3 +187,40 @@ def _clean(cmd):
         except Exception:                                       # noqa: BLE001
             out[k] = v
     return out
+
+
+# ══ 그래프 전체에 한 번만 부르는 것들 ════════════════════════════════════════
+# ★ 구역이 셋이어도 그래프는 하나고 서비스도 한 벌이다. 구역별 `RosSide` 가 각자
+#   부르면 노드가 겹치거나 핸들러가 덮어써진다.
+
+def install_services(handlers):
+    """씬 서비스 4종을 그래프에 꽂는다. **한 번만** 부른다.
+
+    `handlers` 는 sim_main 이 만든 소켓용 {cmd: fn} 표다. 소켓과 ROS 가 서로 다른
+    함수를 부르면 둘이 어긋나므로 같은 표를 쓴다.
+    """
+    h = handlers
+    ros_graph.set_handlers(
+        # srv SetVelocity: seg · velocity_mps -> ok · actual_mps
+        # 소켓          : seg · mps          -> ok · actual
+        set_velocity=_svc(h["set_velocity"], ("ok", "actual_mps"),
+                          req_map={"velocity_mps": "mps"},
+                          res_map={"actual": "actual_mps"}),
+        despawn_box=_svc(h["despawn_box"], ("ok",)),
+        set_spawn_enabled=_svc(h["set_spawn_enabled"], ("ok",)),
+        swap_pallet=_svc(h["swap_pallet"], ("ok",)),
+    )
+
+
+def build(zones, log=print):
+    """그래프를 세운다. **Play 전에** 한 번 부른다."""
+    ros_graph.build(zones=list(zones))
+    for z in zones:
+        log("[ros_side] %s — %s / %s"
+            % (z, ros_graph.cmd_topic(z), ros_graph.evt_topic(z)))
+
+
+def wire(log=print):
+    """동적 필드를 잇는다. **Play + 몇 프레임 뒤**에 한 번 부른다 (TS-022 2번)."""
+    ros_graph.wire()
+    log("[ros_side] 배선 완료 — 명령 대기")
