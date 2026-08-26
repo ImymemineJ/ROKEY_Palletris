@@ -472,6 +472,7 @@ class _GtPick:
         #   첫 값으로 집으러 가서 흡착이 4.1mm 떠서 실패했다. **연속 두 번의
         #   폴에서 같은 자리(5mm·1.5도 이내)여야** 보고한다.
         self._prev = {}          # zone -> (box_id, x_mm, y_mm, yaw_deg)
+        self._first = {}         # zone -> (box_id, 처음 본 시각) — 필터 타임아웃용
         # ★ 스토퍼 창. 지선에 줄 선 **둘째 박스**(스토퍼 앞 200mm)를 보고해
         #   팔이 엉뚱한 자리로 간 사고 (잔차 79mm IK_FAIL). 가장 큰 박스가
         #   스토퍼에 닿았을 때의 중심보다 60mm 여유까지만 픽업으로 인정한다.
@@ -494,21 +495,34 @@ class _GtPick:
             present = bool(r.get("present"))
             bid = str(r.get("box_id") or "")
             if present:
+                # ★ 필터 타임아웃 (2026-08-27 실측 — B존 277초 침묵). 뒤집힌 박스가
+                #   창 밖에 누워 길을 막으면 아래 두 필터가 **영원히** 보고를 안 해
+                #   존이 죽고, 그 존행 박스들이 리턴만 돈다 (74바퀴 실측). 같은
+                #   박스가 이만큼 버티면 필터를 무시하고 일단 보고한다 — 픽이
+                #   실패해도 재시도 상한(3회)이 치워 주므로 지선이 뚫린다.
+                _fk = self._first.get(z)
+                if _fk is None or _fk[0] != bid:
+                    self._first[z] = _fk = (bid, now)
+                _force = (now - _fk[1]) > 15.0
+                if _force and self._said.get(z) != bid:
+                    self.log("[gtpick] %s %s 15초째 필터에 걸림(창밖/불안정) — "
+                             "강제 보고 (실패하면 상한이 치운다)" % (z, bid))
                 # ── 스토퍼 창 밖 = 아직 도착 안 한 박스. 이번 틱은 보고하지 않는다
                 #    (present=false 를 보내면 관제탑이 "치워졌다"로 오인해 빗장을 푼다)
-                if pos[self.sp.axis] < self._win_m:
+                if pos[self.sp.axis] < self._win_m and not _force:
                     continue
                 # ── 자리 잡음: 직전 폴과 같은 자리일 때만 보고
                 cur = (bid, round(pos[0] * 1000), round(pos[1] * 1000),
                        float(pose.get("yaw_deg") or 0.0))
                 pv = self._prev.get(z)
                 self._prev[z] = cur
-                if (pv is None or pv[0] != bid
+                if (not _force and (pv is None or pv[0] != bid
                         or abs(pv[1] - cur[1]) > 5 or abs(pv[2] - cur[2]) > 5
-                        or abs(pv[3] - cur[3]) > 1.5):
+                        or abs(pv[3] - cur[3]) > 1.5)):
                     continue
             else:
                 self._prev[z] = None
+                self._first[z] = None
             self.rg.send_pickup(
                 zone=z, box_id=bid, present=present,
                 # ★ mm 정수다 (§3-2). x·y 는 박스 **중심**.
