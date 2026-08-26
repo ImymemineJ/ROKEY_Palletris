@@ -478,8 +478,20 @@ class _GtPick:
             self._spur_mps = float(cfg["conveyor"].get(
                 "spur_velocity_mps", cfg["conveyor"]["belt_velocity_mps"]))
             self._spur_cur = {}          # zone -> 마지막 지시값 (스팸 방지)
+            # ★ 진입부 보호 (2026-08-27 2차 — 영상 'A존 상자겹침' 프레임 추적).
+            #   점유 정지가 **막 꺾여 들어오던 박스를 본선 교차 지점에서 얼렸다** —
+            #   입구에 45도로 걸쳐 선 박스를 본선 뒤차들이 치고 지나가며 회전
+            #   (yaw 60/180)·겹침·사이드 이탈이 났다. 진입부(교차 창 ~ 진입 판정
+            #   +여유)에 박스가 있는 동안은 정지를 미룬다 — 교차로를 벗어난 뒤
+            #   얼리면 의도대로 "지선 중간 대기"가 된다.
+            self._cross = {str(k).upper(): (v[0] / 1000.0, v[1] / 1000.0)
+                           for k, v in
+                           (cfg["zones"].get("pickup_cross_mm") or {}).items()}
+            self._entry_m = (float(cfg["routing"].get("divert_done_y_mm", 1200))
+                             / 1000.0 + 0.4)
             log("[gtpick] 지선 점유 제어 켬 (PL_SPUR_STOP=2) — 스토퍼에 박스가"
-                " 있는 동안 그 지선을 세운다")
+                " 있는 동안 그 지선을 세운다 (진입부 %.1fm 까지는 통과 보장)"
+                % self._entry_m)
         self.next_t = 0.0
         self._said = {}          # zone -> 마지막으로 알린 box_id (로그 도배 방지)
         # ★ 자리 잡음 판정 (2026-08-27 실측). 도착 직후 아직 돌고 있는 박스를
@@ -512,6 +524,15 @@ class _GtPick:
             # ── 점유 기반 지선 제어 (__init__ 의 _spur2 주석) ──
             if self._spur2:
                 want = 0.0 if present else self._spur_mps
+                if want == 0.0:
+                    # 진입부 보호 — 교차 창에 박스가 있으면 아직 못 세운다
+                    _cw = self._cross.get(str(z).upper())
+                    if _cw and any(
+                            _e.get("pos_m") is not None
+                            and _cw[0] <= _e["pos_m"][0] <= _cw[1]
+                            and 0.30 <= _e["pos_m"][1] <= self._entry_m
+                            for _e in dict(self.sp._snap).values()):
+                        want = self._spur_mps
                 if self._spur_cur.get(z) != want:
                     try:
                         self._cc.set_velocity("%s_pickup" % str(z).lower(), want)
