@@ -214,9 +214,21 @@ class RosSide:
             #   부수 효과: 첫 박스가 지선 진입 판정을 빨리 넘어 소터 열림 시간이
             #   줄고, 뒤차가 딸려 들어가는 확률도 준다.
             #   흡착 중 끌림이 다시 보이면 PL_SPUR_STOP=1 로 정지 방식 복원.
-            if act == 0 and os.environ.get("PL_SPUR_STOP", "0") == "1":   # PICK
+            _spur_stop = os.environ.get("PL_SPUR_STOP", "0") == "1"
+            if act == 0 and _spur_stop:                         # PICK — 하강 전 정지
                 self.link.call(cmd="set_velocity", seg=seg, mps=0.0)
             ev = run_cmd(self.cycle, _clean(cmd), log=self.log)
+            # ★ 재가동 시점 = **집어 올린 직후** (2026-08-27 김병직 설계).
+            #   PLACE 끝까지 세워 두면 뒤차 도착이 배치 시간만큼 늦고, 상시 가동은
+            #   뒤차가 스토퍼 앞차에 붙어 실루엣이 병합된다 (풀 비전 실측).
+            #   픽 성공 순간 돌리면 뒤차는 로봇이 배치하러 간 사이에 **홀로**
+            #   스토퍼에 도착한다 — 병합 0 · 파이프라인 손실 0.
+            #   ⚠ 픽 실패여도 재가동한다: 실패 3회 뒤 폐기(despawn) 경로에는
+            #     PLACE 가 없어서, 여기서 안 돌리면 지선이 영영 선다 (교착).
+            #     실패 재시도 중 뒤차가 접근하는 창은 남지만 지선 0.3 에서
+            #     흡착 실패 자체가 드물다 (간극 2.1~2.4mm 실측).
+            if _spur_stop and act == 0:
+                self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
             if act == 1:                                        # PLACE — 성공/실패 무관
                 self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
             self._push(ev)
