@@ -38,5 +38,18 @@ if [ -d "$BRIDGE_LIB" ] && [[ ":$LD_LIBRARY_PATH:" != *":$BRIDGE_LIB:"* ]]; then
     export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$BRIDGE_LIB"
 fi
 
+# ★ 낙하 배치 — 2026-08-25 채택 실행값 (적재율 75.5%).
+#   ⚠ 이 둘만 **아직 환경변수다.** yaml 로 못 옮긴다:
+#     PL_DROP_KG      packing_robot/cycle.py     모듈 import 시점에 읽는다
+#     PL_CONTACT_STOP packing_sim/isaac/robot_motion.py
+#   둘 다 **Isaac 프로세스 안에서** 읽히므로 여기(exec 전)에서 걸어야 한다.
+#   ROS launch 에 넣어도 Isaac 에는 안 닿는다 — 다른 프로세스다.
+#   ★ drop_max_kg(system.yaml) 와 PL_DROP_KG 가 **같아야 한다.** 어긋나면
+#     계획이 연 자리를 로봇이 거부한다.
+#   ⚠ 헤드리스 게이트처럼 이 껍데기를 안 쓰는 실행은 직접 export 해야 한다.
+: "${PL_DROP_KG:=3.5}"
+: "${PL_CONTACT_STOP:=1}"
+export PL_DROP_KG PL_CONTACT_STOP
+
 cd "$ISAAC_DIR"
 exec ./isaac-sim.sh --exec "$HERE/demo_stack15_test1_1.py" "$@"
