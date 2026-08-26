@@ -774,24 +774,55 @@ else:
         % (pw, pd, clr, pw + 2 * clr, pd + 2 * clr))
     say("   유효 적재 면적은 팔레트 그대로 %.0f x %.0f (%.0f mm2)" % (pw, pd, pw * pd))
 
+    # 옛 이름(2 면 시절)을 끈다 — 재고 고치기라 여러 번 돌아도 안전해야 한다
+    for z in sorted(origins):
+        for suf in ("lo", "hi"):
+            old = st.GetPrimAtPath(fmt % (z, suf))
+            if old.IsValid():
+                old.SetActive(False)
+
     for z in sorted(origins):
         ox, oy, oz = [float(v) for v in origins[z]]
         cx, cy = ox + pw / 2.0, oy + pd / 2.0
         z1 = oz + float(pal["max_stack_mm"]) if str(GW.get("z_to")) == "stack" \
             else float(GW.get("z_to_mm", oz))
-        rx = float(robots[z][0])
-        # 로봇이 팔레트의 어느 쪽(X)에 있나. 그쪽 벽을 비운다.
-        robot_side = "hi" if rx > cx else "lo"
+        rx, ry = float(robots[z][0]), float(robots[z][1])
+        # 비울 면을 **유도**한다. 두 곳이다:
+        #   (1) 로봇 베이스가 붙은 면
+        #   (2) ★ 픽업 쪽 면 — 로봇이 박스를 **지선에서 집어 와** 팔레트로
+        #       넘긴다. 그 사이에 벽을 세우면 팔이 박스를 들고 못 넘어간다.
+        #       실측 2026-08-26: -Y 면을 세웠더니 **12/12 IK_FAIL** 이 났다
+        #       (픽업 Y 4181 · 팔레트 Y 4476~ · 벽 Y 4451~4471 · 높이 800~1950).
+        open_sides = set()
+        if abs(rx - cx) >= abs(ry - cy):
+            open_sides.add("xhi" if rx > cx else "xlo")
+        else:
+            open_sides.add("yhi" if ry > cy else "ylo")
+        if GW.get("skip_pick_side", True):
+            py = float(cfg["conveyor"]["stopper_x_mm"])      # 지선 끝 = 픽업 Y
+            px = float(robots[z][0])                         # 지선 중심 = 로봇 X
+            if abs(px - cx) >= abs(py - cy):
+                open_sides.add("xhi" if px > cx else "xlo")
+            else:
+                open_sides.add("yhi" if py > cy else "ylo")
+        robot_side = "/".join(sorted(open_sides))
+
+        # 네 면. 모서리가 맞물리게 Y 면은 두께만큼 더 길게 뺀다.
+        hx, hy = pw / 2.0 + clr, pd / 2.0 + clr
+        faces = {
+            "xlo": (cx - hx - th, cx - hx, cy - hy - th, cy + hy + th),
+            "xhi": (cx + hx, cx + hx + th, cy - hy - th, cy + hy + th),
+            "ylo": (cx - hx, cx + hx, cy - hy - th, cy - hy),
+            "yhi": (cx - hx, cx + hx, cy + hy, cy + hy + th),
+        }
         made = []
-        for suf, sign in (("lo", -1.0), ("hi", +1.0)):
+        for suf, (x0, x1, y0, y1) in faces.items():
             name = fmt % (z, suf)
-            if GW.get("skip_robot_side", True) and suf == robot_side:
-                old = st.GetPrimAtPath(name)
-                if old.IsValid():
-                    old.SetActive(False)      # 전에 세웠다면 끈다
+            prim = st.GetPrimAtPath(name)
+            if GW.get("skip_robot_side", True) and suf in open_sides:
+                if prim.IsValid():
+                    prim.SetActive(False)
                 continue
-            inner = cx + sign * (pw / 2.0 + clr)
-            x0, x1 = sorted((inner, inner + sign * th))
             cu = UsdGeom.Cube.Define(st, name)
             cu.GetSizeAttr().Set(1.0)
             pr = cu.GetPrim()
@@ -804,17 +835,16 @@ else:
                 if pr.HasAttribute(a):
                     pr.RemoveProperty(a)
             xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Vec3d((x0 + x1) / 2000.0, cy / 1000.0, (z0 + z1) / 2000.0))
-            xf.AddScaleOp().Set(Gf.Vec3f((x1 - x0) / 1000.0, pd / 1000.0,
+                Gf.Vec3d((x0 + x1) / 2000.0, (y0 + y1) / 2000.0,
+                         (z0 + z1) / 2000.0))
+            xf.AddScaleOp().Set(Gf.Vec3f((x1 - x0) / 1000.0, (y1 - y0) / 1000.0,
                                          (z1 - z0) / 1000.0))
             if not pr.HasAPI(UsdPhysics.CollisionAPI):
                 UsdPhysics.CollisionAPI.Apply(pr)
-            v = bb(name)
-            made.append("%s X %.1f~%.1f" % (suf, v[0], v[3]))
-        say("   %s  팔레트 중심 X %.1f · 로봇 X %.1f -> **%s 쪽 비움**"
-            % (z, cx, rx, robot_side))
-        say("       %s  ·  Y %.1f~%.1f  Z %.1f~%.1f"
-            % (" / ".join(made) or "(없음)", cy - pd / 2, cy + pd / 2, z0, z1))
+            made.append(suf)
+        say("   %s  팔레트 중심 (%.0f, %.0f) · 로봇 (%.0f, %.0f) -> **%s 비움**"
+            % (z, cx, cy, rx, ry, robot_side))
+        say("       세운 면 %s  ·  Z %.1f~%.1f" % ("/".join(sorted(made)), z0, z1))
 
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)

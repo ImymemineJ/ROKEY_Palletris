@@ -291,6 +291,10 @@ pallet:
     clearance_mm: 5          # 팔레트 가장자리 바깥 여유 (편도)
     thickness_mm: 20
     skip_robot_side: true
+    # ★ 픽업 쪽 면도 비운다. 로봇이 박스를 **지선에서 집어 와** 팔레트로 넘기므로
+    #   그 사이를 막으면 팔이 못 넘어간다 — 실측 2026-08-26 **12/12 IK_FAIL**.
+    #   (픽업 Y 4181 · 팔레트 Y 4476~ · 벽이 Y 4451~4471 에 1150 mm 로 섰다)
+    skip_pick_side: true
     # 높이: 벨트면부터 **적재 상한 위**까지 — 낙하를 막으려면 스택보다 높아야 한다
     z_from_mm: 800           # conveyor.belt_top_z_mm 와 같다
     z_to: stack              # 팔레트 상면 + max_stack_mm
