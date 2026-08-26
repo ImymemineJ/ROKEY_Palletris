@@ -239,7 +239,8 @@ def main():
             return _q.run(_job)
 
         H["despawn_box"] = h_despawn_grip
-        server.register({"despawn_box": h_despawn_grip})
+        # register() 는 중복을 거부한다 — 이건 의도된 덮어쓰기이므로 표에 직접 넣는다
+        server.handlers["despawn_box"] = h_despawn_grip
 
         # ── 로봇 (B 소유 핸들러) ─────────────────────────────
         # ★ 지금 집으려는 박스. 워커가 없는 정본 서버에서는 `grasp` 요청이 곧
