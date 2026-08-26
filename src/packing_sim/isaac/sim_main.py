@@ -212,6 +212,35 @@ def main():
         H.update(cc.handlers())
         server.register(cc.handlers())
 
+        # ★ despawn 래퍼 (2026-08-27 실측). PLACE 실패(걸림 142mm·낙하 불가)로
+        #   박스가 패드에 매달린 채 관제탑이 despawn 을 부를 수 있다. 그리퍼
+        #   조인트를 문 채 순간이동시키면 조인트가 로봇을 잡아채므로, 어느 팔이든
+        #   그 박스를 물고 있으면 **먼저 패드를 열고** 치운다. 전부 mainq 안에서
+        #   한 job 으로 돌아 순서가 보장된다. rms 는 아래 로봇 루프가 채운다 —
+        #   같은 dict 객체라 클로저로 잡아도 나중 내용이 보인다.
+        _despawn_orig = H["despawn_box"]
+
+        def h_despawn_grip(req, _sp=sp, _rms=rms, _q=q):
+            bid = (req or {}).get("box_id")
+            rec = _sp.boxes.get(bid)
+            if rec is None:
+                return {"ok": False, "error": "없는 box_id %s" % bid}
+
+            def _job():
+                for _z, _rm in _rms.items():
+                    try:
+                        if rec["path"] in (_rm.grip.gripped() or []):
+                            _rm.grip.open()
+                            print("[sim_main] despawn 전 %s 그리퍼 개방 — %s 를 물고 있었다"
+                                  % (_z, bid))
+                    except Exception as e:      # 개방 실패해도 despawn 은 진행한다
+                        print("[sim_main] despawn 전 그리퍼 개방 실패(%s): %s" % (_z, e))
+                return _sp._despawn(bid)
+            return _q.run(_job)
+
+        H["despawn_box"] = h_despawn_grip
+        server.register({"despawn_box": h_despawn_grip})
+
         # ── 로봇 (B 소유 핸들러) ─────────────────────────────
         # ★ 지금 집으려는 박스. 워커가 없는 정본 서버에서는 `grasp` 요청이 곧
         #   그 신호다. B 코드를 고치지 않고 **등록할 때 감싸서** 채운다.

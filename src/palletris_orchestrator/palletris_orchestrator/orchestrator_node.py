@@ -581,10 +581,17 @@ class ZoneCycle:
                 self.t_robot = time.time()
                 self.send_robot_cmd(RobotCmd.PICK)
                 return
-            # PLACING 실패 등 그 외: 계획 취소하고 처음으로 (기존 경로)
-            self.call_async("/algo/cancel_plan",
-                            {"zone": self.zone_id, "box_id": box_id}, None)
-            self.reset_to_idle()
+            # ── PLACING 실패: 박스가 십중팔구 패드에 매달려 있다 ──
+            # ★ 2026-08-27 실측 (A존): BOX054 를 2층에 놓다가 142mm 위에서 걸려
+            #   (5kg 낙하 불가) ABORTED 났는데, 여기가 reset_to_idle 만 하고
+            #   박스를 안 치웠다 — 문 채 IDLE 로 돌아가 이후 모든 PICK 이
+            #   매달린 박스(높이 280)에 막혀 잔차 306mm ABORTED 폭풍, 존 영구
+            #   고장. 치운다(despawn 이 sim 쪽에서 그리퍼 개방까지 한다) —
+            #   박스를 이미 떨어뜨린 경우(DROPPED)도 같은 처리가 맞다:
+            #   어디 떨어졌는지 모르는 박스는 라인에서 빼는 것뿐이다.
+            self._fail_box = (None, 0)
+            self.send_robot_cmd_home()
+            self.discard_box("PLACE_FAILED:%s" % ev.reason)
             return
 
         if self.state == PICKING:
