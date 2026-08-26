@@ -414,7 +414,11 @@ class LineDetector(Node):
         #   있을 때만 판정한다 — 벨트 위라 중앙 프레임은 반드시 온다.
         _c = np.mean(np.asarray(det["corners_px"], float), axis=0)
         _H, _W = bgr.shape[0], bgr.shape[1]
-        if abs(_c[0] - _W / 2.0) > _W / 3.0 or abs(_c[1] - _H / 2.0) > _H / 3.0:
+        # ★ 2차: 2/3 -> **1/3 폭** (같은 날). 2/3 안에서도 최대 부풀기 +39mm 라
+        #   3호가 375mm 까지 밀리는데 3/4호 분류 경계가 정확히 375 다 — 시드 고정
+        #   지터가 그 구간인 BOX015/018 이 재현성 있게 4호로 넘어갔다 (실측 2판).
+        #   1/3 폭이면 최대 +19mm, 경계까지 16mm 여유.
+        if abs(_c[0] - _W / 2.0) > _W / 6.0 or abs(_c[1] - _H / 2.0) > _H / 6.0:
             return None, None, None         # 중앙 아님 — 다음 프레임에서 판정
         try:
             R, t = camera_pose(self.tf_buf, self.world_frame,
