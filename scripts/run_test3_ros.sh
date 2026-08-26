@@ -103,6 +103,9 @@ export PL_SPAWN_N="${PL_SPAWN_N:-0}"   # 총 개수. 0 = 무제한
 #   같아야 한다 (yaml 주석의 경고). 이걸 안 켜고 돌리면 계획은 협곡 안에 자리를
 #   주는데 로봇은 낙하 없이 내려가다 옆 박스를 쓸어 친다 (B섹터 이상현상.mp4 실측).
 export PL_DROP_KG="${PL_DROP_KG:-3.5}"
+# ★ /clock·/tf 강제 발행 (2026-08-27). 씬의 ROS2Bridge/Clock 노드가 발행자 0 실측 —
+#   PL_CAMROS=2 와 같은 사연. 씬이 진짜로 내는 게 확인되면 1(자동)로 되돌릴 것.
+export PL_CLOCKTF="${PL_CLOCKTF:-2}"
 
 ARGS=(--stage "$PL_STAGE" --zones "$PL_ZONES" --ros --autorun
       --spawn-period "$PL_SPAWN" --spawn-count "$PL_SPAWN_N")

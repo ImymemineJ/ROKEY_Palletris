@@ -264,16 +264,28 @@ def build_clock_tf(cfg, log=print):
     g = str(ros.get("graph_path", "/World/ROS2Bridge"))
     st = omni.usd.get_context().get_stage()
 
+    # ★★ PL_CLOCKTF=2 — 씬 노드와 무관하게 **우리가 낸다** (2026-08-27).
+    #   PL_CAMROS=2 와 같은 사연이다: 씬에 /World/ROS2Bridge/Clock 노드가
+    #   생겼는데(setup_test3_scene [11] 적용본) 실측은 발행자 0 이다 —
+    #   ros2 topic info /clock → Publisher 0 · Subscription 3, /tf 는 토픽조차
+    #   없음 (2026-08-27 새벽). 노드만 보고 비켜서면 **아무도 안 낸다.**
+    #   씬 그래프와 경로가 겹치지 않게 별도 경로에 세운다.
+    _force = os.environ.get("PL_CLOCKTF") == "2"
+    if _force:
+        g = GRAPH + "_ClockTf"
+        log("[ros_graph] PL_CLOCKTF=2 — 씬 노드와 무관하게 /clock·/tf 를 우리가 낸다")
+
     # 씬이 이미 내고 있나. 그래프 경로가 다를 수 있으니 **노드 타입으로** 훑는다.
     scene_clock = scene_tf = None
-    for prim in st.Traverse():
-        if prim.GetTypeName() == "OmniGraphNode":
-            t = str((prim.GetAttribute("node:type").Get()
-                     if prim.GetAttribute("node:type") else "") or "")
-            if t.endswith("ROS2PublishClock"):
-                scene_clock = prim
-            elif t.endswith("ROS2PublishTransformTree"):
-                scene_tf = prim
+    if not _force:
+        for prim in st.Traverse():
+            if prim.GetTypeName() == "OmniGraphNode":
+                t = str((prim.GetAttribute("node:type").Get()
+                         if prim.GetAttribute("node:type") else "") or "")
+                if t.endswith("ROS2PublishClock"):
+                    scene_clock = prim
+                elif t.endswith("ROS2PublishTransformTree"):
+                    scene_tf = prim
     if scene_clock is not None:
         log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다" % scene_clock.GetPath())
         # ★★ 비켜서기 **전에** 광학 프레임을 씬의 tf 에 붙인다 (2026-08-26).
