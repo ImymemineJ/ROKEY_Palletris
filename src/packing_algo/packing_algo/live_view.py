@@ -18,14 +18,25 @@
 | `/robot/event` (`RobotEvent`) | PLACE 성공의 **실측 pose** — 3D 배치도와 heightmap 을 여기서 재구성한다 |
 | `/zone_<z>/status` (`ZoneStatus`) | 관제탑이 발표하는 **공식** 적재수·적재율·최고높이·상태 |
 | `/db/get_box_info` (`GetBoxInfo`) | box_id → 치수. RobotEvent 에 치수가 없다 |
+| `/algo/heightmap/<z>` (`sensor_msgs/Image`) | **algo 의 진짜 heightmap** (켜져 있을 때만) |
 
 ★ **알고리즘 노드에 새 발행을 시키지 않았다.** CLAUDE.md §8 이 "알고리즘은 로봇
   명령을 내지 않는다" 를 정했고, 시각화를 위해 전용 토픽을 새로 파면 `packing_msgs`
   가 바뀌어 팀 4명이 전부 재빌드해야 한다 (§11). 이미 있는 인터페이스만 쓴다.
 
-★ 그래서 이 화면의 heightmap 은 algo 의 것을 **복사**한 게 아니라 같은 입력으로
-  **다시 계산한** 것이다. 둘이 어긋나면 그건 버그의 신호다 — 화면 위에 경고를 띄운다
-  (관제탑이 세는 적재수와 여기서 재구성한 수를 대조한다).
+★ heightmap 은 두 경로가 있다.
+
+  1. **algo 가 직접 보내 준 것** — algo 를 `-p heightmap_topic:=/algo/heightmap` 으로
+     띄우면 16UC1 `sensor_msgs/Image` 로 나온다. **이게 진짜다.**
+     전용 msg 를 새로 만들지 않은 이유: heightmap 은 그냥 120×80 2차원 배열이고,
+     `packing_msgs` 를 건드리면 팀 4명이 전부 재빌드해야 한다 (§11).
+     `TRANSIENT_LOCAL` 이라 **뷰어를 늦게 띄워도 마지막 상태를 바로 받는다.**
+  2. **여기서 다시 계산한 것** — `/robot/event` 의 실측 pose 로 재구성한다.
+     algo 발행이 꺼져 있으면 이쪽만 쓴다.
+
+  둘이 다 있으면 **1을 그리고 2와 대조한다.** 어긋나면 화면에 경고를 띄운다 —
+  `UpdateHeightmap` 에 계획값이 들어갔거나 이벤트를 놓쳤다는 뜻이다 (§3-4 규약 3).
+  화면 제목에 지금 무엇을 보고 있는지("algo 발행" / "재구성")를 적는다.
 
 ## 알려진 한계
 
@@ -78,6 +89,10 @@ def make_ros_source(zone, argv):
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
 
+    from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                           ReliabilityPolicy)
+    from sensor_msgs.msg import Image
+
     from packing_msgs.msg import RobotCmd, RobotEvent, ZoneStatus
     from packing_msgs.srv import GetBoxInfo
 
@@ -89,6 +104,9 @@ def make_ros_source(zone, argv):
             super().__init__("live_view")
             self.declare_parameter("zone", zone)
             self.zone = str(self.get_parameter("zone").value).lower()
+            # algo 가 heightmap 을 내보내면 그걸 쓴다 (기본 경로). 빈 문자열이면 안 듣는다.
+            self.declare_parameter("heightmap_topic", "/algo/heightmap")
+            self.hm_topic = str(self.get_parameter("heightmap_topic").value or "")
             self.cfg = load()
             self.pk = HeightmapPacker(self.cfg)
             # ★ 콜백이 동시에 돈다 (MultiThreadedExecutor). pk 는 읽기/쓰기가 겹치므로
@@ -99,6 +117,7 @@ def make_ros_source(zone, argv):
             self.notes = []               # 화면에 띄울 경고
             self.seen = set()             # 이미 반영한 (seq, box_id) — 중복 이벤트 방지
             self.pending = {}             # box_id -> 치수 조회 중인 이벤트
+            self.algo_hm = None           # algo 가 보내 준 **진짜** heightmap
 
             cb = ReentrantCallbackGroup()
             self.create_subscription(RobotEvent, "/robot/event", self.on_event, 10,
@@ -107,6 +126,15 @@ def make_ros_source(zone, argv):
                                      self.on_status, 10, callback_group=cb)
             self.cli = self.create_client(GetBoxInfo, "/db/get_box_info",
                                           callback_group=cb)
+            if self.hm_topic:
+                # ★ TRANSIENT_LOCAL 로 맞춰야 한다. 발행 쪽이 TRANSIENT_LOCAL 인데
+                #   VOLATILE 로 구독하면 **연결 자체가 안 된다** — 토픽은 보이는데
+                #   메시지가 하나도 안 오는, 에러 없는 실패가 된다.
+                qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                                 reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+                self.create_subscription(Image, f"{self.hm_topic}/{self.zone}",
+                                         self.on_hm, qos, callback_group=cb)
             self.PLACE = RobotCmd.PLACE
             self.get_logger().info(
                 f"live_view — zone {self.zone} · /robot/event 와 /zone_{self.zone}/status 를 듣는다")
@@ -124,6 +152,24 @@ def make_ros_source(zone, argv):
                     self.pk.reset()
                     self.seen.clear()
                     self.t0 = None
+
+        # ---------- /algo/heightmap/<z> ----------
+        def on_hm(self, msg):
+            """algo 의 heightmap 을 그대로 받는다 (16UC1 Image).
+
+            ★ 재구성보다 이쪽이 **진짜**다. 다만 재구성을 버리지 않는다 —
+              둘을 대조하는 것이 이 화면의 진단 가치이기 때문이다. 어긋나면
+              `UpdateHeightmap` 에 계획값이 들어갔거나 이벤트를 놓친 것이다.
+            """
+            try:
+                if msg.encoding != "16UC1":
+                    self._note(f"heightmap encoding 이 {msg.encoding} 다 — 16UC1 이어야 한다")
+                    return
+                a = np.frombuffer(msg.data, dtype="<u2")
+                # 발행 쪽이 height=W(Px) · width=D(Py) 로 넣었다 (algo_service_node._pub_hm)
+                self.algo_hm = a.reshape(msg.height, msg.width).astype(np.int32)
+            except Exception as e:      # noqa: BLE001 — 콜백은 절대 안 죽는다
+                self._note(f"heightmap 수신 실패: {e}")
 
         # ---------- /robot/event ----------
         def on_event(self, ev):
@@ -207,6 +253,20 @@ def make_ros_source(zone, argv):
                                   pose["z_mm"], ww, dd, h, pose["yaw_deg"]])
                 notes = list(self.notes)
                 n = len(pk.placed)
+                # ★ algo 가 보내 준 heightmap 이 있으면 **그게 진짜**다. 재구성은
+                #   버리지 않고 대조에만 쓴다 — 둘이 어긋나는 것이 곧 버그 신호다.
+                hm, hm_src = pk.hm, "재구성"
+                if self.algo_hm is not None:
+                    if self.algo_hm.shape != pk.hm.shape:
+                        notes.append(f"algo heightmap 크기 {self.algo_hm.shape} 가 "
+                                     f"설정 {pk.hm.shape} 와 다르다 — config 불일치")
+                    else:
+                        hm, hm_src = self.algo_hm, "algo 발행"
+                        gap = int(np.abs(self.algo_hm - pk.hm).max())
+                        if gap > pk.cell:
+                            notes.append(
+                                f"algo heightmap 과 재구성이 최대 {gap}mm 어긋난다 — "
+                                "UpdateHeightmap 에 계획값이 들어갔거나 이벤트를 놓쳤다")
                 # 재구성과 공식 집계가 어긋났다면 숨기지 않고 화면에 띄운다.
                 # ★ 단, **치수 조회가 도는 중**이면 어긋나는 게 정상이다 —
                 #   get_box_info 왕복 동안 잠깐 하나 모자란다. 그때까지 경고를 내면
@@ -219,9 +279,9 @@ def make_ros_source(zone, argv):
                 return {"zone": self.zone, "count": n, "fill": pk.fill_rate(),
                         "cap": pk.capacity_rate(),
                         "elapsed_s": 0.0 if self.t0 is None else time.perf_counter() - self.t0,
-                        "hmax": int(pk.hm.max()), "max_stack": pk.max_stack,
+                        "hmax": int(hm.max()), "max_stack": pk.max_stack,
                         "pallet": [pk.W * pk.cell, pk.D * pk.cell],
-                        "hm": pk.hm, "boxes": boxes,
+                        "hm": hm, "hm_src": hm_src, "boxes": boxes,
                         "state": "" if off is None else off.state,
                         "notes": notes[-3:]}
 
@@ -265,7 +325,9 @@ def draw(fig, axes, st, fills):
     hm = np.asarray(st["hm"])
     ax_hm.imshow(hm.T, origin="lower", cmap="viridis", vmin=0, vmax=ms,
                  extent=[0, W, 0, D], aspect="equal")
-    ax_hm.set_title("heightmap (mm)", fontsize=9)
+    # 어느 쪽 heightmap 을 보고 있는지 제목에 밝힌다 — "진짜냐 재구성이냐" 를
+    # 모르면 화면을 믿을 수도 의심할 수도 없다.
+    ax_hm.set_title(f"heightmap (mm) — {st.get('hm_src', '재구성')}", fontsize=9)
     ax_hm.set_xlabel("Px"); ax_hm.set_ylabel("Py")
 
     # 적재율 두 가지를 같이 그린다 — 기준이 다르면 곡선 모양이 아주 다르다.
@@ -371,7 +433,8 @@ def main():
                 #   CPU 를 먹고 창이 버벅인다.
                 # ★ 경고가 바뀐 것도 '바뀐 것'이다. 박스가 안 늘 때만 나는 경고
                 #   (db 없음 등)가 있어서, 개수만 보면 그 경고가 영영 안 뜬다.
-                notes_sig = tuple(st.get("notes") or ())
+                notes_sig = (tuple(st.get("notes") or ()), st.get("hm_src"),
+                             st.get("hmax"))
                 if changed or notes_sig != last_notes or args.source == "file":
                     last_notes = notes_sig
                     draw(fig, axes, st, fills or [pair])
