@@ -79,7 +79,7 @@ import sys
 import yaml
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
-CUR = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/project_1/test_3.usd")
+CUR = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/Collected_test_3/test_3.usd")
 OVL = os.environ.get("PL_CONFIG_OVERLAY",
                      "/home/rokey/palletris_ws/src/packing_bringup/config/test_3.yaml")
 A47 = ("https://omniverse-content-production.s3-us-west-2.amazonaws.com"

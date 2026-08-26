@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(ROOT, "src", "packing_sim", "isaac"))
 from pxr import Usd, UsdGeom                                   # noqa: E402
 
 STAGE = os.environ.get("PL_STAGE",
-                       "/home/rokey/isaac_scenes/project_1/test_3.usd")
+                       "/home/rokey/isaac_scenes/Collected_test_3/test_3.usd")
 OVERLAY = os.environ.get("PL_CONFIG_OVERLAY",
                          os.path.join(ROOT, "src", "packing_bringup",
                                       "config", "test_3.yaml"))

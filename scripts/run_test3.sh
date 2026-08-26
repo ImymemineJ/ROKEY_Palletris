@@ -22,7 +22,7 @@
 #   system.yaml 은 그대로 두므로 test1-1 기준선은 영향받지 않는다.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-export PL_STAGE="${PL_STAGE:-/home/rokey/isaac_scenes/project_1/test_3.usd}"
+export PL_STAGE="${PL_STAGE:-/home/rokey/isaac_scenes/Collected_test_3/test_3.usd}"
 export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-src/packing_bringup/config/test_3.yaml}"
 export PL_ZONE="${PL_ZONE:-A}"
 # ★ 로봇 **3 대를 동시에** 돌린다. 존마다 워커·팔·팔레트가 따로다.

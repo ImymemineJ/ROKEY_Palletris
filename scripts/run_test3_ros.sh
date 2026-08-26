@@ -69,7 +69,7 @@ for _f in "share/packing_msgs/srv/SetVelocity.srv" \
 done
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-115}"
-export PL_STAGE="${PL_STAGE:-$HOME/isaac_scenes/project_1/test_3.usd}"
+export PL_STAGE="${PL_STAGE:-$HOME/isaac_scenes/Collected_test_3/test_3.usd}"
 export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-$WS/src/packing_bringup/config/test_3.yaml}"
 export PL_ZONES="${PL_ZONES:-A,B,C}"
 
