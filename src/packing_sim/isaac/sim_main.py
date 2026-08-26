@@ -255,6 +255,7 @@ def main():
         #   메시지 필드가 Play 후에야 생겨서 그 전에 이으면 죽는다 (TS-022 2번).
         # ★ 그래프는 하나, 서비스는 한 벌, 구역별 `RosSide` 는 step() 만 각자 돈다.
         ros = []
+        gtpick = None
         if a.ros:
             # ★ omni.replicator.core 는 **카메라용**이다 — `ROS2CameraHelper` 가
             #   요구하는 renderProduct 를 여기서 만든다 (ros_graph.build_cameras).
@@ -266,6 +267,13 @@ def main():
             ros_side.install_services(H)
             ros_side.build(ZONES, cfg=cfg)   # cfg -> /clock·/tf 도 (씬에 없을 때만)
             ros = [ros_side.RosSide(cfg, z, HZ[z]) for z in ZONES]
+            # ★ 임시 대역 — 카메라가 없어 인식 노드가 못 내는 픽업 좌표를
+            #   씬 실측으로 대신 낸다. PL_GTPICK=0 이면 안 만든다.
+            import ros_graph as _RG
+            if _RG.GT_PICK:
+                gtpick = _GtPick(sp, ZONES, _RG)
+                print("[sim_main] 픽업 좌표를 **씬 실측**으로 낸다 (임시 대역) — "
+                      "카메라가 들어오면 PL_GTPICK=0")
 
         world.reset()
         if rms:
@@ -332,6 +340,8 @@ def main():
                 router.step(time.time())   # ★ 논블로킹 (§9). 급송보다 먼저.
             if feeder is not None:
                 feeder.step(time.time())
+            if gtpick is not None:
+                gtpick.step(time.time())   # ★ ros.step 앞. 이번 틱에 반영되게
             for _r in ros:
                 _r.step()              # ★ 논블로킹. 모션은 워커가 돈다 (§9)
             # ★★ **헤드리스에서도 render=True 로 돈다.**
@@ -366,6 +376,67 @@ def main():
         kit.close()
 
 
+# 마스터 DB. `db_service_node.default_db_path()` 와 같은 자리다 (워크스페이스 루트).
+#   ★ **읽기 전용으로만 연다.** 유일한 writer 는 db_service_node 다 (CLAUDE.md §8) —
+#     다른 프로세스가 쓰기로 열면 `database is locked` 가 난다.
+_DB_PATH = str(Path(__file__).resolve().parents[3] / "palletris.db")
+
+
+class _GtPick:
+    """픽업 좌표를 **씬 실측(ground truth)** 으로 `/zone_*/box_at_pickup` 에 낸다.
+
+    ★★ **임시 대역이다.** §3-2 정본은 이 토픽을 인식 노드(트랙 D)가 낸다.
+      씬에 카메라 prim 이 아직 하나도 없어서(2026-08-26, 89 개 삭제) 그 노드가
+      볼 이미지가 없다. 이 토픽 하나가 비면 관제탑이 **영원히 IDLE** 이라
+      그 뒤 사슬(algo · db · 로봇 · 반출)을 통째로 못 잰다.
+      카메라가 들어오면 `PL_GTPICK=0` 으로 끄고 인식 노드로 돌린다.
+      ⚠ 둘 다 켜면 발행자가 둘이라 관제탑이 두 좌표를 번갈아 받는다.
+
+    ★ 값은 `spawner.h_pickup_check` 가 그대로 준다 — 스토퍼에 **멎은** 박스만
+      돌려주므로 도착 판정을 여기서 다시 하지 않는다.
+
+    ★ 5 Hz 로 낸다. 관제탑이 같은 박스를 여러 번 받는 것을 전제로 만들어져 있고
+      (`on_box_arrived`: "detector 는 5Hz 폴링"), 늦게 떠도 도착을 놓치지 않는다.
+    """
+
+    PERIOD_S = 0.2
+
+    def __init__(self, spawner, zones, rg, log=print):
+        # ★ `ros_graph` 를 인자로 받는다. 그 모듈은 최상단에서 `omni.graph.core` 를
+        #   import 하므로 **Isaac 이 뜬 뒤에만** 들어온다 — sim_main 상단에서 못 건다.
+        self.sp, self.zones, self.rg, self.log = spawner, list(zones), rg, log
+        self.next_t = 0.0
+        self._said = {}          # zone -> 마지막으로 알린 box_id (로그 도배 방지)
+
+    def step(self, now):
+        if now < self.next_t:
+            return
+        self.next_t = now + self.PERIOD_S
+        for z in self.zones:
+            r = self.sp.h_pickup_check({"zone": z}) or {}
+            if r.get("error"):
+                # 스포너가 모르는 존이다. 조용히 넘어가면 영영 안 온다.
+                self.log("[gtpick] %s %s" % (z, r["error"]))
+                continue
+            pose = r.get("pose") or {}
+            pos = pose.get("pos_m") or (0.0, 0.0, 0.0)
+            present = bool(r.get("present"))
+            bid = str(r.get("box_id") or "")
+            self.rg.send_pickup(
+                zone=z, box_id=bid, present=present,
+                # ★ mm 정수다 (§3-2). x·y 는 박스 **중심**.
+                x_mm=int(round(pos[0] * 1000.0)),
+                y_mm=int(round(pos[1] * 1000.0)),
+                yaw_deg=float(pose.get("yaw_deg") or 0.0))
+            if present and self._said.get(z) != bid:
+                self._said[z] = bid
+                self.log("[gtpick] %s 도착 %s (%d, %d) yaw %.1f"
+                         % (z, bid, round(pos[0] * 1000), round(pos[1] * 1000),
+                            float(pose.get("yaw_deg") or 0.0)))
+            elif not present:
+                self._said[z] = None
+
+
 class _Feeder:
     """벨트에 박스를 하나씩 넣는다. **메인 스레드에서만** 돈다.
 
@@ -398,6 +469,37 @@ class _Feeder:
         dests = list(bx.get("dests") or [])
         dr = _r.Random(int(bx.get("random_seed", 42)))
         self.dests = [dr.choice(dests) for _ in range(n)] if dests else [None] * n
+        # ★★ 2026-08-26 — **마스터 DB 가 구역의 정본이다.**
+        #   정본 설계(트랙 D)는 운송장번호 -> boxes_master.address -> 동 ->
+        #   zone_map -> 구역 이다. `by_dest`(SEOUL/BUSAN/DAEJEON)는 그 앞 단계의
+        #   자리표시자라, 도시로 뿌리면 DB 가 정한 구역과 **어긋난다.**
+        #   실측 2026-08-26: BOX002(천왕동 -> C)가 **A 팔레트에 실렸다.** 에러는 없었다.
+        #   -> 여기서 box_id 의 DB 구역을 읽어, 그 구역으로 가는 dest 로 바꿔 준다.
+        #      라우팅 표(by_dest)는 그대로 쓰므로 진리원은 하나(DB)로 남는다.
+        #   ⚠ 임시다. 정본은 `/diverter/request`(db_service_node.on_diverter)를
+        #     부르는 것인데, 이 코드는 Isaac 안이라 rclpy 를 못 쓴다. 중재자 사슬이
+        #     붙으면 이 블록을 지운다.
+        self._db_dest = {}
+        try:
+            import sqlite3
+            _bd = (cfg.get("routing") or {}).get("by_dest") or {}
+            zone_to_dest = {}
+            for _d, _z in _bd.items():
+                zone_to_dest.setdefault(str(_z).upper(), _d)
+            if zone_to_dest:
+                _c = sqlite3.connect("file:%s?mode=ro" % _DB_PATH, uri=True)
+                for _bid, _z in _c.execute("SELECT box_id, zone FROM boxes_master"):
+                    _dd = zone_to_dest.get(str(_z).upper())
+                    if _dd:
+                        self._db_dest[_bid] = _dd
+                _c.close()
+                log("[투입] 구역은 **마스터 DB** 를 따른다 (%d 건) — by_dest 는 표기용"
+                    % len(self._db_dest))
+        except Exception as e:                                  # noqa: BLE001
+            # DB 를 못 읽어도 라인은 돌아야 한다. 다만 조용히 넘어가면 안 된다 —
+            # 그 순간부터 구역 배정이 DB 와 어긋난 채로 계속 돈다.
+            log("[투입] !! 마스터 DB 를 못 읽었다 (%r) — by_dest 로 뿌린다. "
+                "DB 가 정한 구역과 어긋날 수 있다" % (e,))
         self.h_spawn = sp.handlers()["spawn_box"]
         self.h_stat = sp.handlers()["spawn_status"]
         self.period, self.total, self.cap, self.log = float(period), int(total), int(cap), log
@@ -420,8 +522,10 @@ class _Feeder:
         #   ⚠ `demo_stack15_test1_1.py:134` 은 `BOX%05d` 인데 그쪽은 DB 를 안 쓴다.
         bid = "BOX%03d" % (self.i + 1)
         kw = {"box_id": bid, "type": self.types[self.i], "yaw_deg": 0}
-        if self.dests[self.i]:
-            kw["dest"] = self.dests[self.i]
+        # ★ DB 가 아는 박스면 DB 구역을 따른다 (위 주석).
+        _d = self._db_dest.get(bid) or self.dests[self.i]
+        if _d:
+            kw["dest"] = _d
         r = self.h_spawn(kw) or {}
         if r.get("ok"):
             self.i += 1

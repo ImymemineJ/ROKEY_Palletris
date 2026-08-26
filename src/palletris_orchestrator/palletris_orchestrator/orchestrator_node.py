@@ -12,6 +12,7 @@ orchestrator_node.py — 관제탑 (1차: B구역 전용)
   3. 로봇에게 명령하는 노드는 여기 하나뿐. algo도 detector도 로봇을 부르지 않는다
 """
 
+import os
 import threading
 import time
 
@@ -31,7 +32,10 @@ from packing_msgs.srv import (
     MarkPlaced,
     PlanPlacement,
     SetStatus,
+    ResetHeightmap,
+    SetSpawnEnabled,
     SetVelocity,
+    SwapPallet,
     UpdateHeightmap,
 )
 
@@ -64,6 +68,11 @@ SERVICES = {
     "/algo/cancel_plan":      CancelPlan,
     "/conveyor/set_velocity": SetVelocity,
     "/sim/despawn_box":       DespawnBox,
+    # ★ 2026-08-26 추가 — 팔레트 교체(§7 사양 경로). 서버는 셋 다 있었는데
+    #   **부르는 쪽이 없어서** PALLET_FULL 이 그냥 종료로 끝나고 있었다.
+    "/sim/set_spawn_enabled": SetSpawnEnabled,
+    "/sim/swap_pallet":       SwapPallet,
+    "/algo/reset_heightmap":  ResetHeightmap,
 }
 
 # ★ 로봇 모션 제한 시간. 집기·놓기는 5~10초 걸리므로 서비스 타임아웃(2초)과
@@ -71,6 +80,20 @@ SERVICES = {
 ROBOT_TIMEOUT_S  = 20.0
 
 CALL_TIMEOUT_S   = 2.0    # 서비스 응답 제한. 넘으면 계획을 버리고 IDLE 로 돌아간다
+# ★★ 2026-08-26 — **서비스별 예외.** 2.0 초는 "plan() < 200ms"(명세서 §7.9) 를
+#   전제로 정한 값인데, `lookahead k:4` 를 켠 뒤 plan 한 번이 786~859 ms 다
+#   (algo 노드 자신이 ERROR 로 찍는다). 구역이 셋이면 파이썬 GIL 때문에 사실상
+#   줄을 서서 2.4 초가 되고, **세 구역이 동시에 타임아웃 난다** — 로봇이 집은 채
+#   멈춘다 (실측 2026-08-26 error4).
+#   여기서 늘리는 것은 **증상 완화**다. 근본은 둘 중 하나로 정해야 한다:
+#     · lookahead 를 줄여 §7.9 를 지킨다 (k:1 이면 1 ms)
+#     · §7.9 기준을 실제 비용에 맞춰 개정한다 (정정인님 결정 사항)
+CALL_TIMEOUT_BY_SRV = {
+    "/algo/plan_placement":   6.0,
+    "/algo/update_heightmap": 6.0,
+    "/algo/cancel_plan":      6.0,
+    "/algo/reset_heightmap":  6.0,
+}
 WAIT_SERVER_S    = 2.0    # 서버가 아직 안 떴을 때 기다려 볼 시간
 TIMEOUT_SCAN_S   = 0.1    # 타임아웃 감시 주기
 # ★ IDLE 인데 스토퍼에 박스가 이만큼 서 있으면 치운다.
@@ -146,6 +169,11 @@ class ZoneCycle:
         self.rejected = 0
         self.fill_rate = 0.0        # ZoneStatus 가 매번 읽으므로 미리 만들어 둔다
         self.max_height_mm = 0
+        # ★ 판갈이 — PALLET_FULL 이 나면 몇 판까지 이어갈지. 1 이면 예전 동작
+        #   (첫 만재에 종료). 데모로 트럭 상차·재시작을 보려면 2 이상.
+        self._last_ev = None      # 마지막으로 처리한 (seq, action)
+        self.pallets_done = 0
+        self.max_pallets = int(os.environ.get("PL_MAX_PALLETS", "3"))
 
         # ★ 명령 일련번호. 로봇이 event 에 이 값을 그대로 실어 보내야
         #   "지금 온 결과가 방금 그 명령의 것"임이 보장된다.
@@ -269,12 +297,22 @@ class ZoneCycle:
     # ② FETCHING : DB에 "이 박스 크기 뭐야?" 물어본다
     # ══════════════════════════════════════════════════════════
     def fetch_box_info(self):
+        # ★ 2026-08-26 — 응답이 올 때쯤 self.box 가 비어 있을 수 있다 (경합).
+        box = self.box
+        if box is None:
+            self.log.warn("조회할 박스가 없다 — 대기로 복귀")
+            self.reset_to_idle()
+            return
+        box_id = box["box_id"]
+
         def on_response(future):
             res = future.result()
             if not res.found:
                 # DB에 없는 박스 = 인식이 실패했다. 집지 않고 버린다.
-                self.log.warn(f"DB에 없음: {self.box['box_id']} → 폐기")
+                self.log.warn(f"DB에 없음: {box_id} → 폐기")
                 self.discard_box("NOT_IN_DB")
+                return
+            if self.box is None:          # 그새 손을 뗐다
                 return
             self.box.update({
                 "w": res.info.size_w_mm,
@@ -286,7 +324,7 @@ class ZoneCycle:
             self.state = PLANNING
             self.request_plan()
 
-        self.call_async("/db/get_box_info", {"box_id": self.box["box_id"]}, on_response)
+        self.call_async("/db/get_box_info", {"box_id": box_id}, on_response)
 
     # ══════════════════════════════════════════════════════════
     # ③ PLANNING : algo에 "어디 놓을까?" 물어본다
@@ -297,14 +335,29 @@ class ZoneCycle:
 
             # ── 이탈 경로 A: 팔레트 만재 → 시나리오 종료 ──
             if res.message == "PALLET_FULL":
-                self.log.info("PALLET_FULL — 시나리오 종료")
-                self.finish()
+                # ★★ 2026-08-26 — 여기서 **끝내지 않는다.**
+                #   §7 사양 경로가 "PALLET_FULL -> 트럭 상차 -> 팔레트 교체" 인데
+                #   관제탑이 그냥 DONE 으로 갔다. 서버(/sim/swap_pallet ·
+                #   /sim/set_spawn_enabled · /algo/reset_heightmap)는 셋 다 있었고
+                #   **부르는 쪽이 없었을 뿐**이다 (계약 감사 2026-08-26).
+                #   PL_MAX_PALLETS 판을 채우면 그때 종료한다.
+                self.pallets_done += 1
+                if self.pallets_done >= self.max_pallets:
+                    self.log.info("PALLET_FULL — %d 판째, 시나리오 종료"
+                                  % self.pallets_done)
+                    self.finish()
+                else:
+                    self.log.info("PALLET_FULL — %d 판째. 팔레트를 간다"
+                                  % self.pallets_done)
+                    self.swap_pallet()
                 return
 
             # ── 이탈 경로 B: 이 박스만 자리 없음 → 박스만 버리고 계속 ──
             # ★ 여기서 끝내면 안 된다. 다음 박스는 들어갈 수 있다.
             if res.message == "NO_FEASIBLE_POSE" or not res.ok:
-                self.log.info(f"NO_FEASIBLE_POSE: {self.box['box_id']} → 폐기")
+                _b = self.box
+                self.log.info("NO_FEASIBLE_POSE: %s → 폐기"
+                              % (_b["box_id"] if _b else "?"))
                 self.discard_box("NO_FEASIBLE_POSE")
                 return
 
@@ -315,12 +368,18 @@ class ZoneCycle:
             self.t_robot = time.time()      # 집기 구간 타임아웃 시작
             self.send_robot_cmd(RobotCmd.PICK)
 
+        # ★ 같은 이유로 여기서도 한 번만 읽는다 (2026-08-26).
+        box = self.box
+        if box is None:
+            self.log.warn("계획을 요청할 박스가 없다 — 대기로 복귀")
+            self.reset_to_idle()
+            return
         self.call_async("/algo/plan_placement", {
             "zone": self.zone_id,
-            "box_id": self.box["box_id"],
-            "size_w_mm": self.box["w"],
-            "size_d_mm": self.box["d"],
-            "size_h_mm": self.box["h"],
+            "box_id": box["box_id"],
+            "size_w_mm": box["w"],
+            "size_d_mm": box["d"],
+            "size_h_mm": box["h"],
         }, on_response)
 
     # ══════════════════════════════════════════════════════════
@@ -332,15 +391,22 @@ class ZoneCycle:
         ★ 보낼 때마다 seq 를 올린다. 로봇이 그 seq 를 되돌려줘야
           늦게 온 지난 명령의 결과와 구분할 수 있다.
         """
+        # ★ 2026-08-26 — self.box 를 **한 번만** 읽는다. 이 메서드는 콜백 안에서
+        #   불리는데, 그동안 타임아웃 타이머가 self.box 를 비울 수 있다.
+        #   HOME/STOP 은 박스가 없어도 보내야 하므로 그 둘만 통과시킨다.
+        box = self.box
+        if box is None and action in (RobotCmd.PICK, RobotCmd.PLACE):
+            self.log.warn("로봇 명령을 낼 박스가 없다 — 보내지 않는다")
+            return
         self.seq += 1
         cmd = RobotCmd()
         cmd.action = action
         cmd.seq = self.seq
 
         if action == RobotCmd.PICK:
-            cmd.box_id = self.box["box_id"]
-            cmd.x_mm = self.box["x_mm"]
-            cmd.y_mm = self.box["y_mm"]
+            cmd.box_id = box["box_id"]
+            cmd.x_mm = box["x_mm"]
+            cmd.y_mm = box["y_mm"]
             # ★ z_mm 은 **박스 밑면**이다 (RobotCmd.msg 정본 · PLACE 도 밑면을 보낸다).
             #   벨트 위에 놓인 박스의 밑면 = 벨트 상면이다.
             #   ⚠ 2026-08-26 수정 (김병직): 여기가 `800 + h`(=박스 **상면**)였다.
@@ -349,20 +415,20 @@ class ZoneCycle:
             #   허공으로 내려간다 — CLAUDE.md §10 "박스를 400mm 위에서 놓는다"와 같은 부류.
             #   숫자는 system.yaml 의 conveyor.belt_top_z_mm 이 정본이다.
             cmd.z_mm = self.belt_top_mm
-            cmd.yaw_deg = float(self.box["yaw_deg"])
-            cmd.size_w_mm = self.box["w"]
-            cmd.size_d_mm = self.box["d"]
-            cmd.size_h_mm = self.box["h"]
+            cmd.yaw_deg = float(box["yaw_deg"])
+            cmd.size_w_mm = box["w"]
+            cmd.size_d_mm = box["d"]
+            cmd.size_h_mm = box["h"]
 
         elif action == RobotCmd.PLACE:
-            cmd.box_id = self.box["box_id"]
+            cmd.box_id = box["box_id"]
             cmd.x_mm = self.plan.x_mm
             cmd.y_mm = self.plan.y_mm
             cmd.z_mm = self.plan.z_mm   # ★ 밑면 기준. 중심으로 쓰면 팔레트에 파묻힌다
             cmd.yaw_deg = float(self.plan.yaw_deg)
-            cmd.size_w_mm = self.box["w"]
-            cmd.size_d_mm = self.box["d"]
-            cmd.size_h_mm = self.box["h"]
+            cmd.size_w_mm = box["w"]
+            cmd.size_d_mm = box["d"]
+            cmd.size_h_mm = box["h"]
 
         # HOME / STOP 은 box_id 도 좌표도 비운다 (기본값 그대로).
 
@@ -377,23 +443,59 @@ class ZoneCycle:
         # ── ① seq 대조 ── ★ 무엇보다 먼저 한다.
         #   타임아웃으로 손을 뗀 뒤 로봇이 뒤늦게 답하면, 그 실패가 다음 박스의
         #   결과로 둔갑한다. 에러도 안 나고 엉뚱하게 도는 버그다.
-        if ev.seq != self.seq:
+        # ★★ 2026-08-26 — **action 을 본다.** 아래 분기가 `ev.action` 이 아니라
+        #   `self.state` 로 갈리기 때문에, PLACING 중에 **PICK 이벤트가 다시 오면
+        #   그걸 "놓기 성공" 으로 처리한다.** Isaac 의 EvtPub 은 새 이벤트가 없어도
+        #   마지막 값을 다시 쏘는 구조라 이게 실제로 일어났다 (실측 2026-08-26):
+        #     update[B] BOX005 가 3 번 · db placed BOX005 가 2 번 ·
+        #     algo 가 "이미 반영된 박스다 — 재시도로 보고 무시했다" 로 막아 줬다.
+        #   팔이 아직 박스를 들고 있는데 사이클이 끝난 것으로 처리되니
+        #   **집자마자 멈춘 것처럼 보인다.**
+        want = {PICKING: RobotCmd.PICK, PLACING: RobotCmd.PLACE}.get(self.state)
+        if want is not None and ev.action != want:
             self.log.warn(
-                f"지난 명령의 결과 무시: seq {ev.seq} (지금은 {self.seq})")
+                f"{self.state} 인데 action={ev.action} 이벤트가 왔다 — 무시",
+                throttle_duration_sec=5.0)
+            return
+
+        # ★ 같은 (seq, action) 을 두 번 처리하지 않는다. seq 검사만으로는 재방송을
+        #   못 막는다 — 재방송은 seq 가 **같아서** 그 검사를 그대로 통과한다.
+        key = (int(ev.seq), int(ev.action))
+        if key == self._last_ev:
+            return
+        self._last_ev = key
+
+        if ev.seq != self.seq:
+            # ★ throttle 을 건다. Isaac 의 EvtPub 은 새 이벤트가 없어도 마지막 값을
+            #   다시 쏘는 구조라(ros_graph `_event_gate_script` 주석), 이 경고가
+            #   정상 동작 중에도 반복된다. 안 누르면 로그가 통째로 덮인다.
+            self.log.warn(
+                f"지난 명령의 결과 무시: seq {ev.seq} (지금은 {self.seq})",
+                throttle_duration_sec=5.0)
             return
 
         # 처리 중이 아닐 때 온 것도 버린다.
         # (self.box 가 None 인데 ["box_id"] 를 읽으면 노드가 죽는다)
-        if self.state not in (PICKING, PLACING) or self.box is None:
+        #
+        # ★★ 2026-08-26 — **여기서 지역 변수로 붙잡는다.** 검사만으로는 부족했다.
+        #   MultiThreadedExecutor + ReentrantCallbackGroup 이라 이 콜백이 도는 도중에
+        #   0.5 초 상태 타이머의 `check_robot_timeout()` 이 `reset_to_idle()` 을 불러
+        #   `self.box` 를 None 으로 만든다. 검사는 통과했는데 **일곱 줄 뒤에서** 죽었다:
+        #       TypeError: 'NoneType' object is not subscriptable   (실측: ABORTED 직후)
+        #   관제탑이 죽으면 `/robot/cmd` 를 낼 사람이 없어져 **라인 전체가 멈춘다.**
+        #   아래에서는 self.box 를 다시 읽지 않는다 — 한 번 잡은 값만 쓴다.
+        box = self.box
+        if self.state not in (PICKING, PLACING) or box is None:
             return
+        box_id = box["box_id"]
 
         # ── 이탈 경로 C: 로봇 실패 → 계획 취소하고 처음으로 ──
         if not ev.ok:
             self.log.warn(f"로봇 실패({self.state}): {ev.reason}")
             self.call_async("/algo/cancel_plan",
-                            {"zone": self.zone_id, "box_id": self.box["box_id"]}, None)
+                            {"zone": self.zone_id, "box_id": box_id}, None)
             self.call_async("/db/set_status",
-                            {"box_id": self.box["box_id"], "status": "PICK_FAILED",
+                            {"box_id": box_id, "status": "PICK_FAILED",
                              "reason": ev.reason}, None)
             self.reset_to_idle()
             return
@@ -401,7 +503,7 @@ class ZoneCycle:
         if self.state == PICKING:
             self.log.info(f"[④→⑤] 집기 성공 ({ev.duration_s:.1f}초)")
             self.call_async("/db/set_status",
-                            {"box_id": self.box["box_id"], "status": "PICKED",
+                            {"box_id": box_id, "status": "PICKED",
                              "reason": ""}, None)
             self.state = PLACING
             self.t_robot = time.time()          # 놓기 구간 타임아웃 다시 시작
@@ -440,7 +542,8 @@ class ZoneCycle:
         if held < ROBOT_TIMEOUT_S:
             return
 
-        bid = self.box["box_id"] if self.box else ""
+        _b = self.box                        # ★ 두 번 읽으면 그 사이에 비워진다
+        bid = _b["box_id"] if _b else ""
         self.log.error(
             f"로봇 응답 없음 — {self.state} 에서 {held:.1f}초 (제한 {ROBOT_TIMEOUT_S}초). 계획을 버린다")
         self.t_robot = None
@@ -453,6 +556,16 @@ class ZoneCycle:
     # ⑥ UPDATING : algo에 "여기 놨다" 알려준다
     # ══════════════════════════════════════════════════════════
     def update_heightmap(self, actual_pose):
+        # ★★ 2026-08-26 — 박스 정보를 **지금** 붙잡는다. 아래 `on_response` 는
+        #   서비스 왕복 뒤에 도는데, 그 사이 타임아웃 타이머가 `reset_to_idle()` 로
+        #   `self.box` 를 비울 수 있다 (on_robot_event 에서 실제로 죽었다).
+        #   콜백 안에서 self.box 를 다시 읽으면 같은 자리에서 노드가 죽는다.
+        box = self.box
+        if box is None:
+            self.log.warn("update_heightmap 인데 처리 중인 박스가 없다 — 건너뛴다")
+            return
+        box_id, bw, bd, bh = box["box_id"], box["w"], box["d"], box["h"]
+
         def on_response(future):
             res = future.result()
             if not res.ok:
@@ -466,19 +579,19 @@ class ZoneCycle:
                 f" · 최고 {res.max_height_mm}mm")
             # ★ MarkPlaced 는 zone 과 actual_pose 를 받는다. 계획 pose 가 아니다.
             self.call_async("/db/mark_placed",
-                            {"box_id": self.box["box_id"], "zone": self.zone_id,
+                            {"box_id": box_id, "zone": self.zone_id,
                              "actual_pose": actual_pose}, None)
             # ★ 이 박스는 끝났다. IDLE 로 돌아간 직후에도 detector 가 보내 둔
             #   이전 프레임이 도착하므로, present=false 를 볼 때까지 빗장을 건다.
-            self._done_id = self.box["box_id"]
+            self._done_id = box_id
             self.reset_to_idle()
 
         self.call_async("/algo/update_heightmap", {
             "zone": self.zone_id,
-            "box_id": self.box["box_id"],
-            "size_w_mm": self.box["w"],
-            "size_d_mm": self.box["d"],
-            "size_h_mm": self.box["h"],
+            "box_id": box_id,
+            "size_w_mm": bw,
+            "size_d_mm": bd,
+            "size_h_mm": bh,
             "actual_pose": actual_pose,
         }, on_response)
 
@@ -492,7 +605,13 @@ class ZoneCycle:
 
         reason 은 기본값이 있어 기존 호출부 discard_box() 는 그대로 동작한다.
         SetStatus 에 reason 필드가 생겨서, 왜 버렸는지를 DB 에 남기려고 받는다."""
-        bid = self.box["box_id"]
+        # ★ None 을 견딘다. 같은 경합으로 여기서도 죽을 수 있다 (2026-08-26).
+        _b = self.box                        # ★ 두 번 읽으면 그 사이에 비워진다
+        bid = _b["box_id"] if _b else ""
+        if not bid:
+            self.log.warn("discard_box 인데 처리 중인 박스가 없다 — 상태만 되돌린다")
+            self.reset_to_idle()
+            return
         self.rejected += 1
         self._rejected_id = bid          # 씬이 치울 때까지 다시 안 잡는다
         self.call_async("/algo/cancel_plan", {"zone": self.zone_id, "box_id": bid}, None)
@@ -522,6 +641,51 @@ class ZoneCycle:
             self.log.info("[→①] 대기")
         finally:
             self._resetting = False
+
+    def swap_pallet(self):
+        """PALLET_FULL — 사양 경로대로 판을 간다. **노드는 안 죽는다.**
+
+            스폰 정지 -> swap_pallet -> algo reset -> 스폰 재개 -> 벨트 재가동 -> IDLE
+
+        ★ 네 호출을 **콜백으로 잇는다.** 하나라도 동기로 기다리면 executor 가
+          자기 자신을 기다려 에러 없이 멎는다 (CLAUDE.md §9).
+        ★ 중간에 실패해도 IDLE 로 돌아간다. 판을 못 갈았을 뿐이고, 다음 박스에서
+          다시 PALLET_FULL 이 나면 또 시도한다 — 라인을 세우는 것보다 낫다.
+        ★ 스폰 정지는 **판이 없는 그 한 순간**만이다. 반출까지 껴서 길게 끄면
+          반출 안 하는 다른 존까지 굶는다 (트랙 A `c11a500` 과 같은 교훈).
+        """
+        self.state = UPDATING          # 새 박스를 안 받는 상태로 둔다
+
+        def back_to_idle(_tag):
+            self.log.info("팔레트 교체 완료 — 대기로 복귀")
+            self.box = None
+            self.state = IDLE
+            self.call_set_velocity(self.belt_mps, then=None)
+
+        def on_spawn_on(fut):
+            back_to_idle("spawn_on")
+
+        def on_reset(fut):
+            res = fut.result()
+            if not getattr(res, "ok", False):
+                self.log.error("algo reset_heightmap 실패 — 그래도 계속한다")
+            # heightmap 을 비웠으니 우리 지표도 같이 비운다. 안 그러면 다음 판의
+            # 충전율이 이전 판 값에서 이어져 보인다.
+            self.placed = 0
+            self.fill_rate = 0.0
+            self.max_height_mm = 0
+            self.call_async("/sim/set_spawn_enabled", {"enabled": True}, on_spawn_on)
+
+        def on_swap(fut):
+            res = fut.result()
+            if not getattr(res, "ok", False):
+                self.log.error("swap_pallet 실패 — 그래도 heightmap 은 비운다")
+            self.call_async("/algo/reset_heightmap", {"zone": self.zone}, on_reset)
+
+        def on_spawn_off(fut):
+            self.call_async("/sim/swap_pallet", {"zone": self.zone}, on_swap)
+
+        self.call_async("/sim/set_spawn_enabled", {"enabled": False}, on_spawn_off)
 
     def finish(self):
         """PALLET_FULL — 최종 지표를 찍고 멈춘다."""
@@ -648,8 +812,9 @@ class ZoneCycle:
         with self._lock:
             call_id = self._next_call_id
             self._next_call_id += 1
+            _to = CALL_TIMEOUT_BY_SRV.get(srv_name, CALL_TIMEOUT_S)
             call = {"srv": srv_name, "on_response": on_response,
-                    "deadline": time.time() + CALL_TIMEOUT_S, "future": None}
+                    "deadline": time.time() + _to, "future": None}
             self._pending[call_id] = call
 
         future = cli.call_async(req)
@@ -746,7 +911,8 @@ class ZoneCycle:
             except Exception:
                 pass
 
-        self.log.error(f"{srv_name} 응답 없음 — {CALL_TIMEOUT_S}초 초과")
+        self.log.error("%s 응답 없음 — %.1f초 초과"
+                       % (srv_name, CALL_TIMEOUT_BY_SRV.get(srv_name, CALL_TIMEOUT_S)))
 
         if call["on_response"] is None:
             return                                   # 보내고 잊는 호출은 상태를 안 건드린다
@@ -755,9 +921,10 @@ class ZoneCycle:
 
         # ★ 이탈할 때는 계획을 반드시 버린다. 안 버리면 그 자리가 영원히 예약된 채 남는다.
         #   단, 타임아웃 난 게 cancel_plan 자신이면 또 부르지 않는다 (무한 반복).
-        if self.box and srv_name != "/algo/cancel_plan":
+        _box = self.box                      # ★ 검사와 사용 사이에 비워질 수 있다
+        if _box and srv_name != "/algo/cancel_plan":
             self.call_async("/algo/cancel_plan",
-                            {"zone": self.zone_id, "box_id": self.box["box_id"]}, None)
+                            {"zone": self.zone_id, "box_id": _box["box_id"]}, None)
         self.reset_to_idle()
 
 

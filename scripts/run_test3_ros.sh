@@ -43,13 +43,32 @@ ISAAC_DIR="${ISAAC_DIR:-$HOME/isaac-sim-5.1.0}"
 #          어긋나면: symbol lookup error
 #   셋 다 `source install/setup.bash` 한 줄이 해 준다 (install/setup 이 /opt/ros 를
 #   같이 물고 온다). 직접 손으로 맞추려 들지 말 것.
+# ★★ 2026-08-26 수정 — **둘 다** 소스한다. 예전에는 `install/setup.bash` 하나만
+#   걸고 "그게 /opt/ros 를 같이 물고 온다" 고 봤는데 **그 전제가 깨질 수 있다.**
+#   colcon 을 ROS 안 잡힌 셸에서 돌리면 `install/setup.bash` 가 **언더레이 없이**
+#   다시 쓰인다. 그러면 이 스크립트는 멀쩡히 돌고 Isaac 만 조용히 이렇게 된다
+#   (실측 2026-08-26):
+#       Using backup internal ROS2 jazzy distro
+#       Could not load ... librmw_implementation.so: libament_index_cpp.so 없음
+#       ROS2 Bridge startup failed
+#       -> OmniGraphError: unrecognized type 'isaacsim.ros2.bridge.ROS2Context'
+#   증상이 브리지가 아니라 **그래프 노드 타입**으로 나와서 원인이 안 보인다.
 set +e                       # ROS setup 스크립트는 비0 종료를 흘린다
-if [ -f "$WS/install/setup.bash" ]; then
-    . "$WS/install/setup.bash"
-elif [ -f "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" ]; then
+if [ -f "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" ]; then
     . "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 fi
+if [ -f "$WS/install/setup.bash" ]; then
+    . "$WS/install/setup.bash"
+fi
 set -e
+
+# ★ 여기서 **멈춘다.** 이대로 두면 Isaac 이 11 초 뒤 엉뚱한 에러로 죽는다.
+if [ -z "${ROS_DISTRO:-}" ] || [ -z "${AMENT_PREFIX_PATH:-}" ]; then
+    echo "✖ 시스템 ROS 2 가 안 잡혔다 (ROS_DISTRO='${ROS_DISTRO:-}')." >&2
+    echo "  이대로 띄우면 Isaac 이 내장 배포판으로 가서 ROS2 브리지가 죽는다." >&2
+    echo "  고치는 법:  source /opt/ros/jazzy/setup.bash && colcon build --symlink-install" >&2
+    exit 1
+fi
 
 if [ -z "${AMENT_PREFIX_PATH:-}" ]; then
     # 시스템 ROS 가 아예 없다 — 내장으로 간다. packing_msgs 는 못 쓴다.

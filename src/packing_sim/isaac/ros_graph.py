@@ -69,6 +69,15 @@ SERVICES = [
 #   구역 문자는 관제탑과 같게 **소문자**로 맞춘다 (`self.zone = str(zone).lower()`).
 CMD_TOPIC_FMT = "/zone_%s/robot/cmd"
 EVT_TOPIC_FMT = "/zone_%s/robot/event"
+# ★★ **임시 대역** — 씬에 카메라 prim 이 아직 하나도 없다 (2026-08-26, 89 개 삭제).
+#   §3-2 정본은 이 토픽을 **인식 노드(트랙 D)** 가 낸다. 여기서 내는 것은 계약 위반이
+#   아니라 **대역**이다 — 카메라가 들어오면 `PL_GTPICK=0` 으로 끄고 인식 노드로 돌린다.
+#   끄지 않고 둘 다 켜면 발행자가 둘이라 관제탑이 두 좌표를 번갈아 받는다.
+#
+#   왜 필요한가: 이 한 토픽이 없으면 관제탑이 **영원히 IDLE** 이라 그 뒤 사슬
+#   (algo · db · 로봇 · 반출)이 통째로 안 돈다. 카메라를 기다리는 동안 나머지를
+#   못 재는 것이 더 큰 손해다.
+PICK_TOPIC_FMT = "/zone_%s/box_at_pickup"
 
 
 def cmd_topic(zone):
@@ -77,6 +86,10 @@ def cmd_topic(zone):
 
 def evt_topic(zone):
     return EVT_TOPIC_FMT % str(zone).lower()
+
+
+def pick_topic(zone):
+    return PICK_TOPIC_FMT % str(zone).lower()
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.
 _OG_TYPE = {
@@ -98,9 +111,26 @@ HANDLERS = {}
 #   둘 다 **에러 없이 엉뚱하게 도는** 종류다.
 # 보낼 RobotEvent 대기열 {zone: [ev, ...]}. send_event() 가 넣고 EventGate 가 비운다.
 _EVENTS = {}
+# 보낼 BoxAtPickup {zone: fields}. **큐가 아니라 최신값 한 벌**이다 —
+#   도착은 상태이지 사건이 아니라서, 밀리면 낡은 좌표를 뒤늦게 내보내게 된다.
+#   관제탑도 같은 박스를 여러 번 받는 것을 전제로 만들어져 있다
+#   (orchestrator_node.on_box_arrived: "detector 는 5Hz 폴링이라 여러 번 알린다").
+_PICKUPS = {}
+# ★★ 서비스별 요청 필드 {key: [이름, ...]}. **모듈에 둬야 한다** (2026-08-26 실측).
+#   예전에는 생성한 스크립트의 **최상단**에 `_FIELDS = [...]` 로 박았는데,
+#   Isaac 의 ScriptNode 들은 최상단 네임스페이스를 **공유**한다 — 나중에 실행된
+#   스크립트의 `_FIELDS` 가 앞의 것을 통째로 덮었다. 증상:
+#       [ros_graph] !! set_velocity 요청 필드를 못 읽었다: box_id(AttributeError...)
+#       [ros_side]  h_set_velocity 실패: bad mps   받은 요청={}
+#   `box_id` 는 DespawnBox 필드다. 이름(`{key}`)은 f-string 으로 박혀 맞게 찍히는데
+#   필드만 남의 것이라, 로그만 봐서는 "왜 mps 가 나쁘지" 로만 보인다.
+#   -> 키로 찾으면 네임스페이스가 겹쳐도 안 섞인다.
+_SRV_FIELDS = {}
 _state = {"wired": False, "zones": [], "seen_seq": {}}
 # 디버그 출력 (환경변수 PL_ROSGRAPH_DEBUG=1)
 DEBUG = os.environ.get("PL_ROSGRAPH_DEBUG") == "1"
+# 픽업 좌표를 씬 실측(ground truth)으로 대신 낼지. 카메라가 들어오면 0 으로 끈다.
+GT_PICK = os.environ.get("PL_GTPICK", "1") != "0"
 
 
 def set_handlers(**fns):
@@ -129,6 +159,15 @@ def send_event(zone=None, **fields):
       바깥에서 Publisher 입력만 써 두면 언제 나갈지가 틱 순서에 좌우된다.
     """
     _EVENTS.setdefault(_one_zone(zone), []).append(dict(fields))
+
+
+def send_pickup(zone=None, **fields):
+    """BoxAtPickup 최신값을 갈아 끼운다. 실제 발행은 다음 틱의 EventGate 가 한다.
+
+    ★ `send_event` 와 달리 **덮어쓴다.** 도착은 사건이 아니라 상태다 — 큐로 쌓으면
+      박스가 이미 떠난 뒤에 낡은 좌표가 뒤늦게 나간다.
+    """
+    _PICKUPS[_one_zone(zone)] = dict(fields)
 
 
 def take_cmd(zone=None):
@@ -495,6 +534,7 @@ def build(zone="B", zones=None):
     _state["zones"] = zlist
     for z in zlist:
         _EVENTS.setdefault(z, [])
+        _PICKUPS.setdefault(z, None)
         _state["seen_seq"].setdefault(z, None)
 
     nodes = [("Tick", "omni.graph.action.OnPlaybackTick"),
@@ -541,6 +581,22 @@ def build(zone="B", zones=None):
                  ("Ctx.outputs:context", f"{pub}.inputs:context"),
                  # ★ EvtPub 은 Tick 이 아니라 게이트가 친다.
                  ("EvtGate.outputs:execOut", f"{pub}.inputs:execIn")]
+
+        # ── 임시 대역: 픽업 좌표 발행 ────────────────────────
+        # ★★ **새 ScriptNode 를 Tick 에 달지 않는다.** 위 주석의 실측대로 Tick 에
+        #   ScriptNode 를 여럿 매달면 첫 틱 뒤로 하나만 살아남는다. 그래서 이 발행도
+        #   기존 EvtGate 하나가 같이 맡는다 — 노드는 Publisher 만 는다.
+        if GT_PICK:
+            ppub = f"PickPub_{z}"
+            nodes += [(ppub, "isaacsim.ros2.bridge.ROS2Publisher")]
+            values += [
+                (f"{ppub}.inputs:topicName", pick_topic(z)),
+                (f"{ppub}.inputs:messagePackage", PKG),
+                (f"{ppub}.inputs:messageSubfolder", "msg"),
+                (f"{ppub}.inputs:messageName", "BoxAtPickup"),
+            ]
+            conn += [("Ctx.outputs:context", f"{ppub}.inputs:context"),
+                     ("EvtGate.outputs:execOut", f"{ppub}.inputs:execIn")]
 
     for key, srv, path in SERVICES:
         r, s, g = f"{key}_Req", f"{key}_Res", f"{key}_Fn"
@@ -614,12 +670,13 @@ def _service_script(key, srv):
     """
     req_fields, _ = srv_fields(srv)
     names = [f for f, t in req_fields if t in _OG_TYPE]
+    # ★ 스크립트 최상단이 아니라 **모듈 표**에 넣는다 (`_SRV_FIELDS` 주석 참조).
+    _SRV_FIELDS[key] = names
     return f'''
 import importlib
 import omni.graph.core as _og
 
 _M = importlib.import_module("{__name__}")
-_FIELDS = {names!r}
 
 def setup(db): pass
 
@@ -628,7 +685,8 @@ def compute(db):
     #   핸들러는 **즉시 반환**해야 한다 — 오래 걸리는 일은 큐에 넣고 돌아온다.
     req = {{}}
     _miss = []
-    for f in _FIELDS:
+    # ★ 모듈 표에서 **내 것만** 꺼낸다. 최상단 변수로 두면 다른 ScriptNode 가 덮는다.
+    for f in _M._SRV_FIELDS.get("{key}", []):
         try:
             v = getattr(db.inputs, f)
         except Exception as e:
@@ -680,21 +738,22 @@ def _event_gate_script(zones):
       없는 구역은 직전 값을 다시 쏘는데, 관제탑이 `seq` 로 거르므로(§3-4 규약 2)
       문제가 되지 않는다 — 애초에 EvtPub 이 매 틱 다시 쏘고 있어서 달라지는 것도 없다.
     """
-    zl = ", ".join('"%s"' % str(z).upper() for z in zones)
     return f'''
 import importlib
 import omni.graph.core as _og
 
 _M = importlib.import_module("{__name__}")
-_ZONES = [{zl}]
+# ★ 최상단에 `_ZONES = [...]` 같은 이름을 두지 않는다 — ScriptNode 들이 최상단 네임스페이스를
+#   공유해서 서로 덮는다 (`_SRV_FIELDS` 주석의 set_velocity 사고와 같은 부류).
+#   지금은 게이트가 하나뿐이라 안 겹치지만 같은 함정을 남겨 두지 않는다.
 
 def setup(db):
     if _M.DEBUG:
-        print("[ros_graph] gate setup — 구역 %s" % _ZONES)
+        print("[ros_graph] gate setup — 구역 %s" % _M._state["zones"])
 
 def compute(db):
     _any = False
-    for _z in _ZONES:
+    for _z in _M._state["zones"]:
         q = _M._EVENTS.get(_z) or []
         if not q:
             continue
@@ -709,6 +768,32 @@ def compute(db):
             except Exception:
                 print("[ros_graph] %s RobotEvent 필드 %r 를 못 씀 — 계약 확인" % (_z, k))
         _any = True
+
+    # ── 임시 대역: 픽업 좌표 ────────────────────────────────
+    # ★ 이벤트와 달리 **큐가 아니라 최신값**이다. 매 틱 같은 값을 다시 써도 되고,
+    #   그래야 관제탑이 늦게 떠도 도착을 놓치지 않는다 (5Hz 폴링과 같은 모양).
+    # ★ 여기서 _any 를 같이 올린다 — 안 올리면 로봇 이벤트가 없는 동안
+    #   execOut 이 DISABLED 라 **픽업이 한 번도 안 나간다.**
+    if _M.GT_PICK:
+        for _z in _M._state["zones"]:
+            pk = _M._PICKUPS.get(_z)
+            if not pk:
+                continue
+            node = _og.Controller.node(_M.GRAPH + "/PickPub_" + _z)
+            for k, v in pk.items():
+                try:
+                    _og.Controller.attribute("inputs:" + k, node).set(v)
+                except Exception:
+                    print("[ros_graph] %s BoxAtPickup 필드 %r 를 못 씀 — 계약 확인"
+                          % (_z, k))
+            # ★★ 쓰고 나면 **비운다** (2026-08-26). 안 비우면 값이 계속 남아
+            #   게이트가 **매 틱** ENABLED 가 되고, 그러면 EvtPub 까지 같이 켜져
+            #   낡은 RobotEvent 가 매 틱 재방송된다. 관제탑이 seq 로 거르긴 하지만
+            #   `지난 명령의 결과 무시` 경고가 초당 수십 줄씩 쏟아져 로그를 덮는다.
+            #   `_GtPick` 이 0.2 초마다 다시 채우므로 발행은 의도대로 5 Hz 다.
+            _M._PICKUPS[_z] = None
+            _any = True
+
     # ⚠ 새 이벤트가 없어도 EvtPub 은 어차피 매 틱 마지막 값을 다시 쏜다 (미해결).
     #   관제탑은 seq 로 거른다. 여기서 DISABLED 를 걸어도 안 막혔다 — 실측.
     #   ★ False 를 돌려주면 **게이트가 다음 틱부터 안 돈다.** 절대 그러지 말 것.

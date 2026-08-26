@@ -36,6 +36,12 @@
   7. 꺾을 때 **속도를 같이 준다.** A47 의 `SorterSpeed` 기본값이 0.0 이고
      `h_set_sorter` 는 "mps 를 안 주면 안 건드린다" 라, 안 주면 소터가 0 인 채
      남는다. 본선 롤러에는 소터 자리에 구멍이 있어 **선 소터는 라인을 막는다.**
+  8. **지선 벨트가 서 있으면 안 꺾는다** (2026-08-26 추가). 지선을 세우는 것은
+     관제탑이다 — 집기 전에 반드시 세운다 (§2.5). 서 있는 지선으로 밀어 넣으면
+     박스가 입구(Y 0.7 언저리)에서 멎었다가 45 s 뒤 되돌아온다. 실측:
+       `!! BOX004 가 45 s 안에 지선 C 에 못 올라갔다 (Y 0.68)` (진입 판정 Y 1.2)
+     ⚠ 그래서 꺾은 뒤 **지선 벨트를 켜지 않는다.** 켜면 로봇이 흡착하는 동안
+       박스가 끌려간다 — 그 벨트는 이제 관제탑 소유다.
 """
 import os
 import time
@@ -202,16 +208,46 @@ class Router:
                              % (z, self._zone_load(z, allpos), bid))
                 continue                                # 규칙 4
 
+            # ── 규칙 8: **지선 벨트가 서 있으면 안 꺾는다** (2026-08-26) ──
+            #   지선을 세우는 것은 관제탑이다 — 집기 전에 반드시 세운다 (§2.5).
+            #   서 있는 지선으로 밀어 넣으면 박스가 입구(Y 0.7 언저리)에서 멎었다가
+            #   45 s 뒤 본선으로 되돌아온다. 실측 2026-08-26:
+            #       [router] !! BOX004 가 45 s 안에 지선 C 에 못 올라갔다 (Y 0.68)
+            #       [router] !! BOX005 가 45 s 안에 지선 B 에 못 올라갔다 (Y 0.82)
+            #   (진입 판정선은 Y 1.2 다.) 안 꺾인 박스는 루프를 한 바퀴 돌고 다시 온다
+            #   — 규칙 4(계량)와 같은 처리라 라인은 계속 흐른다.
+            spd = self._spur_mps(z)
+            if spd is not None and abs(spd) < 1e-6:
+                if now - self.t_log.get("v" + z, 0.0) >= 10.0:
+                    self.t_log["v" + z] = now
+                    self.log("[router] 존 %s 지선이 서 있다 (관제탑이 집는 중)"
+                             " — %s 는 한 바퀴 돈다" % (z, bid))
+                continue
+
             r = self._turn(z, seg, True)
             if r.get("ok"):
                 self.state[bid] = "divert"
                 self.t_div[bid] = now
-                if seg and self._h_vel:                 # 계량이 세워 뒀을 수 있다
-                    self._h_vel({"seg": seg, "mps": self.belt_mps})
+                # ★★ 여기서 지선 벨트를 **켜지 않는다** (2026-08-26).
+                #   예전에는 "계량이 세워 뒀을 수 있다"며 다시 켰는데, ROS 경로에서
+                #   지선을 세우는 것은 **관제탑**이다. 라우터가 도로 켜면 로봇이
+                #   흡착하는 동안 박스가 끌려간다 (§2.5 가 금지하는 그 상황).
+                #   서 있으면 위 규칙 8 에서 이미 안 꺾고 돌려보낸다.
                 self.log("[router] %s -> 존 %s   X %.2f m 에서 꺾는다"
                          % (bid, z, p[0]))
             else:
                 self.log("[router] !! 분류 명령 실패 (존 %s) -> %r" % (z, r))
+
+    def _spur_mps(self, zone):
+        """그 구역 지선(`<z>_pickup`)의 현재 속도 [m/s]. 모르면 None.
+
+        ★ `conveyor_ctl.speed_of` 는 **마지막으로 지시한 값**이다. USD 에서 되읽으면
+          조각마다 배율이 달라 원값을 못 되돌린다 — 필요한 것은 "누가 뭘 시켰나" 다.
+        """
+        fn = getattr(self.cc, "speed_of", None)
+        if fn is None:                      # 옛 conveyor_ctl 과도 돌아가게 둔다
+            return None
+        return fn("%s_pickup" % str(zone).lower())
 
     def _count_laps(self, poses):
         """리턴 라인을 `max_laps` 바퀴 돌면 치운다.

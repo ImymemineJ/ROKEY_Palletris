@@ -66,7 +66,7 @@ conveyor:
   #   ⚠ 이 값들은 m/s 가 아니다. 그래프 변수 원시값이다.
   belt_velocity_raw:
     /World/ConveyorTrack_04/ConveyorBeltGraph: 0.5    # A11 루프 코너
-    /World/ConveyorTrack_05/ConveyorBeltGraph: 0.2    # X -21737~-3853 (+X) — 실측 1.4 m/s
+    /World/ConveyorTrack_05/ConveyorBeltGraph: 0.5    # X -21737~-3853 (+X) — 5호 박스 코너 걸림 방지
     /World/ConveyorTrack_01/ConveyorBeltGraph: 0.5    # A02 커브
     /World/ConveyorTrack_02/ConveyorBeltGraph: 0.3    # X -2967~-2064 (+Y)
 
