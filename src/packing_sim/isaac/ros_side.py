@@ -133,6 +133,7 @@ class RosSide:
 
         self._busy = threading.Lock()
         self._hold = None                # 모션 중 도착한 명령 1건 보류 (step 주석)
+        self._parked0 = False            # 초기 대기 자세를 이미 잡았는가 (step 주석)
         self._done = []                  # 워커가 넣고 step() 이 비운다
         self._done_lk = threading.Lock()
 
@@ -155,7 +156,14 @@ class RosSide:
         # ② 새 명령 — 보류분이 있으면 그것부터
         cmd = self._hold or ros_graph.take_cmd(self.zone)
         if cmd is None:
+            # ★ 시작 직후 한 번, 첫 박스를 기다리는 동안 **초기 자세도 대기 자세로**
+            #   옮겨 둔다 (2026-08-27 김병직). cycle 이 명목 스토퍼 좌표로 시드해
+            #   뒀다. 명령이 먼저 오면 안 한다 — 어차피 픽이 그 자리로 간다.
+            if not self._parked0 and self._busy.acquire(blocking=False):
+                self._parked0 = True
+                threading.Thread(target=self._park0, daemon=True).start()
             return
+        self._parked0 = True                 # 초기 대기 자세는 더 이상 필요 없다
         if not self._busy.acquire(blocking=False):
             # ★ 버리지 않고 **한 건 보류**한다 (2026-08-27). 대기 자세 이동(2~3 s)
             #   중에 다음 PICK 이 오는 것이 정상 흐름이 됐다 — ABORTED 로 답하면
@@ -170,6 +178,16 @@ class RosSide:
         threading.Thread(target=self._work, args=(cmd,), daemon=True).start()
 
     # ── 워커 스레드 ────────────────────────────────────────
+    def _park0(self):
+        """시작 직후 초기 대기 자세. 실패해도 조용히 넘어간다 (최적화지 결과가 아니다)."""
+        try:
+            self.log("[ros_side] 초기 대기 자세로 이동 (스토퍼 상공)")
+            self.cycle.park_over_pick()
+        except Exception as e:                                  # noqa: BLE001
+            self.log("[ros_side] 초기 대기 자세 실패 (무시): %r" % (e,))
+        finally:
+            self._busy.release()
+
     def _work(self, cmd):
         try:
             try:
@@ -197,11 +215,16 @@ class RosSide:
             # ★ 결과를 **밀어 넣은 뒤에** 대기 자세로 간다 (2026-08-27 김병직 제안).
             #   관제탑은 이미 다음 단계로 가고, 이동 중 오는 PICK 은 step 이 한 건
             #   보류한다 — 아래 _hold 참조.
-            if act == 1:
+            # ★ 다음 명령이 **이미 와 있으면 생략한다** (2026-08-27 김병직).
+            #   박스가 벌써 도착한 상태에서 대기 자세를 거치면 같은 자리를 두 번
+            #   가는 셈이다 — 보류분이 있으면 바로 그 픽으로 간다.
+            if act == 1 and self._hold is None:
                 try:
                     self.cycle.park_over_pick()
                 except Exception as e:                          # noqa: BLE001
                     self.log("[ros_side] 대기 자세 실패 (무시): %r" % (e,))
+            elif act == 1:
+                self.log("[ros_side] 다음 명령 대기중 — 대기 자세 생략")
         finally:
             self._busy.release()
 

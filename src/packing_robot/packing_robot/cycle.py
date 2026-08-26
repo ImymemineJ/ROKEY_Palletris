@@ -235,7 +235,22 @@ class Cycle:
         #   메시지에 `stack_top_mm` 이 실려 오면 그것과도 max 를 취하므로 둘 다 산다.
         #   ⚠ 팔레트를 갈면 리셋해야 한다 -> `reset_stack()`
         self._stack_top_m = 0.0
-        self._park = None      # 마지막 픽 (x, y, 벨트면 z) [m] — park_over_pick 용
+        # ★ 시작 자세도 대기 자세와 같게 (2026-08-27 김병직). 아직 집은 적이 없으니
+        #   명목값으로 시드한다 — 스토퍼 앞면에 5호(최대)가 닿아 있다고 가정한 중심.
+        #   실제 픽이 한 번 돌면 pick() 이 실측값으로 덮는다.
+        _cw = (cfg["zones"].get("pickup_cross_mm") or {}).get(zone)
+        if _cw:                              # test_3 계열만 (test1-1 은 키가 없다)
+            _ax = str(cfg["conveyor"].get("pickup_axis", "x")).lower()
+            _stop_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+            _half_m = max(max(t["w_mm"], t["d_mm"]) for t in cfg["boxes"]["types"]) / 2000.0
+            _cross_m = (_cw[0] + _cw[1]) / 2000.0
+            _belt_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
+            if _ax == "y":
+                self._park = (_cross_m, _stop_m - _half_m, _belt_m)
+            else:
+                self._park = (_stop_m - _half_m, _cross_m, _belt_m)
+        else:
+            self._park = None
         # ★ 집기가 놓기에 넘겨주는 값 3개. 원래 `_run` 안의 지역변수였는데,
         #   관제탑이 PICK/PLACE 를 **따로** 보내면서 호출이 둘로 갈려 사라진다.
         #     _pick_yaw  놓기 yaw 의 기준 (nearest_equiv_yaw). 없으면 손목이 180° 돈다
