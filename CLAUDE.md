@@ -106,6 +106,7 @@ string  status         # SPAWNED|SCANNED|VERIFIED|DIVERTED|PICKED|PLACED|PICK_FA
 | `/robot/cmd` | `packing_msgs/msg/RobotCmd` | 관제탑 → 로봇 |
 | `/robot/event` | `packing_msgs/msg/RobotEvent` | 로봇 → 관제탑 |
 | `/zone_*/status` | `packing_msgs/msg/ZoneStatus` | 관제탑 → 중재자·모니터링 |
+| `/zone_*/vision_check` · `/line/vision_check` | `packing_msgs/msg/VisionCheck` | 인식 → 모니터링 (깊이 교차검증 진단. 구독자 없어도 됨) |
 
 ```
 # msg/BoxAtPickup.msg   — 인식 노드가 픽업 좌표까지 실어 보낸다
@@ -326,6 +327,11 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
   꺼져 있으면 눈으로는 멀쩡한데 카메라 이미지가 캄캄하다.
 - ⚠️ 화면이 전부 0 이면 조명보다 **카메라가 형상 안에 파묻혔는지** 먼저 의심할 것.
 - **처리 효율**: 천장 카메라는 도착 신호가 왔을 때만 추론한다.
+- ★ **깊이 교차검증** (2026-08-26, 트랙 D): 같은 카메라의 `<ns>/depth` 로 박스 윗면 z 를
+  **직접 재서** RGB 추정과 대조한다. RGB 는 사양 3종 평면 중 가장 잘 맞는 것을 고르는
+  **추측**이라, 종류를 틀리면 평면이 60~130 mm 어긋나 **중심 x·y 까지 같이 틀어진다.**
+  결과는 `packing_msgs/msg/VisionCheck` 로 나가고, **깊이가 없으면 예전 동작 그대로** 돈다.
+  끄기: `ros2 launch ... depth:=false`. 자세한 것은 `docs/2026-08-26_깊이_교차검증.md`.
 
 ---
 
@@ -420,6 +426,9 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | 놓고 나서 박스가 혼자 조금씩 미끄러진다 | 박스 프림에 solver iteration·마찰이 안 걸렸다 (`spawner.py` 는 걸고, `verify_suction.make_box` 는 안 건다) |
 | 박스가 슬롯에 안 들어가고 `IK_FAIL` | 계획 간격이 0 이라 슬롯이 박스와 정확히 같은 크기다 (`--algo-clearance`) |
 | 깊은 구덩이 자리에서만 `IK_FAIL` | `_corridor_ok` 가 로봇 쪽 기둥을 안 본다 (`corridor_near_gap_mm`) |
+| **깊이 교차검증이 `HEIGHT_MISMATCH` 만 낸다 (dz 가 딱 박스 높이만큼)** | rgb 와 depth 의 **짝이 한 프레임 어긋났다.** 박스 도착 직전의 벨트 깊이를 현재 RGB 와 짝지은 것이다. `depth.max_stamp_skew_s` 는 **한 프레임 안**이어야 한다 (0.02) |
+| 깊이 교차검증이 화면 **가장자리에서만** 어긋난다 | `depth.is_range` 가 씬 규약과 반대다 (광축거리 vs 시선거리). 중앙에서는 두 규약이 같아서 안 보인다 |
+| 깊이 확인 커버리지가 낮다 (`VisionCheck.depth_ok=false` 가 잦다) | 이미지 UDP 단편 손실. **rgb 도 같이 잃고 있다.** DDS 송수신 버퍼를 키울 것 (§15) |
 | `database is locked` | `db_service_node` 외 프로세스가 `.db` 를 열었다 |
 
 ---
@@ -549,7 +558,7 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | `src/packing_algo/` | 트랙 C — `heightmap_core.py` · `algo_service_node.py` |
 | `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` · `cycle.py` |
 | `src/palletris_orchestrator/` | 트랙 B — `orchestrator_node.py` (관제탑. 상태머신 7개) |
-| `src/packing_vision/` | 트랙 D — `vision_node.py` (cam1 등록 · cam2 검증 · pick_cam 좌표). 코어 `detect.py`·`geometry.py` 는 ROS 의존성 0 |
+| `src/packing_vision/` | 트랙 D — `vision_node.py` (cam1 등록 · cam2 검증 · pick_cam 좌표). 코어 `detect.py`·`geometry.py`·**`depth.py`** 는 ROS 의존성 0 |
 | `src/packing_sim/isaac/` | 트랙 A — `spawner.py` · `camera_pick.py` · `conveyor_ctl.py` · `robot_motion.py` · `sim_main.py` |
 | `scripts/` | 검증 — `verify_reach.py` · `check_place_plan.py` 등 |
 
@@ -621,4 +630,9 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | ~~팔레트 90° 회전으로 적재율 개선~~ **기각** | 정정인 | 실측 −3.1%p 이고, 애초에 트럭 바닥 2800 에 1200×3=3600 이 안 들어간다. **현행이 이미 돌린 결과**다 (TS-029) |
 | 적재율 표기: 실제높이 기준 + **용량 기준 병기** | 팀 | §7.8 정본은 그대로 두고 `capacity_rate` 를 보조로 추가했다. 포화 시 66.9% vs 66.3% 로 사실상 같다 — 발표에 어느 곡선을 쓸지만 정하면 된다 (TS-017) |
 | ~~`/robot/cmd` 네임스페이스~~ **해소** | 김병직/김학민 | 2026-08-26. 관제탑은 `/zone_{a|b|c}/robot/cmd` 를 쓰는데 `ros_graph.py` 가 `/robot/cmd` 단수라 **서로 못 만났다** (에러도 안 난다). `ros_graph` 를 구역별로 맞췄다. ⚠ §3-2 표는 아직 단수형이다 — 문서를 고칠지 결정할 것 |
+| ★ **`packing_msgs` 에 `VisionCheck.msg` 추가** | 민범진 → 팀 | 2026-08-26. 깊이 교차검증 진단 채널(`/zone_*/vision_check`·`/line/vision_check`). **기존 타입은 한 글자도 안 바꿨고 덧붙이기만 했다.** 그래도 공용이라 **팀 전원 재빌드**가 필요하다 (§14). 로봇 동작 경로가 아니라 아무도 구독 안 해도 된다 |
+| `recognition.depth` 를 `system.yaml` 에 넣을지 | 팀 | 깊이 교차검증의 임계값. 지금은 `packing_vision/depth.py` 의 `DEFAULTS` 가 갖고 있고 **yaml 에 키가 있으면 그쪽이 이긴다.** 승인되면 블록을 붙이기만 하면 되고 코드는 안 바뀐다 (`depth.py` 머리 주석에 그대로 적어 뒀다). §11 "공용 파일 승인 없이 수정 금지" 때문에 안 넣었다 |
+| ★ **씬에 깊이 카메라 헬퍼가 없다** | 김학민 | cam1·cam2·pick_cam 에 `ROS2CameraHelper type:"depth"` 를 rgb·camera_info 와 **같은 render product** 로 붙여야 한다. 선례가 이미 있다 — `scripts/setup_camera_graph.py` 의 `cameraHelperDepth`. 같은 render product 면 stamp 가 정확히 같아 짝 맞추기가 100 % 가 된다. ⚠ 시선거리(range)로 내는 헬퍼면 `depth.is_range: true` 로 바꿀 것 |
+| 다중 PC 의 DDS 버퍼 | 팀 | 이미지가 커서 UDP 단편 손실이 난다 — **깊이만이 아니라 rgb 도 같이 잃고 있었다.** 실측: 기본 버퍼에서 깊이 확인 커버리지 4/8 → 송수신 16 MB 로 6/8. `FASTRTPS_DEFAULT_PROFILES_FILE` + `net.core.rmem_max` |
+| `reject_on_disagree` 를 켤지 | 팀 | RGB 와 깊이가 어긋났을 때 **좌표를 아예 안 낼 것인가.** 기본은 **안 막는다** — 데모가 서는 쪽이 더 나쁘다는 판단이다. 어긋남은 `VisionCheck` 과 경고로 남는다 |
 | ~~`db_service_node` 가 죽는다~~ **해소** | 민범진 | 2026-08-26. `schema.sql` 은 `share/packing_db/` 에 깔리는데 노드가 `../share/...` 로 한 단계만 올라가 못 찾았다 (`gen_master_db.py` 도 같은 버그). `ament_index` 로 바꿨다. **트랙 D 파일을 고쳤으니 확인 바람** |

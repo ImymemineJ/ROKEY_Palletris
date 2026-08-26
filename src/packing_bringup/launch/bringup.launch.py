@@ -4,6 +4,8 @@
     ros2 launch packing_bringup bringup.launch.py
     ros2 launch packing_bringup bringup.launch.py use_sim_time:=false
     ros2 launch packing_bringup bringup.launch.py vision:=false      # 인식 끄고
+    ros2 launch packing_bringup bringup.launch.py depth:=false       # 깊이 교차검증만 끄고
+    ros2 launch packing_bringup bringup.launch.py depth_mode:=prefer # 깊이가 좌표를 정한다
 
     # ★ 기본값은 stage 2 (3구역, system.yaml stage:2 와 짝). 예전 1구역(B만) 으로
     #   돌리려면 zones · pick_cam_ns 를 같이 좁혀야 한다 — 하나만 바꾸면
@@ -15,6 +17,7 @@
     algo_service_node    /algo/*        4개   (트랙 C)
     db_service_node      /db/* + /diverter/request  7개 (트랙 D)
     vision_node          cam1·cam2·pick_cam        (트랙 D)
+                         └ 깊이 교차검증 → /line/vision_check · /zone_*/vision_check
     orchestrator_node    관제탑 — /robot/cmd 의 유일한 발신자 (트랙 B)
 
 Isaac(Action Graph)이 내는 것은 여기서 안 띄운다 — /clock · /tf · 카메라 영상 ·
@@ -94,6 +97,17 @@ def generate_launch_description():
         DeclareLaunchArgument("algo", default_value="true"),
         DeclareLaunchArgument("db", default_value="true"),
         DeclareLaunchArgument("vision", default_value="true"),
+        # ── 깊이 교차검증 (트랙 D, 2026-08-26) ────────────────────────────
+        # ★ 왜 launch 인자로 빼는가: 통합 중에 깊이가 말썽이면 **코드를 안 고치고**
+        #   되돌릴 길이 있어야 한다. 깊이는 확인 채널이라 없어도 라인은 돈다.
+        #     depth:=false        깊이 구독 자체를 안 만든다 (완전히 예전 동작)
+        #     depth_mode:=prefer  깊이가 잰 평면으로 좌표를 낸다 (RGB 는 확인 쪽)
+        #   나머지 임계값은 노드 파라미터 `depth.*` 로 그대로 열려 있다.
+        #     예) --ros-args -p depth.z_tol_mm:=30.0
+        DeclareLaunchArgument("depth", default_value="true",
+                              description="깊이 교차검증 사용 여부"),
+        DeclareLaunchArgument("depth_mode", default_value="crosscheck",
+                              description="crosscheck | prefer | off"),
         DeclareLaunchArgument("orchestrator", default_value="true"),
         # ★★ 3 구역 씬(test_3)은 좌표계가 통째로 다르다 — 팔레트가 셀 컨베이어
         #   위(z 950)고 페데스탈이 1950 이며 최대 적재가 1000 이다. 그 값들이
@@ -117,6 +131,11 @@ def generate_launch_description():
 
     # 모든 노드가 같은 파라미터를 받게 한 곳에 모은다.
     common = [{"use_sim_time": use_sim_time}]
+    # ★ 인식 노드 두 종류가 **같은 깊이 설정**을 받아야 한다. 한쪽만 켜 두면
+    #   투입부와 픽업이 다른 근거로 판정하고, 지표가 섞여서 아무 뜻이 없어진다.
+    vision_depth = [{"depth.enabled": ParameterValue(LaunchConfiguration("depth"),
+                                                     value_type=bool),
+                     "depth.mode": LaunchConfiguration("depth_mode")}]
     cli = ["--ros-args", "--log-level", log_level]
 
     def _overlay_env():
@@ -155,7 +174,8 @@ def generate_launch_description():
                 "짝이 어긋나면 다른 구역 카메라로 좌표를 낸다")
         return [Node(package="packing_vision", executable="zone_detector",
                      name=f"detector_zone_{z}", output="screen",
-                     parameters=common + [{"zone": z, "pick_cam_ns": c}],
+                     parameters=common + vision_depth
+                                + [{"zone": z, "pick_cam_ns": c}],
                      arguments=cli,
                      additional_env=_overlay_env(),
                      condition=IfCondition(LaunchConfiguration("vision")))
@@ -170,7 +190,7 @@ def generate_launch_description():
         node("packing_db", "db_service_node", "db"),
 
         # 투입부 인식 — cam1 등록 · cam2 검증. 라인이 하나라 이것도 하나다.
-        node("packing_vision", "vision_node", "vision"),
+        node("packing_vision", "vision_node", "vision", vision_depth),
 
         # 관제탑 — ★ 로봇 명령을 내는 유일한 노드다 (CLAUDE.md §8).
         #   구역이 3곳이어도 **프로세스도 노드도 하나**다. 구역별 상태만 늘어난다.
