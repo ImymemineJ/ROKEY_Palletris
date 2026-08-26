@@ -20,8 +20,11 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   [9] 순환 루프 (방향 · 높이 · 프레임 · 레일)
   [10] 팔레트 가이드 벽 (overhang 7.8 고려 · 편도 여유 5)
   [11] ROS 2 브리지 — /clock · /tf
-  [12] 적재 스테이션 가이드 벽 (로봇 쪽은 비움)
-  [13] 전부 검증한다
+  [12] 적재 스테이션 가이드 벽 (로봇 쪽은 비움 · 끄면 치운다)
+  [13] 로봇 · 페데스탈 배치 (이격 — 기둥도 같이 옮긴다)
+  [14] 손목 카메라 3 대 (system.yaml 정본)
+  [15] 전부 검증한다
+
 
 ═══ 왜 이렇게 하는가 — 실측으로 얻은 것들 ═══════════════════════════════════
 
@@ -77,7 +80,7 @@ import sys
 import yaml
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
-CUR = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/project_1/test_3.usd")
+CUR = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/Collected_test_3/test_3.usd")
 OVL = os.environ.get("PL_CONFIG_OVERLAY",
                      "/home/rokey/palletris_ws/src/packing_bringup/config/test_3.yaml")
 A47 = ("https://omniverse-content-production.s3-us-west-2.amazonaws.com"
@@ -771,15 +774,27 @@ else:
 #   면적은 팔레트 그대로다. clearance 는 면적이 아니라 **허용 오버행**이다.
 say("\n[12] 적재 스테이션 가이드 벽")
 GW = ((cfg.get("pallet") or {}).get("guide_wall") or {})
+WALL_FMT = str(GW.get("name_fmt", "/World/PalletWall_%s_%s"))
+WALL_SUF = ("xlo", "xhi", "ylo", "yhi", "lo", "hi")   # "lo/hi" 는 2 면 시절 옛 이름
 if not GW.get("enabled"):
-    say("   꺼져 있다 (pallet.guide_wall.enabled)")
+    # ★ 끄면 **치워야** 한다. 예전에는 say 만 하고 넘어가서, enabled 를 false 로
+    #   바꿔도 씬에 이미 선 벽이 그대로 남았다 — 껐는데 안 없어지는 상태가 된다.
+    _off = []
+    for z in sorted((cfg.get("zones") or {}).get("pallet_origin_world_mm") or {}):
+        for suf in WALL_SUF:
+            pr = st.GetPrimAtPath(WALL_FMT % (z, suf))
+            if pr.IsValid() and pr.IsActive():
+                pr.SetActive(False)
+                _off.append("%s_%s" % (z, suf))
+    say("   꺼져 있다 (pallet.guide_wall.enabled) — 치운 벽 %d 개%s"
+        % (len(_off), (": " + ", ".join(_off)) if _off else ""))
 else:
     pal = cfg["pallet"]
     pw, pd = float(pal["width_mm"]), float(pal["depth_mm"])
     clr = float(GW.get("clearance_mm", 5))
     th = float(GW.get("thickness_mm", 20))
     z0 = float(GW.get("z_from_mm", cfg["conveyor"]["belt_top_z_mm"]))
-    fmt = str(GW.get("name_fmt", "/World/PalletWall_%s_%s"))
+    fmt = WALL_FMT
     origins = cfg["zones"]["pallet_origin_world_mm"]
     robots = cfg["zones"]["robot_base_world_mm"]
     say("   팔레트 %.0f(X) x %.0f(Y) · 여유 %.0f -> 벽 안쪽 간격 **%.0f x %.0f**"
@@ -858,10 +873,147 @@ else:
             % (z, cx, cy, rx, ry, robot_side))
         say("       세운 면 %s  ·  Z %.1f~%.1f" % ("/".join(sorted(made)), z0, z1))
 
+# ══ [13] 로봇 · 페데스탈 배치 (이격) ════════════════════════════════════════
+# ★ 로봇만 옮기면 **기둥 위에서 벗어나 허공에 선다.** 둘을 같이 옮긴다
+#   (김병직 ee25497 이 test1-1 에서 겪은 것과 같은 함정).
+# ★ 재고 고치기다 — 씬의 현재 위치를 재서 config 값까지의 차이만큼 민다.
+#   여러 번 돌려도 같은 결과가 된다.
+# ★ 지선 중심 = 로봇 X 라, 이 값을 바꾸면 [5]·[7] 이 지선·레일·스토퍼를 따라
+#   옮긴다. 그래서 이 단계는 [5] 보다 **뒤에 와도 된다** — [5] 는 씬이 아니라
+#   config 의 ROBOT_X 를 보기 때문이다.
+# 기둥 원통의 자체 높이 [m]. 실제 높이 = 이 값 x scale.z.
+# `scripts/set_test3_geometry.py` 의 CYL_H 와 같은 값이다.
+PED_CYL_H = 1.2
+say("\n[13] 로봇 · 페데스탈 배치")
+_RB = cfg["zones"]["robot_base_world_mm"]
+for z in sorted(_RB):
+    want = [float(v) for v in _RB[z]]
+    rp, pp = "/World/robot_%s" % z, "/World/Pedestal_%s" % z
+    rprim = st.GetPrimAtPath(rp)
+    if not rprim.IsValid():
+        chk("로봇 %s" % rp, False, "없다")
+        continue
+    a = xop(rprim, "translate", Gf.Vec3d(0, 0, 0))
+    cur = a.Get()
+    dx = want[0] / 1000.0 - float(cur[0])
+    dy = want[1] / 1000.0 - float(cur[1])
+    dz = want[2] / 1000.0 - float(cur[2])
+    if max(abs(dx), abs(dy), abs(dz)) < 1e-6:
+        say("   %s 이미 맞다 (%.0f, %.0f, %.0f)" % (z, want[0], want[1], want[2]))
+        continue
+    a.Set(Gf.Vec3d(float(cur[0]) + dx, float(cur[1]) + dy, float(cur[2]) + dz))
+    # 기둥도 **같은 만큼** 민다. x·y 는 상대 이동이면 충분하다.
+    # ★★ z 는 상대 이동만으로는 **모자란다** (2026-08-26). 기둥은 원통이고
+    #   실제 높이 = CYL_H(1.2) x scale.z 다. 페데스탈 높이가 바뀌면 중심 z 와
+    #   scale.z 를 **둘 다** 고쳐야 한다. translate 만 밀면 원통 길이는 그대로라
+    #   로봇 베이스가 기둥 윗면에서 떨어진다 — 1950 -> 1700 이면 윗면 1600,
+    #   베이스 1700 이라 **로봇이 100 mm 허공에 뜬다.**
+    #   중심 = 높이/2 · scale.z = 높이 / CYL_H. 절대값으로 쓴다 (재고 고치기).
+    pprim = st.GetPrimAtPath(pp)
+    if pprim.IsValid():
+        _hm = want[2] / 1000.0                      # 기둥 실제 높이 [m] = 베이스 z
+        b = xop(pprim, "translate", Gf.Vec3d(0, 0, 0))
+        c2 = b.Get()
+        b.Set(Gf.Vec3d(float(c2[0]) + dx, float(c2[1]) + dy, _hm / 2.0))
+        sc = xop(pprim, "scale", Gf.Vec3f(1, 1, 1))
+        cs = sc.Get()
+        sc.Set(Gf.Vec3f(float(cs[0]), float(cs[1]), _hm / PED_CYL_H))
+        say("   %s 기둥 중심 z %.3f · scale.z %.5f (높이 %.0f mm)"
+            % (z, _hm / 2.0, _hm / PED_CYL_H, want[2]))
+    else:
+        chk("페데스탈 %s" % pp, False, "없다 — 로봇만 옮기면 허공에 선다")
+    say("   %s 로봇 %+.0f, %+.0f, %+.0f mm -> (%.0f, %.0f, %.0f) · 기둥 같이 이동"
+        % (z, dx * 1000, dy * 1000, dz * 1000, want[0], want[1], want[2]))
+
+
+# ══ [14] 손목 카메라 (구역 3 대) ═════════════════════════════════════════════
+# ★ 왜 필요한가: `test1-1.usd` 에는 `/World/robot/gripper/CamWrist` 가 있는데
+#   test_3 의 로봇 3 대에는 **하나도 없었다** (실측 2026-08-26). 로봇 애셋 참조와
+#   SurfaceGripper 설정은 두 씬이 같으므로, 트랙 B 작업물 중 test_3 로 안 넘어온
+#   것은 이 카메라뿐이다.
+# ★ 값은 `system.yaml` 의 `recognition.wrist_cam` 정본을 읽는다. offset 170 도
+#   tilt 18 도 실측으로 정해진 값이라 여기서 지어내지 않는다 — 100 이면 카메라가
+#   그리퍼 몸통(반경 122.8) 안에 파묻혀 화소가 전부 0 으로 나온다.
+# ★ 물리는 안 붙인다. 링크에 콜라이더나 질량을 더하면 아티큘레이션 동역학이 바뀐다.
+say("\n[14] 손목 카메라")
+_BASE_YAML = os.path.join(os.path.dirname(OVL), "system.yaml")
+try:
+    _sys = yaml.safe_load(open(_BASE_YAML, encoding="utf-8"))
+except OSError as e:
+    _sys = {}
+    chk("system.yaml 읽기", False, str(e))
+_rec = (_sys.get("recognition") or {})
+_wc = (_rec.get("wrist_cam") or {})
+if not _wc.get("enabled"):
+    say("   꺼져 있다 (recognition.wrist_cam.enabled)")
+else:
+    wo = [float(v) / 1000.0 for v in _wc.get("offset_mm", [170, 0, 30])]
+    whw, whd, whh = (float(v) / 1000.0 for v in _wc.get("housing_mm", [124, 26, 29]))
+    tilt = math.radians(float(_wc.get("tilt_deg", 18)))
+    res = [int(v) for v in _rec.get("resolution", [1280, 720])]
+    hfov = float(_rec.get("hfov_deg", 60))
+    ap_h = 36.0
+    focal = ap_h / (2.0 * math.tan(math.radians(hfov) / 2.0))
+    made = []
+    for z in sorted(cfg["zones"]["robot_base_world_mm"]):
+        gp = "/World/robot_%s/gripper" % z
+        if not st.GetPrimAtPath(gp).IsValid():
+            chk("그리퍼 %s" % gp, False, "없다 — 로봇 참조를 먼저 확인하라")
+            continue
+        cw = gp + "/CamWrist"
+        # 재고 고치기: 이미 있으면 지우고 다시 만든다 (여러 번 돌려도 같은 결과)
+        if st.GetPrimAtPath(cw).IsValid():
+            st.RemovePrim(cw)
+        xf = UsdGeom.Xform.Define(st, cw)
+        pr = xf.GetPrim()
+        xfa = UsdGeom.Xformable(pr)
+        xfa.ClearXformOpOrder()
+        xfa.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Vec3d(wo[0], wo[1], wo[2]))
+        # 시선 기울기 — 툴 +Y 둘레로 -tilt. (w,x,y,z) = (cos t/2, 0, -sin t/2, 0)
+        xfa.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Quatd(math.cos(tilt / 2.0),
+                     Gf.Vec3d(0.0, -math.sin(tilt / 2.0), 0.0)))
+
+        body = UsdGeom.Cube.Define(st, cw + "/Body")
+        body.GetSizeAttr().Set(1.0)
+        bp = body.GetPrim()
+        bxf = UsdGeom.Xformable(bp)
+        bxf.ClearXformOpOrder()
+        bxf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(0, 0, 0))
+        # 긴 변(124)을 접선 방향으로 눕힌다 — 반경으로 두면 몸통을 파고든다
+        if _wc.get("housing_tangential", True):
+            bxf.AddScaleOp().Set(Gf.Vec3f(whh, whw, whd))
+        else:
+            bxf.AddScaleOp().Set(Gf.Vec3f(whw, whh, whd))
+        bp.CreateAttribute("primvars:displayColor",
+                           Sdf.ValueTypeNames.Color3fArray).Set(
+            [Gf.Vec3f(0.10, 0.10, 0.12)])
+
+        cam = UsdGeom.Camera.Define(st, cw + "/Camera")
+        cp = cam.GetPrim()
+        cp.CreateAttribute("focalLength", Sdf.ValueTypeNames.Float).Set(focal)
+        cp.CreateAttribute("horizontalAperture", Sdf.ValueTypeNames.Float).Set(ap_h)
+        cp.CreateAttribute("verticalAperture", Sdf.ValueTypeNames.Float).Set(
+            ap_h * float(res[1]) / float(res[0]))
+        cp.CreateAttribute("clippingRange", Sdf.ValueTypeNames.Float2).Set(
+            Gf.Vec2f(0.02, 6.0))
+        cxf = UsdGeom.Xformable(cp)
+        cxf.ClearXformOpOrder()
+        cxf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Vec3d(0.0, 0.0, whd / 2.0))
+        # USD 카메라는 자기 -Z 를 본다. X 로 180도 돌려 부모 +Z(흡착 방향)를 보게 한다
+        cxf.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Quatd(0.0, Gf.Vec3d(1.0, 0.0, 0.0)))
+        made.append(z)
+    say("   만든 것 %s  ·  offset (%.0f, %.0f, %.0f) mm · 기울기 %.0f deg · "
+        "%s %dx%d hfov %.0f deg"
+        % ("/".join(made) or "없음", wo[0] * 1000, wo[1] * 1000, wo[2] * 1000,
+           math.degrees(tilt), _wc.get("model"), res[0], res[1], hfov))
+
+
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)
-
-# ══ [13] 검증 ════════════════════════════════════════════════════════════════
 say("\n" + "=" * 74)
 say("=== 검증 ===")
 for z, p in sorted(JUNC.items()):
