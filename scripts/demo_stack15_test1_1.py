@@ -1056,6 +1056,8 @@ _PU_CROSS = (None if not _PU_CROSS
 
 
 _STUCK_SINCE = {}                      # box_id -> 픽업 구간에서 처음 본 시각
+# 오분류로 이미 치운 박스. 중복 집계를 막는다 (despawn 반영 지연).
+_MISROUTED = set()
 
 
 def _stuck_box(link, ids):
@@ -1157,6 +1159,30 @@ def meter_thread():
 # ── 위치변환 레일 (색상 라우팅) ────────────────────────────────────────────
 ROUTE = cfg.get("routing") or {}
 ROUTE_ON = bool(ROUTE) and os.environ.get("PL_ROUTE", "1") not in ("", "0")
+
+
+def _zone_of(specs, bid):
+    """`bid` 가 **가야 할** 존. 모르면 None.
+
+    ★ 왜 필요한가 (실측 2026-08-26). `pickup_check` 는 그 존 스토퍼에 멎은 박스를
+      그냥 돌려준다 — **배송지를 안 본다.** 그래서 엉뚱한 지선에 올라탄 박스를
+      로봇이 집어 그 존 팔레트에 놓는데, 어디에서도 에러가 안 난다.
+
+      33 박스 실행에서 BOX00026(DAEJEON->C)이 A 팔레트에 올라갔다. 사슬은 이렇다:
+        BOX00025 가 지선 A 입구 Y 0.598 에서 멎었다 (진입 판정은 Y 1.2)
+        -> 라우터가 진입을 기다리느라 **소터 A 를 분기로 계속 열어 뒀다**
+        -> 그 사이 지나가던 BOX00026 이 같이 밀려 A 지선에 올라탔다
+           (BOX00026 에는 `-> 존 C` 라우팅 명령이 아예 없다)
+        -> 배송지 검사가 없어 그대로 적재
+    """
+    if not ROUTE_ON:
+        return None
+    tbl, keyfn = _route_map()
+    sp = specs.get(bid)
+    if not sp:
+        return None
+    k = keyfn(sp)
+    return tbl.get(str(k)) if k is not None else None
 
 
 def _route_map():
@@ -1940,6 +1966,34 @@ def worker(specs, ids, zone=None):
             while time.time() - t0 < ARRIVE_TIMEOUT_S and not _S["done"]:
                 c = link.call(cmd="pickup_check", zone=zone)
                 if c.get("present"):
+                    # ★ 이 박스가 **이 존 것인가.** 없으면 오분류가 조용히
+                    #   정상 처리된다 (`_zone_of` 주석의 BOX00026 사례).
+                    #   치우는 방식은 바로 아래 STUCK 과 같다 — 남겨 두면 뒤차가
+                    #   밀려 라인이 굳는다. 세는 것이 중요하다: 지표에 안 남으면
+                    #   "적재 22 개" 가 무엇을 담고 있는지 알 수 없다.
+                    _bid = c.get("box_id")
+                    _want = _zone_of(specs, _bid)
+                    #   ⚠ 한 번만 센다. `despawn_box` 는 메인 스레드 큐를 거치므로
+                    #     반영 전에 `pickup_check` 가 같은 박스를 몇 번 더 준다 —
+                    #     그대로 두면 지표에 같은 박스가 여러 줄 쌓인다.
+                    if _want and _want != zone and _bid in _MISROUTED:
+                        continue
+                    if _want and _want != zone:
+                        _MISROUTED.add(_bid)
+                        log("   !! %s 는 %s 행(%s)인데 존 %s 지선에 올라왔다 — "
+                            "치우고 계속한다 (소터가 앞 박스 때문에 열려 있었을 것)"
+                            % (_bid, _want,
+                               specs.get(_bid, {}).get("dest", "?"), zone))
+                        link.call(cmd="despawn_box", box_id=_bid)
+                        _S["rows"].append(
+                            {"id": _bid,
+                             "type": specs.get(_bid, {}).get("name", "?"),
+                             "res": "MISROUTE", "err": (float("nan"),) * 3,
+                             "wall": 0.0, "wait": time.time() - t0,
+                             "knock": 0.0, "who": "-",
+                             "kvec": (0.0, 0.0, 0.0),
+                             "near_mm": 0.0, "far_mm": 0.0, "place": None})
+                        continue
                     pick = c
                     _STUCK_SINCE.clear()
                     break
