@@ -969,6 +969,28 @@ def setup():
             return {"ok": t is not None, "t_m": t, "quat": qq}
         return q.run(_rd)
 
+    def _h_copy_prim(req):
+        """{"cmd":"copy_prim","src":"..","dst":".."} -> {"ok":..}
+
+        ★ 반출한 팔레트를 **트럭에 남겨 두려고** 만들었다. 그냥 원본을 제자리로
+          되돌리면 트럭 위가 비어서 "상차했다" 가 화면에 안 남는다.
+          그래서 지금 자리(트럭 위)에 **사본**을 뜨고, 원본은 로봇 옆으로
+          되돌린다 — 원본이 계속 `/World/Pallet_<존>` 이라 반출 코드가
+          경로를 몰라도 된다.
+        ★ `Sdf.CopySpec` 은 같은 레이어 안에서 프림 스펙을 통째로 복사한다.
+          참조·자식·xform 이 다 따라온다.
+        """
+        def _wr():
+            from pxr import Sdf as _Sdf
+            src, dst = str(req.get("src", "")), str(req.get("dst", ""))
+            pr = stage.GetPrimAtPath(src)
+            if not pr or not pr.IsValid():
+                return {"ok": False, "error": "없는 prim %s" % src}
+            lay = stage.GetEditTarget().GetLayer()
+            ok = _Sdf.CopySpec(lay, _Sdf.Path(src), lay, _Sdf.Path(dst))
+            return {"ok": bool(ok), "dst": dst}
+        return q.run(_wr)
+
     def _h_set_prim_pose(req):
         """{"cmd":"set_prim_pose","path":"..","t_m":[..],"quat":[w,x,y,z]} -> {"ok":..}
 
@@ -994,6 +1016,7 @@ def setup():
                      "prim_bbox": _h_prim_bbox,
                      "move_prim": _h_move_prim,
                      "prim_pose": _h_prim_pose,
+                     "copy_prim": _h_copy_prim,
                      "set_prim_pose": _h_set_prim_pose,
                      "rotate_prim": _h_rotate_prim,
                      "set_kinematic": _h_set_kinematic})
@@ -2361,10 +2384,18 @@ def worker(specs, ids, zone=None):
                     link, zone, log, _cargo)
                 sw = link.call(cmd="swap_pallet", zone=zone)
                 if _pose0.get("ok"):
+                    # ★ 순서가 중요하다. **먼저** 지금 자리(트럭 위)에 사본을 떠서
+                    #   상차한 모습을 남기고, **그다음** 원본을 로봇 옆으로 되돌린다.
+                    #   반대로 하면 사본이 빈 팔레트 자리에 생긴다.
+                    _kept = "/World/PalletShipped_%s_%d" % (zone, pallets + 1)
+                    _cp = link.call(cmd="copy_prim", src=_pal_prim, dst=_kept)
                     _rb = link.call(cmd="set_prim_pose", path=_pal_prim,
                                     t_m=_pose0["t_m"], quat=_pose0.get("quat"))
-                    log("   [반출] 빈 팔레트를 제자리로 (%s) — %s"
-                        % (", ".join("%.3f" % v for v in _pose0["t_m"]),
+                    log("   [반출] 트럭에 %s 로 남기고, 빈 팔레트를 제자리로 "
+                        "(%s) — 사본 %s · 복귀 %s"
+                        % (_kept.rsplit("/", 1)[-1],
+                           ", ".join("%.3f" % v for v in _pose0["t_m"]),
+                           "ok" if _cp.get("ok") else _cp,
                            "ok" if _rb.get("ok") else _rb))
                 else:
                     log("   [반출] !! 팔레트 자리를 못 읽었다 — 빈 판을 못 놓는다: %r"
