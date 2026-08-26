@@ -117,6 +117,8 @@ class RosSide:
     def __init__(self, cfg, zone, handlers, log=print):
         self.zone, self.log = str(zone).upper(), log
         self.link = _InProcLink(handlers)
+        # 지선 재가동 속도 — 숫자를 박지 않는다 (conveyor.belt_velocity_mps 정본)
+        self._belt_mps = float(cfg["conveyor"]["belt_velocity_mps"])
 
         # ★ Cycle 은 **하나만** 만들어 끝까지 쓴다. 명령마다 새로 만들면
         #   _stack_top_m(이송 고도의 바닥)이 0 으로 돌아가 팔이 적재물 위를
@@ -171,10 +173,18 @@ class RosSide:
                 from cmd_adapter import run_cmd
             except ImportError:
                 from packing_robot.cmd_adapter import run_cmd
-            # ★ 규약(seq 복사 · has_actual 게이트 · 예외에도 답하기)은 여기 없다 —
-            #   `cmd_adapter.run_cmd` 하나에 있다. 과도기 노드
-            #   (`packing_robot/robot_node.py`)도 같은 함수를 부른다.
-            self._push(run_cmd(self.cycle, _clean(cmd), log=self.log))
+            # ★★ 지선 벨트는 여기서 직접 건다 (install_services 의 소유권 주석 참조).
+            #   PICK(0) 시작 전에 세우고, PLACE(1) 가 끝나면 다시 돌린다.
+            #   핸들러는 mainq 를 거치므로 워커 스레드에서 불러도 안전하다 —
+            #   소켓 스레드가 부르던 것과 같은 경로다.
+            act = int(cmd.get("action", -1))
+            seg = "%s_pickup" % self.zone.lower()
+            if act == 0:                                        # PICK
+                self.link.call(cmd="set_velocity", seg=seg, mps=0.0)
+            ev = run_cmd(self.cycle, _clean(cmd), log=self.log)
+            if act == 1:                                        # PLACE — 성공/실패 무관
+                self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
+            self._push(ev)
         finally:
             self._busy.release()
 
@@ -205,10 +215,28 @@ def install_services(handlers):
     함수를 부르면 둘이 어긋나므로 같은 표를 쓴다.
     """
     h = handlers
+
+    # ★★ 지선(_pickup) 벨트는 **어댑터가 소유한다** (2026-08-27 새벽).
+    #   브리지가 서비스 **요청의 float32 를 못 쓴다** — velocity_mps 가 항상 0.0
+    #   으로 읽혀(실측: Req 출력 직접 읽기로도 0), 관제탑의 재가동(0.5)이 전부
+    #   정지로 둔갑했다. 각 구역이 1개 놓고 멈춘 원인.
+    #   그래서 정지/재가동은 RosSide 가 PICK/PLACE 시점에 **같은 프로세스에서**
+    #   직접 건다 (값이 브리지를 안 건넌다). 관제탑의 pickup 호출은 계약(§2.5,
+    #   "ok 확인 후 흡착")만 만족시키고 실제로는 안 만진다 — 0 으로 깨진 값이
+    #   어댑터의 재가동을 도로 꺼 버리는 것을 막기 위해서다.
+    #   ⚠ pickup 외 seg (반출 등) 는 그대로 통과시킨다 — 다만 값은 여전히 0 이다.
+    _real_setvel = h["set_velocity"]
+
+    def _setvel_ros(req):
+        seg = str(req.get("seg") or "")
+        if seg.endswith("_pickup"):
+            return {"ok": True, "actual": float(req.get("mps") or 0.0)}
+        return _real_setvel(req)
+
     ros_graph.set_handlers(
         # srv SetVelocity: seg · velocity_mps -> ok · actual_mps
         # 소켓          : seg · mps          -> ok · actual
-        set_velocity=_svc(h["set_velocity"], ("ok", "actual_mps"),
+        set_velocity=_svc(_setvel_ros, ("ok", "actual_mps"),
                           req_map={"velocity_mps": "mps"},
                           res_map={"actual": "actual_mps"}),
         despawn_box=_svc(h["despawn_box"], ("ok",)),
