@@ -1086,6 +1086,15 @@ def setup():
     cc.stop_all()
 
 
+class LinkDown(RuntimeError):
+    """sim 소켓이 끊겼다. **계측 실패**이지 사이클 실패가 아니다.
+
+    이걸 따로 두는 이유: `BrokenPipeError` 를 그대로 올리면 워커가 죽는다.
+    링크가 끊긴 뒤에는 어차피 아무것도 못 하므로, 부르는 쪽이 계측만 건너뛰고
+    **지금까지의 결과를 정상적으로 보고**한 뒤 끝내야 한다.
+    """
+
+
 class LinkPrim:
     """`PalletVision` 이 기대하는 최소 인터페이스 — **소켓으로** 읽는다.
 
@@ -1098,7 +1107,16 @@ class LinkPrim:
         self.link, self.box_id = link, box_id
 
     def get_world_pose(self):
-        r = self.link.call(cmd="get_box_pose", box_id=self.box_id)
+        # ★ 소켓이 끊기면 `BrokenPipeError` 가 여기서 **그대로 올라간다.**
+        #   실측 2026-08-26: release 타임아웃 뒤 sim 이 연결을 닫자, 그 직후
+        #   knock 측정(`worker` 의 `by_id[pid].get_world_pose()`)이 이 예외를
+        #   던져 **존 A 워커가 통째로 죽었다.** 계측이 본체를 죽이면 안 된다
+        #   (CLAUDE.md §9 "노드가 죽으면 안 된다").
+        #   여기서는 `LinkDown` 으로 바꿔 올리고, 부르는 쪽이 계측을 건너뛴다.
+        try:
+            r = self.link.call(cmd="get_box_pose", box_id=self.box_id)
+        except (BrokenPipeError, ConnectionError, OSError) as e:
+            raise LinkDown("get_box_pose(%s): %r" % (self.box_id, e))
         if not r.get("ok"):
             raise RuntimeError("get_box_pose(%s) -> %r" % (self.box_id, r))
         y = math.radians(float(r.get("yaw_deg", 0.0)))
@@ -1107,15 +1125,27 @@ class LinkPrim:
 
 
 def _line_state(link, ids):
-    """라인에 남아 있는 박스들의 위치. 타임아웃 진단용."""
-    st = link.call(cmd="spawn_status")
+    """라인에 남아 있는 박스들의 위치. 타임아웃 진단용.
+
+    ★ **여기서 예외를 내면 안 된다.** 이 함수는 "왜 멈췄나" 를 남기려고 부르는
+      것이라, 부르는 시점에 이미 무언가 잘못돼 있다. 실측 2026-08-26: 링크가
+      끊긴 뒤 워커가 죽으면서 이 진단을 찍으려다 **진단이 같은 예외로 또 죽어**
+      원인이 로그에 하나도 안 남았다.
+    """
+    try:
+        st = link.call(cmd="spawn_status")
+    except Exception as e:
+        return "(라인 상태를 못 읽었다: %r)" % (e,)
     out = []
-    for bid in ids:
-        r = link.call(cmd="get_box_pose", box_id=bid)
-        if not r.get("ok"):
-            continue                      # 놓였거나 despawn 된 것
-        x, y, z = r["pos_m"]
-        out.append("%s(%.2f,%.2f,%.2f)" % (bid[-3:], x, y, z))
+    try:
+        for bid in ids:
+            r = link.call(cmd="get_box_pose", box_id=bid)
+            if not r.get("ok"):
+                continue                  # 놓였거나 despawn 된 것
+            x, y, z = r["pos_m"]
+            out.append("%s(%.2f,%.2f,%.2f)" % (bid[-3:], x, y, z))
+    except Exception as e:
+        out.append("(도중에 끊김: %r)" % (e,))
     return "라인 %s개 · %s" % (st.get("on_belt", "?"), " ".join(out) if out else "비었다")
 
 
@@ -2351,16 +2381,26 @@ def worker(specs, ids, zone=None):
             #   헛것이 찍힌다 (2026-08-23 첫 실행에서 실제로 그랬다).
             place = dict(svc.last) if (res == "PLACED" and svc.last) else None
             err = np.array([float("nan")] * 3)
-            if place is not None:
-                want = np.asarray(CY.pallet_place_to_world(place, t["h_mm"], origin_mm))
-                got = by_id[bid].get_world_pose()[0]
-                err = (got - want) * 1000.0
             knock, who, kvec = 0.0, "-", np.zeros(3)
-            for pid, ref in rest.items():
-                dv = (by_id[pid].get_world_pose()[0] - ref) * 1000.0
-                dmm = float(np.linalg.norm(dv))
-                if dmm > knock:
-                    knock, who, kvec = dmm, pid, dv
+            # ★ 계측이 본체를 죽이지 않게 감싼다. 링크가 끊기면 숫자만 포기하고
+            #   지금까지의 결과를 정상적으로 보고한 뒤 끝낸다 (CLAUDE.md §9).
+            try:
+                if place is not None:
+                    want = np.asarray(
+                        CY.pallet_place_to_world(place, t["h_mm"], origin_mm))
+                    got = by_id[bid].get_world_pose()[0]
+                    err = (got - want) * 1000.0
+                for pid, ref in rest.items():
+                    dv = (by_id[pid].get_world_pose()[0] - ref) * 1000.0
+                    dmm = float(np.linalg.norm(dv))
+                    if dmm > knock:
+                        knock, who, kvec = dmm, pid, dv
+            except LinkDown as e:
+                log("   [존 %s] sim 링크가 끊겼다 — 계측을 건너뛰고 정리한다: %s"
+                    % (zone, e))
+                break
+            except Exception as e:                       # 계측 실패로 죽지 않는다
+                log("   [존 %s] !! 계측 실패 (계속 간다): %r" % (zone, e))
 
             # ★ 이 자리로 가려면 로봇 쪽 기둥을 넘어야 했는가. 넘었다면 아래팔이
             #   그 위를 쓸고 지나갔다는 뜻이고, 그게 knock 의 코드상 원인이다.
