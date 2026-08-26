@@ -282,7 +282,7 @@ def main():
             #   씬 실측으로 대신 낸다. PL_GTPICK=0 이면 안 만든다.
             import ros_graph as _RG
             if _RG.GT_PICK:
-                gtpick = _GtPick(sp, ZONES, _RG)
+                gtpick = _GtPick(sp, ZONES, _RG, conveyor=cc, cfg=cfg)
                 print("[sim_main] 픽업 좌표를 **씬 실측**으로 낸다 (임시 대역) — "
                       "카메라가 들어오면 PL_GTPICK=0")
 
@@ -461,10 +461,25 @@ class _GtPick:
 
     PERIOD_S = 0.2
 
-    def __init__(self, spawner, zones, rg, log=print):
+    def __init__(self, spawner, zones, rg, log=print, conveyor=None, cfg=None):
         # ★ `ros_graph` 를 인자로 받는다. 그 모듈은 최상단에서 `omni.graph.core` 를
         #   import 하므로 **Isaac 이 뜬 뒤에만** 들어온다 — sim_main 상단에서 못 건다.
         self.sp, self.zones, self.rg, self.log = spawner, list(zones), rg, log
+        # ★ PL_SPUR_STOP=2 — **점유 기반** 지선 제어 (2026-08-27 김병직 설계 완성형).
+        #   모드 1("픽 중 정지")은 인식 대기 중이 무방비라, 앞차가 스토퍼에서
+        #   인식을 기다리는 동안 뒤차가 내려와 붙었다 (실측: C존 3호+5호 병합
+        #   실루엣 734x543mm → 인식 영구 실패). 여기서는 **스토퍼 점유 = 정지,
+        #   비면(박스가 들려 나가면) = 재가동**을 5Hz 폴마다 직접 건다.
+        #   메인 스레드라 conveyor_ctl 을 mainq 없이 바로 불러도 안전하다.
+        self._cc = conveyor
+        self._spur2 = (os.environ.get("PL_SPUR_STOP") == "2"
+                       and conveyor is not None and cfg is not None)
+        if self._spur2:
+            self._spur_mps = float(cfg["conveyor"].get(
+                "spur_velocity_mps", cfg["conveyor"]["belt_velocity_mps"]))
+            self._spur_cur = {}          # zone -> 마지막 지시값 (스팸 방지)
+            log("[gtpick] 지선 점유 제어 켬 (PL_SPUR_STOP=2) — 스토퍼에 박스가"
+                " 있는 동안 그 지선을 세운다")
         self.next_t = 0.0
         self._said = {}          # zone -> 마지막으로 알린 box_id (로그 도배 방지)
         # ★ 자리 잡음 판정 (2026-08-27 실측). 도착 직후 아직 돌고 있는 박스를
@@ -494,6 +509,15 @@ class _GtPick:
             pos = pose.get("pos_m") or (0.0, 0.0, 0.0)
             present = bool(r.get("present"))
             bid = str(r.get("box_id") or "")
+            # ── 점유 기반 지선 제어 (__init__ 의 _spur2 주석) ──
+            if self._spur2:
+                want = 0.0 if present else self._spur_mps
+                if self._spur_cur.get(z) != want:
+                    try:
+                        self._cc.set_velocity("%s_pickup" % str(z).lower(), want)
+                        self._spur_cur[z] = want
+                    except Exception as e:                      # noqa: BLE001
+                        self.log("[gtpick] 지선 %s 속도 실패 (무시): %r" % (z, e))
             if present:
                 # ★ 필터 타임아웃 (2026-08-27 실측 — B존 277초 침묵). 뒤집힌 박스가
                 #   창 밖에 누워 길을 막으면 아래 두 필터가 **영원히** 보고를 안 해
