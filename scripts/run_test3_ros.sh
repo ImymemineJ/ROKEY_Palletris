@@ -115,4 +115,8 @@ LOG_DIR="$HOME/palletris_logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/isaac_$(date +%Y%m%d_%H%M%S).log"
 echo "[run_test3_ros] 로그   $LOG"
-"$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@" 2>&1 | tee "$LOG"
+# ★ 파이프에 물리면 파이썬 stdout 이 4 KB 블록 버퍼가 되어 로그가 한참 뒤처진다
+#   (첫 시도 실측: 실행 몇 분째인데 파일은 BOX001 스폰에서 끊겨 있었다).
+#   demo_stack15 의 Tee 가 당한 것과 같은 함정 — 줄 단위로 강제한다.
+export PYTHONUNBUFFERED=1
+stdbuf -oL -eL "$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@" 2>&1 | tee "$LOG"
