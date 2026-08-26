@@ -1409,7 +1409,18 @@ def router_thread(specs, ids):
     #   본선 롤러는 Y ±451.6 이다 (setup_test3_scene 검증 출력). 박스 **뒷면**이
     #   그 선을 넘으면 소터 위가 아니다 — 벨트가 서 있어도 붙들 이유가 없다.
     y_clear = float(ROUTE.get("sorter_clear_y_mm", 460)) / 1000.0
+    # ★★ 멈춘 박스는 소터가 도와줄 게 없다 (2026-08-26 3차).
+    #   문턱을 아무리 맞춰도 **정지 위치는 그때그때 다르다.** 실측(영상 error4):
+    #   3 호가 Y 0.606 에서 멈췄는데 뒷면이 0.436 이라 기준 0.460 에 **26 mm**
+    #   모자랐다. 그래서 로봇이 끝날 때까지 9 초를 붙들었다.
+    #   멈춘 이유는 `cycle.py:392` 가 집는 동안 지선 벨트를 세우기 때문이다 —
+    #   벨트가 설 자리는 예측할 수 없다. 그러니 **위치가 아니라 정지로** 판단한다:
+    #   `STALL_S` 동안 Y 가 `STALL_MM` 도 안 움직이면 소터를 놓아 준다.
+    #   그 박스는 벨트가 다시 돌면 알아서 올라간다. 소터를 붙들 이유가 없다.
+    STALL_S = float(os.environ.get("PL_DIV_STALL_S", "1.5"))
+    STALL_MM = 5.0
     released = {}                       # bid -> 소터를 이미 되돌렸나
+    last_y = {}                         # bid -> (마지막 Y, 그 시각)
     _mly = ROUTE.get("main_line_y_mm") or [-500, 500]
     y_lo, y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
     thru = list(ROUTE.get("thru_world", [-1, 0, 0]))
@@ -1527,11 +1538,24 @@ def router_thread(specs, ids):
                     _sp = specs.get(bid) or {}
                     _half = max(float(_sp.get("w_mm", 480)),
                                 float(_sp.get("d_mm", 380))) / 2000.0
+                    _now = time.time()
+                    _ly, _lt = last_y.get(bid, (p[1], _now))
+                    if abs(p[1] - _ly) * 1000.0 >= STALL_MM:
+                        _ly, _lt = p[1], _now           # 움직였다 — 시계 리셋
+                    last_y[bid] = (_ly, _lt)
+                    _stalled = (_now - _lt) >= STALL_S
+                    _why = None
                     if p[1] - _half >= y_clear or p[1] >= y_release:
+                        _why = "벗어남"
+                    elif _stalled and p[1] > 0.0:
+                        # 지선 쪽으로 이미 나왔는데 멈췄다 — 벨트가 서 있는 것이다.
+                        _why = "정지 %.1f s" % (_now - _lt)
+                    if _why:
                         turn(z, seg, False)
                         released[bid] = True
-                        log("   [라우팅] %s 소터 %s 벗어남 (Y %.2f · 뒷면 %.2f m) "
-                            "— 소터 즉시 복귀" % (bid, z, p[1], p[1] - _half))
+                        last_y.pop(bid, None)
+                        log("   [라우팅] %s 소터 %s 복귀 (%s · Y %.2f · 뒷면 %.2f m)"
+                            % (bid, z, _why, p[1], p[1] - _half))
                 if state.get(bid) == "divert":
                     # 진행을 1 초마다 남긴다. 어디서 걸리는지 봐야 고칠 수 있다.
                     now = time.time()
