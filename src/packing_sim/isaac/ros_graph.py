@@ -466,14 +466,20 @@ def build_cameras(cfg, zones, log=print):
 
     # 씬이 이미 카메라를 쏘고 있으면 비켜선다 (/clock 과 같은 이유 — 발행자 2 개면
     # vision 이 두 이미지를 번갈아 받아 tf 시각이 어긋난다).
-    for prim in st.Traverse():
-        if prim.GetTypeName() == "OmniGraphNode":
-            t = prim.GetAttribute("node:type")
-            if t and str(t.Get() or "").endswith("ROS2CameraHelper"):
-                log("[ros_graph] 픽업 카메라는 씬이 쏜다 (%s) — 건너뛴다.\n"
-                    "   ⚠ 씬 쪽 `frameId` 는 **CamPick_*_optical** 이어야 한다"
-                    " (프레임은 이미 tf 에 올라가 있다)" % prim.GetPath())
-                return 0
+    # ★★ PL_CAMROS=2 는 **강제**다 (2026-08-26). 씬에 `RGBPublish` 노드가 있는데
+    #   실제로는 토픽이 하나도 안 나오는 상태를 실측했다 — 노드만 보고 비켜서면
+    #   **둘 다 안 쏘는** 상태가 된다. 씬 노드가 진짜로 쏘는지는 빌드 시점에
+    #   알 수 없으므로(rclpy 없음), 사람이 `ros2 topic list` 로 확인하고 강제한다.
+    if os.environ.get("PL_CAMROS") != "2":
+        for prim in st.Traverse():
+            if prim.GetTypeName() == "OmniGraphNode":
+                t = prim.GetAttribute("node:type")
+                if t and str(t.Get() or "").endswith("ROS2CameraHelper"):
+                    log("[ros_graph] 픽업 카메라는 씬이 쏜다 (%s) — 건너뛴다.\n"
+                        "   ⚠ 토픽이 실제로 안 나오면 PL_CAMROS=2 로 강제할 것" % prim.GetPath())
+                    return 0
+    else:
+        log("[ros_graph] PL_CAMROS=2 — 씬 노드와 무관하게 우리가 쏜다")
 
     try:
         import omni.replicator.core as rep
