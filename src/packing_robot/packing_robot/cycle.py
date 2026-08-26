@@ -235,6 +235,7 @@ class Cycle:
         #   메시지에 `stack_top_mm` 이 실려 오면 그것과도 max 를 취하므로 둘 다 산다.
         #   ⚠ 팔레트를 갈면 리셋해야 한다 -> `reset_stack()`
         self._stack_top_m = 0.0
+        self._park = None      # 마지막 픽 (x, y, 벨트면 z) [m] — park_over_pick 용
         # ★ 집기가 놓기에 넘겨주는 값 3개. 원래 `_run` 안의 지역변수였는데,
         #   관제탑이 PICK/PLACE 를 **따로** 보내면서 호출이 둘로 갈려 사라진다.
         #     _pick_yaw  놓기 yaw 의 기준 (nearest_equiv_yaw). 없으면 손목이 180° 돈다
@@ -370,6 +371,34 @@ class Cycle:
         if z > cur[2] + 1e-3:
             self._move([cur[0], cur[1], z], self._last_put_yaw, TRANSIT_TOL_MM)
 
+    def park_over_pick(self):
+        """놓은 뒤 팔을 **스토퍼 상공**으로 미리 옮겨 둔다 (2026-08-27 김병직 제안).
+
+        자세: 마지막으로 집은 자리 XY, 높이는 **5호(최대) 박스 상면 + 50 mm** —
+        어떤 박스가 와도 안 부딪히고, 다음 PICK 의 하강 거리가 최소가 된다.
+
+        ★ 호출 시점: PLACE 결과를 관제탑에 **보낸 뒤** (ros_side._work). 그래야
+          벨트 재가동·다음 계획이 이 이동을 기다리지 않는다. 이동 중 새 PICK 이
+          오면 ros_side 가 한 건 보류했다가 끝나는 즉시 실행한다.
+        ⚠ 실패해도 조용히 넘어간다 — 대기 자세는 최적화지 결과가 아니다.
+        """
+        if self._park is None:
+            return
+        px, py, belt_z = self._park
+        # 최대 박스 높이는 config 에서 — 숫자를 박지 않는다 (CLAUDE.md 단위 규칙)
+        max_h_m = max(t["h_mm"] for t in self.cfg["boxes"]["types"]) / 1000.0
+        park_z = belt_z + max_h_m + 0.050
+        transit = max(self._stack_top_m + self.approach_m, park_z)
+        try:
+            cur = self._face_now()
+            if cur is not None and cur[2] < transit - 1e-3:
+                self._move([cur[0], cur[1], transit], self._last_put_yaw, TRANSIT_TOL_MM)
+            self._move([px, py, transit], self._last_put_yaw, TRANSIT_TOL_MM)
+            if park_z < transit - 1e-3:
+                self._move([px, py, park_z], self._last_put_yaw, TRANSIT_TOL_MM)
+        except Exception as e:                                  # noqa: BLE001
+            self.log("[cycle] 대기 자세 이동 실패 (무시): %r" % (e,))
+
     # ── 한 사이클 ────────────────────────────────────────────
     def run(self, box_id, pick_pose):
         """박스 하나를 집어서 놓는다. 반환은 RESULTS 중 하나.
@@ -488,6 +517,9 @@ class Cycle:
         pick_c = list(pick_pose["pos_m"])
         pick_top = pick_c[2] + h / 2000.0                    # 박스 상면 z [m]
         pick_yaw = float(pick_pose.get("yaw_deg", 0.0))
+        # ★ 대기 자세(park_over_pick)용. 좌표를 지어내지 않는다 — 방금 실제로
+        #   집은 자리라 씬이 바뀌어도 저절로 따라간다. z 는 **벨트면**(박스 밑면).
+        self._park = (pick_c[0], pick_c[1], pick_c[2])
         # ★ 픽 상공으로 **곧장 가지 않는다.** 호 이송은 z 를 선형 보간하므로, 직전 배치의
         #   후퇴 자리가 낮으면(예: 1층 배치 후 0.69 m) 호 중간이 픽업 대기 박스 윗면
         #   (1.141 m)보다 낮아지고, 그리퍼 몸통(Ø245)이 박스 모서리를 쓸어 밀어 버린다.

@@ -132,6 +132,7 @@ class RosSide:
         self.cycle = Cycle(self.link, _NoSvc(), cfg, self.zone, log=log)
 
         self._busy = threading.Lock()
+        self._hold = None                # 모션 중 도착한 명령 1건 보류 (step 주석)
         self._done = []                  # 워커가 넣고 step() 이 비운다
         self._done_lk = threading.Lock()
 
@@ -151,19 +152,21 @@ class RosSide:
         for ev in evs:
             ros_graph.send_event(self.zone, **ev)
 
-        # ② 새 명령
-        cmd = ros_graph.take_cmd(self.zone)
+        # ② 새 명령 — 보류분이 있으면 그것부터
+        cmd = self._hold or ros_graph.take_cmd(self.zone)
         if cmd is None:
             return
         if not self._busy.acquire(blocking=False):
-            # ★ 조용히 버리지 않는다. 답이 없으면 관제탑은 20초를 버린 뒤에야 안다.
-            self.log("[ros_side] 이미 모션 중인데 seq=%s 가 왔다 — ok=false 로 답한다"
-                     % cmd.get("seq"))
-            self._push(dict(seq=int(cmd.get("seq", 0)), action=int(cmd.get("action", 0)),
-                            box_id=str(cmd.get("box_id", "")), ok=False, reason="ABORTED",
-                            has_actual=False, actual_x_mm=0, actual_y_mm=0,
-                            actual_z_mm=0, actual_yaw_deg=0.0, duration_s=0.0))
+            # ★ 버리지 않고 **한 건 보류**한다 (2026-08-27). 대기 자세 이동(2~3 s)
+            #   중에 다음 PICK 이 오는 것이 정상 흐름이 됐다 — ABORTED 로 답하면
+            #   관제탑이 멀쩡한 박스를 실패 처리한다. 관제탑 타임아웃(20 s) 안에
+            #   이동이 끝나므로 다음 틱들에서 재시도하면 된다.
+            if self._hold is None:
+                self._hold = cmd
+                self.log("[ros_side] 모션 중 — seq=%s 보류 (끝나면 바로 실행)"
+                         % cmd.get("seq"))
             return
+        self._hold = None
         threading.Thread(target=self._work, args=(cmd,), daemon=True).start()
 
     # ── 워커 스레드 ────────────────────────────────────────
@@ -191,6 +194,14 @@ class RosSide:
             if act == 1:                                        # PLACE — 성공/실패 무관
                 self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
             self._push(ev)
+            # ★ 결과를 **밀어 넣은 뒤에** 대기 자세로 간다 (2026-08-27 김병직 제안).
+            #   관제탑은 이미 다음 단계로 가고, 이동 중 오는 PICK 은 step 이 한 건
+            #   보류한다 — 아래 _hold 참조.
+            if act == 1:
+                try:
+                    self.cycle.park_over_pick()
+                except Exception as e:                          # noqa: BLE001
+                    self.log("[ros_side] 대기 자세 실패 (무시): %r" % (e,))
         finally:
             self._busy.release()
 
