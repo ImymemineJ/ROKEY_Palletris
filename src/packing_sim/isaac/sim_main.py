@@ -605,6 +605,22 @@ class _Feeder:
         self.h_stat = sp.handlers()["spawn_status"]
         self.period, self.total, self.cap, self.log = float(period), int(total), int(cap), log
         self.i, self.next_t = 0, 0.0
+        # ★ 리턴 합류 **예측** 스폰 보류 (2026-08-27 김병직 지시).
+        #   리턴에서 복귀하는 박스는 본선 사이드로 얹혀 들어오고, 그 순간 새로
+        #   스폰된 박스와 간격이 압축돼 지선에서 추돌·비틀림이 생긴다 (영상
+        #   '풀비전_리턴구간 이슈'). 감시 창(merge_watch_mm)은 2026-08-26 에
+        #   설정만 들어가고 **소비 코드가 없었다** — 여기서 처음 작동한다.
+        #   접근 창(merge_approach_mm, _04 커브부터)까지 보면 합류 몇 초 전에
+        #   미리 스폰이 멈춰서, 복귀 박스가 본선에 자리 잡은 뒤 새 박스가 나온다.
+        self.sp = sp
+        _lp = (cfg["conveyor"].get("loop") or {})
+        self._watch = []
+        for _k in ("merge_watch_mm", "merge_approach_mm"):
+            _w = _lp.get(_k)
+            if _w:
+                self._watch.append((_w["x"][0] / 1000.0, _w["x"][1] / 1000.0,
+                                    _w["y"][0] / 1000.0, _w["y"][1] / 1000.0))
+        self._held_log = 0.0
 
     def step(self, now):
         if self.total and self.i >= self.total:
@@ -615,6 +631,17 @@ class _Feeder:
         # 스폰 지점이 아직 안 비었으면 **겹쳐 스폰된다.** 다음 틱에 다시 본다.
         if st.get("on_belt", 0) >= self.cap or not st.get("spawn_clear", True):
             return
+        # ★ 리턴 박스가 합류에 접근 중이면 스폰을 미룬다 (__init__ 주석 참조).
+        #   벨트는 안 세운다 — 투입만 잡는다.
+        if self._watch:
+            for _b, _e in dict(getattr(self.sp, "_snap", {})).items():
+                _p = _e.get("pos_m")
+                if _p and any(x0 <= _p[0] <= x1 and y0 <= _p[1] <= y1
+                              for x0, x1, y0, y1 in self._watch):
+                    if now - self._held_log > 5.0:
+                        self._held_log = now
+                        self.log("[투입] 리턴 박스 %s 합류 접근 — 스폰 보류" % _b)
+                    return
         # ★★ **3 자리다** (`BOX001`). 5 자리로 내면 조용히 다 막힌다 (2026-08-26 실측):
         #   · 마스터 DB(`boxes_master`)가 3 자리라 관제탑이 "DB 에 없음 -> 폐기"
         #   · QR 라벨 PNG 도 `qr_labels/BOX001.png` 라 라벨이 안 붙는다
