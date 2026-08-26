@@ -519,13 +519,24 @@ def build_cameras(cfg, zones, log=print):
     # ★ 2026-08-26 — prim 경로는 **설정이 정본**이다. 옛 `/World/CamPick_A/Camera`
     #   는 씬에서 지워졌다 (카메라 89 개 삭제 후 rsd455 리그 5 대 설치, PR #33).
     #   `cameras.pick_prim.{A,B,C}` 가 그 리그의 Color 렌즈를 가리킨다.
-    pick_prims = ((cfg.get("cameras") or {}).get("pick_prim") or {})
+    cams_cfg = (cfg.get("cameras") or {})
+    pick_prims = (cams_cfg.get("pick_prim") or {})
+    targets = []
     for z in zones:
-        zl = str(z).lower()
-        cam_path = pick_prims.get(str(z).upper())             or "/World/CamPick_%s/Camera" % str(z).upper()
-        cam_prim = cam_path.rsplit("/", 1)[0]
+        zu = str(z).upper()
+        targets.append(("Cam_%s" % zu, "/pick_cam_%s" % zu.lower(),
+                        pick_prims.get(zu) or "/World/CamPick_%s/Camera" % zu))
+    # ★ 라인 카메라 2대 (2026-08-27, 김병직 지시 — vision:=true 전환 준비).
+    #   cam1(투입부 등록)·cam2(검증). vision_node 의 cam1_ns/cam2_ns 기본값이
+    #   /cam1·/cam2 라 네임스페이스를 거기 맞춘다. 렌즈 경로는 설정이 정본
+    #   (rsd455_1/_2 리그) — 광학 프레임은 build_clock_tf 가 이미 tf 에 넣었다.
+    if cams_cfg.get("spawn_prim"):
+        targets.append(("Cam_L1", "/cam1", str(cams_cfg["spawn_prim"])))
+    if cams_cfg.get("line2_prim"):
+        targets.append(("Cam_L2", "/cam2", str(cams_cfg["line2_prim"])))
+    for gname, ns, cam_path in targets:
         if not st.GetPrimAtPath(cam_path).IsValid():
-            log("[ros_graph] !! %s 가 씬에 없다 — 존 %s 카메라 생략" % (cam_path, zl))
+            log("[ros_graph] !! %s 가 씬에 없다 — %s 카메라 생략" % (cam_path, ns))
             continue
         try:
             rp = rep.create.render_product(cam_path, tuple(int(v) for v in res))
@@ -564,8 +575,7 @@ def build_cameras(cfg, zones, log=print):
                 " 인식이 실패할 것이다 (build_clock_tf 를 먼저 불렀나?)" % opt_path)
             frame = _rig
 
-        g = "%s/Cam_%s" % (GRAPH, str(z).upper())
-        ns = "/pick_cam_%s" % zl
+        g = "%s/%s" % (GRAPH, gname)
         try:
             c.edit(
                 {"graph_path": g, "evaluator_name": "execution"},
@@ -590,7 +600,7 @@ def build_cameras(cfg, zones, log=print):
                      ("Info.inputs:nodeNamespace", ns),
                      ("Info.inputs:topicName", "camera_info")]})
         except Exception as e:                                  # noqa: BLE001
-            log("[ros_graph] !! 존 %s 카메라 그래프 실패: %r" % (zl, e))
+            log("[ros_graph] !! %s 카메라 그래프 실패: %r" % (ns, e))
             continue
         made += 1
         log("[ros_graph] 카메라 %s -> %s/rgb + /camera_info  (frameId %s · %dx%d)"
