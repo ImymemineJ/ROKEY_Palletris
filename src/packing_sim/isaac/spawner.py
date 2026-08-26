@@ -111,6 +111,16 @@ DESPAWN_XYZ_M = (-50.0, -50.0, -10.0)
 # 스폰 지점 앞뒤로 이만큼 안에 박스가 있으면 "안 비었다" 로 본다.
 # 가장 긴 박스(5호 480) 보다 넉넉해야 겹치지 않는다.
 SPAWN_CLEAR_M = 0.70
+# ── 반출 연출 (2026-08-27 김병직). 만재 팔레트가 반출 컨베이어를 타고 나가는
+#    모습을 시연에 넣기 위한 것. **기본 꺼짐** — 켜야만 동작이 바뀐다.
+#    방향/속도/끝은 씬 좌표계 기준이고, 팔레트 반출은 -Y (도크 쪽) 로 나간다.
+#    ⚠ 숫자를 코드에 박지 않는 규칙(§4)의 예외가 아니다 — 이건 **연출 파라미터**라
+#      system.yaml(공용, 승인 필요)이 아니라 환경변수로 뺐다. 값을 굳히면
+#      test_3.yaml 오버레이로 옮길 것.
+OUTFEED_ON = os.environ.get("PL_OUTFEED", "0") == "1"
+OUTFEED_MPS = float(os.environ.get("PL_OUTFEED_MPS", "0.55"))
+OUTFEED_DIR = (0.0, -1.0)                 # -Y 방향으로 흘러 나간다
+OUTFEED_END_M = float(os.environ.get("PL_OUTFEED_END_M", "-8.0"))
 LOST_XY_M = 200.0
 LOST_Z_MIN_M = -50.0
 
@@ -231,6 +241,7 @@ class Spawner:
         self._snap = {}                    # box_id -> {"pos_m", "yaw_deg", "vel_mps"}
         self._pickup = {"present": False, "box_id": "", "pose": None}
         self._pickup_by_zone = {}
+        self._outfeed = {}                 # 반출 중인 박스 box_id -> prim 경로
 
         self._ensure_roots()
         self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
@@ -260,6 +271,9 @@ class Spawner:
         큐 처리는 `sim_main` 이 `mainq.pump()` 로 한다 — 여기서는 스냅샷만 갱신한다.
         """
         self._refresh()
+        if OUTFEED_ON:
+            # 물리 60 Hz 고정이라 dt 는 상수다 (sim_main 이 그렇게 띄운다).
+            self._outfeed_step(1.0 / 60.0)
 
     def _refresh(self):
         """모든 박스의 pose/속도를 한 번 읽어 스냅샷과 픽업 상태를 갱신한다.
@@ -657,6 +671,13 @@ class Spawner:
 
         ★ zone 을 반드시 받는다. 안 받으면 존이 셋이어도 늘 같은 팔레트를 비운다
           — 실측 2026-08-26: B 를 상차했는데 A 가 초기화됐다.
+
+        ★ 반출 연출 (`PL_OUTFEED=1`, 2026-08-27 김병직): 박스를 그 자리에서
+          지우면 화면에서 **한 프레임에 사라진다** — 사양 §7 의 "트럭 상차" 가
+          시연에 안 보인다. 켜면 박스를 지우지 않고 **키네마틱으로 바꿔 반출
+          방향으로 밀어**, 팔레트가 통째로 컨베이어를 타고 나가는 것처럼 보인다.
+          다 나가면 그때 despawn 한다 (`_outfeed_step` 이 매 틱 민다).
+          기본은 꺼짐 — 켜야만 동작이 바뀐다.
         """
         zone = str(zone or self.zone).upper()
         box = self.pallet_box.get(zone)
@@ -670,11 +691,74 @@ class Spawner:
             x, y, z = e["pos_m"]
             if px0 <= x <= px1 and py0 <= y <= py1 and z >= ptop - 0.05:
                 on_pallet.append(box_id)
+        if OUTFEED_ON and on_pallet:
+            for box_id in on_pallet:
+                self._outfeed_begin(box_id)
+            self._log("[spawner] swap_pallet %s — 박스 %d 개를 반출 컨베이어로 내보낸다 %s"
+                      % (zone, len(on_pallet), on_pallet))
+            return {"ok": True, "removed": len(on_pallet), "zone": zone}
         for box_id in on_pallet:
             self._despawn(box_id)
         self._log("[spawner] swap_pallet %s — 박스 %d 개를 팔레트째 내보냈다 %s"
                   % (zone, len(on_pallet), on_pallet))
         return {"ok": True, "removed": len(on_pallet), "zone": zone}
+
+    # ── 반출 연출 (PL_OUTFEED=1) ─────────────────────────────
+    def _outfeed_begin(self, box_id):
+        """박스를 키네마틱으로 바꿔 반출 대기열에 넣는다. **메인 스레드 전용.**
+
+        ★ 키네마틱으로 바꾸는 이유: 팔레트 위 더미를 물리로 밀면 위층이 무너지며
+          쏟아진다. 키네마틱이면 쌓인 모양 그대로 **한 덩어리처럼** 움직인다 —
+          실물에서 지게차가 팔레트째 들어 옮기는 그림과 같다.
+        ★ 콜라이더는 끈다. 켜 둔 채 지나가면 지선 컨베이어·기둥과 부딪혀
+          더미가 흐트러진다 (`_detach` 와 같은 이유).
+        ★ 목록에서는 지금 뺀다 (`self.boxes`) — 반출 중인 박스를 다음 사이클이
+          픽업 후보로 보면 안 된다. 프림 경로는 큐가 들고 있으므로 계속 민다.
+        """
+        rec = self.boxes.pop(box_id, None)
+        if rec is None:
+            return
+        prim = self.stage.GetPrimAtPath(rec["path"])
+        if not (prim and prim.IsValid()):
+            return
+        c = UsdPhysics.CollisionAPI(prim)
+        if c:
+            c.CreateCollisionEnabledAttr(False)
+        rb = UsdPhysics.RigidBodyAPI(prim)
+        if rb:
+            rb.CreateKinematicEnabledAttr(True)
+        self._outfeed[box_id] = rec["path"]
+        self._snap.pop(box_id, None)
+
+    def _outfeed_step(self, dt):
+        """반출 중인 박스를 반출 방향으로 민다. **메인 스레드 전용.**
+
+        끝(OUTFEED_END_M)을 지나면 despawn 한다 — 안 그러면 프림이 무한히
+        멀어지며 남는다.
+        """
+        if not self._outfeed:
+            return
+        step = OUTFEED_MPS * dt
+        for box_id, path in list(self._outfeed.items()):
+            prim = self.stage.GetPrimAtPath(path)
+            if not (prim and prim.IsValid()):
+                self._outfeed.pop(box_id, None)
+                continue
+            xf = UsdGeom.Xformable(prim)
+            for op in xf.GetOrderedXformOps():
+                if op.GetOpName() == "xformOp:translate":
+                    t = op.Get()
+                    nx = t[0] + OUTFEED_DIR[0] * step
+                    ny = t[1] + OUTFEED_DIR[1] * step
+                    op.Set(Gf.Vec3d(nx, ny, t[2]))
+                    if (OUTFEED_DIR[0] and
+                            (nx - OUTFEED_END_M) * OUTFEED_DIR[0] > 0) or \
+                       (OUTFEED_DIR[1] and
+                            (ny - OUTFEED_END_M) * OUTFEED_DIR[1] > 0):
+                        self._outfeed.pop(box_id, None)
+                        self.boxes[box_id] = {"path": path, "dims": (0, 0, 0)}
+                        self._despawn(box_id)
+                    break
 
     def _attach_label(self, box_path, box_id, hz):
         """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
