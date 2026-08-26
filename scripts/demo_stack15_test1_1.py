@@ -1227,9 +1227,13 @@ def router_thread(specs, ids):
           그대로 멈춘다** (A47 은 소터 자리에 본선 롤러가 없다).
         """
         if use_sorter:
-            kw = {"cmd": "set_sorter", "zone": zone, "divert": bool(want_div)}
-            if want_div:
-                kw["mps"] = BELT_MPS
+            # ★ 2026-08-26 분기할 때만 주던 것을 **항상** 준다 (김병직 지시서 §7②).
+            #   A47 애셋의 `SorterSpeed` 기본값이 0.0 이고 `h_set_sorter` 규약이
+            #   "mps 를 안 주면 건드리지 않는다" 라, 통과(divert=False)만 시키면
+            #   소터가 영영 0 인 채로 남는다. 본선 롤러에는 소터 자리에 구멍이
+            #   있어서 서 있는 소터는 그냥 지나가지지 않고 **라인을 막는다.**
+            kw = {"cmd": "set_sorter", "zone": zone,
+                  "divert": bool(want_div), "mps": BELT_MPS}
             return link.call(**kw)
         return link.call(cmd="set_direction", seg=seg,
                          world=(div if want_div else thru))
@@ -1844,6 +1848,19 @@ def worker(specs, ids, zone=None):
                 _r = link.call(cmd="set_velocity", seg=_seg, mps=BELT_MPS)
                 if not _r.get("ok"):
                     log("   [벨트] %s 못 켰다 — %s" % (_seg, _r.get("error")))
+            # ★ 소터도 기동 때 켠다 (2026-08-26). `turn()` 은 박스가 분기점에
+            #   닿아야 불리는데, 그 전에 지나가는 박스는 **선 소터에 막힌다.**
+            #   `conveyor_ctl.run_all()` 이 하는 것과 같다 — 방향은 통과.
+            #   실측 근거(김병직): PL_ZONES=A,B,C 로 60 s 뒤 박스 4 개가
+            #   4.6 m 에서 1.6 m 로 뭉쳤다. 느려진 게 아니라 존 A 분기에서
+            #   막혀 뒤가 밀린 것이다 (간격이 좁아지는 것이 근거다).
+            #   ★ `ZONES` 가 아니라 A·B·C 전부다. 존 A 만 돌려도 분기를 놓친
+            #     박스는 순환 루프로 가느라 **B·C 소터 위를 지나간다.**
+            for _z in ("A", "B", "C"):
+                _r = link.call(cmd="set_sorter", zone=_z, divert=False,
+                               mps=BELT_MPS)
+                if not _r.get("ok"):
+                    log("   [소터] %s 못 켰다 — %s" % (_z, _r.get("error")))
         if ROUTE_ON:
             # 라우팅은 박스를 세 지선으로 나눠 보내므로 셋 다 돌아야 한다.
             for _z in sorted(set(_route_map()[0].values())):
