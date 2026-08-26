@@ -38,6 +38,8 @@ Isaac(Action Graph)이 내는 것은 여기서 안 띄운다 — /clock · /tf �
   → Isaac 없이 ROS 그래프만 볼 때는 use_sim_time:=false.
   → scripts/verify_ros_graph.py 는 /clock 을 스스로 내주므로 true 로 둬도 된다.
 """
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction
 from launch.conditions import IfCondition
@@ -93,11 +95,38 @@ def generate_launch_description():
         DeclareLaunchArgument("db", default_value="true"),
         DeclareLaunchArgument("vision", default_value="true"),
         DeclareLaunchArgument("orchestrator", default_value="true"),
+        # ★★ 3 구역 씬(test_3)은 좌표계가 통째로 다르다 — 팔레트가 셀 컨베이어
+        #   위(z 950)고 페데스탈이 1950 이며 최대 적재가 1000 이다. 그 값들이
+        #   `config/test_3.yaml` 에 있고 `system.yaml` **위에 겹쳐서** 쓴다
+        #   (오버레이라 단독으로는 불완전하다 — `packing_common/config.py` 참조).
+        #
+        #   ⚠ 이걸 안 주면 **에러 없이 어긋난다.** 관제탑·algo 는 test1-1 좌표로
+        #     계획하고 Isaac 은 test_3 좌표로 움직인다 — 엉뚱한 자리에 놓는데
+        #     아무 경고도 안 뜬다. 그래서 상속에만 맡기지 않고 인자로 받는다.
+        #
+        #   ros2 launch packing_bringup bringup.launch.py \
+        #       config_overlay:=$PWD/src/packing_bringup/config/test_3.yaml
+        #   기본값은 **상속된 환경변수**다 — 터미널에서 export 해 둔 경우 그게 살고,
+        #   인자를 주면 그쪽이 이긴다. 빈 문자열을 그냥 넘기면 export 한 값을
+        #   덮어써서 꺼 버린다.
+        DeclareLaunchArgument(
+            "config_overlay",
+            default_value=os.environ.get("PL_CONFIG_OVERLAY", ""),
+            description="system.yaml 위에 겹칠 오버레이 yaml (3구역은 test_3.yaml)"),
     ]
 
     # 모든 노드가 같은 파라미터를 받게 한 곳에 모은다.
     common = [{"use_sim_time": use_sim_time}]
     cli = ["--ros-args", "--log-level", log_level]
+
+    def _overlay_env():
+        """`config_overlay` 를 노드 환경변수로 넘긴다.
+
+        ★ 인자의 기본값이 상속된 `PL_CONFIG_OVERLAY` 라, 안 주면 터미널에서
+          export 한 값이 그대로 간다. 값이 없으면 빈 문자열이 가는데
+          `config.load()` 가 falsy 로 보고 오버레이를 안 건다.
+        """
+        return {"PL_CONFIG_OVERLAY": LaunchConfiguration("config_overlay")}
 
     def node(pkg, exe, cond, extra=None):
         # ★ name= 을 주지 않는다.
@@ -109,6 +138,7 @@ def generate_launch_description():
         return Node(package=pkg, executable=exe, output="screen",
                     parameters=common + (extra or []),
                     arguments=cli,
+                    additional_env=_overlay_env(),
                     condition=IfCondition(LaunchConfiguration(cond)))
 
     def _zone_detectors(context, *_a, **_k):
@@ -127,6 +157,7 @@ def generate_launch_description():
                      name=f"detector_zone_{z}", output="screen",
                      parameters=common + [{"zone": z, "pick_cam_ns": c}],
                      arguments=cli,
+                     additional_env=_overlay_env(),
                      condition=IfCondition(LaunchConfiguration("vision")))
                 for z, c in zip(zs, cs)]
 
