@@ -868,6 +868,9 @@ else:
 # ★ 지선 중심 = 로봇 X 라, 이 값을 바꾸면 [5]·[7] 이 지선·레일·스토퍼를 따라
 #   옮긴다. 그래서 이 단계는 [5] 보다 **뒤에 와도 된다** — [5] 는 씬이 아니라
 #   config 의 ROBOT_X 를 보기 때문이다.
+# 기둥 원통의 자체 높이 [m]. 실제 높이 = 이 값 x scale.z.
+# `scripts/set_test3_geometry.py` 의 CYL_H 와 같은 값이다.
+PED_CYL_H = 1.2
 say("\n[13] 로봇 · 페데스탈 배치")
 _RB = cfg["zones"]["robot_base_world_mm"]
 for z in sorted(_RB):
@@ -886,13 +889,24 @@ for z in sorted(_RB):
         say("   %s 이미 맞다 (%.0f, %.0f, %.0f)" % (z, want[0], want[1], want[2]))
         continue
     a.Set(Gf.Vec3d(float(cur[0]) + dx, float(cur[1]) + dy, float(cur[2]) + dz))
-    # 기둥도 **같은 만큼** 민다. 절대좌표로 쓰지 않는다 — 기둥은 원점이 밑면이라
-    # 로봇 베이스(윗면)와 z 기준이 다르다.
+    # 기둥도 **같은 만큼** 민다. x·y 는 상대 이동이면 충분하다.
+    # ★★ z 는 상대 이동만으로는 **모자란다** (2026-08-26). 기둥은 원통이고
+    #   실제 높이 = CYL_H(1.2) x scale.z 다. 페데스탈 높이가 바뀌면 중심 z 와
+    #   scale.z 를 **둘 다** 고쳐야 한다. translate 만 밀면 원통 길이는 그대로라
+    #   로봇 베이스가 기둥 윗면에서 떨어진다 — 1950 -> 1700 이면 윗면 1600,
+    #   베이스 1700 이라 **로봇이 100 mm 허공에 뜬다.**
+    #   중심 = 높이/2 · scale.z = 높이 / CYL_H. 절대값으로 쓴다 (재고 고치기).
     pprim = st.GetPrimAtPath(pp)
     if pprim.IsValid():
+        _hm = want[2] / 1000.0                      # 기둥 실제 높이 [m] = 베이스 z
         b = xop(pprim, "translate", Gf.Vec3d(0, 0, 0))
         c2 = b.Get()
-        b.Set(Gf.Vec3d(float(c2[0]) + dx, float(c2[1]) + dy, float(c2[2]) + dz))
+        b.Set(Gf.Vec3d(float(c2[0]) + dx, float(c2[1]) + dy, _hm / 2.0))
+        sc = xop(pprim, "scale", Gf.Vec3f(1, 1, 1))
+        cs = sc.Get()
+        sc.Set(Gf.Vec3f(float(cs[0]), float(cs[1]), _hm / PED_CYL_H))
+        say("   %s 기둥 중심 z %.3f · scale.z %.5f (높이 %.0f mm)"
+            % (z, _hm / 2.0, _hm / PED_CYL_H, want[2]))
     else:
         chk("페데스탈 %s" % pp, False, "없다 — 로봇만 옮기면 허공에 선다")
     say("   %s 로봇 %+.0f, %+.0f, %+.0f mm -> (%.0f, %.0f, %.0f) · 기둥 같이 이동"

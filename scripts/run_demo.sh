@@ -51,5 +51,17 @@ fi
 : "${PL_CONTACT_STOP:=1}"
 export PL_DROP_KG PL_CONTACT_STOP
 
+# ★ PL_NOWINDOW=1 이면 창 없이 돈다. 시뮬이 실시간의 약 7 배로 가서 지표를
+#   빨리 받을 수 있다. 창이 없으면 Play 를 눌러 줄 사람이 없으므로
+#   PL_AUTOPLAY 를 같이 켠다 (안 켜면 스크립트가 경고하고 멈춘다).
+#   ⚠ 눈으로 봐야 하는 판정에는 쓰지 말 것 — CLAUDE.md §10-3.
+#     계측은 "무엇이 얼마나" 를, 화면은 "무엇이 빠졌는지" 를 답한다.
+#   ⚠ 헤드리스의 사이클 시간에는 폴링 인공물이 섞인다 (§10-2).
+WIN=()
+if [ "${PL_NOWINDOW:-0}" = "1" ]; then
+    WIN=(--no-window)
+    export PL_AUTOPLAY="${PL_AUTOPLAY:-1}"
+fi
+
 cd "$ISAAC_DIR"
-exec ./isaac-sim.sh --exec "$HERE/demo_stack15_test1_1.py" "$@"
+exec ./isaac-sim.sh "${WIN[@]}" --exec "$HERE/demo_stack15_test1_1.py" "$@"
