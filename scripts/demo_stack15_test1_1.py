@@ -1352,6 +1352,10 @@ def router_thread(specs, ids):
     # ★ 존별 계량. 그 존 픽업 구간이 차 있으면 **안 꺾는다** — 안 꺾인 박스는
     #   순환 루프를 돌고 다시 온다. 본선을 세우지 않으므로 로봇 3 대가 서로
     #   굶기지 않는다 (`meter_thread` 주석 참조).
+    # 리턴 합류 감시 창 — 루프 마지막 조각(`_02`)에서 본선으로 올라오는 구간.
+    # 숫자는 설정에서 읽는다 (`conveyor.loop.merge_watch_mm`). 없으면 게이트 꺼짐.
+    _MW = ((cfg["conveyor"].get("loop") or {}).get("merge_watch_mm") or None)
+
     _cross = (cfg["zones"].get("pickup_cross_mm") or {})
     _pr = cfg["conveyor"].get("pickup_range_mm") or [0, 0]
     pk_y = (min(_pr) / 1000.0, max(_pr) / 1000.0)
@@ -1501,11 +1505,25 @@ def router_thread(specs, ids):
             #   붐빔이 영영 안 풀린다 (실측 2026-08-25: `[본선] 정지 (최대 2 개)`
             #   에서 그대로 굳었다). 본선은 계속 돌리고 **투입**을 잡는다 —
             #   이미 라인에 있는 박스는 흘러서 분기점을 지나거나 루프로 빠진다.
-            hold = crowd >= 2
+            # ── 리턴 합류 게이트 (2026-08-26) ─────────────────────────
+            # ★ 리턴 라인 박스가 본선으로 **합류하는 순간** 본선에서 내려오는 박스와
+            #   부딪힌다. 합류 창(`merge_gap_x_mm`)에는 신호가 없어서 둘이 같은
+            #   자리를 동시에 지난다 — 부딪히면 둘 다 옆으로 밀려 소터가 못 꺾는다.
+            #   벨트를 세우는 대신 **투입을 잡는다** (위 본선 혼잡과 같은 이유:
+            #   본선을 세우면 그 조각의 박스도 못 빠져나가 붐빔이 안 풀린다).
+            #   합류하는 박스가 창을 지나갈 동안만 새 박스를 안 넣는다.
+            merging = 0
+            if _MW:
+                merging = sum(1 for q in allpos.values()
+                              if _MW["x"][0] <= q[0] * 1000.0 <= _MW["x"][1]
+                              and _MW["y"][0] <= q[1] * 1000.0 <= _MW["y"][1])
+            hold = crowd >= 2 or merging > 0
+            _why = ("보류 — 리턴 합류 중 (%d 개)" % merging if merging > 0
+                    else "보류 — 본선이 붐빈다")
             if hold != bool(_S.get("hold_spawn")):
                 _S["hold_spawn"] = hold
                 log("   [투입] %s (%s 최대 %d 개)"
-                    % ("보류 — 본선이 붐빈다" if hold else "재개",
+                    % (_why if hold else "재개",
                        "소터 구간" if use_sorter else "분기 조각", crowd))
             time.sleep(0.15)
     except Exception as e:
@@ -2271,6 +2289,19 @@ def worker(specs, ids, zone=None):
                 log("       팔레트가 찼다 — 사양 경로로 교체한다 "
                     "(스폰 정지 -> swap_pallet -> algo reset -> 재가동)")
                 link.call(cmd="set_spawn_enabled", enabled=False)
+                # ★★ 2026-08-26 **트럭으로 보낸 뒤** 판을 간다.
+                #   예전에는 `swap_pallet` 만 불러서 팔레트가 화면에서 그냥
+                #   사라졌다. 목표는 "셀 컨베이어 -> 합류 라인 -> 트럭 상차" 를
+                #   보여 주는 것이다 (`ship_pallet` 은 이미 구현돼 있었는데
+                #   PL_PER_PALLET>0 일 때만 불렸다).
+                #   반출이 끝나면 팔레트 위에는 아무것도 없으므로 이어지는
+                #   `swap_pallet` 은 빈 판을 갖다 놓는 일만 한다.
+                _cargo = [w["id"] for w in _S["rows"]
+                          if w["res"] == "PLACED" and w.get("zone", zone) == zone]
+                log("   [반출] 팔레트가 찼다 — 박스 %d 개를 트럭으로 보낸다"
+                    % len(_cargo))
+                _S.setdefault("ships", {})[zone] = ship_pallet(
+                    link, zone, log, _cargo)
                 sw = link.call(cmd="swap_pallet", zone=zone)
                 svc.reset_pallet()
                 link.call(cmd="set_spawn_enabled", enabled=True)
@@ -2638,8 +2669,21 @@ def on_step(dt):
                 import random as _rnd
                 _dr = _rnd.Random(int(SEED) if SEED is not None
                                   else int(cfg["boxes"].get("random_seed", 42)))
-                for bid in ids:
-                    specs[bid]["dest"] = _dr.choice(_dests)
+                # ★ 2026-08-26 `choice` -> **균등 분배**. `choice` 는 매번 독립
+                #   추출이라 개수가 안 맞는다 — 실측 105 개에서 SEOUL 39 ·
+                #   DAEJEON 38 · BUSAN 28 이 나왔다 (39:38:28). 존 하나가 굶으면
+                #   그 팔레트만 안 차서 "한 판 채워 반출" 이 안 보인다.
+                #   목록을 정확히 1:1:1 로 만들고 **섞는다** — 순서는 여전히
+                #   무작위지만 개수는 보장된다. 나머지(n%3)는 앞에서부터 준다.
+                _q, _r = divmod(len(ids), len(_dests))
+                _plan = [_dests[k] for k in range(len(_dests)) for _ in range(_q)]
+                _plan += _dests[:_r]
+                _dr.shuffle(_plan)
+                for bid, _d in zip(ids, _plan):
+                    specs[bid]["dest"] = _d
+                _cnt = {d: _plan.count(d) for d in _dests}
+                log("배송지 분배  %s (총 %d)"
+                    % (", ".join("%s=%d" % kv for kv in sorted(_cnt.items())), len(_plan)))
                 # ★ 배송지에 맞는 **색**도 같이 칠한다 (2026-08-25).
                 #   스폰 카메라가 읽을 대상이다. 색 -> 배송지 판정을 붙이기 전까지는
                 #   그림만 바뀌고 라우팅은 그대로 `by_dest` 를 쓴다.
