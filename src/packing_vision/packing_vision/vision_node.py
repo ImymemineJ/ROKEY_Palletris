@@ -504,7 +504,21 @@ class LineDetector(Node):
         """박스를 봤는데 식별 못 했다 — DB 에 알린다 (인식률의 분모).
 
         ★ 응답을 기다리지 않는다. 이건 통계용이라 라인을 세울 이유가 없다.
+        ★ 쿨다운 2초 (2026-08-27 김병직). 프레임마다 부르니 같은 박스 하나가
+          지나가는 동안 수십 번 쌓였다 — 실측 10분에 1200건, 인식률 분모가
+          프레임 수로 왜곡(11%)되고 DB 만 두들긴다 (db_service 사망 사고의
+          방아쇠였다). 같은 (지점, 사유)는 2초에 한 번만 보낸다 — 벨트 0.55 m/s
+          에서 박스 하나가 시야를 지나는 시간보다 길어 사실상 박스당 1건이 된다.
         """
+        import time as _t
+        k = (where_at, reason)
+        now = _t.monotonic()
+        last = getattr(self, "_miss_last", {}).get(k, 0.0)
+        if now - last < 2.0:
+            return
+        if not hasattr(self, "_miss_last"):
+            self._miss_last = {}
+        self._miss_last[k] = now
         if not self.cli_miss.service_is_ready():
             self.get_logger().warn("/db/report_miss 가 아직 없다 — 통계에서 빠진다",
                                    once=True)
