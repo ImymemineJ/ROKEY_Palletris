@@ -190,15 +190,15 @@ def render_compare_video(cfg, steps_a, steps_b, out_path,
     max_step = max(len(steps_a), len(steps_b)) - 1
     n = max_step + 1 + hold
     fig = plt.figure(figsize=(13.0, 6.8))
+    # ★ left 여백을 0.21로 넓혀 하단 바 차트 좌측 알고리즘 이름 범례 텍스트가 짤리지 않게 조절!
     gs = fig.add_gridspec(2, 2, height_ratios=[3.2, 1], hspace=0.38, wspace=0.08,
-                          left=0.04, right=0.96, top=0.88, bottom=0.10)
+                          left=0.21, right=0.96, top=0.88, bottom=0.10)
     axL = fig.add_subplot(gs[0, 0], projection="3d")
     axR = fig.add_subplot(gs[0, 1], projection="3d")
     axF = fig.add_subplot(gs[1, :])
     title = fig.suptitle("", fontsize=13, fontweight="bold")
 
     final_fill_a = steps_a[-1]['fill'] * 100
-    # EP는 규격 높이(1300mm) 이내 실효 적재율 42.3% 또는 용량 적재율 70% 보정 표기
     final_fill_b = min(70.0, steps_b[-1]['cap'] * 100)
 
     def frame(f):
