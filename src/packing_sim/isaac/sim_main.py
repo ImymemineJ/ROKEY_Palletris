@@ -331,6 +331,16 @@ def main():
               % (a.port, " · ROS 2 켬 (구역 %d)" % len(ros) if ros else ""))
 
         # ── 메인 루프: 물리만 돌린다 ─────────────────────────
+        # ★ PL_RENDER_EVERY=N — N 프레임에 1 번만 그린다 (기본 1 = 매 프레임).
+        #   GUI 병목은 렌더링이라 2 면 체감 약 2 배속. 물리(60 Hz)는 그대로다.
+        #   채택 실행(demo_stack15 --render-every 2)과 같은 장치다.
+        #   ⚠ 라우터 폴링(벽시계 0.15 s) 대비 분기 창(시뮬 0.58 s)이 배속만큼
+        #     좁아진다 — 2 배속이면 벽시계 0.29 s 로 아직 2 번은 본다. 3 이상은
+        #     소터가 박스를 놓칠 수 있으니 화면으로 확인할 것.
+        _rn = max(1, int(os.environ.get("PL_RENDER_EVERY", "1")))
+        if _rn > 1:
+            print("[sim_main] 렌더 %d 프레임당 1 회 — 체감 약 %d 배속" % (_rn, _rn))
+        _fr = 0
         while kit.is_running():
             q.pump()                       # 소켓 스레드가 맡긴 USD 작업
             for _rm in rms.values():
@@ -355,7 +365,8 @@ def main():
             #   실측 약 1.5 m/s (사양 0.5 의 3 배) 가 나오고 실행마다 값이 다르다.
             #   **정지(0)는 정확하다.** 속도 검증은 `isaac-sim.sh` +
             #   `scripts/verify_belt_speed.py` 로 한다. conveyor_ctl docstring 참조.
-            world.step(render=not a.no_render)
+            _fr += 1
+            world.step(render=(not a.no_render) and (_fr % _rn == 0))
     except KeyboardInterrupt:
         print("\n[sim_main] 종료")
     except Exception:
