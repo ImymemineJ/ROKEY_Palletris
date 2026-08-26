@@ -69,6 +69,14 @@ for _f in "share/packing_msgs/srv/SetVelocity.srv" \
 done
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-115}"
+# ★ 씬은 **Collected 판**이 정본이다 (2026-08-26 김학민).
+#   `Collect Asset` 로 참조 애셋을 폴더 안에 다 모은 형태라 **절대경로 참조가 0 건**
+#   이고, 발표용 다른 노트북에서도 그대로 열린다. 옛 `project_1/test_3.usd` 는
+#   `/home/<계정>/isaac_assets/...` 를 물고 있어 그 PC 에서만 열린다.
+_COLLECTED="$HOME/isaac_scenes/Collected_test_3/test_3.usd"
+if [ -z "${PL_STAGE:-}" ] && [ -f "$_COLLECTED" ]; then
+    PL_STAGE="$_COLLECTED"
+fi
 export PL_STAGE="${PL_STAGE:-$HOME/isaac_scenes/project_1/test_3.usd}"
 export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-$WS/src/packing_bringup/config/test_3.yaml}"
 export PL_ZONES="${PL_ZONES:-A,B,C}"
