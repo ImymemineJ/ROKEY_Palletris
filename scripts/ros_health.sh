@@ -96,3 +96,22 @@ row_srv /db/get_box_info         "db"
 row_srv /db/mark_placed          "db"
 row_srv /diverter/request        "db (중재자)"
 echo
+
+# ── 중복 노드 검사 ─────────────────────────────────────
+# ★ `ros2 launch` 를 Ctrl-C 나 kill 로 끊으면 **자식 파이썬 노드가 살아남는다.**
+#   그러면 관제탑이 둘·셋이 되어 같은 구역에 명령을 겹쳐 쏜다 — 에러는 안 난다.
+#   토픽에 `pub 2` 처럼 수가 하나 더 보이면 여기를 볼 것 (2026-08-26 실측: 3 개).
+# ⚠ 죽일 때 `pkill -f orchestrator_node` 를 쓰지 마라 — **자기 셸의 명령줄에도**
+#   그 문자열이 들어 있어 자기를 죽인다. 설치 경로로 고르는 아래 방식을 쓸 것.
+_dup=""
+for _n in palletris_orchestrator packing_vision packing_algo packing_db; do
+    _c=$(ps -eo args | grep -c "lib/$_n/" 2>/dev/null)
+    _c=$((_c - 1))                     # grep 자기 자신 제외
+    case "$_n" in packing_vision) _lim=4 ;; *) _lim=1 ;; esac
+    [ "$_c" -gt "$_lim" ] && _dup="$_dup $_n($_c>$_lim)"
+done
+if [ -n "$_dup" ]; then
+    printf "  %s★ 중복 노드:%s%s\n" "$R" "$_dup" "$N"
+    printf "  %s   정리:  python3 scripts/kill_ros_nodes.py%s\n" "$D" "$N"
+    echo
+fi

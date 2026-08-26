@@ -116,6 +116,12 @@ def main():
                     help="S 초마다 박스 하나 투입 (0 = 안 넣는다)")
     ap.add_argument("--spawn-count", type=int, default=0, metavar="N",
                     help="총 N 개까지만 (0 = 무제한)")
+    # ★ 라우팅 (2026-08-26 김병직). `--ros` 경로에는 박스를 **꺾는 주체가 없다** —
+    #   소터를 돌리는 것과 꺾으라고 지시하는 것은 별개고, 지시는 데모 스크립트
+    #   안에만 있었다. 그래서 존 옆을 그냥 지나쳐 순환 루프만 돌았다
+    #   (실측: 12 개 중 존 진입 0 개). router.py docstring 참조.
+    ap.add_argument("--no-route", action="store_true",
+                    help="배송지 분류를 끈다 (기본은 켬)")
     a = ap.parse_args()
 
     import _paths                                       # noqa: E402
@@ -250,8 +256,10 @@ def main():
         # ★ 그래프는 하나, 서비스는 한 벌, 구역별 `RosSide` 는 step() 만 각자 돈다.
         ros = []
         if a.ros:
+            # ★ omni.replicator.core 는 **카메라용**이다 — `ROS2CameraHelper` 가
+            #   요구하는 renderProduct 를 여기서 만든다 (ros_graph.build_cameras).
             for _e in ("isaacsim.core.nodes", "isaacsim.ros2.bridge",
-                       "omni.graph.scriptnode"):
+                       "omni.graph.scriptnode", "omni.replicator.core"):
                 enable_extension(_e)
             kit.update()
             import ros_side
@@ -297,6 +305,11 @@ def main():
             import ros_side
             ros_side.wire()
 
+        router = None
+        if not a.no_route:
+            import router as RT
+            router = RT.Router(cfg, sp, cc)
+
         feeder = None
         if a.spawn_period > 0:
             feeder = _Feeder(cfg, sp, a.spawn_period, a.spawn_count)
@@ -315,6 +328,8 @@ def main():
             for _rm in rms.values():
                 _rm.step()                 # ★ world.step() 앞. 로봇 전부
             sp.step()
+            if router is not None:
+                router.step(time.time())   # ★ 논블로킹 (§9). 급송보다 먼저.
             if feeder is not None:
                 feeder.step(time.time())
             for _r in ros:
@@ -397,7 +412,13 @@ class _Feeder:
         # 스폰 지점이 아직 안 비었으면 **겹쳐 스폰된다.** 다음 틱에 다시 본다.
         if st.get("on_belt", 0) >= self.cap or not st.get("spawn_clear", True):
             return
-        bid = "BOX%05d" % self.i
+        # ★★ **3 자리다** (`BOX001`). 5 자리로 내면 조용히 다 막힌다 (2026-08-26 실측):
+        #   · 마스터 DB(`boxes_master`)가 3 자리라 관제탑이 "DB 에 없음 -> 폐기"
+        #   · QR 라벨 PNG 도 `qr_labels/BOX001.png` 라 라벨이 안 붙는다
+        #     -> 픽업 카메라가 QR 을 못 읽어 `box_id` 가 빈 채 나가고,
+        #        관제탑이 "box_at_pickup 에 box_id 가 비어 있다 — 무시" 로 버린다
+        #   ⚠ `demo_stack15_test1_1.py:134` 은 `BOX%05d` 인데 그쪽은 DB 를 안 쓴다.
+        bid = "BOX%03d" % (self.i + 1)
         kw = {"box_id": bid, "type": self.types[self.i], "yaw_deg": 0}
         if self.dests[self.i]:
             kw["dest"] = self.dests[self.i]
