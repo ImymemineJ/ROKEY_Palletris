@@ -177,6 +177,10 @@ class DbService(Node):
         ★ 옛 코드는 `<here>/../share/packing_db/schema.sql` 을 봤다. 설치본에서
           share 는 모듈 기준 **4 단계 위**라 그 경로는 존재하지 않는다 —
           일반 colcon build 로는 여기서 죽었다. paths.find_data 가 그걸 안다.
+
+        ★ 김학민님도 같은 날 같은 버그를 찾아 ament 인덱스로 고쳤다 (main ff5c5d0).
+          여기서는 그 수정을 paths.find_data 로 흡수했다 — 같은 버그가
+          gen_master_db · config.py · 정답지 CSV 에도 있어 한 곳으로 모아야 했다.
         """
         with open(find_data("packing_db", "schema.sql", __file__),
                   encoding="utf-8") as f, self._w:

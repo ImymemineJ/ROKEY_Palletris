@@ -1240,6 +1240,12 @@ def router_thread(specs, ids):
                    if r[0] <= q[0] <= r[1] and pk_y[0] <= q[1] <= pk_y[1])
 
     state = {}                      # box_id -> "divert" | "done"
+    laps = {}                       # box_id -> 리턴 라인을 돈 횟수
+    in_loop = {}                    # box_id -> 지금 루프 안에 있나
+    # PL_MAX_LAPS 로 덮어쓸 수 있다 — 소멸 경로를 짧은 실행에서 확인할 때 쓴다
+    MAX_LAPS = int(os.environ.get("PL_MAX_LAPS")
+                   or ROUTE.get("max_laps", 0) or 0)
+    LOOP_Y = float(ROUTE.get("loop_y_mm", -1500)) / 1000.0
     t_div = {}                      # box_id -> 꺾기 시작한 시각
     t_log = {}                      # box_id -> 마지막 진행 로그 시각
     # ★ 꺾은 채로 두면 그 조각 위의 뒤차가 전부 옆으로 밀린다. 실측 2026-08-24:
@@ -1260,6 +1266,23 @@ def router_thread(specs, ids):
                 if r.get("ok"):
                     allpos[bid] = r["pos_m"]
             poses = {b: q for b, q in allpos.items() if state.get(b) != "done"}
+            # ── 리턴 라인 재순환 카운트 → MAX_LAPS 바퀴면 치운다 ──────────
+            # ★ 존이 영영 안 비면 박스가 **영원히 돈다.** 장시간 실행에서 prim 이
+            #   쌓여 프레임이 떨어진다 (실측 2026-08-25: 12 개 중 8 개가 동시에
+            #   루프를 돌았다). 한 바퀴 = 루프로 내려갔다가 본선 띠로 돌아오는 것.
+            for _b, _q in poses.items():
+                if _q[1] < LOOP_Y:
+                    in_loop[_b] = True
+                elif in_loop.get(_b) and y_lo <= _q[1] <= y_hi:
+                    in_loop[_b] = False
+                    laps[_b] = laps.get(_b, 0) + 1
+                    log("   [라우팅] %s 리턴 %d 바퀴째" % (_b, laps[_b]))
+                    if MAX_LAPS > 0 and laps[_b] >= MAX_LAPS:
+                        rr = link.call(cmd="despawn_box", box_id=_b)
+                        state[_b] = "done"
+                        log("   [라우팅] %s %d 바퀴 -> 소멸 (%s)"
+                            % (_b, laps[_b],
+                               "ok" if rr.get("ok") else repr(rr)))
             for bid, p in list(poses.items()):
                 z = kind_of.get(key_of(specs[bid]))
                 if z is None or z not in jx or z not in mseg:
@@ -2436,6 +2459,30 @@ def on_step(dt):
                                   else int(cfg["boxes"].get("random_seed", 42)))
                 for bid in ids:
                     specs[bid]["dest"] = _dr.choice(_dests)
+                # ★ 배송지에 맞는 **색**도 같이 칠한다 (2026-08-25).
+                #   스폰 카메라가 읽을 대상이다. 색 -> 배송지 판정을 붙이기 전까지는
+                #   그림만 바뀌고 라우팅은 그대로 `by_dest` 를 쓴다.
+                #   표를 새로 만들지 않고 `by_dest` + `by_color` 를 이어 유도한다:
+                #     SEOUL -> (by_dest) A -> (by_color 역방향) red
+                _z2c = {}
+                for _c, _z in (ROUTE.get("by_color") or {}).items():
+                    _z2c.setdefault(str(_z), str(_c))
+                _pal = set((cfg["boxes"].get("colors") or {}).keys())
+                _d2c = {str(d): _z2c.get(str(z))
+                        for d, z in (ROUTE.get("by_dest") or {}).items()
+                        if _z2c.get(str(z)) in _pal}
+                if _d2c:
+                    for bid in ids:
+                        _c = _d2c.get(specs[bid].get("dest"))
+                        if _c:
+                            specs[bid]["color"] = _c
+                    log("박스 색      %s (배송지에서 유도)"
+                        % ", ".join("%s=%s" % kv for kv in sorted(_d2c.items())))
+                else:
+                    # 색표가 비었거나 존이 안 맞으면 조용히 넘기지 않는다 —
+                    # 전부 기본색이 되어 카메라가 아무것도 못 가른다.
+                    log("!! 박스 색을 못 정했다 (boxes.colors %s · by_color %s)"
+                        % (sorted(_pal), ROUTE.get("by_color")))
             log("박스      %d 개  %s" % (N,
                 ["%s/%s" % (t["name"], specs[b].get("dest", "-"))
                  for b, t in zip(ids, fed)]))

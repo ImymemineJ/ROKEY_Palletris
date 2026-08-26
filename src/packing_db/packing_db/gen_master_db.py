@@ -212,6 +212,8 @@ def main():
     db_path = default_db_path(a.db_path)
     # ★ 옛 코드는 `<here>/schema.sql` **하나만** 봤다. 설치본에는 그 자리에 파일이
     #   없어서 일반 colcon build 로는 FileNotFoundError 로 죽었다.
+    #   김학민님도 같은 날 같은 버그를 ament 인덱스로 고쳤다 (main ff5c5d0).
+    #   그 수정을 paths.find_data 로 흡수했다 — 정답지 CSV 도 같은 함수로 찾는다.
     schema = find_data("packing_db", "schema.sql", __file__)
 
     if a.reset:
