@@ -516,6 +516,21 @@ class ZoneCycle:
             self.log.warn(f"로봇 실패({self.state}): {ev.reason}")
             self.call_async("/algo/cancel_plan",
                             {"zone": self.zone_id, "box_id": box_id}, None)
+            # ★ 같은 박스 재시도 상한 (2026-08-27 실측). 스토퍼에서 뒤차가 앞차
+            #   위로 올라타 2단이 되면(패드가 정확히 810+210+210=1226 에서 막힘)
+            #   로봇은 아래 박스를 영원히 못 집는데, 관제탑은 같은 박스를 계속
+            #   재시도했다 — B존이 잔차 226mm 실패를 **100회 넘게** 반복하며 섰다.
+            #   3회 실패하면 그 박스를 치운다(despawn) — 위에 얹힌 박스가 스토퍼로
+            #   떨어져 다음 픽 대상이 되므로 자가 회복된다.
+            _fb, _fc = getattr(self, "_fail_box", (None, 0))
+            _fc = _fc + 1 if _fb == box_id else 1
+            self._fail_box = (box_id, _fc)
+            if _fc >= int(os.environ.get("PL_PICK_RETRY_MAX", "3")):
+                self.log.warn("%s %d회 연속 실패 — 집을 수 없는 박스로 보고 치운다"
+                              % (box_id, _fc))
+                self._fail_box = (None, 0)
+                self.discard_box("PICK_FAILED_x%d" % _fc)
+                return
             self.call_async("/db/set_status",
                             {"box_id": box_id, "status": "PICK_FAILED",
                              "reason": ev.reason}, None)
