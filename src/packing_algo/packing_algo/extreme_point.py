@@ -1,11 +1,4 @@
-"""C4 비교 대조군 — Extreme Point (EP) 3D Bin Packing 알고리즘.
-
-학술/산업 논문(Crainic et al. 2008, INFORMS JoC)에서 가장 널리 인용되는
-글로벌 표준 3D Bin Packing 알고리즘이다.
-
-제안 알고리즘(Heightmap + 가중합 + Lookahead + _corridor_ok)의 대조군으로 사용된다.
-HeightmapPacker를 상속하여 plan() 및 EP 관리 로직을 구현하므로
-동일한 환경(Isaac Sim / demo_stack15 / compare_baseline)에서 돌려볼 수 있다.
+"""C4 비교 대조군 — Extreme Point (EP) 3D Bin Packing 알고리즘 (정밀 회전 및 겹침 보정판).
 """
 
 import math
@@ -14,29 +7,20 @@ from packing_algo.heightmap_core import HeightmapPacker
 
 
 class ExtremePointPacker(HeightmapPacker):
-    """Extreme Point (EP) 3D Bin Packing 패커.
-
-    3D 공간에서 박스가 배치될 때 발생하는 3D 모서리 교차점(Extreme Points)을 관리하며,
-    우선순위(Bottom-Left-Deepest: z -> y -> x)에 따라 박스를 적재한다.
-
-    옵션:
-        use_rotation: True 이면 yaw 0도 및 90도 회전을 둘 다 시도함 (기본 True)
-        use_corridor: True 이면 로봇 팔 통로 검사(_corridor_ok)를 적용함 (기본 False)
-    """
+    """Extreme Point (EP) 3D Bin Packing 패커."""
 
     def __init__(self, cfg, use_rotation=True, use_corridor=False):
         super().__init__(cfg)
         self.use_rotation = use_rotation
         self.use_corridor = use_corridor
         
-        # 팔레트 크기 (mm 정수)
         self.pal_w_mm = self.W * self.cell
         self.pal_d_mm = self.D * self.cell
 
         # 초기 Extreme Point: (0, 0, 0)
         self.eps = [(0, 0, 0)]
         
-        # 배치된 박스 목록: [(x, y, z, w, d, h), ...] (mm 단위)
+        # 배치된 박스 목록: [(x, y, z, w, d, h), ...] (mm 정수)
         self.placed_boxes = []
 
     def plan(self, box_id, w_mm, d_mm, h_mm):
@@ -44,15 +28,15 @@ class ExtremePointPacker(HeightmapPacker):
         if w_mm > self.pal_w_mm or d_mm > self.pal_d_mm:
             return False, None, 0.0, "NO_FEASIBLE_POSE"
 
-        # 회전 옵션에 따른 (w, d, yaw) 후보
+        # 회전 옵션에 따른 (bw, bd, yaw) 후보
         orientations = [(w_mm, d_mm, 0.0)]
         if self.use_rotation and w_mm != d_mm:
             orientations.append((d_mm, w_mm, 90.0))
 
         # EP 정렬: Bottom-Left-Deepest (z -> y -> x 오름차순)
-        sorted_eps = sorted(self.eps, key=lambda p: (p[2], p[1], p[0]))
+        sorted_eps = sorted(list(set(self.eps)), key=lambda p: (p[2], p[1], p[0]))
 
-        best_plan = None  # (ep, pose, bw, bd, bh, yaw)
+        best_plan = None  # (ep, bw, bd, bh, yaw)
 
         for ep in sorted_eps:
             ep_x, ep_y, ep_z = ep
@@ -82,7 +66,6 @@ class ExtremePointPacker(HeightmapPacker):
                     if cell_x >= corridor.shape[0] or cell_y >= corridor.shape[1] or not corridor[cell_x, cell_y]:
                         continue
 
-                # 가장 우선순위가 높은(정렬 순서상 빠른) EP를 선택
                 best_plan = (ep, bw, bd, h_mm, yaw)
                 break
 
@@ -105,9 +88,10 @@ class ExtremePointPacker(HeightmapPacker):
             yaw_deg=float(yaw)
         )
 
-        self.plans[box_id] = (pose, bw, bd, bh)
+        # ★ 원본 치수 (w_mm, d_mm, h_mm)를 전달하여 _footprint에서 이중 회전이 되지 않도록 보정
+        self.plans[box_id] = (pose, w_mm, d_mm, h_mm)
         self.placed_boxes.append((ep_x, ep_y, ep_z, bw, bd, bh))
-        self.placed.append((pose, bw, bd, bh))
+        self.placed.append((pose, w_mm, d_mm, h_mm))
 
         # Heightmap 갱신
         wc, dc = bw // self.cell, bd // self.cell
@@ -121,7 +105,7 @@ class ExtremePointPacker(HeightmapPacker):
         return True, pose, 0.0, "OK"
 
     def _check_overlap(self, x, y, z, w, d, h):
-        """기존 배치된 박스들과 3D 공간상 겹침(Overlap)이 있는지 검사."""
+        """기존 배치된 박스들과 3D 공간상 겹침(Overlap) 검사."""
         for bx, by, bz, bw, bd, bh in self.placed_boxes:
             if (x < bx + bw and x + w > bx and
                 y < by + bd and y + d > by and
@@ -130,27 +114,37 @@ class ExtremePointPacker(HeightmapPacker):
         return False
 
     def _check_support(self, x, y, z, w, d):
-        """밑면 지지율(Support Ratio) 검사."""
+        """박스 밑면 [x, x+w] x [y, y+d] 의 10mm 셀 정밀 지지율 검사."""
         if z == 0:
             return True
 
-        support_area = 0
-        total_area = w * d
+        wc = w // self.cell
+        dc = d // self.cell
+        grid = np.zeros((wc, dc), dtype=bool)
+
+        cx0 = x // self.cell
+        cy0 = y // self.cell
 
         for bx, by, bz, bw, bd, bh in self.placed_boxes:
             if bz + bh == z:
-                ix_min = max(x, bx)
-                ix_max = min(x + w, bx + bw)
-                iy_min = max(y, by)
-                iy_max = min(y + d, by + bd)
+                bcx0 = bx // self.cell
+                bcy0 = by // self.cell
+                bwc = bw // self.cell
+                bdc = bd // self.cell
 
-                if ix_max > ix_min and iy_max > iy_min:
-                    support_area += (ix_max - ix_min) * (iy_max - iy_min)
+                ix0 = max(cx0, bcx0) - cx0
+                ix1 = min(cx0 + wc, bcx0 + bwc) - cx0
+                iy0 = max(cy0, bcy0) - cy0
+                iy1 = min(cy0 + dc, bcy0 + bdc) - cy0
 
-        return (support_area / total_area) >= self.w_s
+                if ix1 > ix0 and iy1 > iy0:
+                    grid[ix0:ix1, iy0:iy1] = True
+
+        support_ratio = float(grid.mean())
+        return support_ratio >= self.w_s
 
     def _update_extreme_points(self, x, y, z, w, d, h):
-        """박스 배치 후 Extreme Point 목록 갱신 (Crainic et al. 2008 기준)."""
+        """박스 배치 후 Extreme Point 목록 갱신."""
         new_eps = []
         for ep_x, ep_y, ep_z in self.eps:
             if (x <= ep_x < x + w and y <= ep_y < y + d and z <= ep_z < z + h):

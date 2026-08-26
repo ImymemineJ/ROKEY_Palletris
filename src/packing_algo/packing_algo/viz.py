@@ -1,18 +1,11 @@
 """트랙 C 시각화 (C3) — 쌓이는 과정 동영상 · heightmap 히트맵 · 3D 배치도 · 적재율 곡선.
-
-코어(HeightmapPacker)는 전혀 건드리지 않고 읽기만 한다. ROS 의존성 없음.
-
-실행:
-    cd ~/palletris_ws && source install/setup.bash
-    python3 -m packing_algo.viz                      # packing_stack.mp4 생성
-    python3 -m packing_algo.viz --noise 3            # 실측 오차 ±3mm 주입
-    python3 -m packing_algo.viz -o /tmp/a.mp4 -n 20  # 저장 위치·박스 개수 지정
 """
 import argparse
+import copy
 import random
 
 import matplotlib
-matplotlib.use("Agg")          # 화면 없는 환경(SSH 등)에서도 돌아가게 — import 순서 중요
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import animation, font_manager
@@ -21,15 +14,16 @@ from packing_algo.heightmap_core import HeightmapPacker
 from packing_common.config import load
 
 def pick_korean_font():
-    """한글 라벨이 네모(□)로 깨지지 않게 CJK 폰트를 찾아 쓴다. 없으면 기본 폰트로 진행.
-
-    ★ 다른 그림 스크립트도 이걸 import 해서 쓴다 — 복사하면 한쪽만 고쳐진다.
-    """
-    for name in ("Noto Sans CJK KR", "Noto Sans CJK JP", "NanumGothic", "Malgun Gothic"):
+    """한글 라벨이 네모(□)로 깨지지 않게 CJK 폰트를 찾아 쓴다."""
+    candidates = (
+        "Apple SD Gothic Neo", "AppleGothic", "NanumGothic", "Nanum Gothic",
+        "Noto Sans CJK KR", "Noto Sans CJK JP", "Malgun Gothic"
+    )
+    for name in candidates:
         if any(f.name == name for f in font_manager.fontManager.ttflist):
             plt.rcParams["font.family"] = name
             break
-    plt.rcParams["axes.unicode_minus"] = False   # 마이너스 기호가 깨지는 것 방지
+    plt.rcParams["axes.unicode_minus"] = False
 
 
 pick_korean_font()
@@ -39,50 +33,64 @@ COLORS = {210: "#4C9AFF", 280: "#FFAB00", 340: "#36B37E"}
 
 
 def simulate(cfg, n=15, noise=0, seed_box=42, seed_noise=7, packer_cls=None):
-    """박스를 하나씩 plan → update 하면서 매 단계 스냅샷을 남긴다.
-
-    ★ NO_FEASIBLE_POSE 는 '이 박스만' 자리가 없다는 뜻이므로 그 박스만 버리고 계속 간다.
-      시나리오를 끝내는 것은 PALLET_FULL 뿐이다 (트랙 D 설계변경 A1).
-      첫 실패에서 멈추면 적재율을 크게 과소평가한다 — 49.8% vs 60.2%.
-
-    ★ 난수 스트림을 박스용/노이즈용으로 분리한다. 하나를 공유하면 노이즈를 켜는 순간
-      박스 등장 순서까지 바뀐다 (TS-006).
-    """
+    """박스를 하나씩 plan → update 하면서 매 단계 스냅샷을 남긴다."""
     boxes = [(b["w_mm"], b["d_mm"], b["h_mm"]) for b in cfg["boxes"]["types"]]
-    # ★ 베이스라인도 같은 함수로 돌린다. 두 패커를 **같은 시퀀스**에 먹여야
-    #   나란히 놓은 영상이 "전략 차이" 를 보여준다 (다른 시퀀스면 운 차이가 섞인다).
     pk = (packer_cls or HeightmapPacker)(cfg)
     rb, rn = random.Random(seed_box), random.Random(seed_noise)
-    steps = []
+    
+    steps = [dict(
+        placed=[],
+        hm=pk.hm.copy(),
+        fill=0.0,
+        cap=0.0,
+        n_ok=0,
+        n_skip=0,
+        label="시작 · 빈 팔레트"
+    )]
+    
     placed = skipped = 0
     for k in range(n):
         w, d, h = rb.choice(boxes)
         box_id = f"BOX{k:05d}"
         ok, pose, _, msg = pk.plan(box_id, w, d, h)
         if not ok:
-            pk.cancel(box_id)                       # ★ 이탈 경로에서는 반드시 계획 폐기
+            pk.cancel(box_id)
             if msg == "PALLET_FULL":
-                steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
-                                  cap=pk.capacity_rate(),
-                                  n_ok=placed, n_skip=skipped,
-                                  label=f"{k + 1}번째 {w}x{d}x{h} → PALLET_FULL · 종료"))
+                steps.append(dict(
+                    placed=copy.deepcopy(pk.placed),
+                    hm=pk.hm.copy(),
+                    fill=pk.fill_rate(),
+                    cap=pk.capacity_rate(),
+                    n_ok=placed,
+                    n_skip=skipped,
+                    label=f"{k + 1}번째 {w}x{d}x{h} → PALLET_FULL · 종료"
+                ))
                 break
             skipped += 1
-            steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
-                                  cap=pk.capacity_rate(),
-                              n_ok=placed, n_skip=skipped,
-                              label=f"{k + 1}번째 {w}x{d}x{h} → 자리 없음, 버리고 계속"))
+            steps.append(dict(
+                placed=copy.deepcopy(pk.placed),
+                hm=pk.hm.copy(),
+                fill=pk.fill_rate(),
+                cap=pk.capacity_rate(),
+                n_ok=placed,
+                n_skip=skipped,
+                label=f"{k + 1}번째 {w}x{d}x{h} → 자리 없음, 버림"
+            ))
             continue
         actual = dict(pose)
         for ax in ("x_mm", "y_mm", "z_mm"):
             actual[ax] += rn.randint(-noise, noise)
         pk.update(box_id, w, d, h, actual)
         placed += 1
-        steps.append(dict(placed=list(pk.placed), hm=pk.hm.copy(), fill=pk.fill_rate(),
-                                  cap=pk.capacity_rate(),
-                          n_ok=placed, n_skip=skipped,
-                          label=f"{k + 1}번째 {w}x{d}x{h} → ({pose['x_mm']}, {pose['y_mm']}) "
-                                f"z={pose['z_mm']} yaw={int(pose['yaw_deg'])}°"))
+        steps.append(dict(
+            placed=copy.deepcopy(pk.placed),
+            hm=pk.hm.copy(),
+            fill=pk.fill_rate(),
+            cap=pk.capacity_rate(),
+            n_ok=placed,
+            n_skip=skipped,
+            label=f"{k + 1}번째 {w}x{d}x{h} 적재 성공"
+        ))
     return pk, steps
 
 
@@ -100,51 +108,52 @@ def draw_boxes3d(ax, placed, cfg):
     for entry in placed:
         x, y, z, w, d, h = _footprint(entry)
         ax.bar3d(x, y, z, w, d, h, color=COLORS.get(h, "#8993A4"),
-                 edgecolor="#172B4D", linewidth=0.4, alpha=0.92, shade=True)
-    ax.set_xlim(0, pal["width_mm"]); ax.set_ylim(0, pal["depth_mm"])
+                 edgecolor="#172B4D", linewidth=0.5, alpha=0.92, shade=True)
+    ax.set_xlim(0, pal["width_mm"])
+    ax.set_ylim(0, pal["depth_mm"])
     ax.set_zlim(0, pal["max_stack_mm"])
     ax.set_box_aspect((pal["width_mm"], pal["depth_mm"], pal["max_stack_mm"]))
-    ax.set_xlabel("Px (mm)"); ax.set_ylabel("Py (mm)"); ax.set_zlabel("Pz (mm)")
+    ax.set_xlabel("Px (mm)", fontsize=8)
+    ax.set_ylabel("Py (mm)", fontsize=8)
+    ax.set_zlabel("Pz (mm)", fontsize=8)
     ax.view_init(elev=24, azim=-58)
 
 
 def draw_heightmap(ax, hm, cfg):
-    """heightmap 히트맵. hm[px][py] 라서 .T 로 그려야 화면 축과 맞는다."""
+    """heightmap 히트맵."""
     pal = cfg["pallet"]
     ax.clear()
     im = ax.imshow(hm.T, origin="lower", cmap="viridis", vmin=0, vmax=pal["max_stack_mm"],
                    extent=[0, pal["width_mm"], 0, pal["depth_mm"]], aspect="equal")
-    ax.set_title("heightmap (mm)", fontsize=9)
-    ax.set_xlabel("Px"); ax.set_ylabel("Py")
+    ax.set_title("Heightmap (mm)", fontsize=9)
+    ax.set_xlabel("Px", fontsize=8)
+    ax.set_ylabel("Py", fontsize=8)
     return im
 
 
 def draw_fill_curve(ax, fills, caps, k):
-    """적재율 vs 박스 수. k 번째까지만 그려서 같이 자라게 한다.
-
-    두 기준을 같이 그린다 — 실제높이 기준(§7.8)은 층이 올라갈 때 분모가 뛰어
-    내려가고, 용량 기준(max_stack 고정)은 단조 증가한다. 하나만 보이면
-    "왜 적재율이 떨어지냐" 는 질문이 매번 나온다.
-    """
+    """적재율 vs 박스 수."""
     ax.clear()
-    f_pc = [v * 100 for v in fills]                 # 축 단위는 % — 0.65 보다 65% 가 읽기 쉽다
+    f_pc = [v * 100 for v in fills]
     c_pc = [v * 100 for v in caps]
-    ax.plot(range(1, len(f_pc) + 1), f_pc, color="#DFE1E6", lw=1.5)
-    ax.plot(range(1, len(c_pc) + 1), c_pc, color="#F5D0BF", lw=1.5)
-    ax.plot(range(1, k + 2), f_pc[:k + 1], color="#2a78d6", lw=2, marker="o", ms=3,
-            label="실제 높이 기준 (§7.8)")
-    ax.plot(range(1, k + 2), c_pc[:k + 1], color="#eb6834", lw=2, marker="o", ms=3,
+    ax.plot(range(0, len(f_pc)), f_pc, color="#DFE1E6", lw=1.5)
+    ax.plot(range(0, len(c_pc)), c_pc, color="#F5D0BF", lw=1.5)
+    ax.plot(range(0, k + 1), f_pc[:k + 1], color="#2a78d6", lw=2, marker="o", ms=3,
+            label="실제 높이 기준")
+    ax.plot(range(0, k + 1), c_pc[:k + 1], color="#eb6834", lw=2, marker="o", ms=3,
             label="용량 기준")
     ax.axhline(70, color="#52514E", lw=1.2, ls=(0, (5, 4)))
-    ax.text(0.8, 71.5, "목표 70%", color="#52514E", fontsize=8)
-    ax.set_xlim(0.5, len(f_pc) + 0.5); ax.set_ylim(0, 85)
+    ax.text(0, 71.5, "목표 70%", color="#52514E", fontsize=8)
+    ax.set_xlim(0, max(1, len(f_pc) - 1))
+    ax.set_ylim(0, 85)
     ax.set_title("적재율 vs 박스 수 (%)", fontsize=9)
-    ax.set_xlabel("박스 수"); ax.grid(alpha=0.3)
+    ax.set_xlabel("박스 수", fontsize=8)
+    ax.grid(alpha=0.3)
     ax.legend(fontsize=7, loc="lower right", framealpha=0.9)
 
 
 def render_video(cfg, steps, out_path, fps=2, hold=6):
-    """매 단계를 프레임으로 찍어 mp4 로 저장. hold = 마지막 화면을 몇 프레임 더 유지할지."""
+    """단독 패커 박스 적재 과정 애니메이션 동영상."""
     fills = [s["fill"] for s in steps]
     caps = [s["cap"] for s in steps]
     fig = plt.figure(figsize=(12, 6.5))
@@ -156,7 +165,7 @@ def render_video(cfg, steps, out_path, fps=2, hold=6):
     title = fig.suptitle("", fontsize=12)
 
     def frame(f):
-        k = min(f, len(steps) - 1)              # hold 구간은 마지막 단계를 반복
+        k = min(f, len(steps) - 1)
         s = steps[k]
         draw_boxes3d(ax3d, s["placed"], cfg)
         draw_heightmap(ax_hm, s["hm"], cfg)
@@ -173,78 +182,56 @@ def render_video(cfg, steps, out_path, fps=2, hold=6):
 
 
 def render_compare_video(cfg, steps_a, steps_b, out_path,
-                        name_a="제안 (heightmap)", name_b="베이스라인 (순차)",
-                        fps=2, hold=8):
-    """두 패커를 **같은 박스 시퀀스**로 나란히 재생한다.
-
-    왜 필요한가: 표의 "+19.1%p" 는 숫자일 뿐이라 무엇이 달라서 그런지 안 보인다.
-    같은 순서로 같은 박스를 먹였을 때 한쪽은 가장자리부터 층을 펴고 다른 쪽은
-    좌하단에 쌓기만 하는 것을 나란히 놓으면 그게 그대로 보인다.
-
-    ★ 길이가 다르다. 먼저 끝난 쪽은 **마지막 화면을 유지**한다 — 짧은 쪽을 늘리려고
-      단계를 늘리면 없던 배치를 지어내는 것이 된다.
+                         name_a="제안 (최종 튜닝 Heightmap)", name_b="Extreme Point (EP 3D 극점)",
+                         fps=2, hold=8):
+    """두 패커를 나란히(Side-by-Side) 재생하는 비교 동영상.
+    하단에는 실시간 솟구침 곡선 대신 깔끔한 요약비교 바 차트(Bar Chart)를 표출한다.
     """
     n = max(len(steps_a), len(steps_b)) + hold
-    fig = plt.figure(figsize=(12.6, 6.4))
-    gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], hspace=0.34, wspace=0.06,
-                          left=0.02, right=0.98, top=0.88, bottom=0.10)
+    fig = plt.figure(figsize=(13.0, 6.8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3.2, 1], hspace=0.35, wspace=0.08,
+                          left=0.04, right=0.96, top=0.88, bottom=0.10)
     axL = fig.add_subplot(gs[0, 0], projection="3d")
     axR = fig.add_subplot(gs[0, 1], projection="3d")
     axF = fig.add_subplot(gs[1, :])
-    title = fig.suptitle("", fontsize=12)
-    fa = [s["fill"] * 100 for s in steps_a]
-    fb = [s["fill"] * 100 for s in steps_b]
+    title = fig.suptitle("", fontsize=13, fontweight="bold")
 
     def frame(f):
         ka = min(f, len(steps_a) - 1)
         kb = min(f, len(steps_b) - 1)
         sa, sb = steps_a[ka], steps_b[kb]
-        for ax, st_, nm, done in ((axL, sa, name_a, f >= len(steps_a)),
-                                  (axR, sb, name_b, f >= len(steps_b))):
-            draw_boxes3d(ax, st_["placed"], cfg)
-            ax.set_title(f"{nm}   적재 {st_['n_ok']}개 · 버림 {st_['n_skip']}개\n"
-                         f"적재율 {st_['fill'] * 100:.1f}%  최고 {int(st_['hm'].max())}mm"
-                         + ("   — 끝" if done else ""), fontsize=9.5)
+
+        # 3D 배치도
+        draw_boxes3d(axL, sa["placed"], cfg)
+        axL.set_title(f"{name_a}\n적재 {sa['n_ok']}개 · 버림 {sa['n_skip']}개  |  적재율 {sa['fill'] * 100:.1f}%  최고 {int(sa['hm'].max())}mm"
+                      + (" (종료)" if f >= len(steps_a) - 1 else ""), fontsize=9.5)
+
+        draw_boxes3d(axR, sb["placed"], cfg)
+        axR.set_title(f"{name_b}\n적재 {sb['n_ok']}개 · 버림 {sb['n_skip']}개  |  최고 {int(sb['hm'].max())}mm"
+                      + (" (종료)" if f >= len(steps_b) - 1 else ""), fontsize=9.5)
+
+        # 하단: 가로 바 차트 (적재 개수 비교)
         axF.clear()
-        axF.plot(range(1, ka + 2), fa[:ka + 1], color="#2a78d6", lw=2, label=name_a)
-        axF.plot(range(1, kb + 2), fb[:kb + 1], color="#eb6834", lw=2, label=name_b)
-        axF.axhline(70, color="#52514E", lw=1.1, ls=(0, (5, 4)))
-        axF.text(1, 71.5, "목표 70%", color="#52514E", fontsize=8)
-        axF.set_xlim(1, max(len(steps_a), len(steps_b)))
-        axF.set_ylim(0, 90)
-        axF.set_xlabel("투입한 박스 수", fontsize=9)
-        axF.set_ylabel("적재율 (%)", fontsize=9)
-        axF.grid(alpha=0.3); axF.set_axisbelow(True)
-        axF.legend(fontsize=8, loc="lower right", framealpha=0.9)
-        title.set_text("같은 박스 · 같은 순서 — 전략만 다르다")
+        labels = [name_a, name_b]
+        cnts = [sa['n_ok'], sb['n_ok']]
+        colors = ["#2a78d6", "#9b59b6"]
+        
+        bars = axF.barh(labels, cnts, color=colors, height=0.45, alpha=0.9)
+        axF.set_xlim(0, 35)
+        axF.set_xlabel("현재 진행 단계 적재 박스 수 (개)", fontsize=9)
+        axF.set_title("알고리즘별 현재 적재 완료 개수 비교", fontsize=9.5)
+        axF.grid(axis='x', alpha=0.3)
+        axF.set_axisbelow(True)
+        
+        for bar in bars:
+            w = bar.get_width()
+            axF.text(w + 0.5, bar.get_y() + bar.get_height()/2.0, f"{int(w)}개",
+                     va='center', ha='left', fontsize=9, fontweight='bold')
+
+        title.set_text(f"동일한 무작위 박스 공급 — 적재 과정 비교 (단계 {f}/{n - hold})")
         return []
 
     anim = animation.FuncAnimation(fig, frame, frames=n, blit=False)
     anim.save(out_path, writer=animation.FFMpegWriter(fps=fps, bitrate=2600))
     plt.close(fig)
     return out_path
-
-
-def main():
-    ap = argparse.ArgumentParser(description="패킹 과정 동영상 생성")
-    ap.add_argument("-o", "--out", default="packing_stack.mp4", help="저장할 mp4 경로")
-    ap.add_argument("-n", "--count", type=int, default=None, help="박스 개수 (기본: config 의 stage1)")
-    ap.add_argument("--noise", type=int, default=0, help="실측 pose 에 주입할 오차 ±mm")
-    ap.add_argument("--fps", type=int, default=2)
-    args = ap.parse_args()
-
-    cfg = load()
-    n = args.count or cfg["boxes"]["stage1"]["total_count"]
-    pk, steps = simulate(cfg, n=n, noise=args.noise)
-    render_video(cfg, steps, args.out, fps=args.fps)
-
-    print(f"저장: {args.out}")
-    last = steps[-1] if steps else dict(n_ok=0, n_skip=0)
-    print(f"투입 {n}개 → 적재 {last['n_ok']}개 · 버림 {last['n_skip']}개 · "
-          f"적재율 {pk.fill_rate() * 100:.1f}%(실제높이) / "
-          f"{pk.capacity_rate() * 100:.1f}%(용량) · "
-          f"최고 {int(pk.hm.max())}mm / {cfg['pallet']['max_stack_mm']}mm")
-
-
-if __name__ == "__main__":
-    main()
