@@ -53,3 +53,4 @@ rosbag2_*/
 # QR 라벨 PNG — scripts/gen_qr_labels.py 가 master DB 에서 굽는 생성물이다.
 # DB 를 다시 만들면 목적지가 바뀌므로 커밋해 두면 오히려 어긋난다.
 qr_labels/
+results/runs/

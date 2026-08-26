@@ -63,5 +63,39 @@ if [ "${PL_NOWINDOW:-0}" = "1" ]; then
     export PL_AUTOPLAY="${PL_AUTOPLAY:-1}"
 fi
 
+# ★ 실행 로그를 파일로도 남긴다. 터미널에만 찍히면 끝난 뒤에 원인을 못 찾는다 —
+#   스크롤이 잘리고, 다른 사람이 볼 수도 없다. `PL_LOGDIR` 로 자리를 바꾼다.
+# ★ 배속. `PL_RATE=120` 이면 약 2 배 (기본 60).
+#
+#   Kit 메인 루프가 `app/runLoops/main/rateLimitFrequency` 로 초당 틱 수에 묶여
+#   있다. 물리 dt 는 `World` 가 따로 잡으므로(사양 60 Hz), 이 값을 올리면
+#   **같은 시뮬 시간을 더 짧은 벽시계에** 돈다. Isaac 자체 테스트도 같은 키로
+#   물리 레이트를 맞춘다 (exts/isaacsim.test.collection/.../robot_helpers.py:79).
+#
+#   ⚠ 기계가 못 따라오면 배수가 안 나온다. 화면이 빨라 보이는 것과 실제 배수는
+#     다르다 — 종료 지표의 `벽시계` 줄로 확인할 것.
+#   ⚠ **사이클 시간을 재는 실행에는 쓰지 마라** (CLAUDE.md §10-2).
+#     `cycle.MOTION_POLL_S` 가 벽시계 기준이라, 배속을 올리면 폴 한 번이 더 긴
+#     시뮬 시간이 되어 사이클에 인공물이 늘어난다. 지표용은 기본값 그대로.
+KIT=()
+if [ -n "${PL_RATE:-}" ]; then
+    KIT+=(--/app/runLoops/main/rateLimitFrequency="$PL_RATE")
+    echo "배속: rateLimitFrequency=$PL_RATE (기본 60 -> 약 $((PL_RATE / 60)) 배)" >&2
+fi
+# 그 밖의 Kit 설정을 직접 줄 때. 예: PL_KIT_ARGS="--/app/window/width=1920"
+if [ -n "${PL_KIT_ARGS:-}" ]; then
+    # shellcheck disable=SC2206
+    KIT+=($PL_KIT_ARGS)
+fi
+
+LOGDIR="${PL_LOGDIR:-$HOME/palletris_ws/results/runs}"
+mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=""
 cd "$ISAAC_DIR"
-exec ./isaac-sim.sh "${WIN[@]}" --exec "$HERE/demo_stack15_test1_1.py" "$@"
+if [ -n "$LOGDIR" ]; then
+    LOGF="$LOGDIR/run_$(date +%Y%m%d_%H%M%S).log"
+    echo "로그: $LOGF" >&2
+    # stdbuf: 파이프로 넘기면 블록 버퍼가 되어 진행이 안 보인다.
+    exec stdbuf -oL -eL ./isaac-sim.sh "${WIN[@]}" "${KIT[@]}" \
+         --exec "$HERE/demo_stack15_test1_1.py" "$@" 2>&1 | tee "$LOGF"
+fi
+exec ./isaac-sim.sh "${WIN[@]}" "${KIT[@]}" --exec "$HERE/demo_stack15_test1_1.py" "$@"

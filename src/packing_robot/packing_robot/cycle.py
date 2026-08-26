@@ -28,7 +28,8 @@
 import os
 import time
 
-RESULTS = ("PLACED", "PICK_FAILED", "PALLET_FULL", "BLOCKED", "IK_FAIL")
+RESULTS = ("PLACED", "PICK_FAILED", "PALLET_FULL", "NO_FEASIBLE_POSE",
+           "BLOCKED", "IK_FAIL")
 
 MOTION_TIMEOUT_S = 20.0          # 한 구간 이동에 이보다 오래 걸리면 이상한 것이다
 MOTION_POLL_S = 0.02
@@ -406,7 +407,22 @@ class Cycle:
             self._log("[cycle] plan_placement -> %s" % msg)
             self.svc.cancel_plan(self.zone, box_id)
             self._resume_belt()
-            return "PALLET_FULL" if msg == "PALLET_FULL" else "BLOCKED"
+            # ★★ 계획 실패 두 종을 **구분해서** 올린다 (CLAUDE.md §7).
+            #
+            #   NO_FEASIBLE_POSE  이 박스만 자리가 없다 -> 되돌리고 계속. **우회**다
+            #   PALLET_FULL       가장 작은 박스로도 없다 -> 상차·종료
+            #
+            #   예전에는 PALLET_FULL 이 아니면 전부 BLOCKED 로 뭉갰다. 그러면
+            #   호출자가 둘을 못 가른다 — 로그에는 원래 이름이 찍히는데(위 _log)
+            #   돌려주는 값만 바뀌어서, **잘 도는 것처럼 보이는데 집계가 틀린다.**
+            #   실측 2026-08-26: 5 호 3 개가 우회인데 "실패 3" 으로 잡혔다.
+            #   우회는 흐름 제어이지 실패가 아니다 (설계결정서 §7 bypass_count).
+            #
+            #   ⚠ 관제탑은 이 경로를 안 쓴다 — `PlanPlacement` 응답의 message 를
+            #     직접 보고 이미 둘을 가른다 (orchestrator_node.py:299·305).
+            #     `cycle.run()` 호출자는 스크립트 4 개뿐이고 전부 `== "PLACED"`
+            #     로만 판정해서 새 값이 들어와도 안전하다.
+            return msg if msg in ("PALLET_FULL", "NO_FEASIBLE_POSE") else "BLOCKED"
 
         # 4) 집기
         if self.pick(box_id, pick_pose, h) != "PICKED":
@@ -416,6 +432,22 @@ class Cycle:
             self._resume_belt()
             return "PICK_FAILED"
         self.svc.set_status(box_id, "PICKED")
+
+        # ★★ 여기서 **벨트를 다시 돌린다** (2026-08-26). 예전에는 놓기까지 끝난
+        #   뒤(아래 6 번)에야 돌렸다.
+        #
+        #   박스는 이미 그리퍼에 들려 있다 — 벨트가 돌아도 끌려갈 것이 없다.
+        #   반면 벨트를 세워 두면 **뒤에 줄 선 박스가 그 자리에 얼어붙는다.**
+        #   이송·배치가 6~10 초라 그동안 다음 박스가 스토퍼까지 못 내려온다.
+        #   집자마자 돌리면 그 6~10 초 동안 다음 박스가 내려와 **대기하고 있다.**
+        #
+        #   ⚠ 곁가지 효과가 하나 더 있다. 얼어붙은 박스는 분기 중간에 서 있어서
+        #     소터가 계속 꺾인 채로 남고, 그러면 뒤 박스가 남의 지선으로 밀린다
+        #     (2026-08-26 영상 error3·error4 의 그 현상).
+        #
+        #   ★ 아래 6 번의 `_resume_belt()` 는 그대로 둔다 — 멱등이고(같은 값을
+        #     다시 쓴다), 이탈 경로에서 여기를 안 지나고 끝나는 길이 있다.
+        self._resume_belt()
 
         # 5) 놓기
         res, actual, _measured = self.place(box_id, place, w, d, h)

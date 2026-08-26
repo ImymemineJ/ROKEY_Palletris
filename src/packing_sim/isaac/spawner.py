@@ -194,8 +194,24 @@ class Spawner:
                        for k, rgb in _cols.items()}
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
         # 원점은 **모서리**이고 z 는 **상면**이다 (작업명세서 §3.3).
-        _po = cfg["zones"]["pallet_origin_world_mm"][zone]
+        # ★★ **존마다** 만든다 (2026-08-26). 예전에는 `zone` 하나의 범위만 들고
+        #   있어서, `swap_pallet(zone="B")` 를 불러도 늘 그 하나를 비웠다.
+        #   실측(영상 claude_review): **B 를 상차하면 A 팔레트가 초기화됐다.**
+        #   `h_swap_pallet` 이 zone 을 검사만 하고 `_swap_pallet` 에 안 넘긴 것도
+        #   같이 고친다 — 검사만 하면 "받았지만 안 쓴다" 가 된다.
         _pal = cfg["pallet"]
+        _POZ = cfg["zones"]["pallet_origin_world_mm"]
+        self.pallet_box = {}
+        for _z in self.zones:
+            _p = _POZ.get(_z)
+            if _p is None:
+                continue
+            self.pallet_box[_z] = (
+                (_p[0] / 1000.0, (_p[0] + _pal["width_mm"]) / 1000.0),
+                (_p[1] / 1000.0, (_p[1] + _pal["depth_mm"]) / 1000.0),
+                _p[2] / 1000.0)
+        _po = _POZ[zone]
+        # 하위호환 — 옛 코드가 아직 이 셋을 본다
         self.pallet_x = (_po[0] / 1000.0, (_po[0] + _pal["width_mm"]) / 1000.0)
         self.pallet_y = (_po[1] / 1000.0, (_po[1] + _pal["depth_mm"]) / 1000.0)
         self.pallet_top_m = _po[2] / 1000.0
@@ -398,7 +414,7 @@ class Spawner:
         if zone not in self.zones:
             return {"ok": False, "error": "이 스포너는 존 %s 다 (요청 %s)"
                     % (",".join(self.zones), zone), "removed": 0}
-        return self.mainq.run(self._swap_pallet)
+        return self.mainq.run(lambda: self._swap_pallet(zone))
 
     def h_spawn_status(self, req=None):
         """{"spawned":N, "enabled":bool, ...} — 표(공통가이드 §3)의 두 필드 + 진단용.
@@ -634,20 +650,29 @@ class Spawner:
         self._log("[spawner] despawn %s (라인 밖으로 이동)" % box_id)
         return {"ok": True}
 
-    def _swap_pallet(self):
-        """**메인 스레드 전용.** 팔레트 영역 안에 있는 박스를 전부 치운다."""
+    def _swap_pallet(self, zone=None):
+        """**메인 스레드 전용.** **그 존** 팔레트 위 박스를 전부 치운다.
+
+        ★ zone 을 반드시 받는다. 안 받으면 존이 셋이어도 늘 같은 팔레트를 비운다
+          — 실측 2026-08-26: B 를 상차했는데 A 가 초기화됐다.
+        """
+        zone = str(zone or self.zone).upper()
+        box = self.pallet_box.get(zone)
+        if box is None:
+            return {"ok": False, "removed": 0,
+                    "error": "존 %s 의 팔레트 범위를 모른다 (아는 것: %s)"
+                             % (zone, sorted(self.pallet_box))}
+        (px0, px1), (py0, py1), ptop = box
         on_pallet = []
         for box_id, e in list(self._snap.items()):
             x, y, z = e["pos_m"]
-            if (self.pallet_x[0] <= x <= self.pallet_x[1]
-                    and self.pallet_y[0] <= y <= self.pallet_y[1]
-                    and z >= self.pallet_top_m - 0.05):
+            if px0 <= x <= px1 and py0 <= y <= py1 and z >= ptop - 0.05:
                 on_pallet.append(box_id)
         for box_id in on_pallet:
             self._despawn(box_id)
-        self._log("[spawner] swap_pallet — 박스 %d 개를 팔레트째 내보냈다 %s"
-                  % (len(on_pallet), on_pallet))
-        return {"ok": True, "removed": len(on_pallet)}
+        self._log("[spawner] swap_pallet %s — 박스 %d 개를 팔레트째 내보냈다 %s"
+                  % (zone, len(on_pallet), on_pallet))
+        return {"ok": True, "removed": len(on_pallet), "zone": zone}
 
     def _attach_label(self, box_path, box_id, hz):
         """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
