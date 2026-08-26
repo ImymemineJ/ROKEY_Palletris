@@ -133,7 +133,12 @@ class RosSide:
 
         self._busy = threading.Lock()
         self._hold = None                # 모션 중 도착한 명령 1건 보류 (step 주석)
-        self._parked0 = False            # 초기 대기 자세를 이미 잡았는가 (step 주석)
+        # ★ 풀 비전(PL_GTPICK=2)에서는 대기 자세를 **끈다** (2026-08-27 실측).
+        #   스토퍼 상공에 뜬 팔이 픽업 카메라와 박스 사이를 가려 존 인식이
+        #   "박스가 시야 밖으로 잘렸다"로 좌표를 못 낸다 — 3존이 차례로 섰다.
+        #   gtpick 모드에서는 카메라를 안 쓰므로 대기 자세가 순이득이라 유지.
+        self._park_ok = os.environ.get("PL_GTPICK") != "2"
+        self._parked0 = not self._park_ok  # 끄면 초기 대기 자세도 안 잡는다
         self._done = []                  # 워커가 넣고 step() 이 비운다
         self._done_lk = threading.Lock()
 
@@ -221,7 +226,7 @@ class RosSide:
             #   박스가 벌써 대기 중이어도 이 시점엔 명령이 아직 없다. 그래서 명령이
             #   아니라 **박스 실물**(pickup_check 스냅샷, 스레드 안전)을 본다.
             #   보류분 검사는 그대로 두고 (있으면 당연히 생략) 실물 검사를 더한다.
-            if act == 1:
+            if act == 1 and self._park_ok:
                 _pk = {}
                 if self._hold is None:
                     _pk = self.link.call(cmd="pickup_check", zone=self.zone) or {}
