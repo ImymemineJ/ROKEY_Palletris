@@ -828,6 +828,10 @@ def main():
                     help="`release` 를 부른 뒤 박스가 **언제 멈추는지** 100ms 구간으로 잰다. "
                          "RELEASE_MIN_HOLD_S · release_damping_duration_s · settle_wait_s "
                          "세 개(각 0.5s)가 다 필요한지 여기서만 갈린다")
+    ap.add_argument("--seed", type=int, default=None, metavar="N",
+                    help="박스 등장 순서 시드를 덮어쓴다 (기본은 system.yaml 의 "
+                         "boxes.random_seed=42). 계획을 여러 개 만들어 **한 계획에만 "
+                         "해당하는 결론**을 거르는 데 쓴다")
     ap.add_argument("--poll-ms", type=float, default=None, metavar="MS",
                     help="`cycle.MOTION_POLL_S` 를 덮어쓴다 (기본 20ms). 헤드리스는 시뮬이 "
                          "실시간의 7배로 돌아 20ms 벽시계가 **138ms 시뮬**이 된다 — "
@@ -846,6 +850,7 @@ def main():
                          "빨라 보인다. 궤적을 바꾸는 --vel 과 다르다")
     ap.add_argument("--hm", action="append", metavar="KEY=VAL",
                     help="heightmap 가중치를 **계획용 사본에만** 덮어쓴다. 여러 번 쓸 수 있다. "
+                         "중첩 키는 점으로 (예: lookahead.k=4). "
                          "예: --hm w_wall=0.0 --hm w_far=0.0 --hm w_height=1.2. "
                          "system.yaml 은 안 고친다")
     ap.add_argument("--corridor-gap", type=float, default=None, metavar="MM",
@@ -865,6 +870,11 @@ def main():
 
     _paths.check()
     cfg = _paths.system_config()
+    if a.seed is not None:
+        # ★ 여기서 걸어야 한다. `manifest()` 가 **이 cfg** 로 박스 목록을 뽑는데,
+        #   아래 `_paths.system_config` 패치는 이 줄보다 뒤에 설치돼서 안 먹는다.
+        #   2026-08-25 실측으로 밟았다 — 시드 42/7/99 세 실행의 박스 목록이 동일했다.
+        cfg["boxes"]["random_seed"] = int(a.seed)
     DIMS_G.update({t["name"]: t["h_mm"] for t in cfg["boxes"]["types"]})
     n = a.boxes if a.boxes is not None else int(cfg["boxes"]["stage1"]["total_count"])
 
@@ -941,7 +951,8 @@ def main():
     import cycle as CY                                   # packing_robot
     import sim_link as SL
 
-    if a.pedestal is not None or a.standoff is not None or a.vel is not None:
+    if (a.pedestal is not None or a.standoff is not None or a.vel is not None
+            or a.seed is not None):
         # ★ system.yaml 을 안 고치고 로봇만 옮겨 본다 (철칙 3 — 숫자 변경은 팀 결정이다).
         #   `bring_up` 이 `_paths.system_config()` 로 base 를 읽으므로 그 함수만 감싼다.
         _orig_cfg = _paths.system_config
@@ -959,13 +970,19 @@ def main():
             if a.vel is not None:
                 # robot_motion 이 cfg["robot"]["joint_speed_scale"] 로 스텝 수를 정한다
                 c["robot"]["joint_speed_scale"] = float(a.vel)
+            if a.seed is not None:
+                # ★ 박스 등장 순서. `_pick_boxes` 가 이 값으로 뽑는다.
+                #   같은 시드로 이격만 바꾸면 **짝지은 비교**가 된다.
+                c["boxes"]["random_seed"] = int(a.seed)
             return c
 
         _paths.system_config = _patched
         print("★ 덮어쓴다 (system.yaml 은 그대로): 페데스탈 %s · 이격 %s · 속도배율 %s"
+              " · 시드 %s"
               % (a.pedestal if a.pedestal is not None else "기본",
                  a.standoff if a.standoff is not None else "기본",
-                 a.vel if a.vel is not None else "기본"))
+                 a.vel if a.vel is not None else "기본",
+                 a.seed if a.seed is not None else "기본"))
 
     ok_all = True
     server = link = None
@@ -1017,7 +1034,24 @@ def main():
             _k = _k.strip()
             # system.yaml 에 아직 없는 **선택 키**는 코어가 기본값으로 읽는다.
             # 그런 키까지 막으면 실험 자체가 안 되므로 화이트리스트로 통과시킨다.
-            _OPT = {"corridor_far_ratio": 1.0, "corridor_near_gap_mm": 150.0}
+            _OPT = {"corridor_far_ratio": 1.0, "corridor_near_gap_mm": 150.0,
+                    "top_box_max_h": 0, "tower_ring_mm": 0,
+                    "tower_ring_cells": 25, "max_span_mm": 0,
+                    "corridor_radius_mm": 0,
+                    "corridor_tier2_radius_mm": 0, "corridor_tier2_gap_mm": 271,
+                    "drop_relief_mm": 0, "drop_max_kg": 0.0}
+            # ★ 중첩 키도 받는다: `--hm lookahead.k=4`. 앞보기가 dict 라 스칼라
+            #   문법으로는 손댈 수가 없었다 (type(dict)(float) 로 죽는다).
+            if "." in _k:
+                _p, _, _sub = _k.partition(".")
+                _dst = cfg_plan["heightmap"].get(_p)
+                if not isinstance(_dst, dict):
+                    raise SystemExit("--hm %s: heightmap.%s 가 dict 가 아니다" % (_k, _p))
+                _old = _dst.get(_sub)
+                _dst[_sub] = int(float(_v)) if _old is None or isinstance(_old, int) \
+                    else float(_v)
+                print("계획값  heightmap.%s  %s -> %s" % (_k, _old, _dst[_sub]))
+                continue
             if _k not in cfg_plan["heightmap"] and _k not in _OPT:
                 raise SystemExit("--hm %s: heightmap 에 없는 키다. 있는 키 %s (+선택 %s)"
                                  % (_k, sorted(cfg_plan["heightmap"]), sorted(_OPT)))
@@ -1190,6 +1224,14 @@ def main():
 
         server = B4.StandInServer(handlers, port=a.port)
         print("소켓    127.0.0.1:%d  cmd %s" % (a.port, sorted(handlers)))
+        # ★ IK 가지 선택은 환경변수로 켠다 (robot_motion.IK_SEEDS). 로그에 남겨
+        #   나중에 "이 실행이 켠 거였나" 를 되짚을 수 있게 한다.
+        print("IK 가지  %s%s" % (RM.IK_SEEDS,
+              "  (keep = 기존 동작 · PL_IK_SEEDS=multi 로 켠다)"
+              if RM.IK_SEEDS == "keep" else "  ← 재구성 이동 켜짐"))
+        print("툴 기울기 %.0f 도%s" % (RM.TOOL_TILT_DEG,
+              "  (0 = 기존 동작 · PL_TOOL_TILT=15 로 켠다)" if RM.TOOL_TILT_DEG <= 0
+              else "  ← 이송 중에만 · 착지는 수평"))
 
         # ── 머리 ───────────────────────────────────────────
         link = SL.SimLink(port=a.port)
@@ -1311,8 +1353,12 @@ def main():
                 kw["n"] += 1
                 for _pid, _ref in rest.items():
                     _p = np.asarray(by_id[_pid].get_world_pose()[0], dtype=float)
-                    _d = (_p - _ref) * 1000.0
-                    if float(np.linalg.norm(_d)) <= KNOCK_TRIP_MM:
+                    # ⚠ 변위는 `_dv` 다. 예전엔 `_d` 였는데 바로 아래에서 박스 **깊이**
+                    #   `_d` 가 같은 이름으로 덮어써서, 아래 `for v in _d` 가
+                    #   float 을 훑다가 죽었다 — 하필 **첫 knock 이 나는 그 순간**이라
+                    #   진단이 한 줄도 안 남았다 (2026-08-25).
+                    _dv = (_p - _ref) * 1000.0
+                    if float(np.linalg.norm(_dv)) <= KNOCK_TRIP_MM:
                         continue
                     _w, _d, _h = _dim_of[_pid]
                     # yaw 90/270 이면 x·y 반폭이 바뀐다. 안 바꾸면 AABB 가 틀려
@@ -1320,7 +1366,7 @@ def main():
                     if int(round(abs(_yaw_of(by_id[_pid].get_world_pose()[1])) / 90.0)) % 2:
                         _w, _d = _d, _w
                     _hf = np.array([_w, _d, _h], dtype=float) / 2.0
-                    kw["hit"] = (kw["n"], _pid, [float(v) for v in _d],
+                    kw["hit"] = (kw["n"], _pid, [float(v) for v in _dv],
                                  [float(v) for v in rm.suction_pose()],
                                  _link_dists(rm, _p - _hf, _p + _hf)[:3],
                                  list(diag["tgt"]) if diag["tgt"] else None)
@@ -1551,7 +1597,11 @@ def main():
         # ★ 버림은 실패가 아니다 (§5). 뭉뚱그리면 "실패 N건" 이 부풀려 나오고
         #   발표에서 알고리즘 정상 판단과 진짜 고장을 구분할 수 없다.
         n_rej = len([r for r in rows if r["res"] == "REJECTED"])
-        n_fail = len(rows) - len(placed) - n_rej
+        # ★ `PALLET_FULL` 은 **정상 종료**다 (CLAUDE.md §7: 가장 작은 박스로도 후보가
+        #   없다 -> 트럭 상차 · 종료). 실패로 세면 안 된다 — 실제로 시드 99 가 29개를
+        #   깔끔히 쌓고 팔레트가 차서 끝났는데 "진짜 실패" 로 찍혔다 (2026-08-25).
+        n_full = len([r for r in rows if r["res"] == "PALLET_FULL"])
+        n_fail = len(rows) - len(placed) - n_rej - n_full
         print("\n놓은 것       %d / %d   (적재 %d · 버림 %d · 실패 %d)"
               % (len(placed), len(rows), len(placed), n_rej, n_fail))
         print("%s   %d 단 (밑면 z %s)"
@@ -1617,8 +1667,9 @@ def main():
                  sum(r["sim_s"] for r in rows) / max(1, len(rows))))
 
         for cond, msg in (
-                (len(placed) + n_rej == len(rows),
-                 "%d 개가 PLACED 도 REJECTED 도 아니다 (진짜 실패)" % n_fail),
+                (len(placed) + n_rej + n_full == len(rows),
+                 "%d 개가 PLACED · REJECTED · PALLET_FULL 어느 것도 아니다 (진짜 실패)"
+                 % n_fail),
                 (not off, "배치 오차 초과 %s" % [r["id"] for r in off]),
                 (max_knock <= KNOCK_WARN_MM,
                  "이미 놓인 박스가 %.1f mm 밀렸다 — 이송 높이를 볼 것" % max_knock),

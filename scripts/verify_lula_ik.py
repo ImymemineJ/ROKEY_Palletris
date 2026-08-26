@@ -74,12 +74,17 @@ class Tee:
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._f = self.path.open("w", encoding="utf-8")
+        # ★ 줄 단위 버퍼 (2026-08-25). 기본 버퍼(8 KB)로 열면 --gui --hold 실행을
+        #   Ctrl-C 로 끝낼 때 **마지막 블록이 통째로 날아간다.** 실제로 로그가
+        #   정확히 8192 바이트에서 잘려 6번 박스까지만 남고, 화면에는 22번까지
+        #   찍혀 있었다. 그날 저녁에 네 번 반복된 증상이다.
+        self._f = self.path.open("w", encoding="utf-8", buffering=1)
         self._out = sys.stdout
 
     def write(self, s):
         self._out.write(s)
         self._f.write(s)
+        self._f.flush()          # 줄 단위 버퍼라도 개행 없는 조각은 안 나간다
         return len(s)
 
     def flush(self):

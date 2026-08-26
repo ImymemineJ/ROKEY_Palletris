@@ -87,7 +87,7 @@ class ZoneCycle:
       프로세스를 셋으로 나누면 누가 먼저 보냈는지 알 수 없게 된다.
     """
 
-    def __init__(self, node, zone, belt_mps):
+    def __init__(self, node, zone, belt_mps, belt_top_mm):
         self.node = node
         self.zone = str(zone).lower()
         # ★ 대소문자 규약: 서비스 인자의 zone 은 **대문자**, 토픽 경로만 소문자다
@@ -106,6 +106,9 @@ class ZoneCycle:
         #   **프로세스가 통째로 죽는다.** 실측으로 확인했다.
         self.log = node.get_logger().get_child(self.zone)
         self.belt_mps = float(belt_mps)
+        # 벨트 상면 z [mm]. 벨트 위 박스의 **밑면** 높이이기도 하다.
+        # ★ 숫자를 코드에 박지 않는다 — system.yaml · conveyor.belt_top_z_mm
+        self.belt_top_mm = int(belt_top_mm)
 
         # ReentrantCallbackGroup: 콜백이 서로를 막지 않게 한다.
         # 이게 없으면 서비스 응답 콜백이 타이머 콜백을 기다리다 멈춘다.
@@ -338,8 +341,14 @@ class ZoneCycle:
             cmd.box_id = self.box["box_id"]
             cmd.x_mm = self.box["x_mm"]
             cmd.y_mm = self.box["y_mm"]
-            # 집을 z = 벨트 상면(800) + 박스 높이. 그리퍼 여유는 트랙 B가 뺀다.
-            cmd.z_mm = 800 + self.box["h"]
+            # ★ z_mm 은 **박스 밑면**이다 (RobotCmd.msg 정본 · PLACE 도 밑면을 보낸다).
+            #   벨트 위에 놓인 박스의 밑면 = 벨트 상면이다.
+            #   ⚠ 2026-08-26 수정 (김병직): 여기가 `800 + h`(=박스 **상면**)였다.
+            #   한 필드가 PICK 에서는 상면, PLACE 에서는 밑면이라 뜻이 갈렸다.
+            #   로봇이 정본대로 읽으면 중심을 h/2 만큼 높게 잡아 3호 기준 **210mm 위**
+            #   허공으로 내려간다 — CLAUDE.md §10 "박스를 400mm 위에서 놓는다"와 같은 부류.
+            #   숫자는 system.yaml 의 conveyor.belt_top_z_mm 이 정본이다.
+            cmd.z_mm = self.belt_top_mm
             cmd.yaw_deg = float(self.box["yaw_deg"])
             cmd.size_w_mm = self.box["w"]
             cmd.size_d_mm = self.box["d"]
@@ -593,8 +602,13 @@ class ZoneCycle:
                 return
             if then:
                 then()
+        # ★ 2026-08-26 수정 (김병직): seg 가 "b_pickup" 고정이었다.
+        #   ZoneCycle 은 구역별 인스턴스인데 벨트만 B 를 가리켜서, stage 2 에서
+        #   **A 구역 사이클이 B 구역 벨트를 멈춘다.** 이 파일 상단 Orchestrator
+        #   주석이 경고한 그 위험("A 구역 사이클이 C 구역 값을 읽는다")과 같은 종류다.
+        #   구역 이름 규약은 packing_robot/cycle.py 의 belt_seg 와 같다.
         self.call_async("/conveyor/set_velocity",
-                        {"seg": "b_pickup", "velocity_mps": mps}, on_response)
+                        {"seg": f"{self.zone}_pickup", "velocity_mps": mps}, on_response)
 
     def call_async(self, srv_name, req_dict, on_response):
         """서비스 1회 호출. ★ call_async + add_done_callback 만 쓴다.
@@ -773,6 +787,9 @@ class Orchestrator(Node):
         # 벨트 재가동 속도. ★ 숫자를 코드에 박지 않는다.
         #   출처: src/packing_bringup/config/system.yaml · conveyor.belt_velocity_mps
         self.declare_parameter("belt_velocity_mps", 0.5)
+        # 벨트 상면 z [mm]. ★ 숫자를 코드에 박지 않는다.
+        #   출처: src/packing_bringup/config/system.yaml · conveyor.belt_top_z_mm
+        self.declare_parameter("belt_top_z_mm", 800)
 
         zs = [str(z).strip().lower()
               for z in (self.get_parameter("zones").value or []) if str(z).strip()]
@@ -788,6 +805,7 @@ class Orchestrator(Node):
             raise ValueError("맡을 구역이 하나도 없다 — zone 또는 zones 를 줘야 한다")
 
         belt = float(self.get_parameter("belt_velocity_mps").value)
+        belt_top = int(self.get_parameter("belt_top_z_mm").value)
 
         # ★ 서비스 클라이언트는 여기서 한 벌만 만들어 구역들이 나눠 쓴다.
         # ※ create_client 는 서버가 없어도 그냥 성공한다. 기다리지 않는다.
@@ -796,7 +814,7 @@ class Orchestrator(Node):
             for name, srv_type in SERVICES.items()
         }
 
-        self.cycles = {z: ZoneCycle(self, z, belt) for z in zones}
+        self.cycles = {z: ZoneCycle(self, z, belt, belt_top) for z in zones}
         self.get_logger().info(
             f"관제탑 시작 — 구역 {', '.join(z.upper() for z in zones)} "
             f"({len(zones)} 개) · 노드는 하나다")
