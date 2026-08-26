@@ -53,7 +53,9 @@ GRIP_TOL_MM = float(os.environ.get("PL_GRIP_TOL_MM", "4.0"))
 #   갈렸다 (2026-08-22 실측 — 지령·간극이 동일한 두 실행이 0.4 mm 와 27 mm 로 갈림).
 #   바닥 2 mm 위에서 이 시간만큼 머물면 박스가 표면에 얹혀(±3° 순응 안에서) 진동이
 #   접촉 마찰로 죽는다. 정본 패드값은 건드리지 않는다.
-RELEASE_MIN_HOLD_S = 0.5
+# ★ 2026-08-27 0.5 -> 0.3 (§10-2 --diag-release 실측: 놓기 전 0~0.5 s 동안
+#   박스 이동 0.00~0.03 mm — 기다릴 이유가 없다. 자리잡음은 0.7 s, 최악 1.0 s).
+RELEASE_MIN_HOLD_S = 0.3
 
 _STATUS = ("Open", "Closing", "Closed")
 
@@ -118,7 +120,7 @@ class Gripper:
         self.release_timeout_s = float(r.get("release_wait_timeout_s", 3.0))
         self.release_damping = float(r.get("release_damping", 5.0))
         self.release_damping_s = float(r.get("release_damping_duration_s", 0.5))
-        self.settle_s = float(r.get("settle_wait_s", 0.5))
+        self.settle_s = float(r.get("settle_wait_s", 0.3))   # §10-2 실측 0.5->0.3
         self._g = None                       # begin_grasp 진행 상태
         self._r = None                       # begin_release 진행 상태
 
