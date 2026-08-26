@@ -184,6 +184,14 @@ class Gripper:
         else:
             self._log("[gripper] !! 흡착 실패 — %s  (상태 %s, 잡은 것 %s%s)"
                       % (why, self.status(), self.gripped() or "없음", self._gap_str()))
+            # ★ 실패 판정이어도 패드는 Closed 로 박스를 물고 있다 (2026-08-27 실측 —
+            #   "4.1mm 떠서 붙었다"는 붙긴 붙은 것이다). 안 떼면 박스가 패드에
+            #   매달린 채 스토퍼가 비어 그 존이 영원히 IDLE 이고, 다음 픽 때는
+            #   매달린 박스가 스토퍼 박스에 걸려 잔차 355mm 로 IK_FAIL 이 난다
+            #   (3존 동시 침묵 사고의 원인). 떼면 4mm 아래 제자리로 떨어져
+            #   다시 잡을 수 있다.
+            if self.is_holding():
+                self.view.apply_gripper_action([-1.0])
         return ok
 
     def begin_release(self, extra_settle_s=None):

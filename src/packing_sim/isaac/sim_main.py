@@ -467,6 +467,17 @@ class _GtPick:
         self.sp, self.zones, self.rg, self.log = spawner, list(zones), rg, log
         self.next_t = 0.0
         self._said = {}          # zone -> 마지막으로 알린 box_id (로그 도배 방지)
+        # ★ 자리 잡음 판정 (2026-08-27 실측). 도착 직후 아직 돌고 있는 박스를
+        #   보고했다 — BOX011 이 yaw -26.6 -> -20.2 -> -0.1 로 찍혔고, 관제탑은
+        #   첫 값으로 집으러 가서 흡착이 4.1mm 떠서 실패했다. **연속 두 번의
+        #   폴에서 같은 자리(5mm·1.5도 이내)여야** 보고한다.
+        self._prev = {}          # zone -> (box_id, x_mm, y_mm, yaw_deg)
+        # ★ 스토퍼 창. 지선에 줄 선 **둘째 박스**(스토퍼 앞 200mm)를 보고해
+        #   팔이 엉뚱한 자리로 간 사고 (잔차 79mm IK_FAIL). 가장 큰 박스가
+        #   스토퍼에 닿았을 때의 중심보다 60mm 여유까지만 픽업으로 인정한다.
+        _half = max(max(t["w_mm"], t["d_mm"]) for t in
+                    self.sp.cfg["boxes"]["types"]) / 2000.0
+        self._win_m = self.sp.stopper_pos_m - _half - 0.060
 
     def step(self, now):
         if now < self.next_t:
@@ -482,6 +493,22 @@ class _GtPick:
             pos = pose.get("pos_m") or (0.0, 0.0, 0.0)
             present = bool(r.get("present"))
             bid = str(r.get("box_id") or "")
+            if present:
+                # ── 스토퍼 창 밖 = 아직 도착 안 한 박스. 이번 틱은 보고하지 않는다
+                #    (present=false 를 보내면 관제탑이 "치워졌다"로 오인해 빗장을 푼다)
+                if pos[self.sp.axis] < self._win_m:
+                    continue
+                # ── 자리 잡음: 직전 폴과 같은 자리일 때만 보고
+                cur = (bid, round(pos[0] * 1000), round(pos[1] * 1000),
+                       float(pose.get("yaw_deg") or 0.0))
+                pv = self._prev.get(z)
+                self._prev[z] = cur
+                if (pv is None or pv[0] != bid
+                        or abs(pv[1] - cur[1]) > 5 or abs(pv[2] - cur[2]) > 5
+                        or abs(pv[3] - cur[3]) > 1.5):
+                    continue
+            else:
+                self._prev[z] = None
             self.rg.send_pickup(
                 zone=z, box_id=bid, present=present,
                 # ★ mm 정수다 (§3-2). x·y 는 박스 **중심**.
