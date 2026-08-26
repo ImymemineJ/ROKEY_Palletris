@@ -126,13 +126,17 @@ def main():
     rb = cfg["zones"]["robot_base_world_mm"]["A"]
     po = cfg["zones"]["pallet_origin_world_mm"]["A"]
     cur_gap = rb[0] - (po[0] + pal_w)
-    dx = cur_gap - a.standoff          # 팔레트를 이만큼 -X 로 (양수면 -X 이동)
+    # 팔레트를 X 로 이 만큼 옮긴다 (음수면 -X). 로봇이 팔레트의 **+X 쪽**이므로
+    # 이격을 늘리려면 팔레트가 -X 로 가야 한다.
+    #   이격 = 로봇X - (팔레트원점X + 폭)   ->   원점X_new = 원점X + (이격_cur - 이격_new)
+    # ★ 2026-08-26 --dry-run 으로 부호 오류를 잡았다. 반대로 하면 이격이 줄어든다.
+    pal_dx = cur_gap - a.standoff
 
     dz = a.pedestal - pal_top
     far = math.hypot(math.hypot(a.standoff + pal_w, pal_d / 2.0), dz)
 
     print("페데스탈   %d -> %d   (베이스 - 팔레트상면 = %d)" % (cur_ped, a.pedestal, dz))
-    print("이격(X)    %d -> %d   (팔레트를 %+d mm)" % (cur_gap, a.standoff, -dx))
+    print("이격(X)    %d -> %d   (팔레트를 X %+d mm)" % (cur_gap, a.standoff, pal_dx))
     print("max_stack  %d -> %d" % (cur_ms, ms))
     print()
     print("빈 팔레트 최원점 %.1f mm / 도달 %.0f  -> %s"
@@ -162,7 +166,7 @@ def main():
 
     lines = txt.splitlines(keepends=True)
     n_rb = _block_sub(lines, "robot_base_world_mm", 2, lambda _v: a.pedestal)
-    n_po = _block_sub(lines, "pallet_origin_world_mm", 0, lambda v: v - dx)
+    n_po = _block_sub(lines, "pallet_origin_world_mm", 0, lambda v: v + pal_dx)
     if (n_rb, n_po) != (3, 3):
         print("★ yaml 치환이 robot_base %d · pallet_origin %d 곳 — 둘 다 3 이어야 한다."
               % (n_rb, n_po))
@@ -193,10 +197,10 @@ def main():
                                     (a.pedestal / 1000.0) / CYL_H))
         # ★ 팔레트를 -X 로. 로봇은 못 옮긴다 (지선이 로봇 X 에 정렬돼 있다).
         o = _op(pl_p, UsdGeom.XformOp.TypeTranslate)
-        c = o.Get(); o.Set(Gf.Vec3d(float(c[0]) - dx / 1000.0, float(c[1]), float(c[2])))
+        c = o.Get(); o.Set(Gf.Vec3d(float(c[0]) + pal_dx / 1000.0, float(c[1]), float(c[2])))
         print("  %s: robot z=%.3f · Pedestal z=%.3f scale.z=%.4f · Pallet x=%.3f"
               % (z, a.pedestal / 1000.0, a.pedestal / 2000.0,
-                 (a.pedestal / 1000.0) / CYL_H, float(c[0]) - dx / 1000.0))
+                 (a.pedestal / 1000.0) / CYL_H, float(c[0]) + pal_dx / 1000.0))
     st.GetRootLayer().Save()
     print("씬 저장 · 백업 %s" % bak.replace(HOME, "~"))
     print()
