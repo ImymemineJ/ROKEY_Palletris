@@ -536,11 +536,9 @@ class ZoneCycle:
             return
         box_id = box["box_id"]
 
-        # ── 이탈 경로 C: 로봇 실패 → 계획 취소하고 처음으로 ──
+        # ── 이탈 경로 C: 로봇 실패 ──
         if not ev.ok:
             self.log.warn(f"로봇 실패({self.state}): {ev.reason}")
-            self.call_async("/algo/cancel_plan",
-                            {"zone": self.zone_id, "box_id": box_id}, None)
             # ★ 같은 박스 재시도 상한 (2026-08-27 실측). 스토퍼에서 뒤차가 앞차
             #   위로 올라타 2단이 되면(패드가 정확히 810+210+210=1226 에서 막힘)
             #   로봇은 아래 박스를 영원히 못 집는데, 관제탑은 같은 박스를 계속
@@ -554,11 +552,31 @@ class ZoneCycle:
                 self.log.warn("%s %d회 연속 실패 — 집을 수 없는 박스로 보고 치운다"
                               % (box_id, _fc))
                 self._fail_box = (None, 0)
+                self.call_async("/algo/cancel_plan",
+                                {"zone": self.zone_id, "box_id": box_id}, None)
+                # ★ 팔을 홈으로 치운다 (2026-08-27). 실패한 팔이 스토퍼 위에 떠
+                #   있으면 풀 비전에서 다음 박스가 카메라에 안 보인다. 재시도
+                #   중에는 안 보낸다 — 어차피 같은 자리로 다시 내려간다.
+                self.send_robot_cmd_home()
                 self.discard_box("PICK_FAILED_x%d" % _fc)
                 return
             self.call_async("/db/set_status",
                             {"box_id": box_id, "status": "PICK_FAILED",
                              "reason": ev.reason}, None)
+            # ★★ 픽 실패는 **재인식 없이 바로 재시도한다** (2026-08-27 김병직 설계).
+            #   스토퍼에서 한 번 인식했으면 좌표·신원·계획을 이미 쥐고 있고,
+            #   흡착이 빗나가도 박스는 그 자리 그대로다 — 새 box_at_pickup 을
+            #   기다리는 건 불필요할 뿐 아니라, 풀 비전에서는 실패한 팔이
+            #   카메라를 가려 재인식이 **영영 안 와** 존이 죽는다 (실측 B·C).
+            #   계획(self.plan)도 살아 있으므로 cancel_plan 도 부르지 않는다.
+            if self.state == PICKING and self.box is not None:
+                self.log.warn("픽 재시도 %d회째 — 같은 좌표로 바로 다시" % (_fc + 1))
+                self.t_robot = time.time()
+                self.send_robot_cmd(RobotCmd.PICK)
+                return
+            # PLACING 실패 등 그 외: 계획 취소하고 처음으로 (기존 경로)
+            self.call_async("/algo/cancel_plan",
+                            {"zone": self.zone_id, "box_id": box_id}, None)
             self.reset_to_idle()
             return
 
