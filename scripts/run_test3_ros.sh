@@ -106,6 +106,11 @@ export PL_DROP_KG="${PL_DROP_KG:-3.5}"
 # ★ /clock·/tf 강제 발행 (2026-08-27). 씬의 ROS2Bridge/Clock 노드가 발행자 0 실측 —
 #   PL_CAMROS=2 와 같은 사연. 씬이 진짜로 내는 게 확인되면 1(자동)로 되돌릴 것.
 export PL_CLOCKTF="${PL_CLOCKTF:-2}"
+# ★ 흡착 간극 허용 4 -> 5 (2026-08-27 강의실 실측). 풀 비전은 픽 좌표가 카메라
+#   실측이라 중심이 10~20 mm 어긋나고, 패드가 살짝 비껴 닿으면 정착 간극이
+#   4.0~4.6 mm 로 나온다 — 이 판의 흡착 실패 10건이 전부 이 구간이었고, 전부
+#   Closed 에 박스를 물고 있었다(진짜 실패 서명은 6.40). 슬롯 5 mm 가 상한.
+export PL_GRIP_TOL_MM="${PL_GRIP_TOL_MM:-5}"
 
 ARGS=(--stage "$PL_STAGE" --zones "$PL_ZONES" --ros --autorun
       --spawn-period "$PL_SPAWN" --spawn-count "$PL_SPAWN_N")

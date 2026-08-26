@@ -239,9 +239,16 @@ class ZoneCycle:
     # ① IDLE → ② FETCHING : 박스가 스토퍼에 도착했다
     # ══════════════════════════════════════════════════════════
     def _on_ident(self, msg):
-        """신원 대역 수신 — 스토퍼 박스의 box_id 만 기억한다 (좌표는 안 쓴다)."""
+        """신원 대역 수신 — 스토퍼 박스의 box_id 만 기억한다 (좌표는 안 쓴다).
+
+        (box_id, 최근 수신, 최초 수신) 3짝이다. 최초 수신은 check_stuck_box 의
+        "비전 침묵" 감시가 이 박스가 언제부터 서 있었는지 재는 데 쓴다."""
         if msg.present and msg.box_id:
-            self._ident = (msg.box_id, time.time())
+            now = time.time()
+            if self._ident is not None and self._ident[0] == msg.box_id:
+                self._ident = (msg.box_id, now, self._ident[2])
+            else:
+                self._ident = (msg.box_id, now, now)
         elif not msg.present:
             self._ident = None           # 스토퍼가 비었다 — 낡은 신원을 안 붙인다
 
@@ -818,7 +825,25 @@ class ZoneCycle:
           픽업에서도 QR 을 못 읽어 id 가 빈 경우는 씬 쪽 개입이 필요하다.
           그때는 **에러를 계속 낸다.** 조용히 서 있는 것이 제일 나쁘다.
         """
-        if self.state != IDLE or self._stuck_since is None:
+        if self.state != IDLE:
+            return
+        if self._stuck_since is None:
+            # ★ 비전이 아예 침묵하는 경우 (2026-08-27 강의실 실측): 두 박스가 붙어
+            #   스토퍼에 오면 실루엣이 병합돼(857x712 등) 사양 3종 어느 것과도 안
+            #   맞고, detector 는 box_at_pickup 을 **한 번도 안 낸다** — 위의
+            #   on_box_arrived 무장이 영영 안 된다. 점유 제어는 스토퍼가 찼다고
+            #   지선을 세워 두므로 존 전체가 조용히 죽는다 (B존 실측).
+            #   신원 대역(/zone_*/box_ident)은 씬 실물 기준이라 이 상태를 안다.
+            ident = self._ident
+            if (ident is not None
+                    and time.time() - ident[1] < 3.0            # 지금도 서 있고
+                    and time.time() - ident[2] >= STUCK_TIMEOUT_S):  # 오래 서 있다
+                self.log.error(
+                    f"{ident[0]} 가 스토퍼에 {STUCK_TIMEOUT_S:.0f}초째 서 있는데 "
+                    "인식이 침묵한다 (실루엣 병합 의심) — 치워서 라인을 푼다")
+                self._ident = None
+                self.box = {"box_id": ident[0]}
+                self.discard_box("STUCK_UNSEEN")
             return
         if time.time() - self._stuck_since < STUCK_TIMEOUT_S:
             return
