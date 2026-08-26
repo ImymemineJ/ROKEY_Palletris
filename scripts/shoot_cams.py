@@ -24,7 +24,7 @@ import numpy as np
 import yaml
 
 ROOT = "/home/rokey/palletris_ws"
-CUR = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/project_1/test_3.usd")
+CUR = os.environ.get("PL_STAGE", "/home/rokey/isaac_scenes/Collected_test_3/test_3.usd")
 OVL = os.environ.get("PL_CONFIG_OVERLAY",
                      ROOT + "/src/packing_bringup/config/test_3.yaml")
 SYS = ROOT + "/src/packing_bringup/config/system.yaml"

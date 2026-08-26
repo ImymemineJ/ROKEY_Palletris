@@ -99,8 +99,37 @@ GRIPPER = ROBOT + "/gripper"              # 흡착 그리퍼 몸통 (link_6 에 
 #   /World/robot/root_joint        아티큘레이션 루트
 #   /World/robot/root_joint/tool0  EE 프레임
 #   /World/robot/SurfaceGripper    흡착
+# ★ 로봇 애셋은 `~/isaac_assets/` 에 둔다 — `build_gripper_usd.py` 의 출력이자
+#   구글 드라이브로 팀에 공유되는 원본이다. 씬 트리 안에 사본을 두지 않는다:
+#   자산을 다시 만들면 사본이 조용히 낡아 **옛 그리퍼로 도는데 에러가 안 난다.**
+#   (팀 규약 — main `f1141f2` 김병직 판과 같다)
 ROBOT_USD = os.environ.get(
     "PL_ROBOT_USD", os.path.expanduser("~/isaac_assets/h2017_suction.usd"))
+
+
+def ref_path(asset, layer_path):
+    """참조에 쓸 경로. $HOME 아래면 **상대경로**로 준다.
+
+    절대경로(`/home/rokey/...`)로 박으면 사용자명이 다른 팀 노트북에서 깨진다.
+    USD 는 참조를 못 풀어도 에러를 안 내므로 로봇만 사라진 채 조용히 돈다.
+
+    ★ 기준을 `~/isaac_scenes` 가 아니라 **$HOME** 으로 잡는다. 씬(`~/isaac_scenes/`)과
+      애셋(`~/isaac_assets/`)이 $HOME 아래 형제 디렉토리라, 그 위를 기준으로 삼아야
+      `../../isaac_assets/...` 가 나온다. 씬 트리로 좁히면 애셋이 밖으로 판정돼
+      절대경로로 샌다.
+    """
+    a = os.path.abspath(asset)
+    base = os.path.dirname(os.path.abspath(layer_path))
+    home = os.path.expanduser("~")
+
+    def under(p):
+        return p == home or p.startswith(home + os.sep)
+
+    if under(a) and under(base):
+        rel = os.path.relpath(a, base)
+        return rel if rel.startswith("..") else "./" + rel
+    print(f"   ⚠ {a} 가 $HOME 밖이라 절대경로로 넣는다 — 다른 PC 에서 깨진다")
+    return a
 PALLET = "/World/Pallet"
 LOOKS = "/World/Looks"
 PHYS_MAT = LOOKS + "/PhysicsMaterial"
@@ -622,9 +651,10 @@ if os.path.exists(ROBOT_USD):
     spec = Sdf.CreatePrimInLayer(layer, Sdf.Path(ROBOT))
     spec.specifier = Sdf.SpecifierDef
     spec.typeName = "Xform"
-    spec.referenceList.prependedItems.append(Sdf.Reference(ROBOT_USD))
+    _rp = ref_path(ROBOT_USD, USD_PATH)
+    spec.referenceList.prependedItems.append(Sdf.Reference(_rp))
     xform(spec, (base[0], base[1], base[2]), (1.0, 1.0, 1.0))
-    print(f"로봇 {ROBOT} <- {ROBOT_USD}")
+    print(f"로봇 {ROBOT} <- {_rp}")
     print(f"      베이스 ({base[0]:.3f}, {base[1]:.3f}, {base[2]:.3f}) "
           f"= 페데스탈 상면")
 else:
