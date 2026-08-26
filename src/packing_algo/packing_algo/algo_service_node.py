@@ -23,6 +23,9 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy)
+from sensor_msgs.msg import Image
 
 from packing_algo.heightmap_core import HeightmapPacker
 from packing_common.config import load
@@ -48,10 +51,33 @@ class AlgoService(Node):
         # ROS 계약(D2: algo 는 아무것도 발행하지 않는다)을 건드리지 않는다.
         self.declare_parameter("snapshot_path", "")
         self.snap = os.path.expanduser(self.get_parameter("snapshot_path").value or "")
+        # ── heightmap 발행 (시각화 전용, 기본 꺼짐) ──
+        # ★ 왜 sensor_msgs/Image 인가: heightmap 은 그냥 120x80 2차원 배열이다.
+        #   전용 타입을 새로 만들면 packing_msgs 가 바뀌어 **팀 4명이 전부**
+        #   재빌드해야 한다 (CLAUDE.md §11). Image 는 이미 §3-2 에 있는 타입이라
+        #   아무도 재빌드하지 않는다. 16UC1 = 밀리미터 정수 (max_stack 1300 이므로
+        #   65535 안에 넉넉히 들어간다).
+        # ★ 기본값이 빈 문자열인 이유: 이 노드는 원래 아무것도 발행하지 않는다.
+        #   켜는 사람만 켠다 — 끄면 예전과 완전히 같다.
+        self.declare_parameter("heightmap_topic", "")
+        self.hm_topic = str(self.get_parameter("heightmap_topic").value or "")
+        # ★ TRANSIENT_LOCAL — 뷰어를 **나중에** 띄워도 마지막 상태를 바로 받는다.
+        #   VOLATILE 이면 뷰어가 붙기 전에 놓인 박스는 화면에 영영 안 나온다
+        #   (live_view 를 ROS 로 옮기면서 실측으로 확인한 함정이다).
+        qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                         reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
         cb = ReentrantCallbackGroup()
 
         # 구역별 패커 1개씩. stage 1 은 B 만 쓰지만, 3구역 확장 때 코드가 안 바뀐다.
         self.pk = {z: HeightmapPacker(self.cfg) for z in self.cfg["zones"]["list"]}
+        # ★ 토픽 이름은 **소문자**다. config 의 zones.list 는 "A"/"B"/"C" 인데
+        #   토픽 규약은 소문자다 (`/zone_b/status` — orchestrator 도 .lower() 를 쓴다).
+        #   여기서 안 맞추면 뷰어가 `/algo/heightmap/b` 를 듣는데 발행은
+        #   `/algo/heightmap/B` 로 나가 **에러 없이 아무것도 안 온다.**
+        self.hm_pub = ({z: self.create_publisher(
+            Image, f"{self.hm_topic}/{z.lower()}", qos) for z in self.pk}
+            if self.hm_topic else {})
         # ★ 구역마다 락 하나. 왜 필요한가:
         #   - `MultiThreadedExecutor` + `ReentrantCallbackGroup` 이라 콜백이 **동시에** 돈다.
         #   - 관제탑은 1개지만(§8) 로봇 3대를 굴리므로 A·B·C 사이클이 겹쳐 돈다.
@@ -91,6 +117,11 @@ class AlgoService(Node):
         if self.snap:
             self.get_logger().info(
                 "스냅샷 — " + " · ".join(self._snap_path(z) for z in self.pk))
+        if self.hm_topic:
+            self.get_logger().info(
+                "heightmap 발행 — "
+                + " · ".join(f"{self.hm_topic}/{z.lower()}" for z in self.pk)
+                + "  (16UC1 · TRANSIENT_LOCAL)")
 
     # ---------- 공통 ----------
     def _snap_path(self, zone):
@@ -193,12 +224,41 @@ class AlgoService(Node):
             self.get_logger().info(f"update[{req.zone}] {req.box_id} — {pk.last_warning}")
         return res
 
+    # ---------- heightmap 발행 (시각화 전용) ----------
+    def _pub_hm(self, zone):
+        """heightmap 을 16UC1 Image 로 내보낸다. `heightmap_topic` 이 비면 아무것도 안 한다.
+
+        ★ 여기서 예외가 나도 서비스 응답을 막으면 안 된다. 시각화는 부가 기능이고
+          적재는 계속 돌아야 한다 — 스냅샷 쓰기 실패를 warn 으로만 넘기는 것과 같다.
+        """
+        pub = self.hm_pub.get(zone)
+        if pub is None:
+            return
+        try:
+            hm = self.pk[zone].hm
+            msg = Image()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            # frame_id 에 구역을 실어 둔다 — 뷰어가 토픽을 잘못 잡았는지 확인할 수 있다
+            msg.header.frame_id = f"pallet_{zone}"
+            # ★ 이미지 규약: height=행, width=열. 우리 hm 은 (W=Px, D=Py) 이므로
+            #   height=W, width=D 가 된다. 뷰어가 그대로 되읽으려면 이 순서가 중요하다.
+            msg.height, msg.width = hm.shape
+            msg.encoding = "16UC1"
+            msg.is_bigendian = 0
+            msg.step = msg.width * 2
+            msg.data = hm.clip(0, 65535).astype("<u2").tobytes()
+            pub.publish(msg)
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn(f"heightmap 발행 실패({e}) — 시각화만 영향",
+                                   once=True)
+
     # ---------- 시각화용 스냅샷 ----------
     def dump(self, zone):
         """지금 적재 상태를 JSON 으로 떨군다. live_view 가 이 파일을 읽어 그린다.
 
         원자적으로 쓴다 — 뷰어가 반쯤 쓰인 파일을 읽으면 JSON 파싱이 깨진다.
         """
+        self._pub_hm(zone)
         if not self.snap:
             return
         path = self._snap_path(zone)

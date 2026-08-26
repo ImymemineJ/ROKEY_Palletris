@@ -744,6 +744,76 @@ class Spawner:
         UsdShade.MaterialBindingAPI.Apply(m.GetPrim())
         UsdShade.MaterialBindingAPI(m.GetPrim()).Bind(mat)
 
+    def _attach_label(self, box_path, box_id, hz):
+        """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
+
+        ★ 콜라이더를 걸지 않는다. 걸면 흡착 패드가 1 mm 떠 있는 스티커에 먼저
+          닿아 박스를 그만큼 덜 눌러 잡는다 — 들다 놓치는 쪽이다.
+
+        ★ 부모(박스)에 RigidBodyAPI 가 걸려 있지만 이 자식은 CollisionAPI 가
+          없으므로 물리에 참여하지 않는다. 순수 시각 프림이다.
+        """
+        png = os.path.join(self.label_dir, box_id + ".png")
+        if not os.path.exists(png):
+            if not self._label_warned:      # 15 개가 다 없으면 로그가 15 줄 나온다
+                self._label_warned = True
+                self._log("[spawner] ⚠ QR 라벨 PNG 가 없다: %s\n"
+                          "           먼저: python3 scripts/gen_qr_labels.py\n"
+                          "           라벨 없이 계속한다 — cam1 이 등록을 못 해 "
+                          "전 박스가 RETURN 된다" % png)
+            return
+
+        half = self.label_m / 2.0
+        lp = box_path + "/" + LABEL_PRIM
+        m = UsdGeom.Mesh.Define(self.stage, lp)
+        z = hz + LABEL_LIFT_M
+        m.CreatePointsAttr([Gf.Vec3f(-half, -half, z), Gf.Vec3f(half, -half, z),
+                            Gf.Vec3f(half, half, z), Gf.Vec3f(-half, half, z)])
+        m.CreateFaceVertexCountsAttr([4])
+        m.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        m.CreateExtentAttr([Gf.Vec3f(-half, -half, z), Gf.Vec3f(half, half, z)])
+        m.CreateSubdivisionSchemeAttr("none")
+        # ★ st 는 정점 순서와 짝을 맞춘다. v 를 뒤집는 이유는 LABEL_FLIP_V 주석 참조.
+        v0, v1 = (1.0, 0.0) if LABEL_FLIP_V else (0.0, 1.0)
+        st = UsdGeom.PrimvarsAPI(m.GetPrim()).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+        st.Set([Gf.Vec2f(0.0, v0), Gf.Vec2f(1.0, v0),
+                Gf.Vec2f(1.0, v1), Gf.Vec2f(0.0, v1)])
+
+        if not self.stage.GetPrimAtPath(QR_LOOKS_ROOT):
+            UsdGeom.Scope.Define(self.stage, QR_LOOKS_ROOT)
+        mp = QR_LOOKS_ROOT + "/" + box_id
+        mat = UsdShade.Material.Define(self.stage, mp)
+        sh = UsdShade.Shader.Define(self.stage, mp + "/Shader")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
+        sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        # ★ 종이 라벨이라 반사가 거의 없어야 한다. 광택이 있으면 조명이 QR 위에
+        #   하이라이트를 만들어 흰 모듈과 검은 모듈의 대비가 무너진다.
+        sh.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.02, 0.02, 0.02))
+
+        reader = UsdShade.Shader.Define(self.stage, mp + "/stReader")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+        tex = UsdShade.Shader.Define(self.stage, mp + "/Tex")
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(png)
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            reader.ConnectableAPI(), "result")
+        # ★ clamp. repeat 로 두면 가장자리에서 QR 이 한 줄 되풀이돼 흰 여백을
+        #   갉아먹고, 여백이 좁아지면 디텍터가 QR 경계를 못 잡는다.
+        for w in ("wrapS", "wrapT"):
+            tex.CreateInput(w, Sdf.ValueTypeNames.Token).Set("clamp")
+        tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            tex.ConnectableAPI(), "rgb")
+        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+
+        UsdShade.MaterialBindingAPI.Apply(m.GetPrim())
+        UsdShade.MaterialBindingAPI(m.GetPrim()).Bind(mat)
+
     def _make_box(self, path, tname, dims, pos, yaw_deg, mass, box_id,
                   color=None, dest=None):
         """치수를 지오메트리에 굽는다 — `xformOp:scale` 을 안 쓴다.

@@ -34,8 +34,22 @@ jobs:
         run: |
           . /opt/ros/jazzy/setup.sh
           . install/setup.sh
-          colcon test --packages-select packing_common packing_algo --event-handlers console_direct+
+          # ★ packing_db 를 넣었다 (2026-08-26). 여태 빌드만 하고 테스트는 안 돌렸다 —
+          #   그래서 "설치본에서 schema.sql 을 못 찾는다" 를 CI 가 못 잡았고,
+          #   정답지 CSV 드리프트 검사도 전부 장식이 될 뻔했다.
+          colcon test --packages-select packing_common packing_algo packing_db \
+            --event-handlers console_direct+
           colcon test-result --verbose
+
+      # ★ 정답지 스모크 — 한 줄로 드리프트를 전부 잡는다.
+      #   CSV 를 고치고 --regen 을 잊었거나, APARTMENTS 를 바꿨거나,
+      #   households_per_apt 를 바꿨으면 verify() 가 여기서 죽는다.
+      - name: 정답지 적재 스모크
+        shell: bash
+        run: |
+          . /opt/ros/jazzy/setup.sh
+          . install/setup.sh
+          ros2 run packing_db gen_master_db --db-path /tmp/ci.db --reset
 
   # 저장소에 들어오면 안 되는 것들을 막는다.
   guard:
