@@ -265,13 +265,36 @@ def build_clock_tf(cfg, log=print):
     st = omni.usd.get_context().get_stage()
 
     # 씬이 이미 내고 있나. 그래프 경로가 다를 수 있으니 **노드 타입으로** 훑는다.
+    scene_clock = scene_tf = None
     for prim in st.Traverse():
         if prim.GetTypeName() == "OmniGraphNode":
-            t = prim.GetAttribute("node:type")
-            if t and str(t.Get() or "").endswith("ROS2PublishClock"):
-                log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다"
-                    % prim.GetPath())
-                return "scene"
+            t = str((prim.GetAttribute("node:type").Get()
+                     if prim.GetAttribute("node:type") else "") or "")
+            if t.endswith("ROS2PublishClock"):
+                scene_clock = prim
+            elif t.endswith("ROS2PublishTransformTree"):
+                scene_tf = prim
+    if scene_clock is not None:
+        log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다" % scene_clock.GetPath())
+        # ★★ 비켜서기 **전에** 광학 프레임을 씬의 tf 에 붙인다 (2026-08-26).
+        #   예전에는 여기서 바로 돌아가서, 씬이 /clock 을 내는 순간 광학 프레임
+        #   생성까지 같이 사라졌다 — 그러면 이미지 frameId 를 아무리 맞게 줘도
+        #   tf 에 그 프레임이 없어 인식이 전부 "평면이 카메라 뒤" 로 죽는다.
+        if scene_tf is not None:
+            try:
+                opts = _ensure_optical_frames(cfg, st, log)
+                rel = scene_tf.GetRelationship("inputs:targetPrims")
+                tg = list(rel.GetTargets())
+                added = [o for o in opts if Sdf.Path(o) not in tg]
+                if added:
+                    rel.SetTargets(tg + [Sdf.Path(o) for o in added])
+                    log("[ros_graph] 씬 tf 에 광학 프레임 %d 개 추가: %s"
+                        % (len(added), ", ".join(a.rsplit("/", 1)[-1] for a in added)))
+            except Exception as e:                              # noqa: BLE001
+                log("[ros_graph] !! 씬 tf 에 광학 프레임을 못 붙였다: %r" % (e,))
+        else:
+            log("[ros_graph] ⚠ 씬에 tf 발행 노드가 없다 — 광학 프레임을 못 붙인다")
+        return "scene"
 
     K, c = og.Controller.Keys, og.Controller
     NS = "isaacsim.ros2.bridge."
@@ -328,20 +351,12 @@ def build_clock_tf(cfg, log=print):
         (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
 
     # ★★ 카메라 **광학 프레임**도 여기서 만든다 — 이미지를 누가 쏘든 필요하다.
-    #   원래 `build_cameras` 안에 있었는데, 씬이 카메라를 쏘기 시작하면 그 함수가
-    #   통째로 비켜서면서 **광학 프레임까지 같이 사라졌다.** 그러면 씬 쪽 카메라가
-    #   `frameId` 를 아무리 맞게 줘도 tf 에 그 프레임이 없어 인식이 죽는다.
     #   tf 는 이미지 발행자와 **독립**이므로 여기가 맞는 자리다.
-    for tp in list(tgts):
-        if "/CamPick_" not in tp:
-            continue
-        opt = "%s/%s_optical" % (tp, tp.rsplit("/", 1)[-1])
-        try:
-            _make_optical_frame(st, opt, tp + "/Camera")
-            if opt not in tgts:
-                tgts.append(opt)
-        except Exception as e:                                  # noqa: BLE001
-            log("[ros_graph] !! 광학 프레임 %s 실패: %r" % (opt, e))
+    #   2026-08-26: `cameras.pick_prim` 설정 기준으로 바꿨다 (rsd455 리그 대응) —
+    #   옛 `/CamPick_*` 하드코딩은 씬에서 지워진 이름이다.
+    for opt in _ensure_optical_frames(cfg, st, log):
+        if opt not in tgts:
+            tgts.append(opt)
 
     tf_node.GetRelationship("inputs:targetPrims").SetTargets(
         [Sdf.Path(t) for t in tgts])
@@ -352,6 +367,43 @@ def build_clock_tf(cfg, log=print):
     if miss:
         log("   ⚠ 씬에 없어 뺀 prim: %s" % ", ".join(miss))
     return "built"
+
+
+def _ensure_optical_frames(cfg, stage, log=print):
+    """설정의 카메라 렌즈마다 **광학 프레임** 자식을 만들고 경로 목록을 돌려준다.
+
+    ★ 2026-08-26 rsd455 리그 대응. 두 가지가 옛 방식과 다르다:
+      · 프레임 이름이 **리그 이름**에서 온다 (`rsd455_a_optical`). 렌즈 prim 이름
+        (`RSD455`)으로 지으면 A·B·C 가 **전부 같은 프레임명**이 되어 tf 가 겹친다
+        — 프레임 이름은 prim 이름이기 때문이다.
+      · 광학 프레임을 **렌즈 prim 의 자식**으로 둔다. 그러면 렌즈의 자세·오프셋을
+        그대로 상속해 dz 보정이 필요 없다 (옛 `_make_optical_frame` 의 14.5 mm
+        수동 보정은 형제 관계였을 때 이야기다).
+    """
+    from pxr import Gf, Sdf, UsdGeom
+    cams = (cfg.get("cameras") or {})
+    lens_paths = list((cams.get("pick_prim") or {}).values())
+    for k in ("spawn_prim", "line2_prim"):
+        v = cams.get(k)
+        if v:
+            lens_paths.append(str(v))
+    out = []
+    for lens in lens_paths:
+        prim = stage.GetPrimAtPath(str(lens))
+        if not prim or not prim.IsValid():
+            log("[ros_graph] !! 카메라 %s 가 씬에 없다 — 광학 프레임 생략" % lens)
+            continue
+        # 리그 이름 = /World 바로 아래 요소 (rsd455_a · CamPick_A ...)
+        parts = str(lens).strip("/").split("/")
+        rig = parts[1] if len(parts) > 1 else parts[-1]
+        opt = "%s/%s_optical" % (lens, rig)
+        if not stage.GetPrimAtPath(opt).IsValid():
+            xf = UsdGeom.Xform.Define(stage, opt)
+            xf.ClearXformOpOrder()
+            # X 축 180도: USD 카메라(-Z 시선) -> ROS 광학(+z 전방)
+            xf.AddOrientOp().Set(Gf.Quatf(0.0, Gf.Vec3f(1.0, 0.0, 0.0)))
+        out.append(opt)
+    return out
 
 
 def _make_optical_frame(stage, path, cam_path):
@@ -437,10 +489,14 @@ def build_cameras(cfg, zones, log=print):
     K, c = og.Controller.Keys, og.Controller
     NS = "isaacsim.ros2.bridge."
     made = 0
+    # ★ 2026-08-26 — prim 경로는 **설정이 정본**이다. 옛 `/World/CamPick_A/Camera`
+    #   는 씬에서 지워졌다 (카메라 89 개 삭제 후 rsd455 리그 5 대 설치, PR #33).
+    #   `cameras.pick_prim.{A,B,C}` 가 그 리그의 Color 렌즈를 가리킨다.
+    pick_prims = ((cfg.get("cameras") or {}).get("pick_prim") or {})
     for z in zones:
         zl = str(z).lower()
-        cam_prim = "/World/CamPick_%s" % str(z).upper()
-        cam_path = cam_prim + "/Camera"
+        cam_path = pick_prims.get(str(z).upper())             or "/World/CamPick_%s/Camera" % str(z).upper()
+        cam_prim = cam_path.rsplit("/", 1)[0]
         if not st.GetPrimAtPath(cam_path).IsValid():
             log("[ros_graph] !! %s 가 씬에 없다 — 존 %s 카메라 생략" % (cam_path, zl))
             continue
@@ -468,13 +524,18 @@ def build_cameras(cfg, zones, log=print):
         #   프림 이름 그대로 프레임을 내 준다 — 노드를 새로 안 붙여도 된다.
         #   ★ 프레임 자체는 `build_clock_tf` 가 이미 만들어 tf 에 넣어 뒀다
         #     (누가 이미지를 쏘든 필요해서 그쪽으로 옮겼다). 여기서는 이름만 쓴다.
-        opt_path = "%s/%s_optical" % (cam_prim, cam_prim.rsplit("/", 1)[-1])
+        # ★ 광학 프레임 이름은 `_ensure_optical_frames` 와 같은 규칙이다 —
+        #   **리그 이름**(=/World 바로 아래)에서 온다. 렌즈 prim 이름(`RSD455`)으로
+        #   지으면 A·B·C 가 전부 같은 프레임명이 되어 tf 가 겹친다.
+        _parts = cam_path.strip("/").split("/")
+        _rig = _parts[1] if len(_parts) > 1 else _parts[-1]
+        opt_path = "%s/%s_optical" % (cam_path, _rig)
         if st.GetPrimAtPath(opt_path).IsValid():
             frame = opt_path.rsplit("/", 1)[-1]
         else:
             log("[ros_graph] !! 광학 프레임 %s 이 없다 — prim 프레임을 쓴다."
                 " 인식이 실패할 것이다 (build_clock_tf 를 먼저 불렀나?)" % opt_path)
-            frame = cam_prim.rsplit("/", 1)[-1]
+            frame = _rig
 
         g = "%s/Cam_%s" % (GRAPH, str(z).upper())
         ns = "/pick_cam_%s" % zl
