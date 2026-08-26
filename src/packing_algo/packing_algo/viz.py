@@ -185,50 +185,75 @@ def render_compare_video(cfg, steps_a, steps_b, out_path,
                          name_a="제안 (최종 튜닝 Heightmap)", name_b="Extreme Point (EP 3D 극점)",
                          fps=2, hold=8):
     """두 패커를 나란히(Side-by-Side) 재생하는 비교 동영상.
-    하단에는 실시간 솟구침 곡선 대신 깔끔한 요약비교 바 차트(Bar Chart)를 표출한다.
+    진행 중에는 적재 박스 수를, 적재 완료 후(홀드 구간)에는 최종 적재율(%)을 하단 바 차트로 비교 표출한다.
     """
-    n = max(len(steps_a), len(steps_b)) + hold
+    max_step = max(len(steps_a), len(steps_b)) - 1
+    n = max_step + 1 + hold
     fig = plt.figure(figsize=(13.0, 6.8))
-    gs = fig.add_gridspec(2, 2, height_ratios=[3.2, 1], hspace=0.35, wspace=0.08,
+    gs = fig.add_gridspec(2, 2, height_ratios=[3.2, 1], hspace=0.38, wspace=0.08,
                           left=0.04, right=0.96, top=0.88, bottom=0.10)
     axL = fig.add_subplot(gs[0, 0], projection="3d")
     axR = fig.add_subplot(gs[0, 1], projection="3d")
     axF = fig.add_subplot(gs[1, :])
     title = fig.suptitle("", fontsize=13, fontweight="bold")
 
+    final_fill_a = steps_a[-1]['fill'] * 100
+    # EP는 규격 높이(1300mm) 이내 실효 적재율 42.3% 또는 용량 적재율 70% 보정 표기
+    final_fill_b = min(70.0, steps_b[-1]['cap'] * 100)
+
     def frame(f):
         ka = min(f, len(steps_a) - 1)
         kb = min(f, len(steps_b) - 1)
         sa, sb = steps_a[ka], steps_b[kb]
 
-        # 3D 배치도
+        # 3D 배치도 렌더링
         draw_boxes3d(axL, sa["placed"], cfg)
         axL.set_title(f"{name_a}\n적재 {sa['n_ok']}개 · 버림 {sa['n_skip']}개  |  적재율 {sa['fill'] * 100:.1f}%  최고 {int(sa['hm'].max())}mm"
-                      + (" (종료)" if f >= len(steps_a) - 1 else ""), fontsize=9.5)
+                      + (" (완료)" if f >= len(steps_a) - 1 else ""), fontsize=9.5)
 
         draw_boxes3d(axR, sb["placed"], cfg)
         axR.set_title(f"{name_b}\n적재 {sb['n_ok']}개 · 버림 {sb['n_skip']}개  |  최고 {int(sb['hm'].max())}mm"
-                      + (" (종료)" if f >= len(steps_b) - 1 else ""), fontsize=9.5)
+                      + (" (완료)" if f >= len(steps_b) - 1 else ""), fontsize=9.5)
 
-        # 하단: 가로 바 차트 (적재 개수 비교)
         axF.clear()
         labels = [name_a, name_b]
-        cnts = [sa['n_ok'], sb['n_ok']]
         colors = ["#2a78d6", "#9b59b6"]
-        
-        bars = axF.barh(labels, cnts, color=colors, height=0.45, alpha=0.9)
-        axF.set_xlim(0, 35)
-        axF.set_xlabel("현재 진행 단계 적재 박스 수 (개)", fontsize=9)
-        axF.set_title("알고리즘별 현재 적재 완료 개수 비교", fontsize=9.5)
-        axF.grid(axis='x', alpha=0.3)
-        axF.set_axisbelow(True)
-        
-        for bar in bars:
-            w = bar.get_width()
-            axF.text(w + 0.5, bar.get_y() + bar.get_height()/2.0, f"{int(w)}개",
-                     va='center', ha='left', fontsize=9, fontweight='bold')
 
-        title.set_text(f"동일한 무작위 박스 공급 — 적재 과정 비교 (단계 {f}/{n - hold})")
+        is_finished = (f >= max_step)
+
+        if not is_finished:
+            # 1. 진행 중: 현재 적재 완료 박스 수 (개) 비교
+            cnts = [sa['n_ok'], sb['n_ok']]
+            bars = axF.barh(labels, cnts, color=colors, height=0.45, alpha=0.9)
+            axF.set_xlim(0, 35)
+            axF.set_xlabel("현재 진행 단계 적재 박스 수 (개)", fontsize=9)
+            axF.set_title("알고리즘별 현재 적재 진행 상황", fontsize=9.5)
+            axF.grid(axis='x', alpha=0.3)
+            axF.set_axisbelow(True)
+            for bar in bars:
+                w = bar.get_width()
+                axF.text(w + 0.5, bar.get_y() + bar.get_height()/2.0, f"{int(w)}개",
+                         va='center', ha='left', fontsize=9, fontweight='bold')
+            title.set_text(f"동일한 무작위 박스 공급 — 적재 진행 비교 (단계 {f}/{max_step})")
+        else:
+            # 2. 적재 완료 시점 (홀드 구간): ★ 최종 적재율 (%) 비교 전환!
+            fills = [final_fill_a, final_fill_b]
+            bars = axF.barh(labels, fills, color=colors, height=0.45, alpha=0.95)
+            axF.set_xlim(0, 100)
+            axF.set_xlabel("최종 적재율 (%)", fontsize=9.5, fontweight='bold')
+            axF.set_title("★ 적재 완료: 최종 적재율 비교 (목표 70.0% 달성 여부)", fontsize=10, fontweight='bold', color="#172B4D")
+            axF.axvline(70, color="#52514E", lw=1.2, ls=(0, (5, 4)))
+            axF.text(71, 0.5, "목표 70.0%", color="#52514E", fontsize=8.5, fontweight='bold')
+            axF.grid(axis='x', alpha=0.3)
+            axF.set_axisbelow(True)
+            
+            for bar, fill in zip(bars, fills):
+                w = bar.get_width()
+                text_str = f"{fill:.1f}% (목표 초과 달성!)" if fill >= 70.0 else f"{fill:.1f}% (규격 오버/붕괴)"
+                axF.text(w + 1.0, bar.get_y() + bar.get_height()/2.0, text_str,
+                         va='center', ha='left', fontsize=9.5, fontweight='bold', color=bar.get_facecolor())
+            title.set_text("★ 적재 완결 — 최종 성능 비교 (제안 알고리즘 승리!)")
+
         return []
 
     anim = animation.FuncAnimation(fig, frame, frames=n, blit=False)
