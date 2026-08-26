@@ -475,8 +475,15 @@ class ConveyorCtl:
             self.set_sorter_velocity(zn, 0.0)
 
     def run_all(self):
+        # ★ 지선(T자의 I 부분, `*_pickup` = ConveyorBeltGraph_01)만 따로 느리게
+        #   (2026-08-27 김병직). 풀 비전에서 뒤차가 스토퍼의 앞차에 붙으면 두
+        #   실루엣이 병합돼 치수 맞춤이 터진다 (실측 — A존 3호 2개 병합).
+        #   지선이 느리면 뒤차가 닿기 전에 인식+픽이 끝난다. 부수 이득: 스토퍼
+        #   충돌 기울어짐 감소 (0.35 시절 흡착 간극 2.1~2.4mm 실측).
+        #   키가 없으면 본선과 같은 속도 — 기존 동작 그대로.
+        spur = float(self.cfg["conveyor"].get("spur_velocity_mps", self.nominal))
         for seg in self.graphs:
-            self.set_velocity(seg, self.nominal)
+            self.set_velocity(seg, spur if seg.endswith("_pickup") else self.nominal)
         # ★ 소터를 반드시 같이 돌린다. 본선 롤러에는 소터 자리에 구멍이 있어
         #   소터가 서 있으면 **라인이 거기서 막힌다** (실측 2026-08-25: 박스가
         #   X -6.62 에서 165 s 정지).

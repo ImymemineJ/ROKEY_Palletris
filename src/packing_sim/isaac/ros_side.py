@@ -118,7 +118,10 @@ class RosSide:
         self.zone, self.log = str(zone).upper(), log
         self.link = _InProcLink(handlers)
         # 지선 재가동 속도 — 숫자를 박지 않는다 (conveyor.belt_velocity_mps 정본)
-        self._belt_mps = float(cfg["conveyor"]["belt_velocity_mps"])
+        # ★ PLACE 후 지선 재가동 속도 — 지선 전용 키가 있으면 그것 (conveyor_ctl
+        #   run_all 과 같은 규칙. 없으면 본선과 동일 = 기존 동작).
+        self._belt_mps = float(cfg["conveyor"].get(
+            "spur_velocity_mps", cfg["conveyor"]["belt_velocity_mps"]))
 
         # ★ Cycle 은 **하나만** 만들어 끝까지 쓴다. 명령마다 새로 만들면
         #   _stack_top_m(이송 고도의 바닥)이 0 으로 돌아가 팔이 적재물 위를
