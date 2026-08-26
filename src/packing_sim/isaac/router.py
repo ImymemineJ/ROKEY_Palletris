@@ -69,6 +69,13 @@ class Router:
         self.segx = {k: (min(v) / 1000.0, max(v) / 1000.0)
                      for k, v in (rt.get("main_seg_x_mm") or {}).items()}
         self.y_done = float(rt.get("divert_done_y_mm", 1200)) / 1000.0
+        # ★ 뒤차 간격 검사 (2026-08-27 김병직, 영상 '소터에서 다른박스까지 걸림').
+        #   소터가 앞차를 꺾는 동안 뒤차가 너무 가까우면 **소터에 같이 걸려**
+        #   딸려 나간다 — 지선에 박스가 나란히 두 줄로 내려오고(실측 x 205mm 차),
+        #   본선 밖으로 떨어지기도 한다. 꺾기 직전 소터 상류(+X) 이 거리 안에
+        #   다른 박스가 있으면 이번 바퀴는 보낸다 (규칙 4 계량과 같은 처리).
+        #   0 = 검사 안 함 (기존 동작).
+        self.tail_gap_m = float(rt.get("divert_tail_gap_mm", 0)) / 1000.0
         _mly = rt.get("main_line_y_mm") or MAIN_LINE_Y_DEFAULT
         self.y_lo, self.y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
         self.thru = list(rt.get("thru_world", [-1, 0, 0]))
@@ -200,6 +207,20 @@ class Router:
                     and slo <= q[0] <= shi]
             if busy:
                 continue                                # 규칙 3
+
+            # ── 뒤차 간격 (위 tail_gap_m 주석). 본선은 -X 로 흐르므로 상류 = +X ──
+            if self.tail_gap_m > 0:
+                tail = [b2 for b2, q in allpos.items()
+                        if b2 != bid and self.y_lo <= q[1] <= self.y_hi
+                        and shi < q[0] <= shi + self.tail_gap_m]
+                if tail:
+                    if now - self.t_log.get("t" + z, 0.0) >= 10.0:
+                        self.t_log["t" + z] = now
+                        self.log("[router] %s 뒤차 %s 가 %d mm 안 — 이번 바퀴는"
+                                 " 보낸다 (소터 걸림 방지)"
+                                 % (bid, tail[0],
+                                    round(self.tail_gap_m * 1000)))
+                    continue
 
             if self.meter_max > 0 and self._zone_load(z, allpos) >= self.meter_max:
                 if now - self.t_log.get("z" + z, 0.0) >= 10.0:
