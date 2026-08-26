@@ -287,6 +287,23 @@ def build_clock_tf(cfg, log=print):
     tgts, miss = [], []
     for tp in (tfc.get("target_prims") or []):
         (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
+
+    # ★★ 카메라 **광학 프레임**도 여기서 만든다 — 이미지를 누가 쏘든 필요하다.
+    #   원래 `build_cameras` 안에 있었는데, 씬이 카메라를 쏘기 시작하면 그 함수가
+    #   통째로 비켜서면서 **광학 프레임까지 같이 사라졌다.** 그러면 씬 쪽 카메라가
+    #   `frameId` 를 아무리 맞게 줘도 tf 에 그 프레임이 없어 인식이 죽는다.
+    #   tf 는 이미지 발행자와 **독립**이므로 여기가 맞는 자리다.
+    for tp in list(tgts):
+        if "/CamPick_" not in tp:
+            continue
+        opt = "%s/%s_optical" % (tp, tp.rsplit("/", 1)[-1])
+        try:
+            _make_optical_frame(st, opt, tp + "/Camera")
+            if opt not in tgts:
+                tgts.append(opt)
+        except Exception as e:                                  # noqa: BLE001
+            log("[ros_graph] !! 광학 프레임 %s 실패: %r" % (opt, e))
+
     tf_node.GetRelationship("inputs:targetPrims").SetTargets(
         [Sdf.Path(t) for t in tgts])
 
@@ -296,6 +313,163 @@ def build_clock_tf(cfg, log=print):
     if miss:
         log("   ⚠ 씬에 없어 뺀 prim: %s" % ", ".join(miss))
     return "built"
+
+
+def _make_optical_frame(stage, path, cam_path):
+    """`path` 에 ROS 광학 규약 자식 Xform 을 만든다 (USD 카메라 기준 X축 180도).
+
+    카메라 프림의 로컬 오프셋도 같이 넣는다 — `CamPick_*/Camera` 가 부모보다
+    14.5 mm 아래 있어서, 무시하면 1.4 m 높이에서 약 1 % 배율 오차가 난다.
+    """
+    from pxr import Gf, UsdGeom
+    cam = stage.GetPrimAtPath(cam_path)
+    dz = 0.0
+    if cam.IsValid():
+        for op in UsdGeom.Xformable(cam).GetOrderedXformOps():
+            if op.GetOpName() == "xformOp:translate":
+                v = op.Get()
+                if v is not None:
+                    dz = float(v[2])
+                break
+    xf = UsdGeom.Xform.Define(stage, path)
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, dz))
+    # X 축 180도: (w, x, y, z) = (0, 1, 0, 0)
+    xf.AddOrientOp().Set(Gf.Quatf(0.0, Gf.Vec3f(1.0, 0.0, 0.0)))
+    return path
+
+
+# ── 픽업 카메라 — 씬에 발행자가 없으면 우리가 낸다 ─────────────────────────
+def build_cameras(cfg, zones, log=print):
+    """`/pick_cam_{a|b|c}/rgb` + `/camera_info` 를 런타임에 발행한다.
+
+    ★ 왜 런타임인가 — `ROS2CameraHelper` 는 `renderProductPath` 를 요구하는데
+      그건 **런타임에 만들어지는 물건**이라 USD 에 그냥 적어 둘 수 없다.
+      `setup_test3_scene.py [11]` 이 카메라를 못 넣은 이유가 이것이다.
+      우리는 이미 런타임이므로 여기서 만들면 된다 (`/clock`·`/tf` 와 같은 방식).
+
+    ★ 왜 필요한가 — 이게 없으면 사슬이 끊긴다:
+          pick_cam -> (발행자 0) -> vision -> box_at_pickup(안 옴) -> 관제탑 IDLE
+      Isaac 은 픽업 좌표를 이미 알고 있는데(`pickup_check` present=true) 그게
+      ROS 로 안 나가서 관제탑이 영원히 기다렸다 (실측 2026-08-26).
+
+    ★★ **helper 가 두 개다.** `ROS2CameraHelper` 는 `camera_info` 를 안 쏜다 —
+      `ROS2CameraInfoHelper` 를 따로 붙여야 한다. `vision_node` 는 내부
+      파라미터를 코드에 안 박고 `camera_info` 에서 읽으므로, 없으면
+      "camera_info 대기 중" 으로 멈춘다 (`vision_node.py:57` 주석).
+
+    ★ `frameId` 는 **씬 prim 이름**이어야 한다 (`CamPick_A`). `vision_node` 가
+      이미지 헤더의 `frame_id` 로 tf 를 조회하는데, `ROS2PublishTransformTree` 는
+      프레임 이름을 prim 이름으로 정하기 때문이다. 둘이 다르면 tf 조회가 실패한다.
+
+    ⚠ 오프스크린 렌더는 **GUI 조명 리그를 못 받는다.** 돔 라이트가 꺼져 있으면
+      눈으로는 멀쩡한데 이미지가 캄캄하다 (CLAUDE.md §5). 아래에서 검사한다.
+
+    Returns: 만든 카메라 수
+    """
+    import omni.usd
+
+    rec = (cfg.get("recognition") or {})
+    res = list(rec.get("resolution") or [1280, 720])
+    st = omni.usd.get_context().get_stage()
+
+    # 씬이 이미 카메라를 쏘고 있으면 비켜선다 (/clock 과 같은 이유 — 발행자 2 개면
+    # vision 이 두 이미지를 번갈아 받아 tf 시각이 어긋난다).
+    for prim in st.Traverse():
+        if prim.GetTypeName() == "OmniGraphNode":
+            t = prim.GetAttribute("node:type")
+            if t and str(t.Get() or "").endswith("ROS2CameraHelper"):
+                log("[ros_graph] 픽업 카메라는 씬이 쏜다 (%s) — 건너뛴다.\n"
+                    "   ⚠ 씬 쪽 `frameId` 는 **CamPick_*_optical** 이어야 한다"
+                    " (프레임은 이미 tf 에 올라가 있다)" % prim.GetPath())
+                return 0
+
+    try:
+        import omni.replicator.core as rep
+    except ImportError as e:                                    # noqa: BLE001
+        log("[ros_graph] !! omni.replicator.core 를 못 쓴다 (%r) — 카메라 생략" % (e,))
+        return 0
+
+    # 돔 라이트 확인. 없으면 이미지가 캄캄하게 나가는데 **에러는 안 난다.**
+    if not any(p.GetTypeName() == "DomeLight" for p in st.Traverse()):
+        log("[ros_graph] ⚠ 씬에 DomeLight 가 없다 — 카메라 이미지가 어두울 수 있다"
+            " (오프스크린 렌더는 GUI 조명 리그를 안 받는다)")
+
+    K, c = og.Controller.Keys, og.Controller
+    NS = "isaacsim.ros2.bridge."
+    made = 0
+    for z in zones:
+        zl = str(z).lower()
+        cam_prim = "/World/CamPick_%s" % str(z).upper()
+        cam_path = cam_prim + "/Camera"
+        if not st.GetPrimAtPath(cam_path).IsValid():
+            log("[ros_graph] !! %s 가 씬에 없다 — 존 %s 카메라 생략" % (cam_path, zl))
+            continue
+        try:
+            rp = rep.create.render_product(cam_path, tuple(int(v) for v in res))
+            rp_path = rp.path if hasattr(rp, "path") else str(rp)
+        except Exception as e:                                  # noqa: BLE001
+            log("[ros_graph] !! %s 렌더프로덕트 실패: %r" % (cam_path, e))
+            continue
+
+        # ★★ **광학 프레임을 따로 만든다.** 이게 없으면 인식이 통째로 실패한다.
+        #
+        #   `geometry.pixels_to_plane` 는 **ROS 광학 규약**으로 광선을 만든다 —
+        #   x 오른쪽 · y 아래 · **z 전방**. 그런데 `ROS2PublishTransformTree` 가
+        #   내는 tf 는 **USD 프림 자세** 그대로다. `CamPick_*` 는 회전이 없어
+        #   (+Z 가 월드 위) 광선이 하늘로 뻗고, `s <= 0` 이 되어
+        #   "평면이 카메라 뒤에 있다" 로 **3 종 전부** 예외가 난다.
+        #   그러면 로그에는 "사양 3종 어느 것과도 안 맞는다" 로 찍혀서
+        #   **크기 문제처럼 보인다** — 실제로는 투영이 한 번도 성공 못 한 것이다
+        #   (실측 2026-08-26).
+        #
+        #   USD 카메라는 -Z 를 본다. 광학 프레임은 거기서 **X 축 180도** 돌린 것이다:
+        #     X -> X · Y -> -Y · Z -> -Z(=시선 방향)
+        #   자식 Xform 을 하나 만들어 tf 대상에 넣으면 `PublishTransformTree` 가
+        #   프림 이름 그대로 프레임을 내 준다 — 노드를 새로 안 붙여도 된다.
+        #   ★ 프레임 자체는 `build_clock_tf` 가 이미 만들어 tf 에 넣어 뒀다
+        #     (누가 이미지를 쏘든 필요해서 그쪽으로 옮겼다). 여기서는 이름만 쓴다.
+        opt_path = "%s/%s_optical" % (cam_prim, cam_prim.rsplit("/", 1)[-1])
+        if st.GetPrimAtPath(opt_path).IsValid():
+            frame = opt_path.rsplit("/", 1)[-1]
+        else:
+            log("[ros_graph] !! 광학 프레임 %s 이 없다 — prim 프레임을 쓴다."
+                " 인식이 실패할 것이다 (build_clock_tf 를 먼저 불렀나?)" % opt_path)
+            frame = cam_prim.rsplit("/", 1)[-1]
+
+        g = "%s/Cam_%s" % (GRAPH, str(z).upper())
+        ns = "/pick_cam_%s" % zl
+        try:
+            c.edit(
+                {"graph_path": g, "evaluator_name": "execution"},
+                {K.CREATE_NODES: [
+                    ("Tick", "omni.graph.action.OnPlaybackTick"),
+                    ("Ctx", NS + "ROS2Context"),
+                    ("Rgb", NS + "ROS2CameraHelper"),
+                    ("Info", NS + "ROS2CameraInfoHelper")],
+                 K.CONNECT: [("Tick.outputs:tick", "Rgb.inputs:execIn"),
+                             ("Tick.outputs:tick", "Info.inputs:execIn"),
+                             ("Ctx.outputs:context", "Rgb.inputs:context"),
+                             ("Ctx.outputs:context", "Info.inputs:context")],
+                 K.SET_VALUES: [
+                     ("Ctx.inputs:useDomainIDEnvVar", True),
+                     ("Rgb.inputs:renderProductPath", rp_path),
+                     ("Rgb.inputs:frameId", frame),
+                     ("Rgb.inputs:nodeNamespace", ns),
+                     ("Rgb.inputs:topicName", "rgb"),
+                     ("Rgb.inputs:type", "rgb"),
+                     ("Info.inputs:renderProductPath", rp_path),
+                     ("Info.inputs:frameId", frame),
+                     ("Info.inputs:nodeNamespace", ns),
+                     ("Info.inputs:topicName", "camera_info")]})
+        except Exception as e:                                  # noqa: BLE001
+            log("[ros_graph] !! 존 %s 카메라 그래프 실패: %r" % (zl, e))
+            continue
+        made += 1
+        log("[ros_graph] 카메라 %s -> %s/rgb + /camera_info  (frameId %s · %dx%d)"
+            % (cam_path, ns, frame, res[0], res[1]))
+
+    return made
 
 
 # ── 1단계: 뼈대. Play 전에 부른다 ───────────────────────────────────────────
@@ -453,12 +627,20 @@ def compute(db):
     # ★ Isaac 메인 스레드다. 여기서 기다리면 물리가 안 돌아 판정이 영영 안 난다 (§9).
     #   핸들러는 **즉시 반환**해야 한다 — 오래 걸리는 일은 큐에 넣고 돌아온다.
     req = {{}}
+    _miss = []
     for f in _FIELDS:
         try:
             v = getattr(db.inputs, f)
-        except Exception:
+        except Exception as e:
+            # ★ 조용히 넘기면 안 된다. 필드 하나가 빠지면 핸들러가
+            #   "bad mps" 같은 **엉뚱한 사유**로 실패하고, 진짜 원인(그 필드를
+            #   못 읽었다)은 아무 데도 안 남는다 (2026-08-26 실측: 재현에 실패해
+            #   한참 헤맸다).
+            _miss.append("%s(%r)" % (f, e))
             continue
         req[f] = str(v) if isinstance(v, (bytes, bytearray)) else v
+    if _miss:
+        print("[ros_graph] !! {key} 요청 필드를 못 읽었다: " + ", ".join(_miss))
 
     fn = _M.HANDLERS.get("{key}")
     if fn is None:

@@ -28,6 +28,8 @@ CLAUDE.md §2 가 폐기한 그 소켓이 이걸로 사라진다.
 """
 import threading
 
+import os
+
 import ros_graph
 
 
@@ -94,7 +96,10 @@ def _svc(fn, keep, req_map=None, res_map=None):
                 res[dst] = res.pop(src)
         # 버리기 전에 실패 사유는 로그로 남긴다 — 조용히 사라지면 안 된다.
         if not res.get("ok") and res.get("error"):
-            print("[ros_side] %s 실패: %s" % (getattr(fn, "__name__", "?"), res["error"]))
+            # ★ 받은 요청도 같이 찍는다. 사유만 있으면 "bad mps" 가 **값이 이상한
+            #   건지 아예 안 온 건지** 구분이 안 된다 (2026-08-26 실측).
+            print("[ros_side] %s 실패: %s   받은 요청=%r"
+                  % (getattr(fn, "__name__", "?"), res["error"], kw))
         return {k: v for k, v in res.items() if k in keep}
     return wrapped
 
@@ -224,6 +229,17 @@ def build(zones, cfg=None, log=print):
             % (z, ros_graph.cmd_topic(z), ros_graph.evt_topic(z)))
     if cfg is not None:
         ros_graph.build_clock_tf(cfg, log=log)
+        # ★ 픽업 카메라. 없으면 `/zone_*/box_at_pickup` 이 안 와서 관제탑이
+        #   영원히 IDLE 이다 (실측 2026-08-26). ros_graph.build_cameras docstring 참조.
+        #
+        # ⚠ **씬에서 직접 배선하기로 하면 `PL_CAMROS=0` 으로 끈다.** 씬에
+        #   `ROS2CameraHelper` 가 있으면 build_cameras 가 알아서 비켜서지만,
+        #   씬 쪽을 아직 만드는 중이라면 이 스위치로 명시적으로 끄는 편이 낫다 —
+        #   발행자가 둘이면 vision 이 두 이미지를 번갈아 받는다.
+        if os.environ.get("PL_CAMROS", "1") != "0":
+            ros_graph.build_cameras(cfg, list(zones), log=log)
+        else:
+            log("[ros_side] PL_CAMROS=0 — 픽업 카메라는 씬이 쏜다고 보고 안 만든다")
 
 
 def wire(log=print):
