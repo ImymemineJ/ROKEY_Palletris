@@ -169,6 +169,17 @@ class LineDetector(Node):
             self.get_logger().warn(f"{cam.ns}: 사양 3종과 안 맞는다")
             self._report_miss(cam.ns.strip("/"), "SIZE_MISMATCH")
             return None, None
+        # ★ 원시 측정값을 남긴다. 위에서 사양 3종 중 하나로 **스냅**하기 때문에
+        #   DB 에 들어가는 것은 사양 치수(340x250 …)지 잰 값이 아니다.
+        #   카메라 교정·인식 정확도를 볼 때 필요한 건 스냅 전 숫자다.
+        #   info 가 아니라 debug 인 이유: 프레임마다 나오면 다른 로그가 안 보인다.
+        #     보려면  --ros-args --log-level debug
+        lo, sh = out["measured_m"]
+        bt = out["type"]
+        self.get_logger().debug(
+            f"{cam.ns}: 실측 {lo * 1000:.1f} x {sh * 1000:.1f} mm "
+            f"→ {bt['name']} ({bt['w_mm']}x{bt['d_mm']}) "
+            f"오차 {out['fit_err_m'] * 1000:.1f} mm")
         return det, out
 
     def _on_cam1(self, bgr, header):
@@ -383,6 +394,15 @@ class ZoneDetector(Node):
             self.get_logger().warn("사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다")
             self._publish_absent()
             return
+
+        # ★ 원시 측정값 (스냅 전). LineDetector._measure 의 같은 로그와 짝이다.
+        #   여기 값이 로봇이 실제로 집으러 갈 때 쓰는 판정이다.
+        _lo, _sh = out["measured_m"]
+        self.get_logger().debug(
+            f"실측 {_lo * 1000:.1f} x {_sh * 1000:.1f} mm "
+            f"→ {out['type']['name']} "
+            f"({out['type']['w_mm']}x{out['type']['d_mm']}) "
+            f"오차 {out['fit_err_m'] * 1000:.1f} mm")
 
         # ★ box_id 는 여기서 읽는다. 다른 노드에서 받아오지 않는다.
         #
