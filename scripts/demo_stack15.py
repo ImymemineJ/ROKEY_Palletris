@@ -1511,13 +1511,17 @@ def main():
                 rest[bid] = pos.copy()
 
             # ── §5 판정 — `NO_FEASIBLE_POSE` ≠ `PALLET_FULL` ────────────────
-            # ★ `cycle.run` 은 둘 다 뭉뚱그려 돌려준다(`BLOCKED`). 어느 쪽인지는
-            #   svc 가 받은 msg 만 안다 — orchestrator.py:240 과 같은 방식이다.
+            # ★ 2026-08-26 부터 `cycle.run` 이 `NO_FEASIBLE_POSE` 를 **그대로**
+            #   돌려준다. 예전에는 PALLET_FULL 이 아니면 전부 `BLOCKED` 로 뭉개서,
+            #   어느 쪽인지는 svc 가 받은 msg 로만 알 수 있었다. `pmsg` 는 옛
+            #   판(`BLOCKED`)에서도 돌게 남겨 둔 대비책이다.
             #   여기서 안 치우면 거부된 박스가 **스토퍼에 그대로 서 있고**, 다음
             #   박스를 같은 자리로 급송하면서 겹친다. 실측: 14번 NO_FEASIBLE_POSE
             #   직후 15번이 간극 -13.95 mm 로 흡착 실패했다.
             pmsg = getattr(svc, "last_plan_msg", None)
-            if res != "PLACED" and res != "PALLET_FULL" and pmsg == "NO_FEASIBLE_POSE":
+            if res == "NO_FEASIBLE_POSE" or (
+                    res not in ("PLACED", "PALLET_FULL")
+                    and pmsg == "NO_FEASIBLE_POSE"):
                 res = "REJECTED"                      # 정상 판단이다. 실패로 세지 않는다
             if res != "PLACED":
                 _park(rp, dm, len(parked))            # 라인 밖으로 — 다음 박스 길을 연다

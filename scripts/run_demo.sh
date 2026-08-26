@@ -63,5 +63,16 @@ if [ "${PL_NOWINDOW:-0}" = "1" ]; then
     export PL_AUTOPLAY="${PL_AUTOPLAY:-1}"
 fi
 
+# ★ 실행 로그를 파일로도 남긴다. 터미널에만 찍히면 끝난 뒤에 원인을 못 찾는다 —
+#   스크롤이 잘리고, 다른 사람이 볼 수도 없다. `PL_LOGDIR` 로 자리를 바꾼다.
+LOGDIR="${PL_LOGDIR:-$HOME/palletris_ws/results/runs}"
+mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=""
 cd "$ISAAC_DIR"
+if [ -n "$LOGDIR" ]; then
+    LOGF="$LOGDIR/run_$(date +%Y%m%d_%H%M%S).log"
+    echo "로그: $LOGF" >&2
+    # stdbuf: 파이프로 넘기면 블록 버퍼가 되어 진행이 안 보인다.
+    exec stdbuf -oL -eL ./isaac-sim.sh "${WIN[@]}" \
+         --exec "$HERE/demo_stack15_test1_1.py" "$@" 2>&1 | tee "$LOGF"
+fi
 exec ./isaac-sim.sh "${WIN[@]}" --exec "$HERE/demo_stack15_test1_1.py" "$@"
