@@ -1400,6 +1400,15 @@ def router_thread(specs, ids):
     #   (2026-08-26 영상 260826error2.mp4 · MISROUTE 4 건).
     #   기본 900 = 본선 레일(790) 을 확실히 벗어난 뒤.
     y_release = float(ROUTE.get("divert_release_y_mm", 900)) / 1000.0
+    # ★★ 진짜 기준은 "박스가 **소터 위를 벗어났나**" 다 (2026-08-26 2차).
+    #   고정선(900)으로는 안 된다. 로봇이 집는 동안 `cycle.py` 가 지선 벨트를
+    #   0 으로 세우기 때문에(cycle.py:392), 계량 2 에서 두 번째 박스가 그 위에
+    #   **얼어붙는다.** 실측(영상 0826error3): 존 B 의 BOX00005 가 Y 0.678 에서
+    #   6 초 정지 -> 900 에 못 닿아 소터가 계속 꺾인 채 -> 뒤 박스가 B 지선으로
+    #   밀려 들어갔다 (파란 박스가 B 에 들어간 그 건).
+    #   본선 롤러는 Y ±451.6 이다 (setup_test3_scene 검증 출력). 박스 **뒷면**이
+    #   그 선을 넘으면 소터 위가 아니다 — 벨트가 서 있어도 붙들 이유가 없다.
+    y_clear = float(ROUTE.get("sorter_clear_y_mm", 460)) / 1000.0
     released = {}                       # bid -> 소터를 이미 되돌렸나
     _mly = ROUTE.get("main_line_y_mm") or [-500, 500]
     y_lo, y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
@@ -1512,12 +1521,17 @@ def router_thread(specs, ids):
                     continue
                 # ★ 소터는 **여기서** 본선으로 돌린다. 박스는 이미 지선 롤러 위라
                 #   지선 벨트가 실어 간다 — 소터를 더 붙들면 뒤차가 같이 밀린다.
-                if (state.get(bid) == "divert" and not released.get(bid)
-                        and p[1] >= y_release):
-                    turn(z, seg, False)
-                    released[bid] = True
-                    log("   [라우팅] %s 지선 %s 올라탐 (Y %.2f m) — 소터 즉시 복귀"
-                        % (bid, z, p[1]))
+                if state.get(bid) == "divert" and not released.get(bid):
+                    # 뒷면이 본선 롤러를 벗어났나. yaw 0 스폰이라 진행축(Y) 치수는
+                    # d 지만, 틀어져도 안전하도록 **긴 변**으로 잰다.
+                    _sp = specs.get(bid) or {}
+                    _half = max(float(_sp.get("w_mm", 480)),
+                                float(_sp.get("d_mm", 380))) / 2000.0
+                    if p[1] - _half >= y_clear or p[1] >= y_release:
+                        turn(z, seg, False)
+                        released[bid] = True
+                        log("   [라우팅] %s 소터 %s 벗어남 (Y %.2f · 뒷면 %.2f m) "
+                            "— 소터 즉시 복귀" % (bid, z, p[1], p[1] - _half))
                 if state.get(bid) == "divert":
                     # 진행을 1 초마다 남긴다. 어디서 걸리는지 봐야 고칠 수 있다.
                     now = time.time()
