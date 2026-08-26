@@ -696,6 +696,13 @@ class _Feeder:
                 self._watch.append((_w["x"][0] / 1000.0, _w["x"][1] / 1000.0,
                                     _w["y"][0] / 1000.0, _w["y"][1] / 1000.0))
         self._held_log = 0.0
+        # ★ 걸림 감시 (2026-08-27 강의실 실측). 합류 창 안에서 박스가 이음매에
+        #   걸려 안 움직이면 스폰 보류가 **영영 안 풀린다** — 라인 전체가 말라붙는
+        #   것을 화면으로 확인했다. "접근 중"의 정의에 움직임을 넣는다:
+        #   8초째 제자리(20mm 미만 이동)면 보류 대상에서 빼고, 30초째면 낙하물로
+        #   보고 치운다(despawn). 창 안에서 30초 정지는 정상 흐름에 없다 —
+        #   갭핑 정지는 최대 2초, 본선·리턴 벨트는 여기서 세우지 않는다.
+        self._move_hist = {}     # {box_id: [x, y, 마지막으로 움직인 시각]}
 
     def step(self, now):
         if self.total and self.i >= self.total:
@@ -711,12 +718,29 @@ class _Feeder:
         if self._watch:
             for _b, _e in dict(getattr(self.sp, "_snap", {})).items():
                 _p = _e.get("pos_m")
-                if _p and any(x0 <= _p[0] <= x1 and y0 <= _p[1] <= y1
-                              for x0, x1, y0, y1 in self._watch):
-                    if now - self._held_log > 5.0:
-                        self._held_log = now
-                        self.log("[투입] 리턴 박스 %s 합류 접근 — 스폰 보류" % _b)
-                    return
+                if not (_p and any(x0 <= _p[0] <= x1 and y0 <= _p[1] <= y1
+                                   for x0, x1, y0, y1 in self._watch)):
+                    self._move_hist.pop(_b, None)
+                    continue
+                # ── 걸림 검사 (__init__ 주석) — 제자리 박스는 "접근 중"이 아니다 ──
+                _h = self._move_hist.get(_b)
+                if _h is None or abs(_p[0] - _h[0]) + abs(_p[1] - _h[1]) > 0.02:
+                    self._move_hist[_b] = [_p[0], _p[1], now]
+                    _still = 0.0
+                else:
+                    _still = now - _h[2]
+                if _still >= 30.0:
+                    self.log("[투입] %s 가 합류 창에서 30초째 제자리 — 낙하물로 보고 치운다"
+                             % _b)
+                    self._move_hist.pop(_b, None)
+                    self.sp._despawn(_b)       # 메인 스레드다 — 직접 불러도 된다
+                    continue
+                if _still >= 8.0:
+                    continue                   # 걸린 박스 때문에 스폰을 영영 막지 않는다
+                if now - self._held_log > 5.0:
+                    self._held_log = now
+                    self.log("[투입] 리턴 박스 %s 합류 접근 — 스폰 보류" % _b)
+                return
         # ★★ **3 자리다** (`BOX001`). 5 자리로 내면 조용히 다 막힌다 (2026-08-26 실측):
         #   · 마스터 DB(`boxes_master`)가 3 자리라 관제탑이 "DB 에 없음 -> 폐기"
         #   · QR 라벨 PNG 도 `qr_labels/BOX001.png` 라 라벨이 안 붙는다
