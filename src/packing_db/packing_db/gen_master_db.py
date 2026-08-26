@@ -16,6 +16,7 @@ import sqlite3
 
 from packing_common.config import load
 from packing_common.ids import box_id as make_box_id
+from packing_common.paths import default_db_path, find_data
 from packing_db.delivery_points import APARTMENTS, address_of
 
 # ★ 파일명은 palletris.db 다 (CLAUDE.md §10). 트랙 D 가이드에는 packing.db 로
@@ -138,8 +139,10 @@ def main():
     a = ap.parse_args()
 
     cfg = load(a.config)
-    db_path = os.path.expanduser(a.db_path) if a.db_path else _default_db_path()
-    schema = os.path.join(os.path.dirname(os.path.realpath(__file__)), "schema.sql")
+    db_path = default_db_path(a.db_path)
+    # ★ 옛 코드는 `<here>/schema.sql` **하나만** 봤다. 설치본에는 그 자리에 파일이
+    #   없어서 일반 colcon build 로는 FileNotFoundError 로 죽었다.
+    schema = find_data("packing_db", "schema.sql", __file__)
 
     rows = build(cfg, db_path, schema)
     zc = {}
@@ -157,17 +160,8 @@ def main():
           f"({' · '.join(z + ':' + ','.join(d for _, d in v) for z, v in ZONE_DONG.items())})")
 
 
-def _default_db_path():
-    """워크스페이스 루트를 config 위치에서 역산한다.
-
-    system.yaml 은 <ws>/src/packing_bringup/config/system.yaml 이므로 4 단계 위가 루트다.
-    실행 위치에 기대지 않는 이유: 상대경로면 실행 디렉터리마다 다른 빈 DB 가 생겨
-    "master 에 없는 박스" 만 찍힌다 (트랙 D 가이드 D1 경고).
-    """
-    from packing_common.config import find_config
-    cfg_path = os.path.realpath(find_config())
-    ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(cfg_path))))
-    return os.path.join(ws, "palletris.db")
+# ★ _default_db_path 는 packing_common.paths.default_db_path 로 옮겼다 (2026-08-26).
+#   db_service_node 에도 똑같은 "config 경로 −4 단계" 산술이 있어 두 벌이었다.
 
 
 if __name__ == "__main__":

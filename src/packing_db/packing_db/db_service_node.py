@@ -51,7 +51,8 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from packing_common.config import find_config, load
+from packing_common.config import load
+from packing_common.paths import default_db_path, find_data
 from packing_db.gen_master_db import dong_of
 from packing_db.metrics import collect, fmt_rate
 from packing_msgs.msg import BoxInfo, MetricsSummary, ZoneStatus
@@ -68,16 +69,11 @@ TS_COLUMN = {"SPAWNED": "spawned_at", "SCANNED": "scanned_at",
              "PICKED": "picked_at", "PLACED": "placed_at"}
 
 
-def default_db_path():
-    """워크스페이스 루트의 palletris.db.
-
-    system.yaml 이 <ws>/src/packing_bringup/config/system.yaml 이므로 4 단계 위가 루트다.
-    상대경로를 쓰면 실행 디렉터리마다 다른 빈 DB 가 생겨 "master 에 없는 박스" 만
-    찍힌다 (트랙 D 가이드 D1 경고).
-    """
-    cfg_path = os.path.realpath(find_config())
-    ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(cfg_path))))
-    return os.path.join(ws, "palletris.db")
+# ★ default_db_path 는 packing_common.paths 로 옮겼다 (2026-08-26).
+#   여기와 gen_master_db 에 "config 경로에서 4 단계 위" 산술이 **두 벌** 있었는데,
+#   find_config() 가 share 를 돌려주는 순간 둘 다 엉뚱한 곳을 가리킨다. DB 는 없으면
+#   그냥 새로 만들어지므로 빈 DB 를 조용히 쓰게 된다 — "master 에 없는 박스" 증상이다.
+#   이제 워크스페이스 표식으로 찾고, PALLETRIS_DB 로 덮어쓸 수 있다.
 
 
 class DbService(Node):
@@ -149,15 +145,15 @@ class DbService(Node):
     # 공통
     # ══════════════════════════════════════════════════════════════
     def _ensure_schema(self):
-        """schema.sql 을 적용한다. CREATE TABLE IF NOT EXISTS 라 여러 번 돌아도 안전하다."""
-        here = os.path.dirname(os.path.realpath(__file__))
-        for cand in (os.path.join(here, "schema.sql"),
-                     os.path.join(here, "..", "share", "packing_db", "schema.sql")):
-            if os.path.isfile(cand):
-                with open(cand, encoding="utf-8") as f, self._w:
-                    self.db.executescript(f.read())
-                return
-        raise SystemExit("schema.sql 을 찾지 못했다")
+        """schema.sql 을 적용한다. CREATE TABLE IF NOT EXISTS 라 여러 번 돌아도 안전하다.
+
+        ★ 옛 코드는 `<here>/../share/packing_db/schema.sql` 을 봤다. 설치본에서
+          share 는 모듈 기준 **4 단계 위**라 그 경로는 존재하지 않는다 —
+          일반 colcon build 로는 여기서 죽었다. paths.find_data 가 그걸 안다.
+        """
+        with open(find_data("packing_db", "schema.sql", __file__),
+                  encoding="utf-8") as f, self._w:
+            self.db.executescript(f.read())
 
     def _now(self):
         """타임스탬프. use_sim_time 이면 sim 시계를 따른다 (CLAUDE.md §3-4 규약 1).

@@ -13,6 +13,11 @@ setup(
         #   아닌 설치본에서 못 찾는다.
         ('share/' + package_name, ['packing_db/schema.sql']),
     ],
+    # ★ site-packages 안에도 같이 깐다 (2026-08-26).
+    #   find_packages() 는 .py 만 가져가서, 설치본의 패키지 디렉터리에는 schema.sql 이
+    #   아예 없었다. share 폴백이 고쳐졌으니 없어도 돌지만, 두 경로 다 살려 두면
+    #   ROS 를 source 안 한 상태에서도 모듈 옆에서 바로 찾힌다.
+    package_data={package_name: ['schema.sql']},
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='민범진',
