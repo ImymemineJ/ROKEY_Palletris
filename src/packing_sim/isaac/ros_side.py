@@ -212,12 +212,18 @@ def install_services(handlers):
     )
 
 
-def build(zones, log=print):
-    """그래프를 세운다. **Play 전에** 한 번 부른다."""
+def build(zones, cfg=None, log=print):
+    """그래프를 세운다. **Play 전에** 한 번 부른다.
+
+    `cfg` 를 주면 `/clock`·`/tf` 도 **씬에 없을 때만** 같이 세운다. 없으면
+    `use_sim_time` 노드들의 시계가 0 에 멎어 타이머가 하나도 안 돈다 (§10).
+    """
     ros_graph.build(zones=list(zones))
     for z in zones:
         log("[ros_side] %s — %s / %s"
             % (z, ros_graph.cmd_topic(z), ros_graph.evt_topic(z)))
+    if cfg is not None:
+        ros_graph.build_clock_tf(cfg, log=log)
 
 
 def wire(log=print):

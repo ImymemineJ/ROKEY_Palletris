@@ -689,10 +689,22 @@ else:
             {"graph_path": G, "evaluator_name": "execution"},
             {K.CREATE_NODES: [("Tick", "omni.graph.action.OnPlaybackTick"),
                               ("Ctx", NS + "ROS2Context"),
+                              # ★★ 시간 소스. 이게 없으면 `/clock` 이 **계속 0** 을
+                              #   낸다 (2026-08-26 실측: sec 0 nanosec 0 고정).
+                              #   토픽은 멀쩡히 보이고 발행자 수도 1 이라 "됐다"고
+                              #   착각하기 딱 좋은데, 구독하는 노드들의 시계가
+                              #   0 에 멎어 **타이머가 하나도 안 뜬다** — /clock 이
+                              #   아예 없을 때와 증상이 똑같다 (§10).
+                              ("SimTime", "isaacsim.core.nodes."
+                                          "IsaacReadSimulationTime"),
                               ("Clock", NS + "ROS2PublishClock"),
                               ("Tf", NS + "ROS2PublishTransformTree")],
              K.CONNECT: [("Tick.outputs:tick", "Clock.inputs:execIn"),
                          ("Tick.outputs:tick", "Tf.inputs:execIn"),
+                         ("SimTime.outputs:simulationTime",
+                          "Clock.inputs:timeStamp"),
+                         ("SimTime.outputs:simulationTime",
+                          "Tf.inputs:timeStamp"),
                          ("Ctx.outputs:context", "Clock.inputs:context"),
                          ("Ctx.outputs:context", "Tf.inputs:context")],
              # ★ ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
