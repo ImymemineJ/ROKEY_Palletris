@@ -2229,6 +2229,12 @@ def worker(specs, ids, zone=None):
             if res != "PLACED":
                 if res == "PALLET_FULL":
                     log("       이 팔레트에 자리가 없다 — 우회 처리하고 다음 박스로 간다.")
+                elif res == "NO_FEASIBLE_POSE":
+                    # ★ 이건 **이 박스만** 안 들어간 것이다 (CLAUDE.md §7). 팔레트는
+                    #   아직 안 찼으니 교체하지 않는다 — 위 `swapped_for` 분기가
+                    #   PALLET_FULL 만 보는 이유다. 사양상 우회는 흐름 제어이지
+                    #   실패가 아니다 (설계결정서 §7, bypass_count).
+                    log("       이 박스만 자리가 없다 — 우회. 팔레트는 그대로 둔다.")
                 else:
                     log("       !! 실패. 라인에서 빼고 다음 박스로 넘어간다.")
                 recover()                            # 그리퍼를 열고, 감겼으면 되돌린다
@@ -2324,8 +2330,12 @@ def report():
     log("-" * 78)
 
     placed = [w for w in rows if w["res"] == "PLACED"]
-    bypassed = [w for w in rows if w["res"] == "PALLET_FULL"]
-    failed = [w for w in rows if w["res"] not in ("PLACED", "PALLET_FULL")]
+    # ★ 우회 2 종. 둘 다 실패가 아니다 (설계결정서 §7 — 버퍼 우회는 흐름 제어다).
+    #   PALLET_FULL      팔레트가 찼다 -> 교체
+    #   NO_FEASIBLE_POSE 이 박스만 자리가 없다 -> 되돌림, 팔레트는 그대로
+    _BYPASS = ("PALLET_FULL", "NO_FEASIBLE_POSE")
+    bypassed = [w for w in rows if w["res"] in _BYPASS]
+    failed = [w for w in rows if w["res"] not in (("PLACED",) + _BYPASS)]
     ok = bool(placed)
     # ★ 분모는 **이 존 몫**이다. 라우팅을 켜면 남의 배송지 박스는 다른 지선으로 간다.
     #   팔레트당 개수를 정했으면(PL_PER_PALLET) 그만큼만 놓고 반출하므로 그 수가 분모다.

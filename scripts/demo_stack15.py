@@ -558,6 +558,25 @@ class OnlineServices:
         return None if s is None else {"w_mm": s["w_mm"], "d_mm": s["d_mm"],
                                        "h_mm": s["h_mm"], "zone": "B"}
 
+    def _smallest_spec(self):
+        """등장하는 박스 중 **가장 작은 것**. 부피 기준. 없으면 None.
+
+        ★ `self.specs` 에서 유도한다. 3 호 340x250x210 을 코드에 박으면 박스 표가
+          바뀔 때 조용히 틀린다 (CLAUDE.md: 숫자를 코드에 박지 않는다).
+        """
+        if getattr(self, "_sm_cache", "x") != "x":
+            return self._sm_cache
+        best = None
+        for sp in self.specs.values():
+            try:
+                v = float(sp["w_mm"]) * float(sp["d_mm"]) * float(sp["h_mm"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if best is None or v < best[0]:
+                best = (v, sp)
+        self._sm_cache = None if best is None else best[1]
+        return self._sm_cache
+
     def plan_placement(self, zone, box_id, w, d, h):
         self._rec("/algo/plan_placement", zone, box_id)
         PK = _load_packer_module()
@@ -575,10 +594,33 @@ class OnlineServices:
         mass = self.specs[box_id]["mass_g"] / 1000.0
         p = pk.find_placement((w / 1000.0 + self.c, d / 1000.0 + self.c, h / 1000.0), mass)
         if p is None:
-            self._log("             [svc] 자리 없음 (관측 %d개, 최상단 %.0f mm)"
-                      % (seen, top * 1000))
-            self.last_plan_msg = "PALLET_FULL"
-            return False, None, "PALLET_FULL"
+            # ★★ 여기서 무조건 PALLET_FULL 을 내면 안 된다 (CLAUDE.md §7).
+            #
+            #   NO_FEASIBLE_POSE = **이 박스만** 자리가 없다 -> 그 박스만 되돌리고 계속
+            #   PALLET_FULL      = **가장 작은 박스로도** 후보가 없다 -> 상차·종료
+            #
+            #   둘을 안 가르면 큰 박스 하나가 안 들어갈 때 팔레트 전체가 나간다.
+            #   실측 2026-08-26 (150 박스): 존 A 가 **8 개**에서 PALLET_FULL 을 냈다.
+            #   최상단 900 mm 에 9 kg 5 호(340 높이)가 실패한 것인데, 높이로는
+            #   1240 <= 1300 이라 남아 있었다 — 하중 순서상 가벼운 박스 위에 못
+            #   올라간 것뿐이다. 한 판 용량이 24~27 개인데 1/3 에서 내보냈다.
+            #
+            #   그래서 **가장 작은 박스로 한 번 더 물어본다.** 그것도 안 들어가면
+            #   그때가 진짜 PALLET_FULL 이다. 치수는 `self.specs` 에서 유도한다 —
+            #   코드에 박지 않는다.
+            sm = self._smallest_spec()
+            full = True
+            if sm is not None and (sm["w_mm"], sm["d_mm"], sm["h_mm"]) != (w, d, h):
+                q = pk.find_placement(
+                    (sm["w_mm"] / 1000.0 + self.c, sm["d_mm"] / 1000.0 + self.c,
+                     sm["h_mm"] / 1000.0), sm["mass_g"] / 1000.0)
+                full = q is None
+            msg = "PALLET_FULL" if full else "NO_FEASIBLE_POSE"
+            self._log("             [svc] 자리 없음 (관측 %d개, 최상단 %.0f mm) -> %s%s"
+                      % (seen, top * 1000, msg,
+                         "" if full else "  (가장 작은 박스는 들어간다 — 계속)"))
+            self.last_plan_msg = msg
+            return False, None, msg
         self.last_plan_msg = "OK"
         cx, cy, _ = p.center_local
         place = {"x_mm": int(round(cx * 1000.0)), "y_mm": int(round(cy * 1000.0)),
