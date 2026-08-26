@@ -528,6 +528,41 @@ def build_cameras(cfg, zones, log=print):
     #   `cameras.pick_prim.{A,B,C}` 가 그 리그의 Color 렌즈를 가리킨다.
     cams_cfg = (cfg.get("cameras") or {})
     pick_prims = (cams_cfg.get("pick_prim") or {})
+
+    # ★ 픽업 리그 정렬 (2026-08-27 김병직 — 풀 비전 5호 실패의 처방).
+    #   카메라가 스토퍼를 비껴 보면 키 큰 박스(5호 340mm)는 옆면까지 실루엣에
+    #   잡혀 치수 맞춤(허용 60mm)이 터진다 — 실측: 3·4호 통과(6.4~9.5mm),
+    #   5호 성공 0/443. 리그를 **스토퍼 박스 중심 바로 위**로 옮기면 옆면이
+    #   사라진다 (오프셋 60mm/높이 1.16m ≈ 3도). USD 는 안 건드린다 —
+    #   런타임 이동이라 되돌리기는 오버레이 키를 빼면 끝이다.
+    #   ⚠ 회전은 안 만진다 — 리그 내부 자세(하향)를 그대로 쓴다.
+    _align = cams_cfg.get("align_pick_z_mm")
+    if _align:
+        from pxr import Gf, UsdGeom
+        _stop_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        _half = max(max(t["w_mm"], t["d_mm"]) for t in cfg["boxes"]["types"]) / 2000.0
+        _cross = (cfg["zones"].get("pickup_cross_mm") or {})
+        _ax_y = str(cfg["conveyor"].get("pickup_axis", "x")).lower() == "y"
+        for z in zones:
+            cw = _cross.get(str(z).upper())
+            lens = pick_prims.get(str(z).upper())
+            if not cw or not lens:
+                continue
+            rig_path = "/" + "/".join(lens.strip("/").split("/")[:2])
+            rig = st.GetPrimAtPath(rig_path)
+            if not rig.IsValid():
+                continue
+            cm = (cw[0] + cw[1]) / 2000.0
+            tgt_along = _stop_m - _half          # 5호가 스토퍼에 닿았을 때 중심
+            pos = (Gf.Vec3d(cm, tgt_along, _align / 1000.0) if _ax_y
+                   else Gf.Vec3d(tgt_along, cm, _align / 1000.0))
+            xf = UsdGeom.Xformable(rig)
+            _ops = {o.GetOpName(): o for o in xf.GetOrderedXformOps()}
+            _op = _ops.get("xformOp:translate") or xf.AddTranslateOp()
+            _op.Set(pos)
+            log("[ros_graph] 픽업 리그 정렬 %s -> (%.0f, %.0f, %.0f) mm"
+                % (rig_path, pos[0] * 1000, pos[1] * 1000, pos[2] * 1000))
+
     targets = []
     for z in zones:
         zu = str(z).upper()
