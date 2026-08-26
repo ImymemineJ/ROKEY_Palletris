@@ -679,11 +679,65 @@ class ZoneDetector(Node):
     def _now(self):
         return self.get_clock().now().nanoseconds / 1e9
 
+    def _pickup_roi(self, header, shape):
+        """픽업 창의 픽셀 ROI. 한 번 계산해 캐시한다 (카메라·스토퍼 둘 다 정적).
+
+        ★ 왜 (2026-08-27 김병직·라이브 캡처 실측): 픽업 카메라 시야에 **팔레트**가
+          들어온다. 방금 쌓은 박스가 같은 분홍이라 검출이 그쪽(더 높아 더 크게
+          보임 — 팔레트 950+340=상면 1290, x1.15 확대)을 잡았다 — C존 기각
+          541x445 = 정확히 팔레트 위 5호였다. 스포너의 pickup_range 상한과
+          같은 원리로, 검출 **전에** 픽업 창 밖을 지운다.
+        """
+        if getattr(self, "_roi", None) is not None:
+            return self._roi
+        if self.cam.K is None:
+            return None
+        try:
+            R, t = camera_pose(self.tf_buf, self.world_frame,
+                               header.frame_id or self.cam.frame_id)
+        except Exception:                                       # noqa: BLE001
+            return None                     # tf 가 아직 — 다음 프레임에 다시
+        cw = (self.cfg["zones"].get("pickup_cross_mm") or {}).get(self.zone.upper())
+        if not cw:
+            return None
+        stop = self.cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        along = (self._win_m - 0.35, stop + 0.05)   # 도착 직전 여유 ~ 스토퍼 앞면
+        cross = (cw[0] / 1000.0, cw[1] / 1000.0)
+        maxh = max(bt["h_mm"] for bt in self.types) / 1000.0
+        us, vs = [], []
+        for a in along:
+            for c in cross:
+                for Z in (self.belt_top_m, self.belt_top_m + maxh):
+                    w = (np.array([c, a, Z]) if self._axis_i == 1
+                         else np.array([a, c, Z]))
+                    pc = R.T @ (w - t)
+                    if pc[2] <= 1e-6:
+                        continue
+                    uv = self.cam.K @ (pc / pc[2])
+                    us.append(uv[0]); vs.append(uv[1])
+        if len(us) < 4:
+            return None
+        H, W = shape[0], shape[1]
+        M = 25                              # 픽셀 여유
+        self._roi = (max(0, int(min(us)) - M), max(0, int(min(vs)) - M),
+                     min(W, int(max(us)) + M), min(H, int(max(vs)) + M))
+        self.get_logger().info("픽업 ROI 확정 %s (팔레트 등 시야 밖 배제)"
+                               % (self._roi,))
+        return self._roi
+
     def _on_image(self, bgr, header):
         t = self._now()
         if not self._idle or (t - self._last) < self._min_dt:
             return
         self._last = t
+
+        # ── 픽업 창 밖(팔레트 쪽)을 지우고 검출한다 (_pickup_roi 주석) ──
+        roi = self._pickup_roi(header, bgr.shape)
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            m = np.zeros_like(bgr)
+            m[y0:y1, x0:x1] = bgr[y0:y1, x0:x1]
+            bgr = m
 
         det = find_box(bgr)
         if det is None:
