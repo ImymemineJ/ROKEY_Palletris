@@ -83,6 +83,28 @@ def load(path=None):
         cfg = yaml.safe_load(f)
     over = os.environ.get("PL_CONFIG_OVERLAY")
     if over:
-        with open(os.path.expanduser(over), encoding="utf-8") as f:
+        with open(_resolve_overlay(over), encoding="utf-8") as f:
             cfg = deep_merge(cfg, yaml.safe_load(f))
     return cfg
+
+
+def _resolve_overlay(path):
+    """오버레이 경로. 상대경로면 **cwd 다음에 저장소 루트**로도 찾는다.
+
+    ★ 2026-08-26 실측: `run_demo.sh` 는 `cd $ISAAC_DIR` 뒤에 실행한다. 그래서
+      `PL_CONFIG_OVERLAY=src/packing_bringup/config/test_3.yaml` 같은 저장소 기준
+      상대경로가 **현재 디렉터리 기준으로 풀려 FileNotFoundError** 가 났다.
+      launch 에서 넘길 때도 노드의 cwd 를 보장할 수 없다.
+    """
+    p = os.path.expanduser(str(path))
+    if os.path.isabs(p) or os.path.exists(p):
+        return p
+    # find_config 가 찾아낸 system.yaml 에서 저장소 루트를 역산한다
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.realpath(find_config())))))
+    cand = os.path.join(root, p)
+    if os.path.exists(cand):
+        return cand
+    raise FileNotFoundError(
+        "PL_CONFIG_OVERLAY 를 못 찾았다: %s\n  찾아본 곳: %s · %s"
+        % (path, os.path.abspath(p), cand))

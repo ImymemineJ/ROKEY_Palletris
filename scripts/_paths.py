@@ -6,6 +6,7 @@
 `packing_robot` 이 colcon 으로 빌드된 뒤에는 `import packing_robot.fk` 가 되지만,
 게이팅 스크립트는 **빌드 전에도 돌아야 하므로** sys.path 로 직접 붙인다.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -55,14 +56,33 @@ def system_config():
     ★ 겹치기가 맞는 또 하나의 이유: `zones` 하위에 `buffer_capacity` · `list` 는
       오버레이에 없다. 겹치면 그건 system.yaml 것이 살고 좌표만 test_3 것이 된다.
     """
-    import os
     import yaml
+    cfg = yaml.safe_load(_resolve(os.environ.get("PALLETRIS_CONFIG")
+                                  or SYSTEM_YAML).read_text())
     over = os.environ.get("PL_CONFIG_OVERLAY")
-    full = os.environ.get("PALLETRIS_CONFIG")
-    cfg = yaml.safe_load(Path(full or SYSTEM_YAML).read_text())
     if over:
-        cfg = deep_merge(cfg, yaml.safe_load(Path(over).read_text()))
+        cfg = deep_merge(cfg, yaml.safe_load(_resolve(over).read_text()))
     return cfg
+
+
+def _resolve(path):
+    """상대경로를 **워크스페이스 루트 기준**으로도 풀어 본다.
+
+    ★ 2026-08-26 실측 버그: `run_demo.sh` 는 `cd $ISAAC_DIR` 를 한 뒤 실행한다.
+      그래서 `PL_CONFIG_OVERLAY=src/packing_bringup/config/test_3.yaml` 처럼
+      워크스페이스 기준 상대경로를 주면 **현재 디렉터리가 Isaac 폴더**라
+      FileNotFoundError 가 난다 (`demo_stack15_test1_1.py` 는 자기 오버레이
+      처리에서 이미 ROOT 기준으로 풀고 있었는데 여기만 안 그랬다).
+      cwd -> ROOT 순으로 찾는다.
+    """
+    p = Path(os.path.expanduser(str(path)))
+    if p.is_absolute() or p.exists():
+        return p
+    cand = ROOT / p
+    if cand.exists():
+        return cand
+    raise FileNotFoundError(
+        "설정 파일을 못 찾았다: %s\n  찾아본 곳: %s · %s" % (path, p.resolve(), cand))
 
 
 def check():
