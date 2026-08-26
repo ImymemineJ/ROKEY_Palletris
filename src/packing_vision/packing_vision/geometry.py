@@ -69,7 +69,13 @@ def rect_from_corners(pts_w):
     return p.mean(axis=0), long_mm, short_mm, yaw
 
 
-def box_pose_from_corners(corners_px, K, R, t, belt_top_m, types, tol_m=0.055):
+def box_pose_from_corners(corners_px, K, R, t, belt_top_m, types, tol_m=0.085):
+    # ★ 0.055 -> 0.085 (2026-08-27 2차). gtpick 이 "정위치·yaw 0·단독" 을 보증한
+    #   5호가 541x445(오차 126~133)로 측정됐다 — 카메라 축이 스토퍼에서 비껴
+    #   키 큰 박스의 옆면이 실루엣에 끼는 원근 부풀기다. cap 170 -> 340mm.
+    #   안전한 이유: 존 인식의 종류는 **좌표 투영 평면**에만 쓰이고, 로봇 치수·
+    #   높이는 DB(cam1 등록, 중앙 게이트로 정확)에서 온다 — 오분류 해악은
+    #   중심 수십 mm 로 흡착 패드 여유 안이다. 병합(700mm대)은 여전히 걸러진다.
     # ★ tol 0.030 -> 0.055 (2026-08-27 김병직 실측). 박스가 카메라 축에서 옆으로
     #   치우치면(소터가 옆으로 쳐 보내 스토퍼 도착 오프셋 실측 ±155~177mm) 먼 쪽
     #   **옆면이 실루엣에 끼어** 측정이 부푼다 — 부풀기 ≈ 높이 x 오프셋 / 카메라높이,
