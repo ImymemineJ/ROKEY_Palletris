@@ -99,8 +99,39 @@ GRIPPER = ROBOT + "/gripper"              # 흡착 그리퍼 몸통 (link_6 에 
 #   /World/robot/root_joint        아티큘레이션 루트
 #   /World/robot/root_joint/tool0  EE 프레임
 #   /World/robot/SurfaceGripper    흡착
+# ★ 정본은 `~/isaac_assets/` 가 **만들어지는 곳**이고(`build_gripper_usd.py` 출력),
+#   씬이 참조하는 것은 `~/isaac_scenes/assets/robot/` 의 **배포 사본**이다.
+#   왜 사본인가: `scripts/sync_scene.sh` 가 `~/isaac_scenes/` 만 rsync 한다.
+#   자산이 그 밖에 있으면 팀 PC 에서 참조가 조용히 깨져 로봇만 안 보인다.
+#   자산을 다시 만들었으면 사본도 갱신할 것.
+_ROBOT_IN_TREE = os.path.expanduser("~/isaac_scenes/assets/robot/h2017_suction.usd")
+_ROBOT_SRC = os.path.expanduser("~/isaac_assets/h2017_suction.usd")
 ROBOT_USD = os.environ.get(
-    "PL_ROBOT_USD", os.path.expanduser("~/isaac_assets/h2017_suction.usd"))
+    "PL_ROBOT_USD",
+    _ROBOT_IN_TREE if os.path.exists(_ROBOT_IN_TREE) else _ROBOT_SRC)
+
+
+def ref_path(asset, layer_path):
+    """참조에 쓸 경로. 씬과 같은 트리 안이면 **상대경로**로 준다.
+
+    절대경로(`/home/rokey/...`)로 박으면 사용자명이 다른 팀 노트북에서 깨진다.
+    USD 는 참조를 못 풀어도 에러를 안 내므로 로봇만 사라진 채 조용히 돈다.
+    """
+    a = os.path.abspath(asset)
+    base = os.path.dirname(os.path.abspath(layer_path))
+    root = os.path.expanduser("~/isaac_scenes")
+
+    def under(p):
+        # base 가 root 자기 자신일 수 있다 (씬을 ~/isaac_scenes/ 바로 아래 둔 경우).
+        # startswith(root + "/") 만 보면 그 경우를 밖으로 판정해 절대경로로 샌다.
+        return p == root or p.startswith(root + os.sep)
+
+    if under(a) and under(base):
+        rel = os.path.relpath(a, base)
+        return rel if rel.startswith("..") else "./" + rel
+    print(f"   ⚠ {a} 가 씬 트리(~/isaac_scenes) 밖이라 절대경로로 넣는다 — "
+          f"다른 PC 에서 깨진다")
+    return a
 PALLET = "/World/Pallet"
 LOOKS = "/World/Looks"
 PHYS_MAT = LOOKS + "/PhysicsMaterial"
@@ -622,9 +653,10 @@ if os.path.exists(ROBOT_USD):
     spec = Sdf.CreatePrimInLayer(layer, Sdf.Path(ROBOT))
     spec.specifier = Sdf.SpecifierDef
     spec.typeName = "Xform"
-    spec.referenceList.prependedItems.append(Sdf.Reference(ROBOT_USD))
+    _rp = ref_path(ROBOT_USD, USD_PATH)
+    spec.referenceList.prependedItems.append(Sdf.Reference(_rp))
     xform(spec, (base[0], base[1], base[2]), (1.0, 1.0, 1.0))
-    print(f"로봇 {ROBOT} <- {ROBOT_USD}")
+    print(f"로봇 {ROBOT} <- {_rp}")
     print(f"      베이스 ({base[0]:.3f}, {base[1]:.3f}, {base[2]:.3f}) "
           f"= 페데스탈 상면")
 else:
