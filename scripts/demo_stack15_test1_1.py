@@ -1086,6 +1086,92 @@ def _stuck_box(link, ids):
     return best
 
 
+# ══ 트랙 C 코어 어댑터 ══════════════════════════════════════════════════════
+# ★★ 왜 필요한가 (2026-08-26).
+#
+#   실제 라인 드라이버는 `src/packing_sim/packing.py` 를 썼다. 그건 트랙 C 코어의
+#   **옛 사본**이라, 어제 채택한 값들이 하나도 안 걸린다. `system.yaml` 의
+#   heightmap 17 개 항목 중 **5 개만** 닿았다:
+#
+#     닿음   cell_mm · allowed_yaw_deg · min_support_ratio · support_tol_mm · max_stack_mm
+#     못 닿음 w_level · level_ring_cells · lookahead · drop_relief_mm · drop_max_kg
+#            plan_clearance_mm · w_height · w_support · w_far · w_wall
+#            gripper_clearance_mm · yaw_tol_deg · topk_support_check
+#
+#   특히 **평탄도의 정의부터 달랐다.** 사본은 `flatness = 발자국 밑 표준편차`(밑바닥이
+#   평평한가)를 보는데, 코어는 `level = 1 - |박스윗면 - 이웃최고| / max_stack`
+#   (이웃과 윗면이 맞는가)를 본다. 사본은 **주변보다 300 mm 높은 평평한 자리**를
+#   좋아한다 — 그게 실측에서 본 절벽이다.
+#
+# ★ 좌표 규약이 다르다. 맞춰 주는 게 이 클래스의 일이다.
+#     packing.Placement   x,y = 발자국 **최소 모서리** · 팔레트 로컬 [m]
+#     heightmap_core      x_mm,y_mm = **중심** · z_mm = 밑면 [mm]
+#
+# ★ 간격을 **두 번 더하면 안 된다.** 드라이버가 `D.CLEARANCE_MM`(30)을 치수에
+#   더해서 넘기는데, 코어는 `plan_clearance_mm`(10)을 **자기 안에서** 건다.
+#   그래서 여기서 드라이버 몫을 도로 뺀다. 안 빼면 40 이 되고, 게다가 코어의
+#   질량표 조회(`_mass_kg[(w,d,h)]`)가 어긋나 **협곡 낙하가 통째로 꺼진다.**
+class AlgoPacker:
+    """`packing.py` 인터페이스로 감싼 트랙 C 코어 (`packing_algo/heightmap_core.py`)."""
+
+    def __init__(self, cfg, clearance_mm):
+        ACORE = D._load_algo_module()
+        self._core = ACORE.HeightmapPacker(cfg)
+        self._clr_mm = float(clearance_mm)
+        self._n = 0
+        self.last_msg = "OK"
+        pal = cfg["pallet"]
+        self.size_xy = np.array([pal["width_mm"] / 1000.0,
+                                 pal["depth_mm"] / 1000.0], dtype=float)
+        self.max_height = pal["max_stack_mm"] / 1000.0
+
+    def _raw_mm(self, m):
+        """드라이버가 더한 간격을 뺀 **실제 치수** [mm]."""
+        return int(round(m * 1000.0 - self._clr_mm))
+
+    def commit(self, pl):
+        """관측 하나를 하이트맵에 반영한다 (`_obs_to_placement` 결과)."""
+        self._n += 1
+        self._core.update(
+            "OBS%04d" % self._n,
+            self._raw_mm(pl.w), self._raw_mm(pl.d), int(round(pl.h * 1000.0)),
+            {"x_mm": int(round((pl.x + pl.w / 2.0) * 1000.0)),
+             "y_mm": int(round((pl.y + pl.d / 2.0) * 1000.0)),
+             "z_mm": int(round(pl.z * 1000.0)),
+             "yaw_deg": 0.0})
+
+    def find_placement(self, box_size, box_mass=0.0, **_kw):
+        """→ `packing.Placement` | None. 사유는 `last_msg` 에 남는다."""
+        PK = D._load_packer_module()                 # Placement 자료구조만 빌린다
+        w_m, d_m, h_m = box_size
+        w, d = self._raw_mm(w_m), self._raw_mm(d_m)
+        h = int(round(h_m * 1000.0))
+        self._n += 1
+        ok, pose, _score, msg = self._core.plan("Q%04d" % self._n, w, d, h)
+        self.last_msg = msg
+        if not ok:
+            return None
+        # 코어가 준 것: 중심 x,y / 밑면 z / yaw. yaw 90 이면 축이 바뀐다.
+        yaw = float(pose["yaw_deg"])
+        ew, ed = (w_m, d_m) if int(round(abs(yaw) / 90.0)) % 2 == 0 else (d_m, w_m)
+        cx, cy = pose["x_mm"] / 1000.0, pose["y_mm"] / 1000.0
+        return PK.Placement(
+            x=cx - ew / 2.0, y=cy - ed / 2.0, z=pose["z_mm"] / 1000.0,
+            w=ew, d=ed, h=h_m, yaw_deg=yaw,
+            # ★ 코어는 지지율을 안 돌려준다. 다만 `min_support_ratio` 미만은
+            #   후보에서 이미 걸러졌으므로 **하한은 보장된다.** 그 값을 적는다 —
+            #   1.0 으로 적으면 로그가 거짓말을 한다.
+            support_ratio=float(self._core.min_sup), flatness=0.0,
+            mass=float(box_mass))
+
+    # 드라이버가 부르는 나머지 (사본과 이름을 맞춘다)
+    def reset(self):
+        self._core.reset()
+
+    def current_height(self):
+        return float(self._core.hm.max()) / 1000.0
+
+
 class LineServices(D.OnlineServices):
     """B5 의 온라인 서비스 그대로 + **벨트만 진짜로 세운다.**
 
@@ -1839,6 +1925,10 @@ def worker(specs, ids, zone=None):
                 return None
 
         def factory():
+            # ★ 기본은 **트랙 C 코어**다 (어제 채택한 값 전부가 여기서만 산다).
+            #   되돌리려면 PL_PACKER=sim — 옛 사본(packing.py)으로 돌아간다.
+            if os.environ.get("PL_PACKER", "algo").lower() != "sim":
+                return AlgoPacker(cfg, D.CLEARANCE_MM)
             return ArmAwarePacker(
                 size_xy=(pal["width_mm"] / 1000.0, pal["depth_mm"] / 1000.0),
                 max_height=pal["max_stack_mm"] / 1000.0,
