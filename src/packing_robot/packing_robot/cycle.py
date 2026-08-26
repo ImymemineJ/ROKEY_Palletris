@@ -404,13 +404,20 @@ class Cycle:
         max_h_m = max(t["h_mm"] for t in self.cfg["boxes"]["types"]) / 1000.0
         park_z = belt_z + max_h_m + 0.050
         transit = max(self._stack_top_m + self.approach_m, park_z)
+        # ★ 대기 yaw 는 **픽 기준 0°** 다 (2026-08-27 실측 — 팔뚝 반전 수정).
+        #   배치 yaw(±90°)를 든 채 스토퍼에 서면, 다음 픽의 yaw 등가 해석
+        #   (nearest_equiv_yaw)이 ±90 에서 같은 거리인 0/180 중 **180° 가지**를
+        #   잡을 수 있어 손목이 반대로 돌아간 자세가 된다. 스토퍼의 박스는
+        #   yaw ~0(지터 ±15°)이므로 0 으로 대 두면 다음 픽이 항상 0 근처를 잡는다.
+        #   상승만 배치 yaw 그대로 (적재물 옆에서 손목까지 돌리지 않는다) —
+        #   회전은 XY 이송 중에 한다.
         try:
             cur = self._face_now()
             if cur is not None and cur[2] < transit - 1e-3:
                 self._move([cur[0], cur[1], transit], self._last_put_yaw, TRANSIT_TOL_MM)
-            self._move([px, py, transit], self._last_put_yaw, TRANSIT_TOL_MM)
+            self._move([px, py, transit], 0.0, TRANSIT_TOL_MM)
             if park_z < transit - 1e-3:
-                self._move([px, py, park_z], self._last_put_yaw, TRANSIT_TOL_MM)
+                self._move([px, py, park_z], 0.0, TRANSIT_TOL_MM)
         except Exception as e:                                  # noqa: BLE001
             self.log("[cycle] 대기 자세 이동 실패 (무시): %r" % (e,))
 
