@@ -31,9 +31,12 @@ allok &= chk("la_rollouts",            getattr(pk, "la_rollouts", "?"), 3)
 allok &= chk("la_depth",               getattr(pk, "la_depth", "?"), 8)
 allok &= chk("w_level",                pk.w_level, 0.05)
 allok &= chk("ring (level_ring_cells)",pk.ring, 4)
-# ★ 기둥 억제는 **꺼짐이 채택값**이다 (인계 문서 §5-1 "넣지 말 것").
-#   켜면 적재율 70.9% -> 64.5% 로 떨어진다 (문서 §0).
-allok &= chk("tower_ring_mm (꺼짐)",   pk.tower_ring_mm, 0)
+# ★ 기둥 억제. 인계 문서 §5-1 은 "넣지 말 것" 인데, 그 근거는 **한 판에 35개를
+#   몰아넣는 조건**의 숫자다. 실제 라인에서는 우물이 큰 박스를 막아 판이 일찍
+#   찼다 (2026-08-26 실측: 반출 20·25개, 우회 6건이 전부 큰 박스).
+#   ⚠ 500 은 스윕 안 한 값이다 — Isaac 으로 판정할 것.
+allok &= chk("tower_ring_mm",          pk.tower_ring_mm, 500)
+allok &= chk("tower_ring_cells",       pk.tower_ring_cells, 45)
 allok &= chk("drop_relief",            pk.drop_relief, 200)
 allok &= chk("drop_max_kg",            pk.drop_max_kg, 3.5)
 allok &= chk("plan_clr",               pk.plan_clr, 10)
