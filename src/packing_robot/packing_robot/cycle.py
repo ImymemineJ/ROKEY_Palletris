@@ -432,7 +432,6 @@ class Cycle:
             self._resume_belt()
             return "PICK_FAILED"
         self.svc.set_status(box_id, "PICKED")
-
         # ★★ 여기서 **벨트를 다시 돌린다** (2026-08-26). 예전에는 놓기까지 끝난
         #   뒤(아래 6 번)에야 돌렸다.
         #
@@ -448,7 +447,6 @@ class Cycle:
         #   ★ 아래 6 번의 `_resume_belt()` 는 그대로 둔다 — 멱등이고(같은 값을
         #     다시 쓴다), 이탈 경로에서 여기를 안 지나고 끝나는 길이 있다.
         self._resume_belt()
-
         # 5) 놓기
         res, actual, _measured = self.place(box_id, place, w, d, h)
         if res != "PLACED":

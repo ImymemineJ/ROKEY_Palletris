@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PALLETRIS Dashboard</title>
+  <meta name="description" content="Palletris 창고 자동 팔레타이징 시뮬레이션 실시간 모니터링 대시보드" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body>
+  <!-- ── 헤더 ─────────────────────────────────── -->
+  <header id="header">
+    <div class="header-left">
+      <div class="logo">
+        <span class="logo-icon">📦</span>
+        <span class="logo-text">PALLETRIS</span>
+        <span class="logo-sub">MONITOR</span>
+      </div>
+    </div>
+    <div class="header-center">
+      <div class="header-stat" id="hdr-elapsed">
+        <span class="hdr-label">⏱ 경과</span>
+        <span class="hdr-value mono" id="elapsed-display">--:--:--</span>
+      </div>
+      <div class="header-stat">
+        <span class="hdr-label">DOMAIN</span>
+        <span class="hdr-value mono">115</span>
+      </div>
+      <div class="header-stat">
+        <span class="hdr-label">SEED</span>
+        <span class="hdr-value mono">42</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <div id="conn-status" class="conn-badge conn-disconnected">
+        <span class="conn-dot"></span>
+        <span id="conn-label">DISCONNECTED</span>
+      </div>
+      <div class="ws-info mono" id="ws-url-display">ws://localhost:9090</div>
+    </div>
+  </header>
+
+  <!-- ── 메인 그리드 ──────────────────────────── -->
+  <main id="main-grid">
+
+    <!-- ── 존 카드 3개 ── -->
+    <section id="zones-row" class="panel-row">
+      <div class="zone-card" id="zone-a">
+        <div class="zone-header">
+          <span class="zone-label">ZONE A</span>
+          <span class="zone-state-badge" id="za-state">IDLE</span>
+          <span class="zone-accept" id="za-accept" title="accepting">→</span>
+        </div>
+        <div class="zone-fill-bar">
+          <div class="fill-track">
+            <div class="fill-bar" id="za-fill-bar" style="width:0%"></div>
+          </div>
+          <span class="fill-pct mono" id="za-fill-pct">0%</span>
+        </div>
+        <div class="zone-stats">
+          <div class="zstat">
+            <span class="zstat-label">배치</span>
+            <span class="zstat-val mono" id="za-placed">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">거부</span>
+            <span class="zstat-val mono warn" id="za-rejected">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">대기</span>
+            <span class="zstat-val mono" id="za-queue">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">최고높이</span>
+            <span class="zstat-val mono" id="za-height">0 mm</span>
+          </div>
+        </div>
+        <canvas id="za-sparkline" class="zone-sparkline" width="200" height="40"></canvas>
+      </div>
+
+      <div class="zone-card" id="zone-b">
+        <div class="zone-header">
+          <span class="zone-label">ZONE B</span>
+          <span class="zone-state-badge" id="zb-state">IDLE</span>
+          <span class="zone-accept" id="zb-accept" title="accepting">→</span>
+        </div>
+        <div class="zone-fill-bar">
+          <div class="fill-track">
+            <div class="fill-bar" id="zb-fill-bar" style="width:0%"></div>
+          </div>
+          <span class="fill-pct mono" id="zb-fill-pct">0%</span>
+        </div>
+        <div class="zone-stats">
+          <div class="zstat">
+            <span class="zstat-label">배치</span>
+            <span class="zstat-val mono" id="zb-placed">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">거부</span>
+            <span class="zstat-val mono warn" id="zb-rejected">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">대기</span>
+            <span class="zstat-val mono" id="zb-queue">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">최고높이</span>
+            <span class="zstat-val mono" id="zb-height">0 mm</span>
+          </div>
+        </div>
+        <canvas id="zb-sparkline" class="zone-sparkline" width="200" height="40"></canvas>
+      </div>
+
+      <div class="zone-card" id="zone-c">
+        <div class="zone-header">
+          <span class="zone-label">ZONE C</span>
+          <span class="zone-state-badge" id="zc-state">IDLE</span>
+          <span class="zone-accept" id="zc-accept" title="accepting">→</span>
+        </div>
+        <div class="zone-fill-bar">
+          <div class="fill-track">
+            <div class="fill-bar" id="zc-fill-bar" style="width:0%"></div>
+          </div>
+          <span class="fill-pct mono" id="zc-fill-pct">0%</span>
+        </div>
+        <div class="zone-stats">
+          <div class="zstat">
+            <span class="zstat-label">배치</span>
+            <span class="zstat-val mono" id="zc-placed">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">거부</span>
+            <span class="zstat-val mono warn" id="zc-rejected">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">대기</span>
+            <span class="zstat-val mono" id="zc-queue">0</span>
+          </div>
+          <div class="zstat">
+            <span class="zstat-label">최고높이</span>
+            <span class="zstat-val mono" id="zc-height">0 mm</span>
+          </div>
+        </div>
+        <canvas id="zc-sparkline" class="zone-sparkline" width="200" height="40"></canvas>
+      </div>
+    </section>
+
+    <!-- ── KPI + 이벤트 로그 행 ── -->
+    <section id="middle-row" class="panel-row">
+
+      <!-- KPI 패널 -->
+      <div class="panel" id="kpi-panel">
+        <div class="panel-title">📊 핵심 지표 (KPI)</div>
+        <div class="kpi-grid">
+          <div class="kpi-card" id="kpi-recognition">
+            <div class="kpi-icon">🔍</div>
+            <div class="kpi-body">
+              <div class="kpi-label">인식률</div>
+              <div class="kpi-value mono" id="kv-recognition">--</div>
+            </div>
+            <div class="kpi-ring-wrap">
+              <canvas id="ring-recognition" width="56" height="56"></canvas>
+            </div>
+          </div>
+          <div class="kpi-card" id="kpi-success">
+            <div class="kpi-icon">✅</div>
+            <div class="kpi-body">
+              <div class="kpi-label">배치 성공률</div>
+              <div class="kpi-value mono" id="kv-success">--</div>
+            </div>
+            <div class="kpi-ring-wrap">
+              <canvas id="ring-success" width="56" height="56"></canvas>
+            </div>
+          </div>
+          <div class="kpi-card" id="kpi-cycle">
+            <div class="kpi-icon">⏱</div>
+            <div class="kpi-body">
+              <div class="kpi-label">평균 사이클</div>
+              <div class="kpi-value mono" id="kv-cycle">-- s</div>
+            </div>
+          </div>
+          <div class="kpi-card" id="kpi-idle">
+            <div class="kpi-icon">🤖</div>
+            <div class="kpi-body">
+              <div class="kpi-label">로봇 유휴율</div>
+              <div class="kpi-value mono" id="kv-idle">--</div>
+            </div>
+            <div class="kpi-ring-wrap">
+              <canvas id="ring-idle" width="56" height="56"></canvas>
+            </div>
+          </div>
+          <div class="kpi-card wide" id="kpi-counts">
+            <div class="kpi-icon">📦</div>
+            <div class="kpi-body">
+              <div class="kpi-label">총 처리</div>
+              <div class="kpi-value mono" id="kv-placed">0</div>
+            </div>
+            <div class="kpi-counts-detail">
+              <span class="cnt-item">스캔 <b id="kv-scanned">0</b></span>
+              <span class="cnt-item warn">실패 <b id="kv-failed">0</b></span>
+              <span class="cnt-item warn">거부 <b id="kv-rejected">0</b></span>
+              <span class="cnt-item">대기 <b id="kv-queue">0</b></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 처리량 추이 그래프 -->
+        <div class="panel-title" style="margin-top:16px">📈 배치 누적 추이</div>
+        <canvas id="throughput-chart" height="80"></canvas>
+      </div>
+
+      <!-- 이벤트 로그 -->
+      <div class="panel" id="event-panel">
+        <div class="panel-title">📋 실시간 이벤트</div>
+        <div id="event-log">
+          <div class="event-placeholder">이벤트 대기 중...</div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ── Heightmap 행 ── -->
+    <section id="heatmap-row" class="panel-row">
+      <div class="panel heatmap-panel" id="hm-panel-a">
+        <div class="panel-title">🗺 Zone A — Heightmap</div>
+        <canvas id="hm-a" class="heatmap-canvas"></canvas>
+        <div class="hm-legend">
+          <span>0 mm</span>
+          <div class="hm-gradient-bar"></div>
+          <span>1300 mm</span>
+        </div>
+      </div>
+      <div class="panel heatmap-panel" id="hm-panel-b">
+        <div class="panel-title">🗺 Zone B — Heightmap</div>
+        <canvas id="hm-b" class="heatmap-canvas"></canvas>
+        <div class="hm-legend">
+          <span>0 mm</span>
+          <div class="hm-gradient-bar"></div>
+          <span>1300 mm</span>
+        </div>
+      </div>
+      <div class="panel heatmap-panel" id="hm-panel-c">
+        <div class="panel-title">🗺 Zone C — Heightmap</div>
+        <canvas id="hm-c" class="heatmap-canvas"></canvas>
+        <div class="hm-legend">
+          <span>0 mm</span>
+          <div class="hm-gradient-bar"></div>
+          <span>1300 mm</span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Chart.js (로컬 CDN 미러가 없으면 온라인 사용) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- roslibjs — ROS 2 WebSocket 브리지 클라이언트 -->
+  <script src="https://cdn.jsdelivr.net/npm/roslib@1.4.0/build/roslib.min.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>
