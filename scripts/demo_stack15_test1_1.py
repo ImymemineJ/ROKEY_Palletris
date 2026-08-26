@@ -2418,7 +2418,17 @@ def worker(specs, ids, zone=None):
                 _S["rows"].pop()                     # 이건 최종 결과가 아니다
                 log("       팔레트가 찼다 — 사양 경로로 교체한다 "
                     "(스폰 정지 -> swap_pallet -> algo reset -> 재가동)")
-                link.call(cmd="set_spawn_enabled", enabled=False)
+                # ★★ 스폰을 **여기서 끄지 않는다** (2026-08-26 2차).
+                #   사양 경로는 "스폰 정지 -> swap_pallet -> algo reset -> 재가동" 인데,
+                #   그 사이에 **반출**이 끼면서 정지 구간이 통째로 길어졌다.
+                #   반출은 셀 -> 커브 -> 합류 -> 트럭까지 12.6 m 를 가는 동작이라
+                #   수십 초가 걸린다. 그동안 스폰이 꺼져 있으면 **본선에서 박스가
+                #   아예 안 나온다** — 반출하지 않는 나머지 두 존까지 굶는다
+                #   (2026-08-26 사용자 관측).
+                #   스폰을 끄는 진짜 이유는 "팔레트가 없는 순간에 새 박스가 오면
+                #   안 된다" 인데, 그 순간은 `swap_pallet` **한 번**뿐이다.
+                #   그러니 정지를 그 직전으로 옮긴다. 반출 중에 이 존으로 오는
+                #   박스는 지선에 서거나(계량 2) 루프를 돈다 — 라인은 계속 흐른다.
                 # ★★ 2026-08-26 **트럭으로 보낸 뒤** 판을 간다.
                 #   예전에는 `swap_pallet` 만 불러서 팔레트가 화면에서 그냥
                 #   사라졌다. 목표는 "셀 컨베이어 -> 합류 라인 -> 트럭 상차" 를
@@ -2439,6 +2449,8 @@ def worker(specs, ids, zone=None):
                     % len(_cargo))
                 _S.setdefault("ships", {})[zone] = ship_pallet(
                     link, zone, log, _cargo)
+                # 팔레트가 없는 **이 한 순간**만 스폰을 잡는다.
+                link.call(cmd="set_spawn_enabled", enabled=False)
                 sw = link.call(cmd="swap_pallet", zone=zone)
                 if _pose0.get("ok"):
                     # ★ 순서가 중요하다. **먼저** 지금 자리(트럭 위)에 사본을 떠서
