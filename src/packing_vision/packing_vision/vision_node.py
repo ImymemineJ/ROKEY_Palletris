@@ -33,6 +33,7 @@ CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현�
 """
 
 import collections
+import time
 
 import numpy as np
 import rclpy
@@ -52,6 +53,7 @@ from packing_msgs.srv import GetBoxInfo, RegisterBox, ReportMiss, VerifyBox
 from packing_vision import depth as depthlib
 from packing_vision.detect import dominant_color_name, find_box, read_qr
 from packing_vision.label import parse_payload
+from packing_vision import geometry as _geo
 from packing_vision.geometry import box_pose_from_corners, quat_to_R
 
 
@@ -404,6 +406,20 @@ class LineDetector(Node):
         if det["clipped"]:
             self.get_logger().warn(f"{cam.ns}: 박스가 화면 밖으로 잘렸다 — 건너뛴다")
             return None, None, None
+        # ★ 중앙 게이트 (2026-08-27 김병직 실측). 박스가 카메라 축에서 벗어날수록
+        #   **옆면이 실루엣에 껴서** 측정이 부푼다 — 이동 중 실측이 343.8 -> 368.6
+        #   -> 397.7 로 자라는 스트림이 그 증거이고, 가장자리에서 3호(340)가
+        #   400을 넘는 순간 **4호(410)로 오등록**됐다 (BOX018: 실물 3호 -> DB 4호
+        #   -> 로봇이 70mm 위에서 흡착 3연속 실패 -> 폐기). 프레임 중앙 1/3 에
+        #   있을 때만 판정한다 — 벨트 위라 중앙 프레임은 반드시 온다.
+        _c = np.mean(np.asarray(det["corners_px"], float), axis=0)
+        _H, _W = bgr.shape[0], bgr.shape[1]
+        # ★ 2차: 2/3 -> **1/3 폭** (같은 날). 2/3 안에서도 최대 부풀기 +39mm 라
+        #   3호가 375mm 까지 밀리는데 3/4호 분류 경계가 정확히 375 다 — 시드 고정
+        #   지터가 그 구간인 BOX015/018 이 재현성 있게 4호로 넘어갔다 (실측 2판).
+        #   1/3 폭이면 최대 +19mm, 경계까지 16mm 여유.
+        if abs(_c[0] - _W / 2.0) > _W / 6.0 or abs(_c[1] - _H / 2.0) > _H / 6.0:
+            return None, None, None         # 중앙 아님 — 다음 프레임에서 판정
         try:
             R, t = camera_pose(self.tf_buf, self.world_frame,
                                cam.frame_id or cam.ns.strip("/"))
@@ -504,7 +520,21 @@ class LineDetector(Node):
         """박스를 봤는데 식별 못 했다 — DB 에 알린다 (인식률의 분모).
 
         ★ 응답을 기다리지 않는다. 이건 통계용이라 라인을 세울 이유가 없다.
+        ★ 쿨다운 2초 (2026-08-27 김병직). 프레임마다 부르니 같은 박스 하나가
+          지나가는 동안 수십 번 쌓였다 — 실측 10분에 1200건, 인식률 분모가
+          프레임 수로 왜곡(11%)되고 DB 만 두들긴다 (db_service 사망 사고의
+          방아쇠였다). 같은 (지점, 사유)는 2초에 한 번만 보낸다 — 벨트 0.55 m/s
+          에서 박스 하나가 시야를 지나는 시간보다 길어 사실상 박스당 1건이 된다.
         """
+        import time as _t
+        k = (where_at, reason)
+        now = _t.monotonic()
+        last = getattr(self, "_miss_last", {}).get(k, 0.0)
+        if now - last < 2.0:
+            return
+        if not hasattr(self, "_miss_last"):
+            self._miss_last = {}
+        self._miss_last[k] = now
         if not self.cli_miss.service_is_ready():
             self.get_logger().warn("/db/report_miss 가 아직 없다 — 통계에서 빠진다",
                                    once=True)
@@ -619,6 +649,18 @@ class ZoneDetector(Node):
         self._min_dt = 1.0 / max(0.1, float(self.get_parameter("infer_rate_hz").value))
         self._last = 0.0
         self._present = False
+        # ★ 스토퍼 창·자리잡음 필터 (2026-08-27 김병직 — gtpick 대역과 같은 규칙).
+        #   실측: 도착 전 박스를 보고했다 — y 3405(스토퍼 -586mm)·yaw 179→88.7 로
+        #   널뛰는 좌표에 로봇이 출발해 흡착·IK 실패. ① 가장 큰 박스가 스토퍼에
+        #   닿았을 때 중심보다 60mm 여유 밖이면 아직 도착 전, ② 직전 추론과
+        #   5mm·1.5도 안으로 같아야 자리잡은 것. ③ 같은 박스가 15초째 걸려
+        #   있으면(뒤집힘 등) 강제 보고 — 관제탑 재시도 상한이 치워 준다.
+        _ax = str(cfg["conveyor"].get("pickup_axis", "x")).lower()
+        self._axis_i = 1 if _ax == "y" else 0
+        _half = max(max(t["w_mm"], t["d_mm"]) for t in self.types) / 2000.0
+        self._win_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0 - _half - 0.060
+        self._stab_prev = None       # (x_mm, y_mm, yaw)
+        self._stab_first = None      # 처음 필터에 걸린 시각 (monotonic)
         self._idle = True          # 관제탑이 놀고 있는가
         self._seen = None          # 직전에 발행한 box_id (중복 로그 억제)
 
@@ -651,11 +693,65 @@ class ZoneDetector(Node):
     def _now(self):
         return self.get_clock().now().nanoseconds / 1e9
 
+    def _pickup_roi(self, header, shape):
+        """픽업 창의 픽셀 ROI. 한 번 계산해 캐시한다 (카메라·스토퍼 둘 다 정적).
+
+        ★ 왜 (2026-08-27 김병직·라이브 캡처 실측): 픽업 카메라 시야에 **팔레트**가
+          들어온다. 방금 쌓은 박스가 같은 분홍이라 검출이 그쪽(더 높아 더 크게
+          보임 — 팔레트 950+340=상면 1290, x1.15 확대)을 잡았다 — C존 기각
+          541x445 = 정확히 팔레트 위 5호였다. 스포너의 pickup_range 상한과
+          같은 원리로, 검출 **전에** 픽업 창 밖을 지운다.
+        """
+        if getattr(self, "_roi", None) is not None:
+            return self._roi
+        if self.cam.K is None:
+            return None
+        try:
+            R, t = camera_pose(self.tf_buf, self.world_frame,
+                               header.frame_id or self.cam.frame_id)
+        except Exception:                                       # noqa: BLE001
+            return None                     # tf 가 아직 — 다음 프레임에 다시
+        cw = (self.cfg["zones"].get("pickup_cross_mm") or {}).get(self.zone.upper())
+        if not cw:
+            return None
+        stop = self.cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        along = (self._win_m - 0.35, stop + 0.05)   # 도착 직전 여유 ~ 스토퍼 앞면
+        cross = (cw[0] / 1000.0, cw[1] / 1000.0)
+        maxh = max(bt["h_mm"] for bt in self.types) / 1000.0
+        us, vs = [], []
+        for a in along:
+            for c in cross:
+                for Z in (self.belt_top_m, self.belt_top_m + maxh):
+                    w = (np.array([c, a, Z]) if self._axis_i == 1
+                         else np.array([a, c, Z]))
+                    pc = R.T @ (w - t)
+                    if pc[2] <= 1e-6:
+                        continue
+                    uv = self.cam.K @ (pc / pc[2])
+                    us.append(uv[0]); vs.append(uv[1])
+        if len(us) < 4:
+            return None
+        H, W = shape[0], shape[1]
+        M = 25                              # 픽셀 여유
+        self._roi = (max(0, int(min(us)) - M), max(0, int(min(vs)) - M),
+                     min(W, int(max(us)) + M), min(H, int(max(vs)) + M))
+        self.get_logger().info("픽업 ROI 확정 %s (팔레트 등 시야 밖 배제)"
+                               % (self._roi,))
+        return self._roi
+
     def _on_image(self, bgr, header):
         t = self._now()
         if not self._idle or (t - self._last) < self._min_dt:
             return
         self._last = t
+
+        # ── 픽업 창 밖(팔레트 쪽)을 지우고 검출한다 (_pickup_roi 주석) ──
+        roi = self._pickup_roi(header, bgr.shape)
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            m = np.zeros_like(bgr)
+            m[y0:y1, x0:x1] = bgr[y0:y1, x0:x1]
+            bgr = m
 
         det = find_box(bgr)
         if det is None:
@@ -689,7 +785,9 @@ class ZoneDetector(Node):
         out = box_pose_from_corners(det["corners_px"], self.cam.K, R, t_vec,
                                     self.belt_top_m, self.types)
         if out is None and not self.xcheck.on:
-            self.get_logger().warn("사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다")
+            self.get_logger().warn(
+                "사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다 [실측 %s]"
+                % (_geo.LAST_REJECT or "?"))
             self._publish_absent()
             return
 
@@ -735,6 +833,25 @@ class ZoneDetector(Node):
         #   토픽에 실을 때 여기서 한 번만 mm 로 바꾼다.
         #   z 는 싣지 않는다 — 벨트 상면(800mm)은 고정이라 관제탑이 안다.
         cx, cy, cz = out["center_m"]
+
+        # ── 스토퍼 창·자리잡음 필터 (__init__ 주석 참조) ──
+        _now = time.monotonic()
+        _cur = (m_to_mm(cx), m_to_mm(cy), round(float(out["yaw_deg"]), 1))
+        if self._stab_first is None:
+            self._stab_first = _now
+        _force = (_now - self._stab_first) > 15.0
+        _prev, self._stab_prev = self._stab_prev, _cur
+        if not _force:
+            if out["center_m"][self._axis_i] < self._win_m:
+                return                   # 아직 스토퍼에 도착 전 — 보고하지 않는다
+            if (_prev is None or abs(_prev[0] - _cur[0]) > 5
+                    or abs(_prev[1] - _cur[1]) > 5
+                    or abs(_prev[2] - _cur[2]) > 1.5):
+                return                   # 아직 자리잡는 중 — 다음 추론에서 다시
+        elif not self._present:
+            self.get_logger().warn(
+                "15초째 창밖/불안정 — 강제 보고 (집기 실패하면 관제탑 상한이 치운다)")
+
         self.pub.publish(BoxAtPickup(
             present=True, box_id=box_id,
             x_mm=m_to_mm(cx), y_mm=m_to_mm(cy),
@@ -791,6 +908,8 @@ class ZoneDetector(Node):
         if self._present:
             self.get_logger().info("픽업 자리 비었다")
         self._present, self._seen = False, None
+        # ★ 필터 상태도 함께 리셋 — 다음 박스를 새 박스로 본다 (창·안정 필터)
+        self._stab_prev = self._stab_first = None
         self.pub.publish(BoxAtPickup(present=False, box_id=""))
 
 

@@ -69,6 +69,22 @@ SERVICES = [
 #   구역 문자는 관제탑과 같게 **소문자**로 맞춘다 (`self.zone = str(zone).lower()`).
 CMD_TOPIC_FMT = "/zone_%s/robot/cmd"
 EVT_TOPIC_FMT = "/zone_%s/robot/event"
+# ★★ **임시 대역** — 씬에 카메라 prim 이 아직 하나도 없다 (2026-08-26, 89 개 삭제).
+#   §3-2 정본은 이 토픽을 **인식 노드(트랙 D)** 가 낸다. 여기서 내는 것은 계약 위반이
+#   아니라 **대역**이다 — 카메라가 들어오면 `PL_GTPICK=0` 으로 끄고 인식 노드로 돌린다.
+#   끄지 않고 둘 다 켜면 발행자가 둘이라 관제탑이 두 좌표를 번갈아 받는다.
+#
+#   왜 필요한가: 이 한 토픽이 없으면 관제탑이 **영원히 IDLE** 이라 그 뒤 사슬
+#   (algo · db · 로봇 · 반출)이 통째로 안 돈다. 카메라를 기다리는 동안 나머지를
+#   못 재는 것이 더 큰 손해다.
+PICK_TOPIC_FMT = "/zone_%s/box_at_pickup"
+# ★ PL_GTPICK=2 — **신원 대역 모드** (2026-08-27 김병직 설계).
+#   풀 비전에서 좌표는 존 인식 카메라가 내지만, 픽업 카메라로 박스 윗면 QR 을
+#   읽는 건 사양(§5) 밖이고 실측도 실패한다 (3/202). 신원은 씬 실측이 계속
+#   내되 **다른 토픽**으로 낸다 — 관제탑이 "좌표=카메라 · 신원=이 토픽" 으로
+#   합친다. 같은 토픽에 발행자 둘이 서는 사고(§ gtpick 주석)가 원천 차단된다.
+if os.environ.get("PL_GTPICK") == "2":
+    PICK_TOPIC_FMT = "/zone_%s/box_ident"
 
 
 def cmd_topic(zone):
@@ -77,6 +93,10 @@ def cmd_topic(zone):
 
 def evt_topic(zone):
     return EVT_TOPIC_FMT % str(zone).lower()
+
+
+def pick_topic(zone):
+    return PICK_TOPIC_FMT % str(zone).lower()
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.
 _OG_TYPE = {
@@ -98,9 +118,26 @@ HANDLERS = {}
 #   둘 다 **에러 없이 엉뚱하게 도는** 종류다.
 # 보낼 RobotEvent 대기열 {zone: [ev, ...]}. send_event() 가 넣고 EventGate 가 비운다.
 _EVENTS = {}
+# 보낼 BoxAtPickup {zone: fields}. **큐가 아니라 최신값 한 벌**이다 —
+#   도착은 상태이지 사건이 아니라서, 밀리면 낡은 좌표를 뒤늦게 내보내게 된다.
+#   관제탑도 같은 박스를 여러 번 받는 것을 전제로 만들어져 있다
+#   (orchestrator_node.on_box_arrived: "detector 는 5Hz 폴링이라 여러 번 알린다").
+_PICKUPS = {}
+# ★★ 서비스별 요청 필드 {key: [이름, ...]}. **모듈에 둬야 한다** (2026-08-26 실측).
+#   예전에는 생성한 스크립트의 **최상단**에 `_FIELDS = [...]` 로 박았는데,
+#   Isaac 의 ScriptNode 들은 최상단 네임스페이스를 **공유**한다 — 나중에 실행된
+#   스크립트의 `_FIELDS` 가 앞의 것을 통째로 덮었다. 증상:
+#       [ros_graph] !! set_velocity 요청 필드를 못 읽었다: box_id(AttributeError...)
+#       [ros_side]  h_set_velocity 실패: bad mps   받은 요청={}
+#   `box_id` 는 DespawnBox 필드다. 이름(`{key}`)은 f-string 으로 박혀 맞게 찍히는데
+#   필드만 남의 것이라, 로그만 봐서는 "왜 mps 가 나쁘지" 로만 보인다.
+#   -> 키로 찾으면 네임스페이스가 겹쳐도 안 섞인다.
+_SRV_FIELDS = {}
 _state = {"wired": False, "zones": [], "seen_seq": {}}
 # 디버그 출력 (환경변수 PL_ROSGRAPH_DEBUG=1)
 DEBUG = os.environ.get("PL_ROSGRAPH_DEBUG") == "1"
+# 픽업 좌표를 씬 실측(ground truth)으로 대신 낼지. 카메라가 들어오면 0 으로 끈다.
+GT_PICK = os.environ.get("PL_GTPICK", "1") != "0"
 
 
 def set_handlers(**fns):
@@ -129,6 +166,15 @@ def send_event(zone=None, **fields):
       바깥에서 Publisher 입력만 써 두면 언제 나갈지가 틱 순서에 좌우된다.
     """
     _EVENTS.setdefault(_one_zone(zone), []).append(dict(fields))
+
+
+def send_pickup(zone=None, **fields):
+    """BoxAtPickup 최신값을 갈아 끼운다. 실제 발행은 다음 틱의 EventGate 가 한다.
+
+    ★ `send_event` 와 달리 **덮어쓴다.** 도착은 사건이 아니라 상태다 — 큐로 쌓으면
+      박스가 이미 떠난 뒤에 낡은 좌표가 뒤늦게 나간다.
+    """
+    _PICKUPS[_one_zone(zone)] = dict(fields)
 
 
 def take_cmd(zone=None):
@@ -225,14 +271,49 @@ def build_clock_tf(cfg, log=print):
     g = str(ros.get("graph_path", "/World/ROS2Bridge"))
     st = omni.usd.get_context().get_stage()
 
+    # ★★ PL_CLOCKTF=2 — 씬 노드와 무관하게 **우리가 낸다** (2026-08-27).
+    #   PL_CAMROS=2 와 같은 사연이다: 씬에 /World/ROS2Bridge/Clock 노드가
+    #   생겼는데(setup_test3_scene [11] 적용본) 실측은 발행자 0 이다 —
+    #   ros2 topic info /clock → Publisher 0 · Subscription 3, /tf 는 토픽조차
+    #   없음 (2026-08-27 새벽). 노드만 보고 비켜서면 **아무도 안 낸다.**
+    #   씬 그래프와 경로가 겹치지 않게 별도 경로에 세운다.
+    _force = os.environ.get("PL_CLOCKTF") == "2"
+    if _force:
+        g = GRAPH + "_ClockTf"
+        log("[ros_graph] PL_CLOCKTF=2 — 씬 노드와 무관하게 /clock·/tf 를 우리가 낸다")
+
     # 씬이 이미 내고 있나. 그래프 경로가 다를 수 있으니 **노드 타입으로** 훑는다.
-    for prim in st.Traverse():
-        if prim.GetTypeName() == "OmniGraphNode":
-            t = prim.GetAttribute("node:type")
-            if t and str(t.Get() or "").endswith("ROS2PublishClock"):
-                log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다"
-                    % prim.GetPath())
-                return "scene"
+    scene_clock = scene_tf = None
+    if not _force:
+        for prim in st.Traverse():
+            if prim.GetTypeName() == "OmniGraphNode":
+                t = str((prim.GetAttribute("node:type").Get()
+                         if prim.GetAttribute("node:type") else "") or "")
+                if t.endswith("ROS2PublishClock"):
+                    scene_clock = prim
+                elif t.endswith("ROS2PublishTransformTree"):
+                    scene_tf = prim
+    if scene_clock is not None:
+        log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다" % scene_clock.GetPath())
+        # ★★ 비켜서기 **전에** 광학 프레임을 씬의 tf 에 붙인다 (2026-08-26).
+        #   예전에는 여기서 바로 돌아가서, 씬이 /clock 을 내는 순간 광학 프레임
+        #   생성까지 같이 사라졌다 — 그러면 이미지 frameId 를 아무리 맞게 줘도
+        #   tf 에 그 프레임이 없어 인식이 전부 "평면이 카메라 뒤" 로 죽는다.
+        if scene_tf is not None:
+            try:
+                opts = _ensure_optical_frames(cfg, st, log)
+                rel = scene_tf.GetRelationship("inputs:targetPrims")
+                tg = list(rel.GetTargets())
+                added = [o for o in opts if Sdf.Path(o) not in tg]
+                if added:
+                    rel.SetTargets(tg + [Sdf.Path(o) for o in added])
+                    log("[ros_graph] 씬 tf 에 광학 프레임 %d 개 추가: %s"
+                        % (len(added), ", ".join(a.rsplit("/", 1)[-1] for a in added)))
+            except Exception as e:                              # noqa: BLE001
+                log("[ros_graph] !! 씬 tf 에 광학 프레임을 못 붙였다: %r" % (e,))
+        else:
+            log("[ros_graph] ⚠ 씬에 tf 발행 노드가 없다 — 광학 프레임을 못 붙인다")
+        return "scene"
 
     K, c = og.Controller.Keys, og.Controller
     NS = "isaacsim.ros2.bridge."
@@ -289,20 +370,12 @@ def build_clock_tf(cfg, log=print):
         (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
 
     # ★★ 카메라 **광학 프레임**도 여기서 만든다 — 이미지를 누가 쏘든 필요하다.
-    #   원래 `build_cameras` 안에 있었는데, 씬이 카메라를 쏘기 시작하면 그 함수가
-    #   통째로 비켜서면서 **광학 프레임까지 같이 사라졌다.** 그러면 씬 쪽 카메라가
-    #   `frameId` 를 아무리 맞게 줘도 tf 에 그 프레임이 없어 인식이 죽는다.
     #   tf 는 이미지 발행자와 **독립**이므로 여기가 맞는 자리다.
-    for tp in list(tgts):
-        if "/CamPick_" not in tp:
-            continue
-        opt = "%s/%s_optical" % (tp, tp.rsplit("/", 1)[-1])
-        try:
-            _make_optical_frame(st, opt, tp + "/Camera")
-            if opt not in tgts:
-                tgts.append(opt)
-        except Exception as e:                                  # noqa: BLE001
-            log("[ros_graph] !! 광학 프레임 %s 실패: %r" % (opt, e))
+    #   2026-08-26: `cameras.pick_prim` 설정 기준으로 바꿨다 (rsd455 리그 대응) —
+    #   옛 `/CamPick_*` 하드코딩은 씬에서 지워진 이름이다.
+    for opt in _ensure_optical_frames(cfg, st, log):
+        if opt not in tgts:
+            tgts.append(opt)
 
     tf_node.GetRelationship("inputs:targetPrims").SetTargets(
         [Sdf.Path(t) for t in tgts])
@@ -313,6 +386,43 @@ def build_clock_tf(cfg, log=print):
     if miss:
         log("   ⚠ 씬에 없어 뺀 prim: %s" % ", ".join(miss))
     return "built"
+
+
+def _ensure_optical_frames(cfg, stage, log=print):
+    """설정의 카메라 렌즈마다 **광학 프레임** 자식을 만들고 경로 목록을 돌려준다.
+
+    ★ 2026-08-26 rsd455 리그 대응. 두 가지가 옛 방식과 다르다:
+      · 프레임 이름이 **리그 이름**에서 온다 (`rsd455_a_optical`). 렌즈 prim 이름
+        (`RSD455`)으로 지으면 A·B·C 가 **전부 같은 프레임명**이 되어 tf 가 겹친다
+        — 프레임 이름은 prim 이름이기 때문이다.
+      · 광학 프레임을 **렌즈 prim 의 자식**으로 둔다. 그러면 렌즈의 자세·오프셋을
+        그대로 상속해 dz 보정이 필요 없다 (옛 `_make_optical_frame` 의 14.5 mm
+        수동 보정은 형제 관계였을 때 이야기다).
+    """
+    from pxr import Gf, Sdf, UsdGeom
+    cams = (cfg.get("cameras") or {})
+    lens_paths = list((cams.get("pick_prim") or {}).values())
+    for k in ("spawn_prim", "line2_prim"):
+        v = cams.get(k)
+        if v:
+            lens_paths.append(str(v))
+    out = []
+    for lens in lens_paths:
+        prim = stage.GetPrimAtPath(str(lens))
+        if not prim or not prim.IsValid():
+            log("[ros_graph] !! 카메라 %s 가 씬에 없다 — 광학 프레임 생략" % lens)
+            continue
+        # 리그 이름 = /World 바로 아래 요소 (rsd455_a · CamPick_A ...)
+        parts = str(lens).strip("/").split("/")
+        rig = parts[1] if len(parts) > 1 else parts[-1]
+        opt = "%s/%s_optical" % (lens, rig)
+        if not stage.GetPrimAtPath(opt).IsValid():
+            xf = UsdGeom.Xform.Define(stage, opt)
+            xf.ClearXformOpOrder()
+            # X 축 180도: USD 카메라(-Z 시선) -> ROS 광학(+z 전방)
+            xf.AddOrientOp().Set(Gf.Quatf(0.0, Gf.Vec3f(1.0, 0.0, 0.0)))
+        out.append(opt)
+    return out
 
 
 def _make_optical_frame(stage, path, cam_path):
@@ -369,20 +479,35 @@ def build_cameras(cfg, zones, log=print):
     """
     import omni.usd
 
+    # ★ PL_CAMROS=0 — 카메라 발행을 **아예 안 만든다** (2026-08-27).
+    #   렌더 프로덕트는 발행 주기와 무관하게 **렌더 프레임마다** GPU 로 그려져서,
+    #   1280x720 5 대가 프레임당 약 33 ms 를 먹었다 (실측 — 렌더 스킵 2 로도
+    #   벽시계 1.0 배속에 묶인 원인). vision:=false + gtpick 대역으로 도는 동안은
+    #   이미지 소비자가 없으니 끄는 게 순이득이다. 카메라 붙일 때 2 로 되돌릴 것.
+    if os.environ.get("PL_CAMROS") == "0":
+        log("[ros_graph] PL_CAMROS=0 — 카메라 발행 없음 (렌더 비용 절감)")
+        return 0
+
     rec = (cfg.get("recognition") or {})
     res = list(rec.get("resolution") or [1280, 720])
     st = omni.usd.get_context().get_stage()
 
     # 씬이 이미 카메라를 쏘고 있으면 비켜선다 (/clock 과 같은 이유 — 발행자 2 개면
     # vision 이 두 이미지를 번갈아 받아 tf 시각이 어긋난다).
-    for prim in st.Traverse():
-        if prim.GetTypeName() == "OmniGraphNode":
-            t = prim.GetAttribute("node:type")
-            if t and str(t.Get() or "").endswith("ROS2CameraHelper"):
-                log("[ros_graph] 픽업 카메라는 씬이 쏜다 (%s) — 건너뛴다.\n"
-                    "   ⚠ 씬 쪽 `frameId` 는 **CamPick_*_optical** 이어야 한다"
-                    " (프레임은 이미 tf 에 올라가 있다)" % prim.GetPath())
-                return 0
+    # ★★ PL_CAMROS=2 는 **강제**다 (2026-08-26). 씬에 `RGBPublish` 노드가 있는데
+    #   실제로는 토픽이 하나도 안 나오는 상태를 실측했다 — 노드만 보고 비켜서면
+    #   **둘 다 안 쏘는** 상태가 된다. 씬 노드가 진짜로 쏘는지는 빌드 시점에
+    #   알 수 없으므로(rclpy 없음), 사람이 `ros2 topic list` 로 확인하고 강제한다.
+    if os.environ.get("PL_CAMROS") != "2":
+        for prim in st.Traverse():
+            if prim.GetTypeName() == "OmniGraphNode":
+                t = prim.GetAttribute("node:type")
+                if t and str(t.Get() or "").endswith("ROS2CameraHelper"):
+                    log("[ros_graph] 픽업 카메라는 씬이 쏜다 (%s) — 건너뛴다.\n"
+                        "   ⚠ 토픽이 실제로 안 나오면 PL_CAMROS=2 로 강제할 것" % prim.GetPath())
+                    return 0
+    else:
+        log("[ros_graph] PL_CAMROS=2 — 씬 노드와 무관하게 우리가 쏜다")
 
     try:
         import omni.replicator.core as rep
@@ -398,12 +523,62 @@ def build_cameras(cfg, zones, log=print):
     K, c = og.Controller.Keys, og.Controller
     NS = "isaacsim.ros2.bridge."
     made = 0
+    # ★ 2026-08-26 — prim 경로는 **설정이 정본**이다. 옛 `/World/CamPick_A/Camera`
+    #   는 씬에서 지워졌다 (카메라 89 개 삭제 후 rsd455 리그 5 대 설치, PR #33).
+    #   `cameras.pick_prim.{A,B,C}` 가 그 리그의 Color 렌즈를 가리킨다.
+    cams_cfg = (cfg.get("cameras") or {})
+    pick_prims = (cams_cfg.get("pick_prim") or {})
+
+    # ★ 픽업 리그 정렬 (2026-08-27 김병직 — 풀 비전 5호 실패의 처방).
+    #   카메라가 스토퍼를 비껴 보면 키 큰 박스(5호 340mm)는 옆면까지 실루엣에
+    #   잡혀 치수 맞춤(허용 60mm)이 터진다 — 실측: 3·4호 통과(6.4~9.5mm),
+    #   5호 성공 0/443. 리그를 **스토퍼 박스 중심 바로 위**로 옮기면 옆면이
+    #   사라진다 (오프셋 60mm/높이 1.16m ≈ 3도). USD 는 안 건드린다 —
+    #   런타임 이동이라 되돌리기는 오버레이 키를 빼면 끝이다.
+    #   ⚠ 회전은 안 만진다 — 리그 내부 자세(하향)를 그대로 쓴다.
+    _align = cams_cfg.get("align_pick_z_mm")
+    if _align:
+        from pxr import Gf, UsdGeom
+        _stop_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        _half = max(max(t["w_mm"], t["d_mm"]) for t in cfg["boxes"]["types"]) / 2000.0
+        _cross = (cfg["zones"].get("pickup_cross_mm") or {})
+        _ax_y = str(cfg["conveyor"].get("pickup_axis", "x")).lower() == "y"
+        for z in zones:
+            cw = _cross.get(str(z).upper())
+            lens = pick_prims.get(str(z).upper())
+            if not cw or not lens:
+                continue
+            rig_path = "/" + "/".join(lens.strip("/").split("/")[:2])
+            rig = st.GetPrimAtPath(rig_path)
+            if not rig.IsValid():
+                continue
+            cm = (cw[0] + cw[1]) / 2000.0
+            tgt_along = _stop_m - _half          # 5호가 스토퍼에 닿았을 때 중심
+            pos = (Gf.Vec3d(cm, tgt_along, _align / 1000.0) if _ax_y
+                   else Gf.Vec3d(tgt_along, cm, _align / 1000.0))
+            xf = UsdGeom.Xformable(rig)
+            _ops = {o.GetOpName(): o for o in xf.GetOrderedXformOps()}
+            _op = _ops.get("xformOp:translate") or xf.AddTranslateOp()
+            _op.Set(pos)
+            log("[ros_graph] 픽업 리그 정렬 %s -> (%.0f, %.0f, %.0f) mm"
+                % (rig_path, pos[0] * 1000, pos[1] * 1000, pos[2] * 1000))
+
+    targets = []
     for z in zones:
-        zl = str(z).lower()
-        cam_prim = "/World/CamPick_%s" % str(z).upper()
-        cam_path = cam_prim + "/Camera"
+        zu = str(z).upper()
+        targets.append(("Cam_%s" % zu, "/pick_cam_%s" % zu.lower(),
+                        pick_prims.get(zu) or "/World/CamPick_%s/Camera" % zu))
+    # ★ 라인 카메라 2대 (2026-08-27, 김병직 지시 — vision:=true 전환 준비).
+    #   cam1(투입부 등록)·cam2(검증). vision_node 의 cam1_ns/cam2_ns 기본값이
+    #   /cam1·/cam2 라 네임스페이스를 거기 맞춘다. 렌즈 경로는 설정이 정본
+    #   (rsd455_1/_2 리그) — 광학 프레임은 build_clock_tf 가 이미 tf 에 넣었다.
+    if cams_cfg.get("spawn_prim"):
+        targets.append(("Cam_L1", "/cam1", str(cams_cfg["spawn_prim"])))
+    if cams_cfg.get("line2_prim"):
+        targets.append(("Cam_L2", "/cam2", str(cams_cfg["line2_prim"])))
+    for gname, ns, cam_path in targets:
         if not st.GetPrimAtPath(cam_path).IsValid():
-            log("[ros_graph] !! %s 가 씬에 없다 — 존 %s 카메라 생략" % (cam_path, zl))
+            log("[ros_graph] !! %s 가 씬에 없다 — %s 카메라 생략" % (cam_path, ns))
             continue
         try:
             rp = rep.create.render_product(cam_path, tuple(int(v) for v in res))
@@ -429,16 +604,20 @@ def build_cameras(cfg, zones, log=print):
         #   프림 이름 그대로 프레임을 내 준다 — 노드를 새로 안 붙여도 된다.
         #   ★ 프레임 자체는 `build_clock_tf` 가 이미 만들어 tf 에 넣어 뒀다
         #     (누가 이미지를 쏘든 필요해서 그쪽으로 옮겼다). 여기서는 이름만 쓴다.
-        opt_path = "%s/%s_optical" % (cam_prim, cam_prim.rsplit("/", 1)[-1])
+        # ★ 광학 프레임 이름은 `_ensure_optical_frames` 와 같은 규칙이다 —
+        #   **리그 이름**(=/World 바로 아래)에서 온다. 렌즈 prim 이름(`RSD455`)으로
+        #   지으면 A·B·C 가 전부 같은 프레임명이 되어 tf 가 겹친다.
+        _parts = cam_path.strip("/").split("/")
+        _rig = _parts[1] if len(_parts) > 1 else _parts[-1]
+        opt_path = "%s/%s_optical" % (cam_path, _rig)
         if st.GetPrimAtPath(opt_path).IsValid():
             frame = opt_path.rsplit("/", 1)[-1]
         else:
             log("[ros_graph] !! 광학 프레임 %s 이 없다 — prim 프레임을 쓴다."
                 " 인식이 실패할 것이다 (build_clock_tf 를 먼저 불렀나?)" % opt_path)
-            frame = cam_prim.rsplit("/", 1)[-1]
+            frame = _rig
 
-        g = "%s/Cam_%s" % (GRAPH, str(z).upper())
-        ns = "/pick_cam_%s" % zl
+        g = "%s/%s" % (GRAPH, gname)
         try:
             c.edit(
                 {"graph_path": g, "evaluator_name": "execution"},
@@ -463,7 +642,7 @@ def build_cameras(cfg, zones, log=print):
                      ("Info.inputs:nodeNamespace", ns),
                      ("Info.inputs:topicName", "camera_info")]})
         except Exception as e:                                  # noqa: BLE001
-            log("[ros_graph] !! 존 %s 카메라 그래프 실패: %r" % (zl, e))
+            log("[ros_graph] !! %s 카메라 그래프 실패: %r" % (ns, e))
             continue
         made += 1
         log("[ros_graph] 카메라 %s -> %s/rgb + /camera_info  (frameId %s · %dx%d)"
@@ -495,6 +674,7 @@ def build(zone="B", zones=None):
     _state["zones"] = zlist
     for z in zlist:
         _EVENTS.setdefault(z, [])
+        _PICKUPS.setdefault(z, None)
         _state["seen_seq"].setdefault(z, None)
 
     nodes = [("Tick", "omni.graph.action.OnPlaybackTick"),
@@ -541,6 +721,22 @@ def build(zone="B", zones=None):
                  ("Ctx.outputs:context", f"{pub}.inputs:context"),
                  # ★ EvtPub 은 Tick 이 아니라 게이트가 친다.
                  ("EvtGate.outputs:execOut", f"{pub}.inputs:execIn")]
+
+        # ── 임시 대역: 픽업 좌표 발행 ────────────────────────
+        # ★★ **새 ScriptNode 를 Tick 에 달지 않는다.** 위 주석의 실측대로 Tick 에
+        #   ScriptNode 를 여럿 매달면 첫 틱 뒤로 하나만 살아남는다. 그래서 이 발행도
+        #   기존 EvtGate 하나가 같이 맡는다 — 노드는 Publisher 만 는다.
+        if GT_PICK:
+            ppub = f"PickPub_{z}"
+            nodes += [(ppub, "isaacsim.ros2.bridge.ROS2Publisher")]
+            values += [
+                (f"{ppub}.inputs:topicName", pick_topic(z)),
+                (f"{ppub}.inputs:messagePackage", PKG),
+                (f"{ppub}.inputs:messageSubfolder", "msg"),
+                (f"{ppub}.inputs:messageName", "BoxAtPickup"),
+            ]
+            conn += [("Ctx.outputs:context", f"{ppub}.inputs:context"),
+                     ("EvtGate.outputs:execOut", f"{ppub}.inputs:execIn")]
 
     for key, srv, path in SERVICES:
         r, s, g = f"{key}_Req", f"{key}_Res", f"{key}_Fn"
@@ -614,12 +810,13 @@ def _service_script(key, srv):
     """
     req_fields, _ = srv_fields(srv)
     names = [f for f, t in req_fields if t in _OG_TYPE]
+    # ★ 스크립트 최상단이 아니라 **모듈 표**에 넣는다 (`_SRV_FIELDS` 주석 참조).
+    _SRV_FIELDS[key] = names
     return f'''
 import importlib
 import omni.graph.core as _og
 
 _M = importlib.import_module("{__name__}")
-_FIELDS = {names!r}
 
 def setup(db): pass
 
@@ -628,9 +825,18 @@ def compute(db):
     #   핸들러는 **즉시 반환**해야 한다 — 오래 걸리는 일은 큐에 넣고 돌아온다.
     req = {{}}
     _miss = []
-    for f in _FIELDS:
+    # ★★ 값은 **Req 노드의 outputs:Request:<필드>** 에서 직접 읽는다 (2026-08-27).
+    #   `db.inputs.<필드>` 는 string 은 전달되는데 **float32 는 연결값이 안 오고
+    #   기본값 0.0 이 나온다** — 실측: 재가동 set_velocity(0.5) 가 왕복은 되는데
+    #   항상 0.0 으로 처리됐다. 정지(0.0)만 있던 동안은 증상이 안 보였다
+    #   ("bad mps 수정 이후 성공" 도 전부 0.0 이었다). Req 출력을 직접 읽으면
+    #   연결 전달에 의존하지 않는다.
+    _rq = _og.Controller.node(_M.GRAPH + "/{key}_Req")
+    # ★ 모듈 표에서 **내 것만** 꺼낸다. 최상단 변수로 두면 다른 ScriptNode 가 덮는다.
+    for f in _M._SRV_FIELDS.get("{key}", []):
         try:
-            v = getattr(db.inputs, f)
+            _at = _og.Controller.attribute("outputs:Request:" + f, _rq)
+            v = _at.get() if _at is not None else getattr(db.inputs, f)
         except Exception as e:
             # ★ 조용히 넘기면 안 된다. 필드 하나가 빠지면 핸들러가
             #   "bad mps" 같은 **엉뚱한 사유**로 실패하고, 진짜 원인(그 필드를
@@ -680,21 +886,22 @@ def _event_gate_script(zones):
       없는 구역은 직전 값을 다시 쏘는데, 관제탑이 `seq` 로 거르므로(§3-4 규약 2)
       문제가 되지 않는다 — 애초에 EvtPub 이 매 틱 다시 쏘고 있어서 달라지는 것도 없다.
     """
-    zl = ", ".join('"%s"' % str(z).upper() for z in zones)
     return f'''
 import importlib
 import omni.graph.core as _og
 
 _M = importlib.import_module("{__name__}")
-_ZONES = [{zl}]
+# ★ 최상단에 `_ZONES = [...]` 같은 이름을 두지 않는다 — ScriptNode 들이 최상단 네임스페이스를
+#   공유해서 서로 덮는다 (`_SRV_FIELDS` 주석의 set_velocity 사고와 같은 부류).
+#   지금은 게이트가 하나뿐이라 안 겹치지만 같은 함정을 남겨 두지 않는다.
 
 def setup(db):
     if _M.DEBUG:
-        print("[ros_graph] gate setup — 구역 %s" % _ZONES)
+        print("[ros_graph] gate setup — 구역 %s" % _M._state["zones"])
 
 def compute(db):
     _any = False
-    for _z in _ZONES:
+    for _z in _M._state["zones"]:
         q = _M._EVENTS.get(_z) or []
         if not q:
             continue
@@ -709,6 +916,32 @@ def compute(db):
             except Exception:
                 print("[ros_graph] %s RobotEvent 필드 %r 를 못 씀 — 계약 확인" % (_z, k))
         _any = True
+
+    # ── 임시 대역: 픽업 좌표 ────────────────────────────────
+    # ★ 이벤트와 달리 **큐가 아니라 최신값**이다. 매 틱 같은 값을 다시 써도 되고,
+    #   그래야 관제탑이 늦게 떠도 도착을 놓치지 않는다 (5Hz 폴링과 같은 모양).
+    # ★ 여기서 _any 를 같이 올린다 — 안 올리면 로봇 이벤트가 없는 동안
+    #   execOut 이 DISABLED 라 **픽업이 한 번도 안 나간다.**
+    if _M.GT_PICK:
+        for _z in _M._state["zones"]:
+            pk = _M._PICKUPS.get(_z)
+            if not pk:
+                continue
+            node = _og.Controller.node(_M.GRAPH + "/PickPub_" + _z)
+            for k, v in pk.items():
+                try:
+                    _og.Controller.attribute("inputs:" + k, node).set(v)
+                except Exception:
+                    print("[ros_graph] %s BoxAtPickup 필드 %r 를 못 씀 — 계약 확인"
+                          % (_z, k))
+            # ★★ 쓰고 나면 **비운다** (2026-08-26). 안 비우면 값이 계속 남아
+            #   게이트가 **매 틱** ENABLED 가 되고, 그러면 EvtPub 까지 같이 켜져
+            #   낡은 RobotEvent 가 매 틱 재방송된다. 관제탑이 seq 로 거르긴 하지만
+            #   `지난 명령의 결과 무시` 경고가 초당 수십 줄씩 쏟아져 로그를 덮는다.
+            #   `_GtPick` 이 0.2 초마다 다시 채우므로 발행은 의도대로 5 Hz 다.
+            _M._PICKUPS[_z] = None
+            _any = True
+
     # ⚠ 새 이벤트가 없어도 EvtPub 은 어차피 매 틱 마지막 값을 다시 쏜다 (미해결).
     #   관제탑은 seq 로 거른다. 여기서 DISABLED 를 걸어도 안 막혔다 — 실측.
     #   ★ False 를 돌려주면 **게이트가 다음 틱부터 안 돈다.** 절대 그러지 말 것.

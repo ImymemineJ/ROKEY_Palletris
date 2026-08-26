@@ -92,9 +92,65 @@ class DbService(Node):
         self._max_retry = int(self.cfg["recognition"]["max_retry"])
 
         # ── DB ──
-        self.db = sqlite3.connect(self.db_path, check_same_thread=False)
+        # ★★ 커넥션 접근 **전부** 직렬화 (2026-08-27, 김병직 — 세그폴트 실측).
+        #   원래는 "쓰기만 Lock" 이었는데 읽기(SELECT)가 락 밖에서 같은 커넥션을
+        #   동시에 썼다. 평소엔 경합이 드물어 버텼지만, cam1 SIZE_MISMATCH 홍수
+        #   (report_miss 1200건+/10분)가 읽기·쓰기 동시 접근을 상시화하자
+        #   프로세스가 exit -11 (네이티브 세그폴트) 로 죽었다 — DB 가 죽으면
+        #   관제탑 3존이 전부 "서비스 없음" 으로 서고 라인이 통째로 멈춘다.
+        #   커넥션을 RLock 프록시로 감싸 execute/commit 이 항상 락 안에서 돈다.
+        #   기존 `with self._w:` 블록은 RLock 이라 그대로 둬도 재진입만 된다.
+        _conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        _lk = threading.RLock()
+
+        class _Rows:
+            """락 **안에서** 미리 읽어 둔 결과 (2026-08-27 2차 수정).
+
+            1차 수정은 execute 만 락으로 감쌌는데, 커서를 돌려주고 락을 푼 뒤
+            호출부가 fetchone() 을 불렀다 — 그 틈에 다른 스레드의 commit() 이
+            커서를 리셋해 COUNT(*) 의 fetchone 이 None 이 됐다 (int(None)
+            TypeError 로 프로세스 사망, 실측). execute 시점에 결과를 다 읽어
+            평범한 리스트로 들고 있으면 커서 수명 문제가 사라진다.
+            이 파일의 사용처는 fetchone()/rowcount 뿐이다 (전수 확인)."""
+            def __init__(self, rows, rowcount, lastrowid):
+                self._rows, self.rowcount, self.lastrowid = rows, rowcount, lastrowid
+                self._i = 0
+
+            def fetchone(self):
+                if self._i < len(self._rows):
+                    self._i += 1
+                    return self._rows[self._i - 1]
+                return None
+
+            def fetchall(self):
+                out, self._i = self._rows[self._i:], len(self._rows)
+                return out
+
+        class _LockedConn:
+            """sqlite3 Connection 의 스레드 직렬화 프록시 (위 주석 참조)."""
+            def __init__(self, conn, lock):
+                self._c, self._lk = conn, lock
+
+            def execute(self, *a, **k):
+                with self._lk:
+                    cur = self._c.execute(*a, **k)
+                    rows = cur.fetchall() if cur.description is not None else []
+                    return _Rows(rows, cur.rowcount, cur.lastrowid)
+
+            def executescript(self, *a, **k):
+                with self._lk:
+                    return self._c.executescript(*a, **k)
+
+            def commit(self):
+                with self._lk:
+                    return self._c.commit()
+
+            def __getattr__(self, n):       # close 등 나머지는 그대로 위임
+                return getattr(self._c, n)
+
+        self.db = _LockedConn(_conn, _lk)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self._w = threading.Lock()          # 쓰기 직렬화
+        self._w = _lk                       # 쓰기 직렬화 (커넥션 락과 같은 것)
         self._ensure_schema()
 
         n = self.db.execute("SELECT COUNT(*) FROM boxes_master").fetchone()[0]

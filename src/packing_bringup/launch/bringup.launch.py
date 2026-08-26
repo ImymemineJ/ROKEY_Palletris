@@ -97,6 +97,15 @@ def generate_launch_description():
         DeclareLaunchArgument("algo", default_value="true"),
         DeclareLaunchArgument("db", default_value="true"),
         DeclareLaunchArgument("vision", default_value="true"),
+        # ★ 존 인식(픽업 좌표)만 따로 끄는 스위치 (2026-08-27 김병직).
+        #   기본값이 vision 과 같아서 안 주면 **기존 동작 그대로**다.
+        #   왜 필요한가: 픽업 카메라가 박스 윗면 QR 을 못 읽는다 (실측: 판독 실패
+        #   199 vs 성공 3 — 1280x720 로는 해상도가 부족). 라인 비전(cam1 등록 ·
+        #   cam2 검증)은 정상이므로, 존 좌표만 gtpick 대역(PL_GTPICK=1)에 맡기는
+        #   하이브리드로 돌릴 때 vision:=true vision_zone:=false 를 쓴다.
+        #   QR 해상도가 해결되면 이 인자는 안 줘도 된다.
+        DeclareLaunchArgument("vision_zone",
+                              default_value=LaunchConfiguration("vision")),
         # ── 깊이 교차검증 (트랙 D, 2026-08-26) ────────────────────────────
         # ★ 왜 launch 인자로 빼는가: 통합 중에 깊이가 말썽이면 **코드를 안 고치고**
         #   되돌릴 길이 있어야 한다. 깊이는 확인 채널이라 없어도 라인은 돈다.
@@ -181,7 +190,7 @@ def generate_launch_description():
                                 + [{"zone": z, "pick_cam_ns": c}],
                      arguments=cli,
                      additional_env=_overlay_env(),
-                     condition=IfCondition(LaunchConfiguration("vision")))
+                     condition=IfCondition(LaunchConfiguration("vision_zone")))
                 for z, c in zip(zs, cs)]
 
     return LaunchDescription(args + [GroupAction([
