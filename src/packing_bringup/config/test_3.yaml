@@ -70,7 +70,9 @@ conveyor:
     #   회전축(curve_dir)이 빠져 있던 것 (아래 loop.curve_dir 주석). 정본 0.2 로 둔다.
     /World/ConveyorTrack_05/ConveyorBeltGraph: 0.2    # X -21737~-3853 (+X) — 실측 1.4 m/s
     /World/ConveyorTrack_01/ConveyorBeltGraph: 0.5    # A02 커브
-    /World/ConveyorTrack_02/ConveyorBeltGraph: 0.3    # X -2967~-2064 (+Y)
+    # ★ 0.3 -> 0.5 (2026-08-27 새벽, 김병직). 커브(_04)에서 내려온 박스가
+    #   _02 진입부에서 정체되며 걸렸다 (화면 실측) — 받는 쪽이 느려서다.
+    /World/ConveyorTrack_02/ConveyorBeltGraph: 0.5    # X -2967~-2064 (+Y)
 
   # ── 순환 루프 고침 (2026-08-25 실측) ─────────────────────────────────────
   # 박스가 리턴 벨트에서 멈추던 것. 원인이 **6 개**였고 전부 실측으로 갈랐다.

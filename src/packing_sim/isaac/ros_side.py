@@ -179,7 +179,13 @@ class RosSide:
             #   소켓 스레드가 부르던 것과 같은 경로다.
             act = int(cmd.get("action", -1))
             seg = "%s_pickup" % self.zone.lower()
-            if act == 0:                                        # PICK
+            # ★★ 기본은 **지선을 세우지 않는다** (2026-08-27, 김병직 증언 — 학민
+            #   작업 때 검증된 방식). 스토퍼가 박스를 물리로 잡으므로 벨트가 돌아도
+            #   되고, 돌아야 다음 박스가 로봇 작업 **중에** 가이드까지 내려온다.
+            #   부수 효과: 첫 박스가 지선 진입 판정을 빨리 넘어 소터 열림 시간이
+            #   줄고, 뒤차가 딸려 들어가는 확률도 준다.
+            #   흡착 중 끌림이 다시 보이면 PL_SPUR_STOP=1 로 정지 방식 복원.
+            if act == 0 and os.environ.get("PL_SPUR_STOP", "0") == "1":   # PICK
                 self.link.call(cmd="set_velocity", seg=seg, mps=0.0)
             ev = run_cmd(self.cycle, _clean(cmd), log=self.log)
             if act == 1:                                        # PLACE — 성공/실패 무관
