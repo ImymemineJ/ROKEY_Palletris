@@ -103,6 +103,29 @@ class DbService(Node):
         _conn = sqlite3.connect(self.db_path, check_same_thread=False)
         _lk = threading.RLock()
 
+        class _Rows:
+            """락 **안에서** 미리 읽어 둔 결과 (2026-08-27 2차 수정).
+
+            1차 수정은 execute 만 락으로 감쌌는데, 커서를 돌려주고 락을 푼 뒤
+            호출부가 fetchone() 을 불렀다 — 그 틈에 다른 스레드의 commit() 이
+            커서를 리셋해 COUNT(*) 의 fetchone 이 None 이 됐다 (int(None)
+            TypeError 로 프로세스 사망, 실측). execute 시점에 결과를 다 읽어
+            평범한 리스트로 들고 있으면 커서 수명 문제가 사라진다.
+            이 파일의 사용처는 fetchone()/rowcount 뿐이다 (전수 확인)."""
+            def __init__(self, rows, rowcount, lastrowid):
+                self._rows, self.rowcount, self.lastrowid = rows, rowcount, lastrowid
+                self._i = 0
+
+            def fetchone(self):
+                if self._i < len(self._rows):
+                    self._i += 1
+                    return self._rows[self._i - 1]
+                return None
+
+            def fetchall(self):
+                out, self._i = self._rows[self._i:], len(self._rows)
+                return out
+
         class _LockedConn:
             """sqlite3 Connection 의 스레드 직렬화 프록시 (위 주석 참조)."""
             def __init__(self, conn, lock):
@@ -110,7 +133,9 @@ class DbService(Node):
 
             def execute(self, *a, **k):
                 with self._lk:
-                    return self._c.execute(*a, **k)
+                    cur = self._c.execute(*a, **k)
+                    rows = cur.fetchall() if cur.description is not None else []
+                    return _Rows(rows, cur.rowcount, cur.lastrowid)
 
             def executescript(self, *a, **k):
                 with self._lk:
