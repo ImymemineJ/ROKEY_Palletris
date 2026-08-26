@@ -11,15 +11,19 @@ import pytest
 
 from packing_common.config import find_config, load
 from packing_db.delivery_points import APARTMENTS, DEPOT
-from packing_db.gen_master_db import ZONE_DONG, build, dong_of
+from packing_db.gen_master_db import build, dong_of
+from packing_db.master_data import load_zone_map
 
 CFG = load()
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(
     os.path.realpath(__file__))), "packing_db", "schema.sql")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture                       # ★ function 스코프 (2026-08-26)
 def db():
+    """★ 예전엔 scope="module" 이었다. 아래 test_unknown_dong_gets_no_zone 이
+    INSERT 후 손으로 DELETE 하는데, 그 사이 assert 가 깨지면 이후 테스트가 전부
+    오염된 DB 로 돈다. build() 는 수 ms 라 매번 새로 만드는 게 공짜다."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "t.db")
         rows = build(CFG, path, SCHEMA)
@@ -67,7 +71,7 @@ def test_zone_map_has_no_duplicate_dong(db):
     con, _ = db
     n = con.execute("SELECT COUNT(*) FROM zone_map").fetchone()[0]
     uniq = con.execute("SELECT COUNT(DISTINCT dong) FROM zone_map").fetchone()[0]
-    assert n == uniq == sum(len(v) for v in ZONE_DONG.values())
+    assert n == uniq == len(load_zone_map())
 
 
 def test_unknown_dong_gets_no_zone(db):
@@ -76,7 +80,7 @@ def test_unknown_dong_gets_no_zone(db):
     con.execute("INSERT INTO boxes_master(box_id, address, delivery_seq, zone) "
                 "VALUES('BOX99999', '서울 마포구 연남동 1-1', 999, 'B')")
     assert zone_of(con, "BOX99999") is None
-    con.execute("DELETE FROM boxes_master WHERE box_id='BOX99999'")
+    # ★ 손으로 지우지 않는다 — 픽스처가 function 스코프라 다음 테스트는 새 DB 다.
 
 
 def test_address_does_not_leak_the_answer(db):
@@ -120,7 +124,7 @@ def test_apartment_dongs_are_all_mapped():
 
     하나라도 빠지면 그 아파트로 가는 박스가 전부 RETURN 된다.
     """
-    mapped = {d for lst in ZONE_DONG.values() for _gu, d in lst}
+    mapped = {d for d, _z in load_zone_map()}
     missing = {d for d, _n, _la, _lo in APARTMENTS} - mapped
     assert not missing, f"zone_map 에 없는 동: {missing}"
 

@@ -11,6 +11,10 @@
   <license>Apache-2.0</license>
 
   <exec_depend>python3-yaml</exec_depend>
+  <!-- ★ paths.py 가 share 경로를 물을 때만 쓴다. 순수 파이썬이라 rclpy 를 안 끌어온다.
+       ROS 없는 환경(Isaac 내장 파이썬 · 맨 scripts)에서도 import 가 살아 있도록
+       paths.py 는 이걸 **함수 안에서 try/except 로만** 부른다. -->
+  <exec_depend>ament_index_python</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

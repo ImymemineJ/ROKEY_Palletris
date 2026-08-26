@@ -106,6 +106,7 @@ string  status         # SPAWNED|SCANNED|VERIFIED|DIVERTED|PICKED|PLACED|PICK_FA
 | `/robot/cmd` | `packing_msgs/msg/RobotCmd` | 관제탑 → 로봇 |
 | `/robot/event` | `packing_msgs/msg/RobotEvent` | 로봇 → 관제탑 |
 | `/zone_*/status` | `packing_msgs/msg/ZoneStatus` | 관제탑 → 중재자·모니터링 |
+| `/zone_*/vision_check` · `/line/vision_check` | `packing_msgs/msg/VisionCheck` | 인식 → 모니터링 (깊이 교차검증 진단. 구독자 없어도 됨) |
 
 ```
 # msg/BoxAtPickup.msg   — 인식 노드가 픽업 좌표까지 실어 보낸다
@@ -254,14 +255,22 @@ builtin_interfaces/Time stamp
 ### 구역 · 로봇 · 팔레트
 | 구역 | 팔레트 원점 (mm) | 로봇 베이스 (mm) |
 |---|---|---|
-| A | (10300, **1800**, 150) | (10900, **1400**, **900**) |
-| B | (10300, **300**, 150) | (10900, **−100**, **900**) |
-| C | (10300, **−1200**, 150) | (10900, **−1600**, **900**) |
+| A | (10300, **1800**, 150) | (10900, **1300**, **900**) |
+| B | (10300, **300**, 150) | (10900, **−200**, **900**) |
+| C | (10300, **−1200**, 150) | (10900, **−1700**, **900**) |
 
 > **이격 300 → 400 (2026-08-24, 김병직 실측).** joint_1 이 픽(−X)에서 배치(+Y)로 90°
 > 넘게 도는 동안 팔뚝이 수평 원호를 그리며 근거리 기둥을 쓸어 밀었다.
 > **궤적 전체 검사로만 잡힌다** — 정지 자세 검사는 같은 계획을 통과로 본다(280mm 차이).
-> ⚠ **더 빼면 나빠진다** (450 에서 −203). `scripts/verify_transit_sweep_isaac.py` 로 재현.
+>
+> **→ 400 → 500 (2026-08-26, `ee25497`).** 이격이 **세 군데 다 달랐다** —
+> 씬 300 · yaml 400 · 어제 채택 실행 500. `demo_stack15.py` 가 `--standoff` 로
+> 런타임에 덮어써서 불일치가 안 드러났고, 통합(`sim_main`)은 yaml 과 씬을 그대로
+> 쓰므로 **어제와 다른 조건으로 돈다.** 2026-08-25 최종 채택이 전부 500 이라
+> (시드 42 **28/29 · 적재율 80.3% · 9단 1300mm**, 3시드 평균 75.5%) 정본을 거기
+> 맞췄다. 발표 자료(`docs/발표/`)의 숫자도 이 조건이다.
+> ⚠ 위의 "450 에서 −203" 은 **이격 400 시절의 측정**이다. 500 채택은 그 스윕이
+> 아니라 적재 실측(위 시드들)에 근거한다 — 둘을 같은 축으로 읽지 말 것.
 
 - **페데스탈 900 mm** (구 문서의 500·700·1700 은 전부 폐기값)
 - 팔레트 **1200(X) × 800(Y)** × 두께 150 → Y 로 3장 = 2400, 트럭 바닥 2800
@@ -318,6 +327,13 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
   꺼져 있으면 눈으로는 멀쩡한데 카메라 이미지가 캄캄하다.
 - ⚠️ 화면이 전부 0 이면 조명보다 **카메라가 형상 안에 파묻혔는지** 먼저 의심할 것.
 - **처리 효율**: 천장 카메라는 도착 신호가 왔을 때만 추론한다.
+- ★ **깊이 교차검증** (2026-08-26, 트랙 D): 같은 카메라의 `<ns>/depth` 로 박스 윗면 z 를
+  **직접 재서** RGB 추정과 대조한다. RGB 는 사양 3종 평면 중 가장 잘 맞는 것을 고르는
+  **추측**이라, 종류를 틀리면 평면이 60~130 mm 어긋나 **중심 x·y 까지 같이 틀어진다.**
+  결과는 `packing_msgs/msg/VisionCheck` 로 나가고, **깊이가 없으면 예전 동작 그대로** 돈다.
+  끄기: `ros2 launch ... depth:=false`. 모드는 `off|crosscheck|rescue|prefer` 4가지이고
+  **기본 `crosscheck` 를 임의로 `prefer` 로 올리지 말 것** (§15 · 재현성).
+  자세한 것은 `docs/2026-08-26_깊이_교차검증.md`.
 
 ---
 
@@ -412,6 +428,9 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | 놓고 나서 박스가 혼자 조금씩 미끄러진다 | 박스 프림에 solver iteration·마찰이 안 걸렸다 (`spawner.py` 는 걸고, `verify_suction.make_box` 는 안 건다) |
 | 박스가 슬롯에 안 들어가고 `IK_FAIL` | 계획 간격이 0 이라 슬롯이 박스와 정확히 같은 크기다 (`--algo-clearance`) |
 | 깊은 구덩이 자리에서만 `IK_FAIL` | `_corridor_ok` 가 로봇 쪽 기둥을 안 본다 (`corridor_near_gap_mm`) |
+| **깊이 교차검증이 `HEIGHT_MISMATCH` 만 낸다 (dz 가 딱 박스 높이만큼)** | rgb 와 depth 의 **짝이 한 프레임 어긋났다.** 박스 도착 직전의 벨트 깊이를 현재 RGB 와 짝지은 것이다. `depth.max_stamp_skew_s` 는 **한 프레임 안**이어야 한다 (0.02) |
+| 깊이 교차검증이 화면 **가장자리에서만** 어긋난다 | `depth.is_range` 가 씬 규약과 반대다 (광축거리 vs 시선거리). 중앙에서는 두 규약이 같아서 안 보인다 |
+| 깊이 확인 커버리지가 낮다 (`VisionCheck.depth_ok=false` 가 잦다) | 이미지 UDP 단편 손실. **rgb 도 같이 잃고 있다.** DDS 송수신 버퍼를 키울 것 (§15) |
 | `database is locked` | `db_service_node` 외 프로세스가 `.db` 를 열었다 |
 
 ---
@@ -443,7 +462,8 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 
 ## 10-2. 사이클 시간 — 어디서 쓰는지 먼저 재라 (2026-08-25)
 
-**18.3 s → 10.6 s.** 같은 조건(20박스 · 도착순 · 간격10 · 이격400), 둘 다 20/20 적재.
+**18.3 s → 10.6 s.** 같은 조건(20박스 · 도착순 · 간격10 · **이격400 — 당시 정본**),
+둘 다 20/20 적재. (이격은 2026-08-26 에 500 으로 바뀌었다. §4 참조)
 
 계측(`--diag-time`)이 없었으면 엉뚱한 데를 깎았을 것이다. 한 사이클 19.5 s 중
 **실제 관절 이동은 4.8 s** 뿐이었고 나머지가 어디로 가는지 아무도 몰랐다.
@@ -540,7 +560,7 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | `src/packing_algo/` | 트랙 C — `heightmap_core.py` · `algo_service_node.py` |
 | `src/packing_robot/` | 트랙 B — `rmpflow_controller.py` · `fk.py` · `cycle.py` |
 | `src/palletris_orchestrator/` | 트랙 B — `orchestrator_node.py` (관제탑. 상태머신 7개) |
-| `src/packing_vision/` | 트랙 D — `vision_node.py` (cam1 등록 · cam2 검증 · pick_cam 좌표). 코어 `detect.py`·`geometry.py` 는 ROS 의존성 0 |
+| `src/packing_vision/` | 트랙 D — `vision_node.py` (cam1 등록 · cam2 검증 · pick_cam 좌표). 코어 `detect.py`·`geometry.py`·**`depth.py`** 는 ROS 의존성 0 |
 | `src/packing_sim/isaac/` | 트랙 A — `spawner.py` · `camera_pick.py` · `conveyor_ctl.py` · `robot_motion.py` · `sim_main.py` |
 | `scripts/` | 검증 — `verify_reach.py` · `check_place_plan.py` 등 |
 
@@ -615,4 +635,10 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | **`RobotEvent` 에 zone 이 없다** | 팀 | §3-2 는 `/robot/event` 를 **전역 토픽 1개**로 정했는데 메시지에 구역 필드가 없다. 로봇 3대가 동시에 돌면 어느 팔레트의 배치인지 이 토픽만으로 구분할 수 없다. 2026-08-26 `live_view` 를 ROS 구독으로 옮기면서 드러났다 — 지금은 관제탑의 `placed_count` 와 대조해 어긋나면 화면에 경고를 띄운다. 3구역 동시 시연을 하려면 `zone` 필드 추가나 토픽 네임스페이스 분리가 필요하다 (packing_msgs 변경 = 전원 재빌드) |
 | 적재율 표기: 실제높이 기준 + **용량 기준 병기** | 팀 | §7.8 정본은 그대로 두고 `capacity_rate` 를 보조로 추가했다. 포화 시 66.9% vs 66.3% 로 사실상 같다 — 발표에 어느 곡선을 쓸지만 정하면 된다 (TS-017) |
 | ~~`/robot/cmd` 네임스페이스~~ **해소** | 김병직/김학민 | 2026-08-26. 관제탑은 `/zone_{a|b|c}/robot/cmd` 를 쓰는데 `ros_graph.py` 가 `/robot/cmd` 단수라 **서로 못 만났다** (에러도 안 난다). `ros_graph` 를 구역별로 맞췄다. ⚠ §3-2 표는 아직 단수형이다 — 문서를 고칠지 결정할 것 |
+| ★ **`depth_mode` 를 `rescue`/`prefer` 로 올릴지** | 팀 | 2026-08-26 결정 기록. 기본은 `crosscheck`(깊이는 채점만). **`prefer` 는 아직 켜지 말 것** — 이유 3개: ① 진짜 Isaac 깊이로 잰 적이 없다(지금 검증은 합성) ② tf·`is_range` 계통 오차를 crosscheck 는 드러내지만 prefer 는 **따라간다** ③ ★ **재현성이 깨진다** — 깊이 도착률이 8개 중 5~7개라 같은 시드에 박스마다 경로가 달라진다(§13 "재현성"). 승격 조건 3개와 근거는 `docs/2026-08-26_깊이_교차검증.md` §4-1. **`rescue`(RGB 가 포기한 박스만 깊이가 건짐)는 재현성을 안 깨는 순이득이라 씬에 깊이가 들어오면 바로 켜도 된다** |
+| ★ **`packing_msgs` 에 `VisionCheck.msg` 추가** | 민범진 → 팀 | 2026-08-26. 깊이 교차검증 진단 채널(`/zone_*/vision_check`·`/line/vision_check`). **기존 타입은 한 글자도 안 바꿨고 덧붙이기만 했다.** 그래도 공용이라 **팀 전원 재빌드**가 필요하다 (§14). 로봇 동작 경로가 아니라 아무도 구독 안 해도 된다 |
+| `recognition.depth` 를 `system.yaml` 에 넣을지 | 팀 | 깊이 교차검증의 임계값. 지금은 `packing_vision/depth.py` 의 `DEFAULTS` 가 갖고 있고 **yaml 에 키가 있으면 그쪽이 이긴다.** 승인되면 블록을 붙이기만 하면 되고 코드는 안 바뀐다 (`depth.py` 머리 주석에 그대로 적어 뒀다). §11 "공용 파일 승인 없이 수정 금지" 때문에 안 넣었다 |
+| ★ **씬에 깊이 카메라 헬퍼가 없다** | 김학민 | cam1·cam2·pick_cam 에 `ROS2CameraHelper type:"depth"` 를 rgb·camera_info 와 **같은 render product** 로 붙여야 한다. 선례가 이미 있다 — `scripts/setup_camera_graph.py` 의 `cameraHelperDepth`. 같은 render product 면 stamp 가 정확히 같아 짝 맞추기가 100 % 가 된다. ⚠ 시선거리(range)로 내는 헬퍼면 `depth.is_range: true` 로 바꿀 것 |
+| 다중 PC 의 DDS 버퍼 | 팀 | 이미지가 커서 UDP 단편 손실이 난다 — **깊이만이 아니라 rgb 도 같이 잃고 있었다.** 실측: 기본 버퍼에서 깊이 확인 커버리지 4/8 → 송수신 16 MB 로 6/8. `FASTRTPS_DEFAULT_PROFILES_FILE` + `net.core.rmem_max` |
+| `reject_on_disagree` 를 켤지 | 팀 | RGB 와 깊이가 어긋났을 때 **좌표를 아예 안 낼 것인가.** 기본은 **안 막는다** — 데모가 서는 쪽이 더 나쁘다는 판단이다. 어긋남은 `VisionCheck` 과 경고로 남는다 |
 | ~~`db_service_node` 가 죽는다~~ **해소** | 민범진 | 2026-08-26. `schema.sql` 은 `share/packing_db/` 에 깔리는데 노드가 `../share/...` 로 한 단계만 올라가 못 찾았다 (`gen_master_db.py` 도 같은 버그). `ament_index` 로 바꿨다. **트랙 D 파일을 고쳤으니 확인 바람** |
