@@ -1,0 +1,89 @@
+#!/bin/bash
+# test_3 + ROS 2 — 관제탑이 로봇 3 대를 움직이는 쪽 (트랙 B).
+#
+#   ./scripts/run_test3_ros.sh              A,B,C · 창 · 자동 Play
+#   PL_ZONES=B ./scripts/run_test3_ros.sh   한 대만
+#   PL_GUI=0   ./scripts/run_test3_ros.sh   창 없이
+#
+# ⚠ `run_test3.sh` 와 **다른 실행이다.** 저쪽은 데모 스크립트
+#   (`demo_stack15_test1_1.py`) 로 Isaac 혼자 다 하고, 이쪽은 `sim_main.py --ros`
+#   로 **ROS 2 만 열고 판단은 관제탑에 맡긴다.** 둘을 동시에 띄우면 안 된다.
+#
+# ★ 이 껍데기가 하는 일은 세 가지뿐이다 — 셋 다 프로세스가 뜨기 **전에** 해야 한다.
+#   환경변수는 glibc·kit 이 **시작 때만** 읽으므로 sim_main 안에서 고쳐도 늦는다:
+#     1) ROS 2 환경  (아래 ①②③ — 하나만 빠져도 증상이 전부 다르다)
+#     2) ROS_DOMAIN_ID=115  (팀 전원 동일. 틀리면 노드는 다 살아 있는데 서로 안 보인다)
+#     3) PL_CONFIG_OVERLAY  (없으면 test1-1 좌표로 움직인다. 경고도 안 뜬다)
+set -e
+HERE="$(dirname "$(readlink -f "$0")")"
+WS="$(dirname "$HERE")"
+
+ISAAC_DIR="${ISAAC_DIR:-$HOME/isaac-sim-5.1.0}"
+[ -d "$ISAAC_DIR" ] || ISAAC_DIR="$HOME/isaacsim"
+
+# ── ROS 2 환경 ──────────────────────────────────────────────────────────────
+# ★★ **시스템 ROS 2 를 쓴다.** Isaac 에는 내장 jazzy 가 딸려 오지만, 우리가
+#   colcon 으로 빌드한 `packing_msgs` 는 `/opt/ros/jazzy` 것에 링크돼 있다.
+#   내장 쪽에 물리면 **fastcdr ABI 가 달라서** 이렇게 죽는다 (2026-08-26 실측):
+#
+#     symbol lookup error: libpacking_msgs__rosidl_typesupport_fastrtps_c.so:
+#       undefined symbol: _ZN8eprosima7fastcdr3Cdr9serializeEPc
+#
+#   그래서 내장 브릿지 lib 경로는 **시스템 ROS 가 없을 때만** 넣는다. 넣어 두면
+#   시스템 것을 가리는 수가 있다.
+#
+# ⚠ 여기서 세 가지가 **동시에** 맞아야 한다. 하나만 빠져도 증상이 다 다르다:
+#     ① AMENT_PREFIX_PATH  — 우리 파이썬이 `.srv` **원문**을 읽어 노드 필드를 만든다
+#          없으면: FileNotFoundError … SetVelocity.srv 를 못 찾았다
+#          (⚠ traceback 을 `kit.close()` 가 먹어서 종료코드 0 으로 조용히 죽는다)
+#     ② LD_LIBRARY_PATH    — 브릿지 C++ 이 `libpacking_msgs__rosidl_*.so` 를 dlopen
+#          없으면: "packing_msgs/srv/SwapPallet does not exist or is not available
+#          in the ROS 2 environment" 가 지나가고 **몇 프레임 뒤 SEGFAULT**
+#     ③ 그 .so 와 같은 ROS 배포판  — 위 fastcdr ABI
+#          어긋나면: symbol lookup error
+#   셋 다 `source install/setup.bash` 한 줄이 해 준다 (install/setup 이 /opt/ros 를
+#   같이 물고 온다). 직접 손으로 맞추려 들지 말 것.
+set +e                       # ROS setup 스크립트는 비0 종료를 흘린다
+if [ -f "$WS/install/setup.bash" ]; then
+    . "$WS/install/setup.bash"
+elif [ -f "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" ]; then
+    . "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+fi
+set -e
+
+if [ -z "${AMENT_PREFIX_PATH:-}" ]; then
+    # 시스템 ROS 가 아예 없다 — 내장으로 간다. packing_msgs 는 못 쓴다.
+    BRIDGE_LIB="$ISAAC_DIR/exts/isaacsim.ros2.bridge/${ROS_DISTRO:-jazzy}/lib"
+    [ -d "$BRIDGE_LIB" ] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$BRIDGE_LIB"
+    echo "⚠ 시스템 ROS 2 를 못 찾았다 — 내장 배포판으로 간다." >&2
+    echo "  packing_msgs 타입이 안 잡혀 세그폴트가 날 수 있다." >&2
+fi
+
+_need="$WS/install/packing_msgs"
+for _f in "share/packing_msgs/srv/SetVelocity.srv" \
+          "lib/libpacking_msgs__rosidl_typesupport_c.so"; do
+    [ -f "$_need/$_f" ] || {
+        echo "⚠ packing_msgs/$_f 가 없다 — colcon build 를 먼저 돌려라." >&2
+        echo "  (이대로 두면 Isaac 이 세그폴트로 죽는다)" >&2
+    }
+done
+
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-115}"
+export PL_STAGE="${PL_STAGE:-$HOME/isaac_scenes/project_1/test_3.usd}"
+export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-$WS/src/packing_bringup/config/test_3.yaml}"
+export PL_ZONES="${PL_ZONES:-A,B,C}"
+
+# ★ 급송 — `--ros` 경로에는 박스를 넣는 주체가 없다 (씬이 아직 안 낸다).
+#   PL_SPAWN=0 으로 끌 수 있다.
+export PL_SPAWN="${PL_SPAWN:-8}"       # 초 간격. 0 = 안 넣는다
+export PL_SPAWN_N="${PL_SPAWN_N:-0}"   # 총 개수. 0 = 무제한
+
+ARGS=(--stage "$PL_STAGE" --zones "$PL_ZONES" --ros --autorun
+      --spawn-period "$PL_SPAWN" --spawn-count "$PL_SPAWN_N")
+[ "${PL_GUI:-1}" != "0" ] && ARGS+=(--gui)
+
+echo "[run_test3_ros] 씬     $PL_STAGE"
+echo "[run_test3_ros] 오버레이 $PL_CONFIG_OVERLAY"
+echo "[run_test3_ros] 구역   $PL_ZONES · DOMAIN $ROS_DOMAIN_ID"
+cd "$WS"
+exec "$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@"
