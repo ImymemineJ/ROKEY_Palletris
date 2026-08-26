@@ -942,9 +942,59 @@ def setup():
             return {"ok": not miss, "missing": miss}
         return q.run(_wr)
 
+    def _h_prim_pose(req):
+        """{"cmd":"prim_pose","path":".."} -> {"ok":..,"t_m":[x,y,z],"quat":[w,x,y,z]}
+
+        ★ 반출 전에 팔레트 자리를 **적어 두려고** 만들었다. `move_prim` 은 변위만
+          받아서, 셀->커브->합류로 여러 번 옮기고 90도 돌린 뒤에는 원래 자리를
+          되짚을 수가 없다 (2026-08-26: 반출한 팔레트가 트럭에 그대로 남아
+          빈 팔레트가 영영 안 왔다).
+        """
+        def _rd():
+            from pxr import UsdGeom as _UG
+            pr = stage.GetPrimAtPath(req.get("path", ""))
+            if not pr or not pr.IsValid():
+                return {"ok": False, "error": "없는 prim"}
+            t = qq = None
+            for o in _UG.Xformable(pr).GetOrderedXformOps():
+                n = o.GetOpName()
+                if n == "xformOp:translate":
+                    v = o.Get()
+                    t = [float(v[0]), float(v[1]), float(v[2])]
+                elif n == "xformOp:orient":
+                    r = o.Get()
+                    im = r.GetImaginary()
+                    qq = [float(r.GetReal()),
+                          float(im[0]), float(im[1]), float(im[2])]
+            return {"ok": t is not None, "t_m": t, "quat": qq}
+        return q.run(_rd)
+
+    def _h_set_prim_pose(req):
+        """{"cmd":"set_prim_pose","path":"..","t_m":[..],"quat":[w,x,y,z]} -> {"ok":..}
+
+        절대 좌표로 되돌린다. 반출이 끝난 자리에 **빈 팔레트를 새로 놓는** 셈이다.
+        """
+        def _wr():
+            from pxr import Gf as _Gf, UsdGeom as _UG
+            pr = stage.GetPrimAtPath(req.get("path", ""))
+            if not pr or not pr.IsValid():
+                return {"ok": False, "error": "없는 prim"}
+            t, qq = req.get("t_m"), req.get("quat")
+            for o in _UG.Xformable(pr).GetOrderedXformOps():
+                n = o.GetOpName()
+                if n == "xformOp:translate" and t:
+                    o.Set(_Gf.Vec3d(float(t[0]), float(t[1]), float(t[2])))
+                elif n == "xformOp:orient" and qq:
+                    o.Set(_Gf.Quatd(float(qq[0]), _Gf.Vec3d(
+                        float(qq[1]), float(qq[2]), float(qq[3]))))
+            return {"ok": True}
+        return q.run(_wr)
+
     server.register({"ping": lambda r: {"ok": True},
                      "prim_bbox": _h_prim_bbox,
                      "move_prim": _h_move_prim,
+                     "prim_pose": _h_prim_pose,
+                     "set_prim_pose": _h_set_prim_pose,
                      "rotate_prim": _h_rotate_prim,
                      "set_kinematic": _h_set_kinematic})
     server.register(sp.handlers())
@@ -2298,11 +2348,27 @@ def worker(specs, ids, zone=None):
                 #   `swap_pallet` 은 빈 판을 갖다 놓는 일만 한다.
                 _cargo = [w["id"] for w in _S["rows"]
                           if w["res"] == "PLACED" and w.get("zone", zone) == zone]
+                # ★ 반출은 팔레트 프림을 **트럭까지 옮기고 끝난다.** 빈 팔레트를
+                #   갖다 놓는 코드가 없어서, 그대로 두면 그 존은 팔레트가 영영
+                #   없다 (2026-08-26 관측: "팔레트가 다시 리스폰 안 됨" ·
+                #   "A 구역 팔레트가 통째로 사라짐"). 자리를 적어 뒀다가 되돌린다.
+                _pal_prim = os.environ.get("PL_PALLET_PRIM",
+                                           "/World/Pallet_%s" % zone)
+                _pose0 = link.call(cmd="prim_pose", path=_pal_prim)
                 log("   [반출] 팔레트가 찼다 — 박스 %d 개를 트럭으로 보낸다"
                     % len(_cargo))
                 _S.setdefault("ships", {})[zone] = ship_pallet(
                     link, zone, log, _cargo)
                 sw = link.call(cmd="swap_pallet", zone=zone)
+                if _pose0.get("ok"):
+                    _rb = link.call(cmd="set_prim_pose", path=_pal_prim,
+                                    t_m=_pose0["t_m"], quat=_pose0.get("quat"))
+                    log("   [반출] 빈 팔레트를 제자리로 (%s) — %s"
+                        % (", ".join("%.3f" % v for v in _pose0["t_m"]),
+                           "ok" if _rb.get("ok") else _rb))
+                else:
+                    log("   [반출] !! 팔레트 자리를 못 읽었다 — 빈 판을 못 놓는다: %r"
+                        % (_pose0,))
                 svc.reset_pallet()
                 link.call(cmd="set_spawn_enabled", enabled=True)
                 if not sw.get("ok"):
