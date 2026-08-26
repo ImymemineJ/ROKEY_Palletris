@@ -1,4 +1,7 @@
-string  seg             # "main"|"a_pickup"|"b_pickup"|"c_pickup"|"return"
+# orchestrator → 씬.  벨트 속도 변경.
+# ⚠️ 토픽이 아니라 서비스인 이유: ok 응답을 확인한 뒤 진행해야 한다.
+#    벨트가 안 멈춘 채 흡착하면 박스가 끌려간다.
+string  seg            # "main"|"a_pickup"|"b_pickup"|"c_pickup"|"return"
 float32 velocity_mps
 ---
 bool    ok

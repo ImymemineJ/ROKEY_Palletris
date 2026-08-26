@@ -1,3 +1,5 @@
-string box_id
+# orchestrator → 씬.  박스를 씬에서 제거한다.
+# 1차: NO_FEASIBLE_POSE 박스를 치우는 유일한 수단 (Return line 이 없다).
+string  box_id
 ---
-bool   ok
+bool    ok

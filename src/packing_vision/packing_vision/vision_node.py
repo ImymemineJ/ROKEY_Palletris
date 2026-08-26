@@ -1,267 +1,481 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-vision_node — 카메라 토픽에서 박스의 '색'과 '크기'를 재서 토픽으로 발행한다.
+"""인식 노드 — 투입부 등록·검증(cam1·cam2) + 픽업 좌표(pick_cam).
 
-구독:
-    /<ns>/rgb           sensor_msgs/Image       rgb8
-    /<ns>/depth         sensor_msgs/Image       32FC1, 단위 m
-    /<ns>/camera_info   sensor_msgs/CameraInfo  fx, fy, cx, cy
+CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현한다.
 
-발행:
-    /vision/detections  std_msgs/String (JSON)
+★ 왜 한 프로세스에 같이 두나
+  둘이 **박스 순번을 공유해야** 한다. 투입부에서 BOX007 로 등록한 박스가
+  스토퍼에 도착했을 때 "이게 7번"임을 알아야 관제탑에 box_id 를 실어 보낼 수
+  있는데, 벨트가 한 줄이라 추월이 없으므로 **등록 순서 = 도착 순서**다.
+  프로세스를 가르면 이 순번을 서비스로 주고받아야 하고, 그럴 서비스가 인터페이스에
+  없다. 중재자를 db_service_node 에 같이 둔 것과 같은 이유다 (명세서 §8.5).
+  노드는 둘이고 프로세스만 하나다 — CLAUDE.md §8 "관제탑은 하나" 규칙과 무관하다.
 
-동작 순서 (한 프레임마다):
-    ① RGB 를 HSV 로 바꿔 빨강/초록/파랑 마스크를 만든다  → 색 감지
-    ② 마스크 안의 depth 중앙값을 구한다                  → 그 물체까지 거리
-    ③ 픽셀 크기 × 거리 ÷ 초점거리 = 실제 크기            → 크기 측정
-    ④ JSON 으로 묶어 발행한다
+★ 카메라 파라미터를 코드에 안 박는다
+  내부 파라미터는 `<cam>/camera_info`, 자세는 tf 에서 온다. `system.yaml` 의
+  `recognition.pick_cam` 에는 x_mm 이 아예 없고(§15 미결), tf 프레임 이름 규약도
+  미정이다. 이미지 헤더의 frame_id 를 그대로 tf 에 물어보면 둘 다 안 막힌다.
 
-★ 왜 배경 차분이 아니라 색 기준인가:
-  배경 차분은 카메라가 바닥을 수직으로 내려다볼 때만 성립한다. camera.usd 에 저장된
-  rsd455 는 Y축으로 52.5° 기울어 있어서 '높이 = 바닥까지 거리 차이' 가 성립하지 않는다.
-  색은 카메라 각도와 무관하게 잡히므로 확인 단계에서는 색이 맞다.
-
-★ 여기서 재는 크기는 '이미지 평면에서 보이는 크기' 다. 카메라가 물체를 비스듬히 보면
-  윗면뿐 아니라 옆면 일부까지 실루엣에 들어와 실제 치수보다 크게 나온다.
-  광축에서 멀리 있는 물체일수록 그렇다. 3호/4호/5호 스냅 판정을 기본으로 끄는 이유다.
-  (--ros-args -p snap_enabled:=true 로 켤 수 있고, 이때 치수는 system.yaml 에서 읽는다)
+★ 토픽 이름
+  기존 손목 카메라 배선과 같은 규약이다 — `<ns>/rgb` + `<ns>/camera_info`,
+  frameId 는 카메라 이름 (demo_stack15_test1_1.py 의 ROS2CameraHelper 참고).
+  ⚠ 지금 씬이 ROS 로 내보내는 카메라는 `/wrist_cam` 하나뿐이다. cam1·cam2·pick_cam
+    은 트랙 A 가 같은 방식으로 CameraHelper 를 붙여야 이 노드가 그림을 받는다.
+    토픽 이름은 전부 파라미터라 씬 쪽 이름이 정해지면 launch 에서 맞추면 된다.
 """
 
-import json
-import math
-
-import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from rclpy.executors import ExternalShutdownException
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from tf2_ros import Buffer, TransformListener
 
-# 단위 변환은 반드시 packing_common 함수만 쓴다 — 직접 나눗셈 금지 (작업명세서 §1.3)
-from packing_common.units import m_to_mm
+from packing_common.config import load
+from packing_common.units import m_to_mm   # ★ 직접 *1000 금지 (CLAUDE.md §4)
+from packing_msgs.msg import BoxAtPickup, ZoneStatus
+from packing_msgs.srv import GetBoxInfo, RegisterBox, ReportMiss, VerifyBox
+
+from packing_vision.detect import dominant_color_name, find_box, read_qr
+from packing_vision.label import parse_payload
+from packing_vision.geometry import box_pose_from_corners, quat_to_R
 
 
-class VisionNode(Node):
+# ★ 예전에 여기 있던 BoxLine(등록 순서 대기열)은 없앴다 (2026-08-25).
+#   투입부와 픽업이 **다른 프로세스**가 됐고(구역별로 따로 띄운다), 구역이 셋이면
+#   단일 FIFO 자체가 틀린다 — 분기기가 박스를 A/B/C 로 갈라 보내므로 도착 순서가
+#   등록 순서와 다르다. 지금은 픽업 카메라가 박스 윗면 QR 을 직접 읽는다.
 
-    def __init__(self):
-        super().__init__('vision_node')
 
-        # ── 파라미터 ─────────────────────────────────────────────────────────
-        # 물리 수치(박스 치수 등)는 system.yaml 이 정본이고, 아래는 노드 동작 설정이다.
-        self.declare_parameter('camera_ns', 'cam_scan')
-        self.declare_parameter('min_area_px', 300)     # 이보다 작은 얼룩은 노이즈로 버린다
-        self.declare_parameter('sat_min', 70)          # 채도 하한 — 회색 배경을 걸러낸다
-        self.declare_parameter('val_min', 40)          # 명도 하한 — 초록 박스가 어두워서 낮게 잡았다
-        self.declare_parameter('log_period_s', 1.0)
-        self.declare_parameter('snap_enabled', False)
-        self.declare_parameter('config_path',
-                               '~/palletris_ws/src/packing_bringup/config/system.yaml')
+class CameraSub:
+    """`<ns>/rgb` + `<ns>/camera_info` 를 묶어 받는다.
 
-        ns = self.get_parameter('camera_ns').value
-        self.min_area = int(self.get_parameter('min_area_px').value)
-        self.s_min = int(self.get_parameter('sat_min').value)
-        self.v_min = int(self.get_parameter('val_min').value)
-        self.log_period = float(self.get_parameter('log_period_s').value)
-        self.snap_enabled = bool(self.get_parameter('snap_enabled').value)
+    camera_info 를 같이 받는 이유: 내부 파라미터를 코드에 박지 않기 위해서다.
+    Isaac 의 CameraHelper 는 camera_info 를 안 쏘므로 CameraInfoHelper 를 따로
+    붙여야 한다 — 씬 쪽에 이미 그 선례가 있다 (손목 카메라).
+    """
 
-        # ── 상태 ────────────────────────────────────────────────────────────
+    def __init__(self, node, ns, on_image, cb_group):
+        self.node, self.ns, self._on_image = node, ns, on_image
+        self.K = None
+        self.frame_id = ""
         self.bridge = CvBridge()
-        self.fx = self.fy = self.cx = self.cy = None
-        self.info_logged = False
-        self.depth = None          # 최신 depth 프레임 (numpy, m)
-        self.last_log = 0.0
-        self.frames = 0
+        # ★ 카메라 토픽은 반드시 BEST_EFFORT 다. 기본 RELIABLE 로 구독하면
+        #   이미지가 하나도 안 온다 (CLAUDE.md §3-4 규약 5).
+        node.create_subscription(Image, f"{ns}/rgb", self._image,
+                                 qos_profile_sensor_data, callback_group=cb_group)
+        node.create_subscription(CameraInfo, f"{ns}/camera_info", self._info,
+                                 qos_profile_sensor_data, callback_group=cb_group)
 
-        self.box_types = self._load_box_types() if self.snap_enabled else []
+    def _info(self, msg):
+        self.K = np.array(msg.k, float).reshape(3, 3)
+        self.frame_id = msg.header.frame_id
 
-        # ── 통신 ────────────────────────────────────────────────────────────
-        # 센서 QoS(best effort)로 구독한다. Isaac 이 reliable 로 쏘든 best effort 로 쏘든
-        # 이쪽이 best effort 면 양쪽 다 붙는다. 반대로 잡으면 조용히 아무것도 안 온다.
-        self.create_subscription(CameraInfo, f'/{ns}/camera_info',
-                                 self.on_info, qos_profile_sensor_data)
-        self.create_subscription(Image, f'/{ns}/depth',
-                                 self.on_depth, qos_profile_sensor_data)
-        self.create_subscription(Image, f'/{ns}/rgb',
-                                 self.on_rgb, qos_profile_sensor_data)
-
-        self.pub = self.create_publisher(String, '/vision/detections', 10)
-
-        self.ns = ns
-        self.get_logger().info(
-            f"vision_node 시작. 색 기준 감지 모드. 구독 /{ns}/rgb · /{ns}/depth · /{ns}/camera_info")
-        if not self.snap_enabled:
-            self.get_logger().info(
-                "snap_enabled=false — 3호/4호/5호 판정은 하지 않는다. "
-                "켜려면 --ros-args -p snap_enabled:=true")
-
-    # ── config ──────────────────────────────────────────────────────────────
-    def _load_box_types(self):
-        """system.yaml 의 박스 3종 치수를 읽는다. 숫자를 코드에 박지 않는다 (철칙 3)."""
+    def _image(self, msg):
+        # 구독 콜백은 입력을 검증한다. rclpy 가 예외를 삼켜서, 잘못된 프레임 하나에
+        # 인식이 통째로 멎는데 에러는 안 뜬다 (CLAUDE.md §9).
         try:
-            from packing_common import config
-            cfg = config.load(self.get_parameter('config_path').value)
-            return cfg['boxes']['types']
-        except Exception as e:                                  # noqa: BLE001
-            self.get_logger().warn(f"system.yaml 을 못 읽어 스냅을 끈다: {e}")
-            self.snap_enabled = False
-            return []
+            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:                      # noqa: BLE001
+            self.node.get_logger().warn(f"{self.ns} 이미지 변환 실패: {e}")
+            return
+        if bgr is None or bgr.size == 0:
+            return
+        try:
+            self._on_image(bgr, msg.header)
+        except Exception as e:                      # noqa: BLE001
+            self.node.get_logger().error(f"{self.ns} 처리 중 예외: {e}")
 
-    # ── 콜백 ────────────────────────────────────────────────────────────────
-    def on_info(self, msg: CameraInfo):
-        # K = [fx 0 cx / 0 fy cy / 0 0 1]
-        self.fx, self.fy = msg.k[0], msg.k[4]
-        self.cx, self.cy = msg.k[2], msg.k[5]
-        if not self.info_logged:
-            self.info_logged = True
+
+def camera_pose(tf_buf, world_frame, frame_id):
+    """tf 에서 월드 ← 카메라(광학) 변환을 꺼낸다. 없으면 None."""
+    tr = tf_buf.lookup_transform(world_frame, frame_id, rclpy.time.Time())
+    q = tr.transform.rotation
+    t = tr.transform.translation
+    return quat_to_R(q.x, q.y, q.z, q.w), np.array([t.x, t.y, t.z])
+
+
+class LineDetector(Node):
+    """cam1 판독 → RegisterBox · cam2 재판독 → VerifyBox."""
+
+    def __init__(self, cfg):
+        super().__init__("line_detector")
+        self.cfg = cfg
+        self._n_reg = 0             # 등록 누계 (로그·지표용)
+        self.types = cfg["boxes"]["types"]
+        self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
+
+        self.declare_parameter("cam1_ns", "/cam1")
+        self.declare_parameter("cam2_ns", "/cam2")
+        self.declare_parameter("world_frame", "World")
+        self.world_frame = str(self.get_parameter("world_frame").value)
+        cb = ReentrantCallbackGroup()
+        self.tf_buf = Buffer()
+        self.tf_lis = TransformListener(self.tf_buf, self)
+
+        self.cli_reg = self.create_client(RegisterBox, "/db/register_box",
+                                          callback_group=cb)
+        self.cli_ver = self.create_client(VerifyBox, "/db/verify_box",
+                                          callback_group=cb)
+        # ★ 인식률의 분모를 만드는 통로다. 박스를 봤는데 식별 못 하면 여기로 알린다 —
+        #   안 알리면 그 박스는 통계에서 사라져 인식률이 언제나 100 % 로 나온다.
+        self.cli_miss = self.create_client(ReportMiss, "/db/report_miss",
+                                           callback_group=cb)
+
+        # ★ 박스 순번 카운터를 두지 않는다. box_id 는 **QR 이 정본**이다.
+        #   세어서 만들면 cam1 이 한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀려
+        #   DB 의 다른 박스 기록을 덮어쓴다 — 에러 없이 전부 틀리는 쪽이다.
+        self._miss1 = 0             # QR 판독 실패 누계 (지표·로그용)
+        self._armed1 = True         # 빈 화면을 한 번 봐야 다음 박스를 센다
+        self._armed2 = True
+
+        self.cam1 = CameraSub(self, self.get_parameter("cam1_ns").value,
+                              self._on_cam1, cb)
+        self.cam2 = CameraSub(self, self.get_parameter("cam2_ns").value,
+                              self._on_cam2, cb)
+        self.get_logger().info("line_detector 시작 — cam1 등록 · cam2 검증")
+
+    # ── 공통: 그림에서 박스 하나를 읽어 종류까지 정한다 ──────────────
+    def _measure(self, bgr, cam):
+        """검출 → tf → 절대 치수로 종류 판별.
+
+        ★ 비율(긴변/짧은변)로 고르지 않는다. 3·4·5호의 비율이 1.36 / 1.32 / 1.26
+          으로 너무 가까워서 몇 픽셀만 흔들려도 종류가 바뀐다. 종류가 바뀌면
+          높이가 바뀌고, 높이가 바뀌면 로봇이 허공이나 박스 속으로 내려간다.
+          pick_cam 과 같은 절대 크기 방식을 쓴다 — 후보마다 자기 높이의 평면에
+          투영해 사양 치수와 비교하면 오차가 171 / ~0 / 175 mm 로 갈린다.
+        """
+        det = find_box(bgr)
+        if det is None:
+            return None, None
+        if cam.K is None:
+            self.get_logger().warn(f"{cam.ns}: camera_info 대기 중", once=True)
+            return None, None
+        if det["clipped"]:
+            self.get_logger().warn(f"{cam.ns}: 박스가 화면 밖으로 잘렸다 — 건너뛴다")
+            return None, None
+        try:
+            R, t = camera_pose(self.tf_buf, self.world_frame,
+                               cam.frame_id or cam.ns.strip("/"))
+        except Exception as e:                  # noqa: BLE001
+            self.get_logger().warn(f"{cam.ns}: tf 조회 실패 — {e}", once=True)
+            return None, None
+        out = box_pose_from_corners(det["corners_px"], cam.K, R, t,
+                                    self.belt_top_m, self.types)
+        if out is None:
+            self.get_logger().warn(f"{cam.ns}: 사양 3종과 안 맞는다")
+            self._report_miss(cam.ns.strip("/"), "SIZE_MISMATCH")
+            return None, None
+        return det, out
+
+    def _on_cam1(self, bgr, header):
+        det, out = self._measure(bgr, self.cam1)
+        if det is None:
+            self._armed1 = True                 # 빈 벨트 — 다음 박스를 받을 준비
+            return
+        if not self._armed1:
+            return                              # 같은 박스를 계속 보고 있다
+        self._armed1 = False
+        bt = out["type"]
+
+        qr = read_qr(bgr, det["corners_px"])
+        box_id = parse_payload(qr)
+        if box_id is None:
+            # ★ QR 을 못 읽었다 = 이 박스는 등록하지 않고 흘려보낸다.
+            #   운송장번호를 지어내면 안 된다 (위 self._miss1 주석 참조).
+            #   등록 안 된 박스는 중재자가 미등록으로 보고 RETURN 시킨다 —
+            #   설계결정서 §2.2 가 요구한 "리젝트 라인이 실제로 발동" 이 이 경로다.
+            #   yaml 의 recognition.cam1_box_miss_rate 로 인위적 드롭을 주입할
+            #   필요도 없다. 라벨이 흐리거나 잘리면 여기가 자연히 걸린다.
+            self._miss1 += 1
+            self.get_logger().warn(
+                f"cam1 QR 판독 실패 (누계 {self._miss1}) — 등록 건너뜀"
+                + (f" · 읽힌 값 {qr!r}" if qr else " · QR 이 안 보인다"))
+            self._report_miss("cam1", "QR_UNREADABLE")
+            return
+        color = dominant_color_name(bgr) or "red"
+
+        # ★ dest 를 비워 보낸다. QR 에는 운송장번호만 있고 구역 글자가 없다 —
+        #   구역은 db_service_node 가 주소(boxes_master.address)의 동으로 정한다.
+        #   여기서 추측해 채우면 인식이 구역까지 아는 척하게 되고, 실제 분류
+        #   근거(주소)와 어긋나도 아무도 모른다 (설계결정서 §5-3).
+        req = RegisterBox.Request(
+            box_id=box_id, size_w_mm=int(bt["w_mm"]), size_d_mm=int(bt["d_mm"]),
+            size_h_mm=int(bt["h_mm"]), color=color, dest="", qr_payload=qr)
+        self._call(self.cli_reg, req, lambda r, b=box_id, t=bt: self._reg_done(r, b, t))
+
+    def _report_miss(self, where_at, reason):
+        """박스를 봤는데 식별 못 했다 — DB 에 알린다 (인식률의 분모).
+
+        ★ 응답을 기다리지 않는다. 이건 통계용이라 라인을 세울 이유가 없다.
+        """
+        if not self.cli_miss.service_is_ready():
+            self.get_logger().warn("/db/report_miss 가 아직 없다 — 통계에서 빠진다",
+                                   once=True)
+            return
+        self.cli_miss.call_async(ReportMiss.Request(where_at=where_at, reason=reason))
+
+    def _reg_done(self, res, box_id, bt):
+        if res is None or not res.ok:
+            self.get_logger().error(
+                f"register_box 실패 {box_id}: {getattr(res, 'message', 'no response')}")
+            return
+        self._n_reg += 1
+        self.get_logger().info(
+            f"cam1 등록 {box_id} ({bt['name']}) → {res.message} · 누계 {self._n_reg}")
+
+    def _on_cam2(self, bgr, header):
+        det, _ = self._measure(bgr, self.cam2)
+        if det is None:
+            self._armed2 = True
+            return
+        if not self._armed2:
+            return
+        self._armed2 = False
+
+        qr = read_qr(bgr, det["corners_px"])
+        box_id = parse_payload(qr)
+        if box_id is None:
+            # cam1 이 등록한 박스인데 cam2 가 못 읽었다 = 검증 불가.
+            # 여기서 box_id 를 추측해 VerifyBox 를 부르면 **엉뚱한 박스를
+            # 통과시킨다.** 부르지 않는 쪽이 안전하다.
+            self.get_logger().warn(
+                "cam2 QR 판독 실패 — 검증 건너뜀"
+                + (f" · 읽힌 값 {qr!r}" if qr else " · QR 이 안 보인다"))
+            return
+        self._call(self.cli_ver, VerifyBox.Request(box_id=box_id, qr_payload=qr),
+                   lambda r, b=box_id: self._ver_done(r, b))
+
+    def _ver_done(self, res, box_id):
+        if res is None:
+            return
+        if res.match:
+            self.get_logger().info(f"cam2 검증 OK {box_id}")
+        else:
+            # ★ 경고만 남기고 끝내면 순서가 꼬인 박스가 그대로 지나간다.
+            #   그렇다고 여기서 버리면 멀쩡한 박스를 죽일 수 있다 — cam2 가 잘못
+            #   읽었을 수도 있기 때문이다. 그래서 **기록만** 남기고 판단은 미룬다.
+            #   불일치가 늘어나는지는 지표(scan_misses)로 보인다.
+            #   ⚠ 미결: 불일치를 REJECTED 로 할지 재순환으로 돌릴지는 팀이 정할 값이다.
+            self.get_logger().warn(
+                f"cam2 검증 불일치 {box_id} — 등록 주인 {res.registered_id or '(없음)'}")
+            self._report_miss("cam2", "VERIFY_MISMATCH")
+
+    # ★ 모든 서비스 호출은 call_async + done_callback 이다.
+    #   콜백 안에서 spin_until_future_complete 를 부르면 executor 가 자기 자신을
+    #   기다려 에러 한 줄 없이 멈춘다 (CLAUDE.md §9).
+    def _call(self, cli, req, done):
+        if not cli.service_is_ready():
+            self.get_logger().warn(f"{cli.srv_name} 서버가 아직 없다 — 건너뛴다")
+            return
+        fut = cli.call_async(req)
+        fut.add_done_callback(lambda f: done(f.result() if f.done() else None))
+
+
+class ZoneDetector(Node):
+    """구역 하나의 하향 카메라 → 스토퍼 도착과 집을 좌표를 BoxAtPickup 으로.
+
+    ★ **구역마다 따로 띄운다** (CLAUDE.md §8 "구역 인식 노드 3"). 한 프로세스에
+      몰면 파이썬 GIL 때문에 세 구역 추론이 줄을 서서 돈다 — 구역을 늘린 의미가
+      없어진다. 프로세스를 나눠야 코어를 실제로 나눠 쓴다.
+
+    ★ box_id 는 **자기 카메라가 읽은 QR** 에서 나온다 (2026-08-25).
+      예전에는 투입부 노드가 등록한 순서를 in-process 큐로 넘겨받았는데,
+      그 방식은 세 가지가 깨진다:
+        1. 프로세스를 나누면 큐를 공유할 수 없다
+        2. 구역이 셋이면 **단일 FIFO 자체가 틀린다** — 분기기가 박스를 A/B/C 로
+           갈라 보내므로 도착 순서가 등록 순서와 다르다
+        3. 투입부가 한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀린다
+      픽업 카메라는 박스 윗면을 바로 위에서 본다. 라벨이 거기 있으므로
+      **읽으면 그만이다.** 구역끼리 아무것도 공유하지 않는다.
+    """
+
+    def __init__(self, cfg):
+        # ★ 노드 이름은 launch 가 `name="detector_zone_a"` 로 붙인다.
+        #   구역마다 **프로세스가 따로**라 name= 을 줘도 안전하다
+        #   (한 프로세스에 노드가 둘일 때만 위험하다 — bringup.launch.py 주석 참조).
+        super().__init__("zone_detector")
+        self.cfg = cfg
+        self.types = cfg["boxes"]["types"]
+        self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
+
+        self.declare_parameter("zone", "b")
+        self.declare_parameter("pick_cam_ns", "/pick_cam")
+        # tf 의 뿌리 프레임. Action Graph 가 parentPrim=/World 로 tf 를 낸다.
+        self.declare_parameter("world_frame", "World")
+        # ★ 처리 효율 (평가 항목). 카메라는 30 Hz 로 오지만 추론은 이 주기로만 한다.
+        #   더 중요한 절약은 아래 IDLE 게이트다 — 관제탑이 집는 중이면 추론 자체를 안 한다.
+        self.declare_parameter("infer_rate_hz", 5.0)
+
+        self.zone = str(self.get_parameter("zone").value).lower()
+        ns = str(self.get_parameter("pick_cam_ns").value)
+        self.world_frame = str(self.get_parameter("world_frame").value)
+        self._min_dt = 1.0 / max(0.1, float(self.get_parameter("infer_rate_hz").value))
+        self._last = 0.0
+        self._present = False
+        self._idle = True          # 관제탑이 놀고 있는가
+        self._seen = None          # 직전에 발행한 box_id (중복 로그 억제)
+
+        cb = ReentrantCallbackGroup()
+        self.tf_buf = Buffer()
+        self.tf_lis = TransformListener(self.tf_buf, self)
+
+        self.cli_info = self.create_client(GetBoxInfo, "/db/get_box_info",
+                                           callback_group=cb)
+        self.pub = self.create_publisher(
+            BoxAtPickup, f"/zone_{self.zone}/box_at_pickup", 10)
+        self.create_subscription(
+            ZoneStatus, f"/zone_{self.zone}/status", self._on_status, 10,
+            callback_group=cb)
+        self.cam = CameraSub(self, ns, self._on_image, cb)
+        self.get_logger().info(
+            f"detector_zone_{self.zone} 시작 — {ns} -> /zone_{self.zone}/box_at_pickup")
+
+    def _on_status(self, msg):
+        # IDLE 일 때만 추론한다. 집는 중에는 새 좌표가 필요 없고, 오히려 팔이
+        # 화면에 들어와 오검출을 만든다.
+        self._idle = (msg.state == "IDLE")
+
+    def _now(self):
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _on_image(self, bgr, header):
+        t = self._now()
+        if not self._idle or (t - self._last) < self._min_dt:
+            return
+        self._last = t
+
+        det = find_box(bgr)
+        if det is None:
+            self._publish_absent()
+            return
+        if det["clipped"]:
+            # 잘린 사각형의 중심은 진짜 중심이 아니다. 틀린 좌표를 주느니
+            # "안 보인다" 가 낫다 — 로봇이 빗나간 자리를 집는 쪽이 훨씬 나쁘다.
+            self.get_logger().warn("박스가 시야 밖으로 잘렸다 — 좌표를 내지 않는다")
+            self._publish_absent()
+            return
+        if self.cam.K is None:
+            self.get_logger().warn("camera_info 대기 중", once=True)
+            return
+
+        try:
+            tr = self.tf_buf.lookup_transform(
+                self.world_frame, self.cam.frame_id or self.cam.ns.strip("/"),
+                rclpy.time.Time())
+        except Exception as e:                  # noqa: BLE001
+            # use_sim_time 이 꺼져 있거나 /clock 이 없으면 여기서 계속 실패한다.
+            self.get_logger().warn(f"tf 조회 실패 ({self.world_frame} ← "
+                                   f"{self.cam.frame_id}): {e}", once=True)
+            return
+
+        q = tr.transform.rotation
+        R = quat_to_R(q.x, q.y, q.z, q.w)
+        t_vec = np.array([tr.transform.translation.x, tr.transform.translation.y,
+                          tr.transform.translation.z])
+
+        out = box_pose_from_corners(det["corners_px"], self.cam.K, R, t_vec,
+                                    self.belt_top_m, self.types)
+        if out is None:
+            self.get_logger().warn("사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다")
+            self._publish_absent()
+            return
+
+        # ★ box_id 는 여기서 읽는다. 다른 노드에서 받아오지 않는다.
+        #
+        # ★ 한 번 읽으면 박스가 떠날 때까지 **기억한다.** 매 프레임 다시 읽으려
+        #   들면 안 된다 — 해독 실패는 무작위가 아니라 **자세에 따라 결정적**이라,
+        #   나쁜 자세로 멈춘 박스는 몇 번을 다시 봐도 계속 실패한다.
+        #   실측(투영 48 회): 자세를 흔들면 98 % 지만, 한 자세로 굳으면 0 % 아니면 100 % 다.
+        #   박스는 스토퍼에서 멈춰 있으므로 한 번만 맞히면 된다.
+        box_id = parse_payload(read_qr(bgr, det["corners_px"])) or ""
+        if not box_id and self._present and self._seen:
+            # 같은 박스를 계속 보고 있다 — 아까 읽은 값을 그대로 쓴다.
+            box_id = self._seen
+        elif not box_id:
+            # 라벨을 아직 한 번도 못 읽었다. 관제탑은 box_id 로 DB 를 조회하므로
+            # 빈 문자열이면 거기서 막힌다 — 그게 맞는 동작이다.
+            # 지어내면 남의 박스 기록을 덮는다.
+            self.get_logger().warn("픽업 QR 판독 실패 — box_id 없이 발행한다",
+                                   throttle_duration_sec=2.0)
+
+        # ★ 계약은 mm 정수다 (CLAUDE.md §3-2). 내부 계산은 m 로 하지만
+        #   토픽에 실을 때 여기서 한 번만 mm 로 바꾼다.
+        #   z 는 싣지 않는다 — 벨트 상면(800mm)은 고정이라 관제탑이 안다.
+        cx, cy, cz = out["center_m"]
+        self.pub.publish(BoxAtPickup(
+            present=True, box_id=box_id,
+            x_mm=m_to_mm(cx), y_mm=m_to_mm(cy),
+            yaw_deg=float(out["yaw_deg"])))
+        if box_id and box_id != self._seen:
             self.get_logger().info(
-                f"{self.ns} 내부 파라미터 수신: fx={self.fx:.1f}px fy={self.fy:.1f}px "
-                f"해상도 {msg.width}x{msg.height}")
+                f"도착 {box_id or '(미상)'} {out['type']['name']} "
+                f"({m_to_mm(cx)}, {m_to_mm(cy)}, {m_to_mm(cz)}) mm "
+                f"yaw {out['yaw_deg']:.1f}° · 맞춤오차 {out['fit_err_m']*1000:.1f} mm")
+            self._crosscheck(box_id, out["type"])
+        self._present = True
+        if box_id:
+            self._seen = box_id
 
-    def on_depth(self, msg: Image):
-        self.depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+    def _crosscheck(self, box_id, btype):
+        """투입부가 등록한 치수와 픽업에서 잰 치수가 같은가 — 비동기로 확인만.
 
-    def on_rgb(self, msg: Image):
-        if self.fx is None:
-            return                      # camera_info 가 아직 안 왔으면 환산을 못 한다
-        bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        dets = self.detect(bgr)
-        self.frames += 1
+        ★ 발행을 여기에 매달지 않는다. 서비스 응답을 기다렸다가 좌표를 내면
+          로봇이 그만큼 늦게 움직인다. 어긋나면 경고만 남기고 지표로 쓴다.
+        """
+        if not self.cli_info.service_is_ready():
+            return
+        fut = self.cli_info.call_async(GetBoxInfo.Request(box_id=box_id))
 
-        out = {
-            'camera': self.ns,
-            'stamp': msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
-            'measure': 'image-plane apparent size',
-            'detections': dets,
-        }
-        m = String()
-        m.data = json.dumps(out, ensure_ascii=False)
-        self.pub.publish(m)
+        def done(f):
+            r = f.result() if f.done() else None
+            if r is None or not r.found:
+                self.get_logger().warn(f"{box_id}: 투입부 등록 기록이 없다")
+                return
+            want = (r.info.size_w_mm, r.info.size_d_mm, r.info.size_h_mm)
+            got = (btype["w_mm"], btype["d_mm"], btype["h_mm"])
+            if want != got:
+                self.get_logger().warn(
+                    f"{box_id}: 투입부는 {want}, 픽업은 {got} 로 봤다")
 
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self.last_log >= self.log_period:
-            self.last_log = now
-            if not dets:
-                self.get_logger().info(f"[{self.ns}] 검출 없음 (프레임 {self.frames})")
-            for d in dets:
-                extra = f" → {d['snap']}" if d.get('snap') else ""
-                self.get_logger().info(
-                    f"[{self.ns}] color={d['color']:<5} "
-                    f"크기 {d['size_mm'][0]}x{d['size_mm'][1]}mm  "
-                    f"거리 {d['depth_m']:.3f}m  면적 {d['area_px']}px{extra}")
+        fut.add_done_callback(done)
 
-    # ── 핵심 ────────────────────────────────────────────────────────────────
-    def color_masks(self, hsv):
-        """색마다 HSV 범위로 마스크를 만든다. OpenCV 의 H 는 0~179 다 (0~359 아님)."""
-        s, v = self.s_min, self.v_min
-        table = {
-            # 빨강은 H=0 을 사이에 두고 갈라져 있어 두 구간을 합쳐야 한다
-            'red': [((0, s, v), (10, 255, 255)), ((170, s, v), (179, 255, 255))],
-            'green': [((35, s, v), (85, 255, 255))],
-            'blue': [((95, s, v), (130, 255, 255))],
-        }
-        out = {}
-        for name, ranges in table.items():
-            mask = None
-            for lo, hi in ranges:
-                m = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
-                mask = m if mask is None else cv2.bitwise_or(mask, m)
-            # 열기 → 닫기: 점 노이즈를 지우고 구멍을 메운다
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-            out[name] = mask
-        return out
-
-    def detect(self, bgr):
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        dets = []
-
-        for color, mask in self.color_masks(hsv).items():
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-            c = max(contours, key=cv2.contourArea)
-            area = float(cv2.contourArea(c))
-            if area < self.min_area:
-                continue
-
-            # 기울어진 면도 제대로 재려면 축정렬 사각형보다 최소회전사각형이 낫다
-            (u, v), (w_px, h_px), angle = cv2.minAreaRect(c)
-
-            blob = np.zeros(mask.shape, np.uint8)
-            cv2.drawContours(blob, [c], -1, 255, -1)
-            depth_m = self.median_depth(blob)
-            if depth_m is None:
-                continue
-
-            long_px, short_px = max(w_px, h_px), min(w_px, h_px)
-            # 핀홀 모델: 실제 크기 = 픽셀 크기 × 거리 ÷ 초점거리
-            long_mm = m_to_mm(long_px * depth_m / self.fx)
-            short_mm = m_to_mm(short_px * depth_m / self.fy)
-
-            det = {
-                'color': color,
-                'size_mm': [long_mm, short_mm],
-                'depth_m': round(depth_m, 4),
-                'area_px': int(area),
-                'uv': [round(u, 1), round(v, 1)],
-                'angle_deg': round(float(angle), 1),
-                # 카메라 광학 좌표계 기준 위치 (X 오른쪽, Y 아래, Z 앞)
-                'pos_m': [round((u - self.cx) * depth_m / self.fx, 4),
-                          round((v - self.cy) * depth_m / self.fy, 4),
-                          round(depth_m, 4)],
-            }
-            if self.snap_enabled:
-                det['snap'] = self.snap(long_mm, short_mm)
-            dets.append(det)
-
-        return dets
-
-    def median_depth(self, blob):
-        """마스크 안의 유효한 depth 중앙값(m). 평균이 아니라 중앙값인 이유는
-        가장자리 픽셀이 배경 거리로 튀어서 평균을 통째로 끌어당기기 때문."""
-        if self.depth is None:
-            return None
-        d = self.depth
-        if d.shape[:2] != blob.shape[:2]:
-            blob = cv2.resize(blob, (d.shape[1], d.shape[0]), interpolation=cv2.INTER_NEAREST)
-        vals = d[blob > 0]
-        vals = vals[np.isfinite(vals) & (vals > 0.0)]
-        if vals.size < 10:
-            return None
-        return float(np.median(vals))
-
-    def snap(self, long_mm, short_mm):
-        """잰 치수를 3호/4호/5호 중 가장 가까운 것에 붙인다."""
-        best, best_err = None, None
-        for t in self.box_types:
-            dims = sorted([t['w_mm'], t['d_mm'], t['h_mm']], reverse=True)
-            err = min(math.hypot(long_mm - dims[i], short_mm - dims[j])
-                      for i in range(3) for j in range(3) if i != j)
-            if best_err is None or err < best_err:
-                best, best_err = t['name'], err
-        return f"{best} (오차 {int(best_err)}mm)"
+    def _publish_absent(self):
+        if self._present:
+            self.get_logger().info("픽업 자리 비었다")
+        self._present, self._seen = False, None
+        self.pub.publish(BoxAtPickup(present=False, box_id=""))
 
 
-def main():
-    rclpy.init()
-    node = VisionNode()
+def _spin(node):
+    ex = MultiThreadedExecutor()
+    ex.add_node(node)
     try:
-        rclpy.spin(node)
+        ex.spin()
     except KeyboardInterrupt:
-        pass
-    except ExternalShutdownException:
-        # Ctrl+C / SIGTERM 으로 끌 때 rclpy 가 이걸 던진다.
-        # 안 잡으면 정상 종료인데도 traceback 이 쏟아져 진짜 에러처럼 보인다.
         pass
     finally:
         node.destroy_node()
-        rclpy.try_shutdown()
+        rclpy.shutdown()
 
 
-if __name__ == '__main__':
+def main(args=None):
+    """투입부 인식 — cam1 등록 · cam2 검증. 라인이 하나라 이 노드도 하나다."""
+    rclpy.init(args=args)
+    _spin(LineDetector(load()))
+
+
+def zone_main(args=None):
+    """구역 인식 — 구역마다 **따로 띄운다** (CLAUDE.md §8 "구역 인식 노드 3").
+
+    한 프로세스에 셋을 몰면 파이썬 GIL 때문에 추론이 줄을 서서 돈다.
+    """
+    rclpy.init(args=args)
+    _spin(ZoneDetector(load()))
+
+
+if __name__ == "__main__":
     main()

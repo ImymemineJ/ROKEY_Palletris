@@ -1,9 +1,11 @@
-string box_id
-int32  size_w_mm
-int32  size_d_mm
-int32  size_h_mm
+# detector_line1 → db.  카메라1 인식 결과를 DB 에 등록한다.
+string  box_id
+int32   size_w_mm
+int32   size_d_mm
+int32   size_h_mm
+string  color
+string  dest           # 2차용. 1차는 ""
+string  qr_payload     # 2차용. 1차는 ""
 ---
-bool   ok
-string zone
-int32  db_seq
-string message
+bool    ok
+string  message

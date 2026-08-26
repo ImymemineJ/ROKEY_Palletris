@@ -141,19 +141,41 @@ YAW_ABORT_DEG = 30.0
 #   ★ 가지는 **구간 시작에서 한 번 고르고 끝까지 유지**한다. 중간에 바꾸면 관절이
 #     180도 튄다 (초기 로그에 |dq| 180.0 deg 가 실제로 있었다).
 #
-#   ★★ 기본 keep — **이 구현은 아직 쓰면 안 된다.** (2026-08-24, 0824error1.mp4)
-#     `_advance_move` 는 매 스텝 IK 를 **직전 해**(p["prev"], q0 에서 출발)로 체인한다.
-#     여기서 고른 가지는 `q_end` 에만 들어가고 **경로에는 안 쓰인다** — 오직
-#     steps 계산(dq = |q_end - q0|)에만 반영된다. 즉 가지는 안 바뀌고 페이싱만 어긋난다.
-#     실측 결과: 'wflip' 을 고른 구간에서 도착 잔차 **343 mm**, 그 자리에서 놓아
-#     박스가 팔레트 밖으로 떨어졌다.
+#   ★★ 2026-08-24 에는 못 쓰는 구현이었다 (0824error1.mp4). 무엇이 틀렸었나:
+#     `_advance_move` 가 매 스텝 IK 를 **직전 해**(p["prev"], q0 에서 출발)로 체인하는데,
+#     고른 가지는 `q_end` 에만 들어가고 **경로에는 안 쓰였다** — steps 계산
+#     (dq = |q_end - q0|)에만 반영됐다. 즉 팔은 원래 가지로 가고 페이싱만 어긋났다.
+#     'wflip' 을 고른 구간에서 도착 잔차 **343 mm**, 그 자리에서 놓아 박스가 떨어졌다.
 #
 #     측정 도구(verify_transit_sweep_isaac.py --seeds multi)는 **시드에서 체인을
-#     시작**하므로 +32.9 -> +70.2 mm 가 나왔다. 컨트롤러는 q0 에서 시작한다. 이 차이다.
+#     시작**하므로 +32.9 -> +70.2 mm 가 나왔다. 컨트롤러는 q0 에서 시작했다. 이 차이다.
 #
-#     제대로 하려면 고른 가지로 팔을 **실제로 재구성하는 이동**이 먼저 필요하다
-#     (안전 고도에서 관절공간 이동). 그건 별개 작업이라 지금은 끈다.
+#   ★★ 2026-08-25 해결. 아래 RECFG_* 참조 — 호를 시작하기 전에 **관절공간으로 팔을
+#     그 가지로 옮긴다.** 그러면 컨트롤러도 측정 도구와 같은 자세에서 체인을 시작한다.
+#     기본값은 여전히 keep(꺼짐)이다. 켜려면 `PL_IK_SEEDS=multi`.
 IK_SEEDS = os.environ.get("PL_IK_SEEDS", "keep")
+
+# ★★ 이송 중 툴 기울기 (2026-08-25). 가지 재구성의 **대안**이다.
+#
+#   왜: 6축은 툴 위치3+자세3 을 다 묶으면 여유자유도가 0 이라 팔꿈치를 못 움직인다.
+#   자세 조건 중 **툴 축 방향**만 조금 풀면 여유가 생긴다. 손목 중심(j4/j5 교점)에서
+#   흡착면까지가 121+150 = 271 mm 라 15도면 손목이 70 mm 옆으로 가고, 팔뚝이 그만큼
+#   비켜난다. 가지 재구성이 준 이득(+32.9 -> +70.2 mm)과 **같은 크기인데 연속적**이라
+#   179도 스윙이 없다 (팔뚝 위치 변경error1.mp4 에서 본 그 동작).
+#
+#   ⚠ 착지 순간에는 반드시 0 이다 — 매달린 박스가 기울어 착지하면 다음 층이 무너진다
+#     (8-24 SAT 15축: 착지 상한 0도). 그래서 sin(pi*u) 로 **구간 양끝에서 0** 이 된다.
+#     하강 구간은 애초에 수평 이동이 거의 없어 아래 TILT_MIN_XY_M 에서 걸러진다.
+#   기본 0 = 꺼짐. 켜려면 `PL_TOOL_TILT=15`.
+TOOL_TILT_DEG = float(os.environ.get("PL_TOOL_TILT", "0"))
+TILT_MIN_XY_M = 0.20                      # 이 정도는 가로로 가는 구간에서만 기울인다
+TILT_DIRS_DEG = (0.0, 90.0, 180.0, 270.0) # 구간 시작에 중간점으로 채점해 하나 고른다
+# ★ 기울기는 **필요한 만큼만** 쓴다 (김병직 요청 2026-08-25 "깊은 부분만").
+#   후보를 작은 것부터 보고 여유가 이만큼 확보되면 거기서 멈춘다. 얕은 자리는
+#   기울기 0 으로 지나가고, 깊은 협곡에서만 최대치까지 올라간다.
+#   ⚠ 매달린 9kg 박스를 기울이는 것이므로 작을수록 좋다 — 전단력이 흡착 한계를 먹는다.
+TILT_ENOUGH_M = 0.06                      # 이만큼 여유가 나오면 더 안 기울인다 (60 mm)
+TILT_FRACTIONS = (0.34, 0.67, 1.0)        # 최대치의 1/3 · 2/3 · 전부
 SEED_PROBE_N = 8                          # 시드 점수용 경로 표본 수 (성기게)
 # ★ 현행 가지(keep)가 이만큼 여유로우면 **갈아타지 않는다.**
 #   가지를 바꾸면 관절 이동량이 커져 사이클이 길어진다 — 실측 6박스에서
@@ -161,6 +183,58 @@ SEED_PROBE_N = 8                          # 시드 점수용 경로 표본 수 (
 #   반대편으로 돌리기 때문이다). 여유가 이미 충분하면 그 비용을 낼 이유가 없다.
 #   값은 배치 오차(실측 7 mm)와 RMP 처짐(35 mm)을 합친 것보다 넉넉하게 잡는다.
 SEED_KEEP_OK_M = 0.06                     # 60 mm
+
+# ★★ 가지 재구성 (2026-08-25). 위 "아직 쓰면 안 된다" 의 해결이다.
+#
+#   고장은 이랬다: `_pick_seed` 가 고른 q_end 는 **페이싱(dq) 계산에만** 쓰였고,
+#   `_advance_move` 는 p["prev"] = q0 에서 IK 를 체인했다. 즉 팔은 원래 가지로 가고
+#   끝점만 다른 가지의 값이라 도착 잔차가 343 mm 났다.
+#
+#   고침: 가지를 갈아타기로 했으면 **호를 시작하기 전에 관절공간으로 팔을 그 가지로
+#   옮긴다.** 옮기는 목표는 **지금 그 자리에서의** 그 가지 해(q_re)다 — 툴은 제자리에
+#   두고 팔꿈치/어깨만 바꾼다. 그래야 호 파라미터(f0 기준)가 그대로 유효하다.
+#
+#   ⚠ 관절공간 이동은 툴이 제자리여도 **팔꿈치가 공간을 훑는다.** 그래서 재구성 경로
+#     자체도 장애물 여유를 표본으로 채점하고, 못 지키면 그 가지를 **후보에서 뺀다.**
+#     (끝점과 호만 보고 고르면 옮기는 도중에 치는 가지를 못 거른다 — 8-24 와 같은 실수)
+#
+#   ⚠⚠ 2026-08-25 실측 (팔뚝 위치 변경error1.mp4). 처음 판은 **하강 구간에서**
+#     179도짜리 어깨 뒤집기(j1flip)를 골라 팔을 스택 옆에서 크게 휘둘렀다.
+#     6축 팔은 여유자유도가 0 이라 **"툴은 제자리, 팔뚝만 회전"이 존재하지 않는다** —
+#     가지 사이에는 연속 경로가 없고 툴이 반드시 크게 움직인다. 그러니 재구성은
+#     **툴이 더미 위로 확실히 떠 있을 때만** 허용해야 한다.
+#     그래서 재구성 표본마다 **툴 높이**도 같이 본다. 장애물 최고점 + 여유 아래로
+#     내려가는 가지는 탈락시킨다 — 하강 구간은 이 조건에서 자동으로 걸러진다.
+RECFG_PROBE_N = 16                        # 재구성 관절경로 표본 수 (툴이 크게 휘므로 촘촘히)
+RECFG_MIN_M = 0.05                        # 재구성 도중 최소 여유 [m]. 못 지키면 그 가지 탈락
+RECFG_CLEAR_Z_M = 0.10                    # 재구성 중 툴이 장애물 최고점보다 이만큼 위여야 한다
+RECFG_OVER_XY_M = 0.20                    # "더미 위" 로 볼 수평 여유 [m]
+
+# ★★ 접촉 감지 — 닿으면 **그 자리에서 멈춘다** (2026-08-25, 김병직 제안).
+#
+#   지금까지는 못 따라가도 지령을 계속 전진시켰다 (`qk = p["prev"]` 로 유지하고
+#   u 는 계속 증가). 그리고 `_settle_move` 가 정체를 인정하기까지 8틱을 더 눌렀다.
+#   그동안 팔은 이웃 박스를 **계속 밀고 있다** — 실측 knock 16.2 · 31.5 mm 가 거기서 났다.
+#
+#   신호: 지령은 나가는데 **툴이 안 움직이면** 닿은 것이다. 그러면 지령을 지금
+#   **실제 관절각**으로 되돌려 미는 힘을 없애고 구간을 끝낸다. 두산 실기의 토크센서
+#   충돌정지와 같은 취지인데, 여기선 토크 대신 **툴 정지**로 감지한다
+#   (Lula 는 collision avoidance 를 지원하지 않는다 — supports_collision_avoidance()=False).
+#
+#   ⚠⚠ 첫 판은 "틱당 절대 이동량 < 0.3 mm 를 u < 0.9 구간에서" 로 봤는데 **한 번도
+#     안 불렸다** (2026-08-25 실측, 접촉 감지 0회). `_advance_move` 는 팔이 막혀도
+#     u 를 끝까지 밀어붙이므로, 툴이 멈출 때쯤엔 u 가 이미 0.9 를 넘어 있다.
+#     -> **지령 대비 실제 이동 비율**로 본다. 구간 끝에서는 지령도 같이 느려지므로
+#        비율은 그대로 유효하고, 창을 자를 필요도 없다.
+#   기본 0 = 꺼짐. 켜려면 `PL_CONTACT_STOP=1`.
+CONTACT_STOP = os.environ.get("PL_CONTACT_STOP", "0") not in ("0", "", "off")
+CONTACT_TICKS = 6                         # 이만큼 연속으로 못 따라가면 닿은 것
+CONTACT_RATIO = 0.25                      # 실제/지령 이동이 이 밑이면 "못 따라감"
+CONTACT_MIN_CMD_M = 0.0005                # 지령이 이만큼은 움직여야 판정한다 (0.5 mm)
+# ★ 계측 — 하강 구간의 **매 틱**을 찍는다. 판정 조건을 세 번 잘못 잡았고(창·절대이동·yaw)
+#   그때마다 로그가 답을 갖고 있었다. 추측 대신 이걸 먼저 본다 (CLAUDE.md §10-2 교훈).
+#   이송 구간은 제외한다 — 길고 관심사가 아니다. `PL_DIAG_CONTACT=1`.
+DIAG_CONTACT = os.environ.get("PL_DIAG_CONTACT", "0") not in ("0", "", "off")
 
 
 def _wrap(rad):
@@ -179,12 +253,53 @@ def _tool_yaw_deg(R):
     return math.degrees(math.atan2(-R[1, 0], -R[0, 0]))
 
 
-def _quat_down(yaw_deg):
-    """툴 z 축이 월드 −Z 를 보고, 그 축 둘레로 yaw 만큼 돌린 자세. (w, x, y, z)"""
-    h = math.radians(yaw_deg) / 2.0
-    # R = Rz(yaw) · Ry(pi). Ry(pi) = (w,x,y,z) = (0,0,1,0) 이므로
-    #   q = qz * qy = (0, -sin(h), cos(h), 0)
-    return np.array([0.0, -math.sin(h), math.cos(h), 0.0])
+def _quat_down(yaw_deg, tilt_deg=0.0, tilt_dir_deg=0.0):
+    """툴 z 축이 월드 −Z 를 보고, 그 축 둘레로 yaw 만큼 돌린 자세. (w, x, y, z)
+
+    `tilt_deg` 를 주면 그 축을 `tilt_dir_deg` 방향으로 그만큼 **기울인다**.
+    0 이면 예전과 완전히 같다 (기본값).
+
+    ★ 왜 기울이나 (2026-08-25): 6축 팔은 툴의 위치3+자세3 을 다 묶으면 여유자유도가
+      0 이라 팔꿈치를 못 움직인다. 자세 조건 중 **툴 축 방향**을 조금 풀면 여유가
+      생긴다. 손목 중심(j4/j5 교점)에서 흡착면까지가 121+150 = **271 mm** 라
+      15도면 손목이 **70 mm** 옆으로 간다 — 팔뚝이 그만큼 비켜난다.
+      가지 재구성(+32.9 -> +70.2 mm)과 같은 크기인데 **연속적**이라 179도 스윙이 없다.
+    ⚠ 착지 순간에는 0 이어야 한다. 매달린 박스가 기울어 착지하면 다음 층이 무너진다
+      (8-24 SAT 15축 실측: 착지 상한 0도). 그래서 구간 양끝에서 0 으로 수렴시킨다.
+    """
+    ry, rz = math.radians(180.0 - tilt_deg), math.radians(yaw_deg)
+    rd = math.radians(tilt_dir_deg)
+    # R = Rz(yaw) · Rz(dir) · Ry(180-tilt) · Rz(-dir)
+    #   Ry(180-tilt) 로 아래를 보되 tilt 만큼 덜 눕히고, Rz(dir) 로 기울일 방위를 정한다.
+    def _rz(a):
+        c, s_ = math.cos(a), math.sin(a)
+        return np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+    c, s_ = math.cos(ry), math.sin(ry)
+    Ry = np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]])
+    R = _rz(rz) @ _rz(rd) @ Ry @ _rz(-rd)
+    return _mat_to_quat(R)
+
+
+def _quat_zaxis(q):
+    """(w,x,y,z) -> 그 자세의 툴 z 축 (월드). R[:, 2] 와 같다."""
+    w, x, y, z = (float(v) for v in q)
+    return np.array([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)])
+
+
+def _mat_to_quat(R):
+    """회전행렬 -> (w, x, y, z). Lula 가 이 순서를 받는다."""
+    t = float(np.trace(R))
+    if t > 0.0:
+        s_ = math.sqrt(t + 1.0) * 2.0
+        return np.array([0.25 * s_, (R[2, 1] - R[1, 2]) / s_,
+                         (R[0, 2] - R[2, 0]) / s_, (R[1, 0] - R[0, 1]) / s_])
+    i = int(np.argmax(np.diag(R)))
+    j, k = (i + 1) % 3, (i + 2) % 3
+    s_ = math.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2.0
+    q = np.zeros(4)
+    q[0] = (R[k, j] - R[j, k]) / s_
+    q[1 + i], q[1 + j], q[1 + k] = 0.25 * s_, (R[j, i] + R[i, j]) / s_, (R[k, i] + R[i, k]) / s_
+    return q
 
 
 class RobotMotion:
@@ -412,16 +527,21 @@ class RobotMotion:
                 self._tcp_mps = float(np.linalg.norm(cur - self._prev_tool)) / self.dt
             self._prev_tool = cur
 
-    def _ik(self, face, yaw_deg, seed):
+    def _ik(self, face, yaw_deg, seed, tilt_deg=0.0, tilt_dir_deg=0.0):
         """흡착면 목표 -> (q, ok). tool0 목표는 흡착면 + 그리퍼 길이다.
 
         `ArticulationKinematicsSolver` 를 쓰지 않는다 — 그건 현재 관절각을 시드로
         **강제**해서(`articulation_kinematics_solver.py:94`) 시드를 고를 수가 없다.
         """
-        tgt = np.asarray(face, dtype=float) + np.array([0.0, 0.0, self.grip_len])
+        quat = _quat_down(yaw_deg, tilt_deg, tilt_dir_deg)
+        # ★ 플랜지 목표는 흡착면에서 **툴 축을 따라** 그리퍼 길이만큼 뒤다.
+        #   기울기가 0 이면 툴 축이 -Z 라 예전과 같은 face + [0,0,grip_len] 이 된다.
+        #   기울였을 때 그 식을 그대로 쓰면 흡착면이 옆으로 어긋난다.
+        zax = _quat_zaxis(quat)
+        tgt = np.asarray(face, dtype=float) - zax * self.grip_len
         q, ok = self.lula.compute_inverse_kinematics(
             frame_name=self.ee, target_position=tgt,
-            target_orientation=_quat_down(yaw_deg),
+            target_orientation=quat,
             warm_start=np.asarray(seed, dtype=float))
         return (np.asarray(q, dtype=float) if ok else None), bool(ok)
 
@@ -472,8 +592,45 @@ class RobotMotion:
                         worst = d
         return worst
 
+    def _recfg_ok(self, q0, q_re):
+        """q0 -> q_re 관절공간 이동이 장애물을 안 치는지. -> (통과여부, 최소여유 [m])
+
+        ★ 툴이 제자리여도 **팔꿈치는 공간을 훑는다.** 이 검사가 없으면 "끝점은 여유로운데
+          거기 가는 길에 치는" 가지를 고르게 된다.
+        """
+        # ★ 장애물(=이미 놓인 박스) 봉투. 재구성 중 툴이 **더미 위를 지날 때만**
+        #   높이를 따진다. 컨베이어 쪽은 팔레트에서 멀어 크게 휘둘러도 상관없는데,
+        #   높이만 보면 거기서도 다 막혀 기능이 아예 안 켜진다.
+        top = max((float(hi[2]) for _, hi in self._obst), default=None)
+        z_min = None if top is None else top + RECFG_CLEAR_Z_M
+        if z_min is not None:
+            lo_xy = np.min([lo[:2] for lo, _ in self._obst], axis=0) - RECFG_OVER_XY_M
+            hi_xy = np.max([hi[:2] for _, hi in self._obst], axis=0) + RECFG_OVER_XY_M
+        worst = float("inf")
+        for k in range(0, RECFG_PROBE_N + 1):
+            u = k / float(RECFG_PROBE_N)
+            q = q0 + (q_re - q0) * u
+            if z_min is not None:
+                # 툴이 더미 속으로 들어가는 순간이 하나라도 있으면 그 가지는 못 쓴다.
+                # (하강 구간에서 고르는 것도 여기서 같이 걸러진다 — 시작점부터 낮다)
+                # ⚠ 재구성 중에는 툴이 기울 수 있다. "플랜지 z - 그리퍼 길이" 로
+                #   퉁치면 기운 자세에서 틀린다 — 회전을 그대로 써서 흡착면을 구하고,
+                #   플랜지와 흡착면 중 **낮은 쪽**을 본다.
+                fp, fR = self.lula.compute_forward_kinematics(self.ee, q)
+                fp, fR = np.asarray(fp, dtype=float), np.asarray(fR)
+                face = fp + fR[:, 2] * self.grip_len
+                over = np.all(face[:2] >= lo_xy) and np.all(face[:2] <= hi_xy)
+                tz = min(float(fp[2]), float(face[2]))
+                if over and tz < z_min:
+                    return False, -1.0
+            worst = min(worst, self._arm_clearance(q))
+        return worst >= RECFG_MIN_M, worst
+
     def _pick_seed(self, face, yaw_to, q0):
-        """끝점과 경로를 함께 보고 가장 여유로운 가지를 고른다. -> (q_end, ok, 이름).
+        """끝점·재구성·호를 함께 보고 가장 여유로운 가지를 고른다.
+
+        -> (q_end, ok, 이름, q_re)   q_re 는 호 시작 전에 관절공간으로 옮겨 갈 자세.
+           'keep' 이면 q_re 는 None 이고 예전과 완전히 같은 경로다.
 
         ★ 구간 **시작에서 한 번** 고르고 끝까지 유지한다. 중간에 바꾸면 관절이 180도 튄다.
         경로는 성기게(SEED_PROBE_N) 훑는다 — 끝점만 보면 도중에 파고드는 가지를 못 거른다.
@@ -488,7 +645,7 @@ class RobotMotion:
                 fk = np.asarray(self.lula.compute_forward_kinematics(self.ee, q_keep)[0])
                 if np.linalg.norm(fk - (np.asarray(face)
                                         + np.array([0.0, 0.0, self.grip_len]))) <= IK_TOL_M:
-                    return q_keep, True, "keep"
+                    return q_keep, True, "keep", None
         for name, sd in bank:
             q_end, ok = self._ik(face, yaw_to, sd)
             if not ok:
@@ -497,7 +654,22 @@ class RobotMotion:
             if np.linalg.norm(fk - (np.asarray(face)
                                     + np.array([0.0, 0.0, self.grip_len]))) > IK_TOL_M:
                 continue
-            score, q = self._arm_clearance(q_end), q_end
+            # ★ 갈아탈 가지면 **지금 자리에서의** 그 가지 해를 먼저 구한다. 호는 여기서
+            #   출발한다. 이게 없으면 팔은 원래 가지로 가고 끝점만 달라져 잔차가 남는다.
+            q_re = None
+            if name != "keep":
+                q_re, ok_re = self._ik(f0, self._cur_yaw_deg(), sd)
+                if not ok_re:
+                    continue
+                pass_re, worst_re = self._recfg_ok(q0, q_re)
+                if not pass_re:
+                    self._log("[robot_motion] 가지 '%s' 기각 — %s"
+                              % (name, "재구성 중 툴이 더미 위로 안 뜬다" if worst_re < 0
+                                 else "재구성 도중 여유 %+.0f mm" % (worst_re * 1000)))
+                    continue
+            # 호는 q_re(있으면)에서 체인해 채점한다 — 실제로 갈 경로와 같아야 한다.
+            q = q_re if q_re is not None else q_end
+            score = self._arm_clearance(q_end)
             if self._obst and self.spheres:
                 for k in range(1, SEED_PROBE_N):
                     u = k / float(SEED_PROBE_N)
@@ -507,10 +679,15 @@ class RobotMotion:
                     q = qi
                     score = min(score, self._arm_clearance(qi))
             if best is None or score > best[0]:
-                best = (score, q_end, name)
+                best = (score, q_end, name, q_re)
         if best is None:
-            return None, False, ""
-        return best[1], True, best[2]
+            return None, False, "", None
+        return best[1], True, best[2], best[3]
+
+    def _cur_yaw_deg(self):
+        """현재 툴 yaw [deg]. 재구성 목표는 **툴을 안 움직이는** 해라야 한다."""
+        q = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
+        return _tool_yaw_deg(np.asarray(self.lula.compute_forward_kinematics(self.ee, q)[1]))
 
     def _at(self, p, u):
         """호 위의 흡착면 좌표. 반경·높이는 선형, 각도는 짧은 쪽."""
@@ -534,10 +711,11 @@ class RobotMotion:
 
         # ★ 가지를 여기서 한 번 고른다 (구간 내내 유지된다). 장애물이나 충돌구체가
         #   없으면 _seed_bank 가 keep 하나만 주므로 예전과 완전히 같은 경로다.
-        q_end, ok, seed_name = self._pick_seed(face, yaw_to, q0)
+        q_end, ok, seed_name, q_re = self._pick_seed(face, yaw_to, q0)
         if ok and seed_name and seed_name != "keep":
-            self._log("[robot_motion] IK 가지 '%s' 선택 (여유 %+.0f mm)"
-                      % (seed_name, self._arm_clearance(q_end) * 1000))
+            self._log("[robot_motion] IK 가지 '%s' 선택 (끝점 여유 %+.0f mm · 재구성 %.1f deg)"
+                      % (seed_name, self._arm_clearance(q_end) * 1000,
+                         float(np.rad2deg(np.max(np.abs(q_re - q0))))))
         if not ok:
             # ★ ok 플래그만 믿지 않는다. 해를 FK 로 되돌려 목표와 맞는지까지 본다.
             self._state = "IK_FAIL"
@@ -549,20 +727,67 @@ class RobotMotion:
         v0, v1 = f0[:2] - self.base_xy, np.asarray(face)[:2] - self.base_xy
         r0, r1 = float(np.linalg.norm(v0)), float(np.linalg.norm(v1))
         th0 = math.atan2(v0[1], v0[0])
-        dq = np.abs(q_end - q0)
+        # ★ 페이싱은 **호가 실제로 출발하는 자세**에서 잰다. 재구성이 있으면 q_re 다.
+        q_arc0 = q0 if q_re is None else q_re
+        dq = np.abs(q_end - q_arc0)
         secs = float(np.max(dq / (self.vlim * self.speed_scale))) if np.any(dq) else 0.0
         steps = max(1, int(math.ceil(secs * self.hz)))
+        # 재구성 구간도 같은 속도 상한으로 스텝을 나눈다
+        re_steps = 0
+        if q_re is not None:
+            dqr = np.abs(q_re - q0)
+            re_secs = float(np.max(dqr / (self.vlim * self.speed_scale))) if np.any(dqr) else 0.0
+            re_steps = max(1, int(math.ceil(re_secs * self.hz)))
         self._path = {"f0": f0, "f1": np.asarray(face, dtype=float),
                       "arc": r0 > ARC_MIN_R_M and r1 > ARC_MIN_R_M,
                       "r0": r0, "r1": r1, "th0": th0,
                       "dth": _wrap(math.atan2(v1[1], v1[0]) - th0),
                       "yaw0": yaw_from, "yaw1": yaw_to,
-                      "u": 0.0, "du": 1.0 / steps, "prev": q0, "k": 0,
+                      "u": 0.0, "du": 1.0 / steps, "prev": q_arc0, "k": 0,
                       "miss": 0, "over": 0,
+                      # ★ 재구성 구간 — 호보다 **먼저** 돈다. q0 -> re_q 관절 보간이고
+                      #   툴은 제자리다(re_q 가 같은 흡착면 자세의 다른 가지 해라서).
+                      #   없으면(keep) re_q 가 None 이라 이 구간을 통째로 건너뛴다.
+                      # 접촉 감지 상태 (위 CONTACT_* 주석)
+                      "cprev": None, "ccmd": None, "cstill": 0,
+                      "re_q": q_re, "re_q0": q0, "re_u": 0.0,
+                      "re_du": (1.0 / re_steps) if re_steps else 1.0,
                       # ★ 구간마다 요구 정밀도가 다르다. 이송(상공 이동·후퇴)은 mm 로
                       #   도착할 이유가 없고, 정밀해야 하는 건 집는/놓는 하강뿐이다.
                       #   상위(cycle)가 `tol_m` 으로 준다. 안 주면 기본값 = 예전 동작.
                       "tol": tol_m}
+        # ★ 기울기 방향은 **구간 시작에 한 번** 고른다 (중간점 u=0.5 로 채점).
+        #   매 스텝 고르면 방향이 튀어 손목이 떤다. 이득이 없으면 0 으로 둔다.
+        p_tmp = self._path
+        tilt_deg, tilt_dir = 0.0, 0.0
+        if (TOOL_TILT_DEG > 0 and self._obst and self.spheres
+                and float(np.linalg.norm(np.asarray(face)[:2] - f0[:2])) >= TILT_MIN_XY_M):
+            mid = self._at(p_tmp, 0.5)
+            ymid = yaw_from + (yaw_to - yaw_from) * 0.5
+            q_base, ok_base = self._ik(mid, ymid, q_arc0)
+            base = self._arm_clearance(q_base) if ok_base else None
+            # ★ 이미 충분히 여유로우면 아예 안 기울인다 — 얕은 자리는 그냥 지나간다.
+            if base is not None and base < TILT_ENOUGH_M:
+                best = None
+                for fr in TILT_FRACTIONS:          # 작은 기울기부터 본다
+                    td = TOOL_TILT_DEG * fr
+                    for dd in TILT_DIRS_DEG:
+                        qm, okm = self._ik(mid, ymid, q_arc0, td, dd)
+                        if not okm:
+                            continue
+                        cl = self._arm_clearance(qm)
+                        if best is None or cl > best[0]:
+                            best = (cl, td, dd)
+                    # 이 크기에서 이미 충분하면 더 크게 안 간다
+                    if best is not None and best[0] >= TILT_ENOUGH_M:
+                        break
+                if best is not None and best[0] > base + 0.005:
+                    tilt_deg, tilt_dir = best[1], best[2]
+                    self._log("[robot_motion] 이송 기울기 %.1f도 방위 %.0f도 "
+                              "(중간점 여유 %+.0f -> %+.0f mm)"
+                              % (tilt_deg, tilt_dir, base * 1000, best[0] * 1000))
+        self._path["tilt"] = tilt_deg
+        self._path["tdir"] = tilt_dir
         self._goal_face = np.asarray(face, dtype=float)
         self._goal_yaw = float(yaw_to)              # ★ 도착 판정에 쓸 목표 자세
         self._hold = 0
@@ -570,15 +795,24 @@ class RobotMotion:
         self._best, self._flat = float("inf"), 0      # 수렴 정체 판정 (위 SETTLE_PLATEAU_*)
         self._s0 = None                              # 정착 진입 시점 (잔차, 틱) — SETTLE_LOG
         self._state = "MOVING"
-        self._log("[robot_motion] move -> %s yaw %.1f -> %.1f  %s  |dq| %.1f deg  n %d"
+        self._log("[robot_motion] move -> %s yaw %.1f -> %.1f  %s  |dq| %.1f deg  n %d%s"
                   % (np.round(face, 4), yaw_from, yaw_to,
                      "호" if self._path["arc"] else "직선",
-                     float(np.rad2deg(np.max(dq))), steps))
+                     float(np.rad2deg(np.max(dq))), steps,
+                     ("  + 재구성 n %d" % re_steps) if re_steps else ""))
 
     def _advance_move(self):
         """호를 한 스텝 전진시킨다. **IK 는 스텝당 최소 1회.**"""
         p = self._path
         if p is None:
+            return
+        # ★ 재구성 먼저 — 관절공간 직선. 툴은 제자리이므로 호 파라미터는 그대로 유효하다.
+        if p["re_q"] is not None and p["re_u"] < 1.0 - 1e-9:
+            p["re_u"] = min(1.0, p["re_u"] + p["re_du"])
+            q = p["re_q0"] + (p["re_q"] - p["re_q0"]) * p["re_u"]
+            self.art.apply_action(self._Action(joint_positions=q))
+            if p["re_u"] >= 1.0 - 1e-9:
+                p["prev"] = np.asarray(p["re_q"], dtype=float)   # 호는 여기서 체인한다
             return
         if p["u"] >= 1.0 - 1e-9:
             self._settle_move(p)
@@ -592,8 +826,11 @@ class RobotMotion:
         qk, ok = None, False
         for _ in range(BISECT):
             u2 = p["u"] + step_u
+            # ★ sin(pi*u) — 구간 양끝에서 정확히 0 이라 착지 자세는 늘 수평이다.
+            tl = p["tilt"] * math.sin(math.pi * u2) if p["tilt"] else 0.0
             cand, cok = self._ik(self._at(p, u2),
-                                 p["yaw0"] + (p["yaw1"] - p["yaw0"]) * u2, p["prev"])
+                                 p["yaw0"] + (p["yaw1"] - p["yaw0"]) * u2, p["prev"],
+                                 tl, p["tdir"])
             if cok and np.all(np.abs(cand - p["prev"]) <= self.cap):
                 qk, ok = cand, True
                 break
@@ -609,6 +846,35 @@ class RobotMotion:
         p["u"] += step_u
         p["k"] += 1
         self.art.apply_action(self._Action(joint_positions=qk))
+        # ★ 닿았나 — **지령은 나갔는데 툴이 안 따라오면** 벽에 걸린 것이다.
+        if CONTACT_STOP:
+            now = self.suction_pose()
+            cmd = self._at(p, p["u"])            # 이번 스텝의 지령 흡착면
+            if p["cprev"] is not None and p["ccmd"] is not None:
+                moved = float(np.linalg.norm(now - p["cprev"]))
+                want = float(np.linalg.norm(cmd - p["ccmd"]))
+                if want >= CONTACT_MIN_CMD_M:
+                    p["cstill"] = (p["cstill"] + 1 if moved < want * CONTACT_RATIO else 0)
+            if DIAG_CONTACT and p.get("tol", REACH_TOL_M) <= REACH_TOL_M + 1e-9:
+                self._log("[diag] adv u %.3f  지령 %5.2f  실제 %5.2f mm  정체 %d  "
+                          "남은 %6.2f mm"
+                          % (p["u"],
+                             (float(np.linalg.norm(cmd - p["ccmd"])) * 1000
+                              if p["ccmd"] is not None else 0.0),
+                             (float(np.linalg.norm(now - p["cprev"])) * 1000
+                              if p["cprev"] is not None else 0.0),
+                             p["cstill"],
+                             float(np.linalg.norm(now - self._goal_face)) * 1000))
+            p["cprev"], p["ccmd"] = now, cmd
+            if p["cstill"] >= CONTACT_TICKS:
+                # ★ 지령을 **지금 실제 관절각**으로 되돌린다 — 미는 힘을 즉시 없앤다.
+                q_now = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
+                self.art.apply_action(self._Action(joint_positions=q_now))
+                err = float(np.linalg.norm(now - self._goal_face))
+                self._log("[robot_motion] 접촉 감지 — %d틱 못 따라감, 그 자리에서 멈춘다 "
+                          "(남은 거리 %.1f mm · u %.2f)" % (CONTACT_TICKS, err * 1000, p["u"]))
+                self._reach_done(err, p)
+                return
         if p["k"] > int(MOVE_LIMIT_S * self.hz):
             self._state = "IK_FAIL"
             self._path = None
@@ -618,6 +884,7 @@ class RobotMotion:
     def _settle_move(self, p):
         """끝점 지령을 유지하며 흡착면이 실제로 목표 **위치와 자세**에 들어오는지 본다."""
         self.art.apply_action(self._Action(joint_positions=p["prev"]))
+        # (아래 CONTACT_STOP 분기에서 정체가 확인되면 지령을 실제 관절각으로 되돌린다)
         face, yaw = self.suction_face()
         err = float(np.linalg.norm(face - self._goal_face))
         # ★ yaw 와 yaw±180 은 물리적으로 같은 자세다 — 180° 주기로 비교한다.
@@ -632,6 +899,9 @@ class RobotMotion:
                 self._reach_done(err, p)
             return
         self._hold = 0
+        if DIAG_CONTACT and tol <= REACH_TOL_M + 1e-9:
+            self._log("[diag] set  잔차 %6.2f mm  yaw %5.1f도  정체 %d  남은틱 %d"
+                      % (err * 1000, dyaw, self._flat, self._settle))
         # ── 수렴 정체 = 이 제어기의 정상상태다. 더 기다려도 안 들어온다 ──
         if err < self._best - SETTLE_PLATEAU_M:
             self._best, self._flat = err, 0
@@ -639,6 +909,35 @@ class RobotMotion:
             self._flat += 1
         if (self._flat >= SETTLE_PLATEAU_TICKS
                 and dyaw < YAW_TOL_DEG and err < REACH_ABORT_M):
+            # ★ 잔차가 허용 밖인 채 정체했다면 **막힌 것**이다. `_reach_done` 은 지령을
+            #   안 거두므로 드라이브가 마지막 깊은 지령을 계속 붙들고 민다 —
+            #   상위가 되잡는 동안 내내 이웃을 밀어 knock 13.3 mm 가 났다 (실측).
+            if CONTACT_STOP and err > p.get("tol", REACH_TOL_M):
+                self.art.apply_action(self._Action(
+                    joint_positions=np.asarray(self.art.get_joint_positions()[:6], dtype=float)))
+            self._reach_done(err, p)
+            return
+        # ★★ 크게 막혔을 때 **더 오래 미는** 구조였다 (2026-08-25 실측).
+        #   위 정체 탈출에 `err < REACH_ABORT_M(50mm)` 이 붙어 있어서, 잔차가 55.6 mm 면
+        #   탈출이 안 걸리고 SETTLE_MAX_S(2.5초) **전체를 누르며 기다렸다.**
+        #   그 2.5초 동안 팔이 이웃을 밀어 knock 17.2 mm 가 났다.
+        #   -> 정체는 정체다. 크기와 무관하게 **즉시 힘을 뺀다.**
+        #      지령을 지금 실제 관절각으로 되돌리면 미는 힘이 그 자리에서 사라진다.
+        # ⚠ **yaw 를 같이 봐야 한다** (2026-08-25 실측). 손목이 346도 도는 이송 구간에서
+        #   위치는 1.3 mm 로 먼저 도착하고 yaw 만 72.7도 남아 있었는데, 위치 잔차가
+        #   안 줄어든다고 "닿았다"로 오판해 **공중(z +144 mm)에서 박스를 놓았다.**
+        #   자세가 아직 수렴 중인 것은 접촉이 아니다.
+        if (CONTACT_STOP and self._flat >= SETTLE_PLATEAU_TICKS
+                and dyaw < YAW_TOL_DEG):
+            q_now = np.asarray(self.art.get_joint_positions()[:6], dtype=float)
+            self.art.apply_action(self._Action(joint_positions=q_now))
+            self._log("[robot_motion] 접촉 감지 — 정체 %d틱, 힘을 뺀다 "
+                      "(잔차 %.1f mm · yaw %.1f도)" % (SETTLE_PLATEAU_TICKS, err * 1000, dyaw))
+            if err > REACH_ABORT_M or dyaw > YAW_ABORT_DEG:
+                # 상위(cycle)가 이 자리를 읽어 되잡거나 낙하로 처리한다.
+                self._state = "IK_FAIL"
+                self._path = None
+                return
             self._reach_done(err, p)
             return
         self._settle -= 1

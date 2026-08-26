@@ -1,4 +1,6 @@
-string box_id
-string status          # SPAWNED|SCANNED|VERIFIED|DIVERTED|PICKED|PLACED|PICK_FAILED|REJECTED
+# 상태 전이 기록.
+string  box_id
+string  status         # PICKED|PLACED|PICK_FAILED|REJECTED|DIVERTED|VERIFIED
+string  reason
 ---
-bool   ok
+bool    ok

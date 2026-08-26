@@ -6,11 +6,12 @@
     Python 버전 차이(3.11 vs 3.12)를 우회하므로 rclpy 가 필요 없다.
 
 세우는 것 (`/World/PalletrisROS`)
-    OnPlaybackTick ─┬─> ROS2Subscriber  /robot/cmd            (packing_msgs/RobotCmd)
+    OnPlaybackTick ─┬─> ROS2Subscriber  /zone_<z>/robot/cmd   (packing_msgs/RobotCmd)
                     ├─> [서비스 4종]     Req -> Script -> Res
-                    └─> EventGate ─────> ROS2Publisher /robot/event  (RobotEvent)
+                    └─> EventGate ─────> ROS2Publisher /zone_<z>/robot/event (RobotEvent)
 
-    `/clock` · `/tf` · 카메라는 **여기서 안 만든다.** 김학민(A)의 기존 그래프 소관이다.
+    `/clock` · `/tf` 는 원래 김학민(A)의 씬 그래프 소관이지만, **씬에 없으면**
+    `build_clock_tf()` 가 런타임에 세운다 (씬에 있으면 비켜선다). 카메라는 안 만든다.
     `/zone_*/box_at_pickup` 도 아니다 — §3-2 에서 **인식 노드(D)** 가 발행한다.
 
 ★★ 실측으로 알아낸 제약 4가지 (TS-022). 순서를 지키지 않으면 조용히 안 된다.
@@ -61,8 +62,21 @@ SERVICES = [
     ("set_spawn_enabled", "SetSpawnEnabled", "/sim/set_spawn_enabled"),
     ("swap_pallet",       "SwapPallet",      "/sim/swap_pallet"),
 ]
-CMD_TOPIC = "/robot/cmd"
-EVT_TOPIC = "/robot/event"
+# ★ 로봇 토픽은 **구역별**이다 (2026-08-26 정합).
+#   CLAUDE.md §3-2 는 `/robot/cmd` 단수로 적혀 있지만 로봇이 3 대라 관제탑이
+#   `/zone_{a|b|c}/robot/cmd` 로 나눠 쓴다 (`orchestrator_node.py:161-171`).
+#   여기가 단수로 남아 있어서 **관제탑과 Isaac 이 서로 못 만났다** — 에러도 안 난다.
+#   구역 문자는 관제탑과 같게 **소문자**로 맞춘다 (`self.zone = str(zone).lower()`).
+CMD_TOPIC_FMT = "/zone_%s/robot/cmd"
+EVT_TOPIC_FMT = "/zone_%s/robot/event"
+
+
+def cmd_topic(zone):
+    return CMD_TOPIC_FMT % str(zone).lower()
+
+
+def evt_topic(zone):
+    return EVT_TOPIC_FMT % str(zone).lower()
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.
 _OG_TYPE = {
@@ -78,9 +92,13 @@ _OG_TYPE = {
 # 핸들러 등록소. ScriptNode 가 여기를 통해 sim_main 의 함수를 부른다.
 #   시그니처: handler(**요청필드) -> dict(응답필드)  ·  즉시 반환할 것 (§9)
 HANDLERS = {}
-# 보낼 RobotEvent 대기열. send_event() 가 넣고 EventGate 가 한 틱에 하나씩 비운다.
-_EVENTS = []
-_state = {"wired": False, "seen_seq": None}
+# ★★ 구역별로 갈린다 (2026-08-26 김병직). 로봇이 3 대라 하나로 두면 안 된다:
+#   · `_EVENTS` 가 하나면 A 구역 결과가 B 구역 토픽으로 나간다
+#   · `seen_seq` 가 하나면 A 구역이 집어간 seq 를 B 구역이 "이미 봤다"고 버린다
+#   둘 다 **에러 없이 엉뚱하게 도는** 종류다.
+# 보낼 RobotEvent 대기열 {zone: [ev, ...]}. send_event() 가 넣고 EventGate 가 비운다.
+_EVENTS = {}
+_state = {"wired": False, "zones": [], "seen_seq": {}}
 # 디버그 출력 (환경변수 PL_ROSGRAPH_DEBUG=1)
 DEBUG = os.environ.get("PL_ROSGRAPH_DEBUG") == "1"
 
@@ -90,25 +108,41 @@ def set_handlers(**fns):
     HANDLERS.update(fns)
 
 
-def send_event(**fields):
+def _one_zone(zone):
+    """zone 을 안 주면 구역이 하나일 때만 그걸 쓴다. 여럿이면 안 넘어간다.
+
+    ★ 구역이 여럿인데 zone 을 생략하면 **조용히 엉뚱한 구역에 실린다.**
+      기존 호출부(selftest_ros_graph.py)는 구역이 하나라 그대로 돈다.
+    """
+    if zone is not None:
+        return str(zone).upper()
+    zs = _state["zones"]
+    if len(zs) == 1:
+        return zs[0]
+    raise ValueError("구역이 %d 개다 — zone 을 명시할 것 (%s)" % (len(zs), zs))
+
+
+def send_event(zone=None, **fields):
     """RobotEvent 를 한 건 예약한다. 실제 발행은 다음 틱의 EventGate 가 한다.
 
     ★ 여기서 바로 발행하지 않는 이유: 발행은 그래프 평가 안에서 일어나야 한다.
       바깥에서 Publisher 입력만 써 두면 언제 나갈지가 틱 순서에 좌우된다.
     """
-    _EVENTS.append(dict(fields))
+    _EVENTS.setdefault(_one_zone(zone), []).append(dict(fields))
 
 
-def take_cmd():
-    """새로 들어온 RobotCmd 를 dict 로 준다. 없으면 None.
+def take_cmd(zone=None):
+    """그 구역에 새로 들어온 RobotCmd 를 dict 로 준다. 없으면 None.
 
     ★ 같은 메시지를 두 번 집지 않도록 `seq` 로 거른다 (§3-4 규약 2번).
       Subscriber 의 `outputs:*` 는 마지막 수신값을 계속 들고 있어서, 안 거르면
       매 틱 같은 명령을 새 명령으로 오인한다.
+      **seq 기억은 구역별이다** — 하나로 두면 A 가 본 seq 를 B 가 버린다.
     """
     if not _state["wired"]:
         return None
-    node = og.Controller.node(f"{GRAPH}/CmdSub")
+    z = _one_zone(zone)
+    node = og.Controller.node(f"{GRAPH}/CmdSub_{z}")
     out = {}
     for a in node.get_attributes():
         n = a.get_name()
@@ -118,9 +152,9 @@ def take_cmd():
             except Exception:                                   # noqa: BLE001
                 pass
     seq = out.get("seq")
-    if seq is None or seq == _state["seen_seq"] or seq == 0:
+    if seq is None or seq == _state["seen_seq"].get(z) or seq == 0:
         return None
-    _state["seen_seq"] = seq
+    _state["seen_seq"][z] = seq
     return out
 
 
@@ -160,36 +194,179 @@ def srv_fields(name):
     return _parse_fields(a), _parse_fields(b)
 
 
-# ── 1단계: 뼈대. Play 전에 부른다 ───────────────────────────────────────────
-def build(zone="B"):
-    """노드를 만들고 **정적 배선만** 한다. 데이터 배선은 wire() 에서."""
+# ── /clock · /tf — 씬에 없으면 우리가 낸다 ─────────────────────────────────
+def build_clock_tf(cfg, log=print):
+    """`/clock` 과 `/tf` 발행 그래프를 **씬에 없을 때만** 세운다.
+
+    ★ 왜 여기 있나 — 원래는 씬(트랙 A) 소관이다. `setup_test3_scene.py [11]` 이
+      같은 그래프를 USD 에 써 넣는다. 그런데 2026-08-26 실측에서 씬의 OmniGraph
+      43 개가 **전부 컨베이어**였다: `/clock` 발행자 0, `/tf` 발행자 0.
+
+      `/clock` 이 없으면 `use_sim_time:=true` 인 노드의 시계가 0 에 멎어
+      **타이머가 하나도 안 뜬다** — 관제탑의 상태 발행도, 로봇 20 초 타임아웃
+      감시도 같이 죽는다. 노드는 살아 있고 에러도 안 난다 (CLAUDE.md §10).
+      씬이 고쳐질 때까지 전 구간이 못 돈다는 뜻이라 런타임에서 메운다.
+
+    ★★ **씬이 이미 내고 있으면 손대지 않는다.** `/clock` 발행자가 둘이면 두 시계가
+      번갈아 나가 tf 조회가 "extrapolation into the future" 로 실패한다. 그래서
+      그래프 경로에 Clock 노드가 있으면 그냥 비켜선다 — 트랙 A 가 씬을 고치는
+      순간 이 함수는 저절로 아무것도 안 하게 된다. 지울 필요가 없다.
+
+    Returns: "scene" (씬이 이미 있다) · "built" (우리가 세웠다) · "skip" (설정 없음)
+    """
+    import omni.usd
+    from pxr import Sdf
+
+    ros = (cfg.get("ros") or {})
+    if not ros:
+        log("[ros_graph] 설정에 ros 가 없다 — /clock·/tf 를 안 만든다")
+        return "skip"
+
+    g = str(ros.get("graph_path", "/World/ROS2Bridge"))
+    st = omni.usd.get_context().get_stage()
+
+    # 씬이 이미 내고 있나. 그래프 경로가 다를 수 있으니 **노드 타입으로** 훑는다.
+    for prim in st.Traverse():
+        if prim.GetTypeName() == "OmniGraphNode":
+            t = prim.GetAttribute("node:type")
+            if t and str(t.Get() or "").endswith("ROS2PublishClock"):
+                log("[ros_graph] /clock 은 씬이 낸다 (%s) — 건너뛴다"
+                    % prim.GetPath())
+                return "scene"
+
     K, c = og.Controller.Keys, og.Controller
+    NS = "isaacsim.ros2.bridge."
+    tfc = ros.get("tf") or {}
+    try:
+        c.edit(
+            {"graph_path": g, "evaluator_name": "execution"},
+            {K.CREATE_NODES: [("Tick", "omni.graph.action.OnPlaybackTick"),
+                              ("Ctx", NS + "ROS2Context"),
+                              # ★★ 시간 소스. 이게 없으면 `/clock` 이 **계속 0** 을
+                              #   낸다 (2026-08-26 실측: sec 0 nanosec 0 고정).
+                              #   토픽은 멀쩡히 보이고 발행자 수도 1 이라 "됐다"고
+                              #   착각하기 딱 좋은데, 구독하는 노드들의 시계가
+                              #   0 에 멎어 **타이머가 하나도 안 뜬다** — /clock 이
+                              #   아예 없을 때와 증상이 똑같다 (§10).
+                              ("SimTime", "isaacsim.core.nodes."
+                                          "IsaacReadSimulationTime"),
+                              ("Clock", NS + "ROS2PublishClock"),
+                              ("Tf", NS + "ROS2PublishTransformTree")],
+             K.CONNECT: [("Tick.outputs:tick", "Clock.inputs:execIn"),
+                         ("Tick.outputs:tick", "Tf.inputs:execIn"),
+                         ("SimTime.outputs:simulationTime",
+                          "Clock.inputs:timeStamp"),
+                         ("SimTime.outputs:simulationTime",
+                          "Tf.inputs:timeStamp"),
+                         ("Ctx.outputs:context", "Clock.inputs:context"),
+                         ("Ctx.outputs:context", "Tf.inputs:context")],
+             # ROS_DOMAIN_ID 를 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
+             K.SET_VALUES: [("Ctx.inputs:useDomainIDEnvVar", True),
+                            ("Clock.inputs:topicName",
+                             str(ros.get("clock_topic", "/clock"))),
+                            ("Tf.inputs:topicName",
+                             str(tfc.get("topic", "/tf")))]})
+    except Exception as e:                                      # noqa: BLE001
+        log("[ros_graph] !! /clock·/tf 그래프 생성 실패: %r" % (e,))
+        return "skip"
+
+    # ⚠ 확장이 안 켜져 있으면 노드가 안 만들어진다. 그대로 만지면
+    #   `Accessed invalid null prim` 으로 **죽는다** (setup_test3_scene [11] 실측).
+    tf_node = st.GetPrimAtPath(g + "/Tf")
+    if not tf_node.IsValid() or not st.GetPrimAtPath(g + "/Clock").IsValid():
+        log("[ros_graph] !! ROS2 브리지 노드가 안 만들어졌다 — 확장 미기동.\n"
+            "   LD_LIBRARY_PATH 를 확인할 것 (scripts/run_test3_ros.sh 참고)")
+        return "skip"
+
+    par = str(tfc.get("parent_prim", "/World"))
+    if st.GetPrimAtPath(par).IsValid():
+        tf_node.GetRelationship("inputs:parentPrim").SetTargets([Sdf.Path(par)])
+
+    # ★ 프레임 이름은 **prim 이름**이 된다. 씬에 없는 prim 은 조용히 버린다 —
+    #   넣으면 그래프가 통째로 죽어 /clock 까지 같이 멎는다.
+    tgts, miss = [], []
+    for tp in (tfc.get("target_prims") or []):
+        (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
+    tf_node.GetRelationship("inputs:targetPrims").SetTargets(
+        [Sdf.Path(t) for t in tgts])
+
+    log("[ros_graph] /clock·/tf 를 **우리가** 세웠다 (%s) — 씬에 없어서다.\n"
+        "   프레임 %d 개: %s"
+        % (g, len(tgts), ", ".join(t.rsplit("/", 1)[-1] for t in tgts) or "없음"))
+    if miss:
+        log("   ⚠ 씬에 없어 뺀 prim: %s" % ", ".join(miss))
+    return "built"
+
+
+# ── 1단계: 뼈대. Play 전에 부른다 ───────────────────────────────────────────
+def build(zone="B", zones=None):
+    """노드를 만들고 **정적 배선만** 한다. 데이터 배선은 wire() 에서.
+
+    Args:
+        zone:  구역 하나 (기존 호출부 호환)
+        zones: 구역 여럿 — `["A","B","C"]`. 주면 이쪽이 이긴다.
+
+    ★★ **그래프는 하나, 서비스는 한 벌, 로봇 노드만 구역별**이다.
+      구역마다 그래프를 따로 만들면 `/conveyor/set_velocity` 같은 **전역 서비스에
+      서버가 3 개** 붙는다 (srv 에 구역 칸이 없다) — 어느 것이 답할지 정해지지 않는다.
+      로봇 토픽만 구역이 갈리므로 CmdSub/EvtGate/EvtPub 만 구역 수만큼 만든다.
+    """
+    K, c = og.Controller.Keys, og.Controller
+    zs = [str(z).upper() for z in (zones or [zone])]
+    seen, zlist = set(), []
+    for z in zs:                       # 중복 제거 — 같은 구역에 노드 둘이면 겹친다
+        if z not in seen:
+            seen.add(z)
+            zlist.append(z)
+    _state["zones"] = zlist
+    for z in zlist:
+        _EVENTS.setdefault(z, [])
+        _state["seen_seq"].setdefault(z, None)
+
     nodes = [("Tick", "omni.graph.action.OnPlaybackTick"),
-             ("Ctx", "isaacsim.ros2.bridge.ROS2Context"),
-             ("CmdSub", "isaacsim.ros2.bridge.ROS2Subscriber"),
-             ("EvtGate", "omni.graph.scriptnode.ScriptNode"),
-             ("EvtPub", "isaacsim.ros2.bridge.ROS2Publisher")]
+             ("Ctx", "isaacsim.ros2.bridge.ROS2Context")]
     values = [
         # ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
         ("Ctx.inputs:useDomainIDEnvVar", True),
-        ("CmdSub.inputs:topicName", CMD_TOPIC),
-        ("CmdSub.inputs:messagePackage", PKG),
-        ("CmdSub.inputs:messageSubfolder", "msg"),
-        ("CmdSub.inputs:messageName", "RobotCmd"),
-        ("EvtPub.inputs:topicName", EVT_TOPIC),
-        ("EvtPub.inputs:messagePackage", PKG),
-        ("EvtPub.inputs:messageSubfolder", "msg"),
-        ("EvtPub.inputs:messageName", "RobotEvent"),
-        ("EvtGate.inputs:usePath", False),
-        ("EvtGate.inputs:script", _event_gate_script()),
     ]
-    conn = [("Tick.outputs:tick", "CmdSub.inputs:execIn"),
-            ("Tick.outputs:tick", "EvtGate.inputs:execIn"),
-            ("Ctx.outputs:context", "CmdSub.inputs:context"),
-            ("Ctx.outputs:context", "EvtPub.inputs:context"),
-            # ★ EvtPub 은 Tick 이 아니라 게이트가 친다. Tick 에 물리면 매 틱
-            #   (60Hz) 같은 이벤트를 계속 쏜다.
-            ("EvtGate.outputs:execOut", "EvtPub.inputs:execIn")]
+    conn = []
+
+    # ── 로봇 토픽: 구독·발행은 구역별, **게이트는 하나** ──
+    #
+    # ★★ 게이트를 구역마다 두면 안 된다 (2026-08-26 김병직 실측).
+    #   `Tick.outputs:tick` 에 `ScriptNode` 를 여럿 매달면 **첫 틱에만 다 돌고
+    #   그 뒤로는 하나만 남는다.** 어느 것이 살아남는지도 실행마다 다르다:
+    #       실행 1: A 만 계속  ·  실행 2: B 만 계속
+    #       (gate setup 은 A·B·C 셋 다 뜬다 — 노드는 만들어졌는데 평가만 멎는다)
+    #   그래서 B·C 의 RobotEvent 가 영영 안 나갔다. 어댑터는 ok 로 답했는데도라
+    #   **관제탑 쪽에서는 20 초 타임아웃으로만 보인다.**
+    #   1 구역일 때 안 보였던 이유: 그때 Tick 에 달린 ScriptNode 가 하나였다
+    #   (서비스 4 개는 Tick 이 아니라 `_Req.outputs:onReceived` 뒤에 달린다).
+    #   -> 게이트 하나가 구역 전부를 훑고 각 EvtPub 입력에 써 넣는다.
+    nodes += [("EvtGate", "omni.graph.scriptnode.ScriptNode")]
+    values += [("EvtGate.inputs:usePath", False),
+               ("EvtGate.inputs:script", _event_gate_script(zlist))]
+    conn += [("Tick.outputs:tick", "EvtGate.inputs:execIn")]
+
+    for z in zlist:
+        sub, pub = f"CmdSub_{z}", f"EvtPub_{z}"
+        nodes += [(sub, "isaacsim.ros2.bridge.ROS2Subscriber"),
+                  (pub, "isaacsim.ros2.bridge.ROS2Publisher")]
+        values += [
+            (f"{sub}.inputs:topicName", cmd_topic(z)),
+            (f"{sub}.inputs:messagePackage", PKG),
+            (f"{sub}.inputs:messageSubfolder", "msg"),
+            (f"{sub}.inputs:messageName", "RobotCmd"),
+            (f"{pub}.inputs:topicName", evt_topic(z)),
+            (f"{pub}.inputs:messagePackage", PKG),
+            (f"{pub}.inputs:messageSubfolder", "msg"),
+            (f"{pub}.inputs:messageName", "RobotEvent"),
+        ]
+        conn += [("Tick.outputs:tick", f"{sub}.inputs:execIn"),
+                 ("Ctx.outputs:context", f"{sub}.inputs:context"),
+                 ("Ctx.outputs:context", f"{pub}.inputs:context"),
+                 # ★ EvtPub 은 Tick 이 아니라 게이트가 친다.
+                 ("EvtGate.outputs:execOut", f"{pub}.inputs:execIn")]
 
     for key, srv, path in SERVICES:
         r, s, g = f"{key}_Req", f"{key}_Res", f"{key}_Fn"
@@ -311,34 +488,53 @@ def compute(db):
 '''
 
 
-def _event_gate_script():
-    """대기열에 RobotEvent 가 있으면 Publisher 입력을 채우고 execOut 을 친다.
+def _event_gate_script(zones):
+    """구역 전부의 대기열을 훑어 각 Publisher 입력을 채우고 execOut 을 친다.
 
-    비어 있으면 **execOut 을 안 친다** — 그래야 발행이 안 나간다.
+    ★★ **게이트는 하나다** (2026-08-26). `Tick` 에 ScriptNode 를 여럿 달면 첫 틱
+      뒤로 하나만 살아남는다 — `build()` 주석에 실측을 적어 뒀다.
+
+    ★ execOut 은 하나뿐이라 켜면 **구역 Publisher 셋이 다 발행한다.** 새 이벤트가
+      없는 구역은 직전 값을 다시 쏘는데, 관제탑이 `seq` 로 거르므로(§3-4 규약 2)
+      문제가 되지 않는다 — 애초에 EvtPub 이 매 틱 다시 쏘고 있어서 달라지는 것도 없다.
     """
+    zl = ", ".join('"%s"' % str(z).upper() for z in zones)
     return f'''
 import importlib
 import omni.graph.core as _og
 
 _M = importlib.import_module("{__name__}")
+_ZONES = [{zl}]
 
-def setup(db): pass
+def setup(db):
+    if _M.DEBUG:
+        print("[ros_graph] gate setup — 구역 %s" % _ZONES)
 
 def compute(db):
-    q = _M._EVENTS
-    if not q:
-        db.outputs.execOut = _og.ExecutionAttributeState.DISABLED
-        return True
-    ev = q.pop(0)                       # 한 틱에 하나. 순서가 뒤집히면 seq 가 꼬인다
-    node = _og.Controller.node(_M.GRAPH + "/EvtPub")
-    for k, v in ev.items():
-        try:
-            _og.Controller.attribute("inputs:" + k, node).set(v)
-        except Exception:
-            print(f"[ros_graph] RobotEvent 필드 '{{k}}' 를 못 씀 — 계약 확인")
-    db.outputs.execOut = _og.ExecutionAttributeState.ENABLED
+    _any = False
+    for _z in _ZONES:
+        q = _M._EVENTS.get(_z) or []
+        if not q:
+            continue
+        ev = q.pop(0)          # 구역당 한 틱에 하나. 뒤집히면 seq 가 꼬인다
+        if _M.DEBUG:
+            print("[ros_graph] gate %s pop seq=%s (큐 %d 남음)"
+                  % (_z, ev.get("seq"), len(q)))
+        node = _og.Controller.node(_M.GRAPH + "/EvtPub_" + _z)
+        for k, v in ev.items():
+            try:
+                _og.Controller.attribute("inputs:" + k, node).set(v)
+            except Exception:
+                print("[ros_graph] %s RobotEvent 필드 %r 를 못 씀 — 계약 확인" % (_z, k))
+        _any = True
+    # ⚠ 새 이벤트가 없어도 EvtPub 은 어차피 매 틱 마지막 값을 다시 쏜다 (미해결).
+    #   관제탑은 seq 로 거른다. 여기서 DISABLED 를 걸어도 안 막혔다 — 실측.
+    #   ★ False 를 돌려주면 **게이트가 다음 틱부터 안 돈다.** 절대 그러지 말 것.
+    db.outputs.execOut = (_og.ExecutionAttributeState.ENABLED if _any
+                          else _og.ExecutionAttributeState.DISABLED)
     return True
 '''
+
 
 
 # 혼자 확인은 `scripts/selftest_ros_graph.py` 가 한다.
