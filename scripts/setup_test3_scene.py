@@ -21,8 +21,9 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   [10] 팔레트 가이드 벽 (overhang 7.8 고려 · 편도 여유 5)
   [11] ROS 2 브리지 — /clock · /tf
   [12] 적재 스테이션 가이드 벽 (로봇 쪽은 비움 · 끄면 치운다)
-  [13] 손목 카메라 3 대 (system.yaml 정본)
-  [14] 전부 검증한다
+  [13] 로봇 · 페데스탈 배치 (이격 — 기둥도 같이 옮긴다)
+  [14] 손목 카메라 3 대 (system.yaml 정본)
+  [15] 전부 검증한다
 
 ═══ 왜 이렇게 하는가 — 실측으로 얻은 것들 ═══════════════════════════════════
 
@@ -859,7 +860,46 @@ else:
             % (z, cx, cy, rx, ry, robot_side))
         say("       세운 면 %s  ·  Z %.1f~%.1f" % ("/".join(sorted(made)), z0, z1))
 
-# ══ [13] 손목 카메라 (구역 3 대) ═════════════════════════════════════════════
+# ══ [13] 로봇 · 페데스탈 배치 (이격) ════════════════════════════════════════
+# ★ 로봇만 옮기면 **기둥 위에서 벗어나 허공에 선다.** 둘을 같이 옮긴다
+#   (김병직 ee25497 이 test1-1 에서 겪은 것과 같은 함정).
+# ★ 재고 고치기다 — 씬의 현재 위치를 재서 config 값까지의 차이만큼 민다.
+#   여러 번 돌려도 같은 결과가 된다.
+# ★ 지선 중심 = 로봇 X 라, 이 값을 바꾸면 [5]·[7] 이 지선·레일·스토퍼를 따라
+#   옮긴다. 그래서 이 단계는 [5] 보다 **뒤에 와도 된다** — [5] 는 씬이 아니라
+#   config 의 ROBOT_X 를 보기 때문이다.
+say("\n[13] 로봇 · 페데스탈 배치")
+_RB = cfg["zones"]["robot_base_world_mm"]
+for z in sorted(_RB):
+    want = [float(v) for v in _RB[z]]
+    rp, pp = "/World/robot_%s" % z, "/World/Pedestal_%s" % z
+    rprim = st.GetPrimAtPath(rp)
+    if not rprim.IsValid():
+        chk("로봇 %s" % rp, False, "없다")
+        continue
+    a = xop(rprim, "translate", Gf.Vec3d(0, 0, 0))
+    cur = a.Get()
+    dx = want[0] / 1000.0 - float(cur[0])
+    dy = want[1] / 1000.0 - float(cur[1])
+    dz = want[2] / 1000.0 - float(cur[2])
+    if max(abs(dx), abs(dy), abs(dz)) < 1e-6:
+        say("   %s 이미 맞다 (%.0f, %.0f, %.0f)" % (z, want[0], want[1], want[2]))
+        continue
+    a.Set(Gf.Vec3d(float(cur[0]) + dx, float(cur[1]) + dy, float(cur[2]) + dz))
+    # 기둥도 **같은 만큼** 민다. 절대좌표로 쓰지 않는다 — 기둥은 원점이 밑면이라
+    # 로봇 베이스(윗면)와 z 기준이 다르다.
+    pprim = st.GetPrimAtPath(pp)
+    if pprim.IsValid():
+        b = xop(pprim, "translate", Gf.Vec3d(0, 0, 0))
+        c2 = b.Get()
+        b.Set(Gf.Vec3d(float(c2[0]) + dx, float(c2[1]) + dy, float(c2[2]) + dz))
+    else:
+        chk("페데스탈 %s" % pp, False, "없다 — 로봇만 옮기면 허공에 선다")
+    say("   %s 로봇 %+.0f, %+.0f, %+.0f mm -> (%.0f, %.0f, %.0f) · 기둥 같이 이동"
+        % (z, dx * 1000, dy * 1000, dz * 1000, want[0], want[1], want[2]))
+
+
+# ══ [14] 손목 카메라 (구역 3 대) ═════════════════════════════════════════════
 # ★ 왜 필요한가: `test1-1.usd` 에는 `/World/robot/gripper/CamWrist` 가 있는데
 #   test_3 의 로봇 3 대에는 **하나도 없었다** (실측 2026-08-26). 로봇 애셋 참조와
 #   SurfaceGripper 설정은 두 씬이 같으므로, 트랙 B 작업물 중 test_3 로 안 넘어온
@@ -868,7 +908,7 @@ else:
 #   tilt 18 도 실측으로 정해진 값이라 여기서 지어내지 않는다 — 100 이면 카메라가
 #   그리퍼 몸통(반경 122.8) 안에 파묻혀 화소가 전부 0 으로 나온다.
 # ★ 물리는 안 붙인다. 링크에 콜라이더나 질량을 더하면 아티큘레이션 동역학이 바뀐다.
-say("\n[13] 손목 카메라")
+say("\n[14] 손목 카메라")
 _BASE_YAML = os.path.join(os.path.dirname(OVL), "system.yaml")
 try:
     _sys = yaml.safe_load(open(_BASE_YAML, encoding="utf-8"))
@@ -944,10 +984,11 @@ else:
         % ("/".join(made) or "없음", wo[0] * 1000, wo[1] * 1000, wo[2] * 1000,
            math.degrees(tilt), _wc.get("model"), res[0], res[1], hfov))
 
+
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)
 
-# ══ [14] 검증 ════════════════════════════════════════════════════════════════
+# ══ [15] 검증 ════════════════════════════════════════════════════════════════
 say("\n" + "=" * 74)
 say("=== 검증 ===")
 for z, p in sorted(JUNC.items()):
