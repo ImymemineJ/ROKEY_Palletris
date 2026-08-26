@@ -230,6 +230,14 @@ class Cycle:
         #   메시지에 `stack_top_mm` 이 실려 오면 그것과도 max 를 취하므로 둘 다 산다.
         #   ⚠ 팔레트를 갈면 리셋해야 한다 -> `reset_stack()`
         self._stack_top_m = 0.0
+        # ★ 집기가 놓기에 넘겨주는 값 3개. 원래 `_run` 안의 지역변수였는데,
+        #   관제탑이 PICK/PLACE 를 **따로** 보내면서 호출이 둘로 갈려 사라진다.
+        #     _pick_yaw  놓기 yaw 의 기준 (nearest_equiv_yaw). 없으면 손목이 180° 돈다
+        #     _pick_top  이송 고도 max(pick_top, put_top, stack_top) 의 한 항
+        #     _pick_c    이송 첫 구간의 xy (그 자리에서 수직 상승한다)
+        self._pick_c = [0.0, 0.0, 0.0]
+        self._pick_top = 0.0
+        self._pick_yaw = 0.0
 
     def _rim_m(self, cx, cy, w, d):
         """놓을 자리 **둘레**에서 가장 높은 이웃 상면 [m]. 이웃이 없으면 None.
@@ -340,6 +348,23 @@ class Cycle:
         """팔레트를 갈았다 — 누적해 온 적재 최상단을 버린다."""
         self._stack_top_m = 0.0
 
+    def retreat_home(self):
+        """팔을 적재물 위 안전 고도로 **수직 상승만** 시킨다.
+
+        ⚠ 관제탑의 `RobotCmd.HOME` 은 본래 "대기 자세로 복귀"지만, **그 관절값이
+          아무 데도 없다** — 문서에도, `robot_motion.handlers()` 에도 (move_ee ·
+          motion_status · grasp · release · is_holding · tcp_speed 여섯뿐이다).
+          없는 값을 지어내지 않는다 (CLAUDE.md §11).
+          지금 확실히 할 수 있는 것은 **적재물 위로 팔을 빼는 것**이고 그것만 한다.
+          진짜 홈 자세가 정해지면 여기를 채운다.
+        """
+        cur = self._face_now()
+        if cur is None:
+            return
+        z = max(self._stack_top_m, cur[2]) + self.approach_m
+        if z > cur[2] + 1e-3:
+            self._move([cur[0], cur[1], z], self._last_put_yaw, TRANSIT_TOL_MM)
+
     # ── 한 사이클 ────────────────────────────────────────────
     def run(self, box_id, pick_pose):
         """박스 하나를 집어서 놓는다. 반환은 RESULTS 중 하나.
@@ -383,7 +408,49 @@ class Cycle:
             self._resume_belt()
             return "PALLET_FULL" if msg == "PALLET_FULL" else "BLOCKED"
 
-        # 4) 집기 — 상공 접근 후 수직 하강
+        # 4) 집기
+        if self.pick(box_id, pick_pose, h) != "PICKED":
+            # §2.5 — 픽 실패는 계획을 버리고 벨트를 다시 돌린 뒤 종료한다.
+            self.svc.set_status(box_id, "PICK_FAILED")
+            self.svc.cancel_plan(self.zone, box_id)
+            self._resume_belt()
+            return "PICK_FAILED"
+        self.svc.set_status(box_id, "PICKED")
+
+        # 5) 놓기
+        res, actual, _measured = self.place(box_id, place, w, d, h)
+        if res != "PLACED":
+            return res
+
+        # 6) heightmap 갱신 — **실제** pose 로 (§7.6)
+        ok_hm, fill = self.svc.update_heightmap(self.zone, box_id, w, d, h, actual)
+        if not ok_hm:
+            # yaw 오차 초과 경고. 로그만 남기고 계속 간다 (§2.2)
+            self._log("[cycle] update_heightmap ok=false — 계속 진행")
+        self.svc.mark_placed(box_id, actual)
+        self._resume_belt()
+        self._log("[cycle] %s 완료  %.2f s  적재율 %s" % (box_id, time.time() - t0, fill))
+        return "PLACED"
+
+    # ══ 관제탑이 부르는 반쪽 두 개 ══════════════════════════════
+    # ★ 왜 나눴나: 관제탑은 RobotCmd(PICK/PLACE)로 **사이클 단위**로 말하는데
+    #   `_run` 은 집기와 놓기를 한 호출 안에서 끝낸다. 그 사이에 벨트·DB·algo
+    #   호출이 섞여 있는데 **그건 관제탑이 이미 한다** (CLAUDE.md §8).
+    #   -> 모션만 떼어 두 조각으로 만들고, `_run` 은 그 둘을 부르는 껍데기로 남긴다.
+    #   **동작은 한 줄도 바꾸지 않았다.** 수용 기준은 시드 42 가 28/29 · 80.3% 로
+    #   좌표까지 재현되는 것이다 (2026-08-25 실측, docs/2026-08-25_실행기록.md).
+    #
+    # ⚠ 경계를 넘는 상태가 4개다. **그래서 Cycle 을 명령마다 새로 만들면 안 된다:**
+    #     _stack_top_m   이송 고도의 바닥. 0 이 되면 팔이 적재물 위를 낮게 지난다 (§10-3)
+    #     _obstacles     move_ee 의 IK 가지 선택용
+    #     _pick_yaw      놓기 yaw 의 기준. 없으면 손목이 먼 쪽으로 180° 돈다
+    #     _pick_c/_top   이송 고도와 첫 상승 지점
+
+    def pick(self, box_id, pick_pose, h):
+        """집기만 한다. "PICKED" | "PICK_FAILED". 이동 실패는 MotionError 로 올라간다.
+
+        ★ set_status·cancel_plan·벨트는 **부르지 않는다** — 관제탑 몫이다.
+        """
         pick_c = list(pick_pose["pos_m"])
         pick_top = pick_c[2] + h / 2000.0                    # 박스 상면 z [m]
         pick_yaw = float(pick_pose.get("yaw_deg", 0.0))
@@ -413,16 +480,26 @@ class Cycle:
         self._move([pick_c[0], pick_c[1], pick_air], pick_yaw, TRANSIT_TOL_MM)
         self._descend_to_gap(box_id, [pick_c[0], pick_c[1]], pick_top, pick_yaw)
 
-        if not self._grasp(box_id):
-            # §2.5 — 픽 실패는 계획을 버리고 벨트를 다시 돌린 뒤 종료한다.
-            self.svc.set_status(box_id, "PICK_FAILED")
-            self.svc.cancel_plan(self.zone, box_id)
-            self._move([pick_c[0], pick_c[1], pick_top + self.approach_m], pick_yaw, TRANSIT_TOL_MM)
-            self._resume_belt()
-            return "PICK_FAILED"
-        self.svc.set_status(box_id, "PICKED")
+        # ★ place() 가 쓴다. 지역변수로 두면 반쪽으로 갈렸을 때 사라진다.
+        self._pick_c, self._pick_top, self._pick_yaw = pick_c, pick_top, pick_yaw
 
-        # 5) 놓기 — 팔레트 좌표를 월드로 바꾸고 상공 접근 후 하강
+        if not self._grasp(box_id):
+            # §2.5 — 픽 실패는 팔만 빼고 나간다. 계획 폐기·상태·벨트는 관제탑 몫이다.
+            self._move([pick_c[0], pick_c[1], pick_top + self.approach_m], pick_yaw, TRANSIT_TOL_MM)
+            return "PICK_FAILED"
+        return "PICKED"
+
+    def place(self, box_id, place, w, d, h):
+        """놓기만 한다. `(결과, actual, 실측여부)`.
+
+        `실측여부=False` 면 actual 은 **계획값**이다 — 씬에서 못 읽었다는 뜻이므로
+        `RobotEvent.has_actual` 에 그대로 실으면 안 된다 (§3-4 규약 3).
+
+        ★ update_heightmap·mark_placed·벨트는 **부르지 않는다** — 관제탑 몫이다.
+          `has_actual=true` 로 관제탑에 실어 보내면 그쪽이 UpdateHeightmap 을 부른다.
+        """
+        # 집기가 남겨 둔 값들. Cycle 을 새로 만들면 여기가 0 이 된다.
+        pick_c, pick_top, pick_yaw = self._pick_c, self._pick_top, self._pick_yaw
         cx, cy, cz = pallet_place_to_world(place, h, self.origin_mm)
         put_top = cz + h / 2000.0
         # ★ 손목을 먼 쪽으로 180° 돌리지 않는다 — nearest_equiv_yaw 주석 참조.
@@ -479,7 +556,7 @@ class Cycle:
         if not self._release():
             self._log("[cycle] release 실패")
             self._abort(box_id)
-            return "BLOCKED"
+            return "BLOCKED", None, False
         # ★ 후퇴는 **절대 내려가지 않는다** (2026-08-25 김병직 지적).
         #   `put_top + approach` 로 고정하면, 협곡 입구에서 떨어뜨렸을 때 팔이 이미
         #   그보다 위에 있어서 **놓고 나서 협곡 안으로 다시 내려간다.** §10-3 과 같은
@@ -493,22 +570,23 @@ class Cycle:
         self._move([cx, cy, retreat_z], put_yaw, TRANSIT_TOL_MM)
 
         # 6) **실제** pose 로 갱신한다 — 계획값이 아니라 (§7.6)
-        actual = self._actual_place(box_id, h) or place
+        # ★ 셋째 반환값이 필요한 이유: 못 읽으면 아래에서 **계획값**으로 대체하는데,
+        #   그걸 `RobotEvent.has_actual=true` 로 실어 보내면 §3-4 규약 3 위반이다 —
+        #   계획값을 되보내면 오차가 누적돼 알고리즘은 1300 안이라 믿는데 실물이 넘는다.
+        #   `_run`(데스크 경로)은 예전처럼 계획값으로 갱신한다 — 동작을 안 바꾼다.
+        measured = self._actual_place(box_id, h)
+        actual = measured or place
         # ★ 적재 최상단 누적. **실제 상면**으로 올린다 — 계획대로 안 앉았으면
         #   그만큼 더 높을 수 있고, 이송은 그 실물을 넘어야 한다.
         act_top = (float(actual.get("z_mm", place.get("z_mm", 0.0))) + h
                    + self.origin_mm[2]) / 1000.0
         self._stack_top_m = max(self._stack_top_m, act_top)
-        ok_hm, fill = self.svc.update_heightmap(self.zone, box_id, w, d, h, actual)
-        if not ok_hm:
-            # yaw 오차 초과 경고. 로그만 남기고 계속 간다 (§2.2)
-            self._log("[cycle] update_heightmap ok=false — 계속 진행")
         # ★ 놓은 뒤에 누적한다. 이송 중에는 들고 있으므로 장애물이 아니다.
+        #   (원문에서는 update_heightmap 다음 줄이었다. 그 사이에 _move 가 없어서
+        #    순서를 앞당겨도 결과가 같다 — _obstacles 는 _move 만 읽는다.)
         self._obstacles.append(place_to_aabb_m(actual, w, d, h, self.origin_mm))
-        self.svc.mark_placed(box_id, actual)
-        self._resume_belt()
-        self._log("[cycle] %s 완료  %.2f s  적재율 %s" % (box_id, time.time() - t0, fill))
-        return "PLACED"
+        return "PLACED", actual, measured is not None
+
 
     # ── 조각 ─────────────────────────────────────────────────
     def _face_now(self):
