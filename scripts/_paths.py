@@ -24,10 +24,45 @@ if str(ROBOT / "packing_robot") not in sys.path:
     sys.path.insert(0, str(ROBOT / "packing_robot"))
 
 
+def deep_merge(base, over):
+    """`over` 를 `base` 위에 겹친다. dict 는 파고들고 나머지는 덮어쓴다."""
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def system_config():
-    """system.yaml 을 읽는다. **모든 숫자의 단일 출처** (작업명세서 4, 철칙 3)."""
+    """system.yaml 을 읽는다. **모든 숫자의 단일 출처** (작업명세서 4, 철칙 3).
+
+    환경변수 둘 (2026-08-26 김병직):
+
+      `PL_CONFIG_OVERLAY`  system.yaml **위에 겹친다.** 3 구역(test_3)이 이 방식이다.
+      `PALLETRIS_CONFIG`   파일을 **통째로 바꾼다.** 완전한 설정일 때만 쓸 것.
+
+    ★★ 왜 겹치기여야 하나 — `config/test_3.yaml` 은 **오버레이**다.
+      최상위 키가 9 개 없다 (`physics` · `service` · `heightmap` · `recognition` ·
+      `lighting` · `profiles` · `run_profile` · `arbiter` · `stage`).
+      통째로 바꾸면 `cfg["physics"]["scene"]` 에서 KeyError 가 난다.
+      ⚠ 그런데 **트레이스백이 안 보인다** — `sim_main` 의 `finally: kit.close()` 가
+        프로세스를 먼저 끝내서 종료 코드 0 에 로그도 깨끗하다. 실측 2026-08-26:
+        "Simulation App Shutting Down" 한 줄만 남고 6 초 만에 조용히 끝났다.
+      이름은 `setup_test3_scene.py` 가 이미 쓰는 `PL_CONFIG_OVERLAY` 를 그대로 쓴다.
+
+    ★ 겹치기가 맞는 또 하나의 이유: `zones` 하위에 `buffer_capacity` · `list` 는
+      오버레이에 없다. 겹치면 그건 system.yaml 것이 살고 좌표만 test_3 것이 된다.
+    """
+    import os
     import yaml
-    return yaml.safe_load(SYSTEM_YAML.read_text())
+    over = os.environ.get("PL_CONFIG_OVERLAY")
+    full = os.environ.get("PALLETRIS_CONFIG")
+    cfg = yaml.safe_load(Path(full or SYSTEM_YAML).read_text())
+    if over:
+        cfg = deep_merge(cfg, yaml.safe_load(Path(over).read_text()))
+    return cfg
 
 
 def check():

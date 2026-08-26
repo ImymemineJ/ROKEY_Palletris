@@ -66,8 +66,21 @@ sys.path.insert(0, str(ROOT / "src/packing_robot/packing_robot"))   # gripper
 DEFAULT_STAGE = os.environ.get(
     "PL_STAGE", "/home/rokey/isaac_scenes/project_1/test1-1.usd")
 # 흡착 그리퍼가 붙은 로봇 판이 씬에 참조돼 있어야 한다 (layout_to_spec 참조).
-ROBOT_PRIM = "/World/robot"
-GRIPPER_PRIM = ROBOT_PRIM + "/SurfaceGripper"
+# ★ 로봇 프림. 씬에 따라 다르다 (2026-08-26 김병직):
+#     test1-1 (1 구역)  /World/robot
+#     test_3  (3 구역)  /World/robot_A · robot_B · robot_C
+#   `demo_stack15_test1_1.py` 가 이미 같은 규약(`PL_ROBOT_FMT`)을 쓴다 — 맞춘다.
+ROBOT_PRIM = os.environ.get("PL_ROBOT_PRIM", "/World/robot")
+ROBOT_FMT = os.environ.get("PL_ROBOT_FMT", "/World/robot_%s")
+
+
+def robot_prim(zone, multi):
+    """구역 `zone` 의 로봇 prim. 구역이 하나면 `PL_ROBOT_PRIM` 을 그대로 쓴다."""
+    return (ROBOT_FMT % str(zone).upper()) if multi else ROBOT_PRIM
+
+
+def gripper_prim(zone, multi):
+    return robot_prim(zone, multi) + "/SurfaceGripper"
 EE_FRAME = "tool0"
 SETTLE_STEPS = 90                  # READY 수렴 (60 Hz 에서 1.5 s). 게이트 판과 같다
 
@@ -76,6 +89,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default=DEFAULT_STAGE)
     ap.add_argument("--zone", default="B", choices=["A", "B", "C"])
+    # ★ 로봇 여러 대를 동시에 돌린다 (2026-08-26). `--zones A,B,C` 로 켠다.
+    #   안 주면 `--zone` 하나뿐이라 기존 동작이 하나도 안 바뀐다 (test1-1 기준선).
+    #   `demo_stack15_test1_1.py` 의 `PL_ZONES` 와 같은 규약이다.
+    ap.add_argument("--zones", default=None,
+                    help="구역 여럿 — 예: A,B,C (test_3 씬). 안 주면 --zone 하나")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--gui", action="store_true", help="창을 띄운다")
     ap.add_argument("--no-robot", action="store_true",
@@ -98,7 +116,8 @@ def main():
     from isaacsim import SimulationApp
     kit = SimulationApp({"headless": not a.gui})
 
-    rm = server = None
+    server = None
+    rms = {}                     # {zone: RobotMotion}. 예외로 빠져도 finally 가 안 죽게
     try:
         from isaacsim.core.api import World
         from isaacsim.core.utils.extensions import enable_extension
@@ -155,7 +174,11 @@ def main():
         #   소켓과 ROS 가 서로 다른 함수를 부르면 둘이 어긋난다.
         H = {"ping": lambda req: {"ok": True}}
 
-        sp = SP.Spawner(stage, cfg, q, zone=a.zone)
+        ZONES = [z.strip().upper() for z in (a.zones or a.zone).split(",") if z.strip()]
+        MULTI = len(ZONES) > 1
+        print("[sim_main] 구역 %s%s" % (", ".join(ZONES), " (다중)" if MULTI else ""))
+
+        sp = SP.Spawner(stage, cfg, q, zone=ZONES[0], zones=ZONES)
         H.update(sp.handlers())
         server.register(sp.handlers())
 
@@ -166,11 +189,21 @@ def main():
         # ── 로봇 (B 소유 핸들러) ─────────────────────────────
         # ★ 지금 집으려는 박스. 워커가 없는 정본 서버에서는 `grasp` 요청이 곧
         #   그 신호다. B 코드를 고치지 않고 **등록할 때 감싸서** 채운다.
+        # ★★ 구역마다 **핸들러 표를 따로 만든다** (2026-08-26). `move_ee`·`grasp` 는
+        #   이름에 구역이 없어서 한 표에 몰면 마지막 로봇이 앞의 것을 덮는다 —
+        #   A 구역 명령이 C 구역 팔을 움직인다. 소켓은 예전처럼 **첫 구역** 것만
+        #   등록한다 (소켓 규약에 구역 칸이 없다. ROS 를 쓰면 구역이 갈린다).
         cur = {"box": None}
+        HZ = {}                       # {zone: 그 구역 핸들러 표}
         if not a.no_robot:
-            rm = _bring_up_robot(world, stage, cfg, a.zone, spawner=sp, cur=cur)
-            if rm is not None:
-                _h = dict(rm.handlers())
+            for zi, z in enumerate(ZONES):
+                rm_z = _bring_up_robot(world, stage, cfg, z, spawner=sp, cur=cur,
+                                       prim_path=robot_prim(z, MULTI),
+                                       grip_path=gripper_prim(z, MULTI))
+                if rm_z is None:
+                    continue
+                rms[z] = rm_z
+                _h = dict(rm_z.handlers())
                 _grasp = _h["grasp"]
 
                 def h_grasp(req, _f=_grasp):
@@ -183,66 +216,80 @@ def main():
                         cur["box"] = None   # 사이클 밖에서 옛 박스로 재지 않는다
 
                 _h["grasp"] = h_grasp
-                H.update(_h)
-                server.register(_h)
+                HZ[z] = dict(H, **_h)     # 씬 핸들러 + 그 구역 로봇 핸들러
+                if zi == 0:
+                    H.update(_h)
+                    server.register(_h)
+        for z in ZONES:
+            HZ.setdefault(z, H)           # 로봇이 없는 구역도 씬 서비스는 답한다
 
         # ── ROS 2 통로 (트랙 B — ros_side.py) ────────────────
         # ★ build() 는 **Play 전**, wire() 는 **Play + 몇 프레임 뒤**다.
         #   메시지 필드가 Play 후에야 생겨서 그 전에 이으면 죽는다 (TS-022 2번).
-        ros = None
+        # ★ 그래프는 하나, 서비스는 한 벌, 구역별 `RosSide` 는 step() 만 각자 돈다.
+        ros = []
         if a.ros:
             for _e in ("isaacsim.core.nodes", "isaacsim.ros2.bridge",
                        "omni.graph.scriptnode"):
                 enable_extension(_e)
             kit.update()
             import ros_side
-            ros = ros_side.RosSide(cfg, a.zone, H)
-            ros.build()
+            ros_side.install_services(H)
+            ros_side.build(ZONES)
+            ros = [ros_side.RosSide(cfg, z, HZ[z]) for z in ZONES]
 
         world.reset()
-        if rm is not None:
-            rm.art.initialize()
+        if rms:
             # ★ READY 로 순간이동한 뒤 **정착시킨다.** 이게 없으면 씬의 로봇이
             #   zero pose(팔이 수직으로 선 자세)로 남아, 첫 이동이 179 도를 돌아야
             #   해서 구간 예산(20 s)을 넘겨 MOTION_TIMEOUT 이 난다
             #   (`verify_b4_test1_1.py` 의 실측). 게이트 스크립트에는 있는데
             #   정본 서버에만 빠져 있었다.
+            # ★★ 로봇 **전부**를 같은 스텝에서 함께 정착시킨다 (2026-08-26).
+            #   한 대씩 SETTLE_STEPS 를 돌리면 앞 로봇이 목표를 안 받는 동안
+            #   옛 목표로 튄다 (바로 아래 apply_action 주석과 같은 이유).
             import numpy as np
             import yaml
             from isaacsim.core.utils.types import ArticulationAction
             _ready = np.array(
                 yaml.safe_load(_paths.DESCRIPTOR.read_text())["default_q"], dtype=float)
-            rm.art.set_joint_positions(_ready)
-            rm.art.set_joint_velocities(np.zeros(6))
             _act = ArticulationAction(joint_positions=_ready)
+            for _z, _rm in rms.items():
+                _rm.art.initialize()
+                _rm.art.set_joint_positions(_ready)
+                _rm.art.set_joint_velocities(np.zeros(6))
             for _ in range(SETTLE_STEPS):
-                rm.art.apply_action(_act)          # 안 걸면 옛 목표로 튄다
+                for _rm in rms.values():
+                    _rm.art.apply_action(_act)     # 안 걸면 옛 목표로 튄다
                 world.step(render=not a.no_render)
-            print("[sim_main] 자세 READY 수렴 %s deg"
-                  % np.round(np.degrees(rm.art.get_joint_positions()[:6]), 1).tolist())
+            for _z, _rm in rms.items():
+                print("[sim_main] %s 자세 READY 수렴 %s deg"
+                      % (_z, np.round(np.degrees(
+                          _rm.art.get_joint_positions()[:6]), 1).tolist()))
         # 벨트는 **멈춘 채로** 시작한다. 오케스트레이터가 set_velocity 로 돌린다.
         # (뜨자마자 돌면 머리가 붙기 전에 박스가 라인 끝까지 흘러가 버린다.)
-        if ros is not None:
+        if ros:
             # 정착 스텝(SETTLE_STEPS)에서 이미 프레임이 돌았지만, 로봇이 없으면
             # (--no-robot) 한 번도 안 돌았을 수 있어 여기서 확실히 채운다.
             for _ in range(60):
                 world.step(render=not a.no_render)
-            ros.wire()
+            import ros_side
+            ros_side.wire()
 
         cc.run_all() if a.autorun else cc.stop_all()
         print("[sim_main] 벨트 %s" % ("가동" if a.autorun else "정지 — set_velocity 대기"))
         print("[sim_main] cmd %s" % server.cmds())
         print("[sim_main] 준비 완료. 소켓 127.0.0.1:%d%s"
-              % (a.port, " · ROS 2 켬" if ros is not None else ""))
+              % (a.port, " · ROS 2 켬 (구역 %d)" % len(ros) if ros else ""))
 
         # ── 메인 루프: 물리만 돌린다 ─────────────────────────
         while kit.is_running():
             q.pump()                       # 소켓 스레드가 맡긴 USD 작업
-            if rm is not None:
-                rm.step()                  # ★ world.step() 앞
+            for _rm in rms.values():
+                _rm.step()                 # ★ world.step() 앞. 로봇 전부
             sp.step()
-            if ros is not None:
-                ros.step()             # ★ 논블로킹. 모션은 워커가 돈다 (§9)
+            for _r in ros:
+                _r.step()              # ★ 논블로킹. 모션은 워커가 돈다 (§9)
             # ★★ **헤드리스에서도 render=True 로 돈다.**
             #
             # `IsaacConveyor` 노드는 `OnTick` 으로 도는데 `OnTick` 은 **렌더 틱에**
@@ -263,7 +310,8 @@ def main():
         kit.close()
 
 
-def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None):
+def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None,
+                    prim_path=None, grip_path=None):
     """씬에 이미 있는 로봇 프림에 Lula 와 그리퍼를 물린다.
 
     씬에 로봇을 **넣지 않는다** — `layout_to_spec_test1_1.py` 가 참조로 넣어 뒀다.
@@ -275,17 +323,21 @@ def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None):
     """
     import numpy as np
 
-    prim = stage.GetPrimAtPath(ROBOT_PRIM)
+    # 구역별로 prim 이 다르다 (test_3 은 robot_A/B/C). 안 주면 예전 기본값.
+    prim_path = prim_path or ROBOT_PRIM
+    grip_path = grip_path or (prim_path + "/SurfaceGripper")
+
+    prim = stage.GetPrimAtPath(prim_path)
     if not prim or not prim.IsValid():
         print("[sim_main] !! %s 가 씬에 없다 — 로봇 없이 간다.\n"
-              "   run_layout_to_spec.sh 를 먼저 돌려라." % ROBOT_PRIM)
+              "   run_layout_to_spec.sh 를 먼저 돌려라." % prim_path)
         return None
-    if not stage.GetPrimAtPath(GRIPPER_PRIM).IsValid():
+    if not stage.GetPrimAtPath(grip_path).IsValid():
         print("[sim_main] !! %s 가 없다 — 씬의 로봇 USD 에 흡착 그리퍼가 없다.\n"
               "   ~/isaac_assets/h2017_suction.usd 를 참조하도록\n"
               "   run_layout_to_spec.sh 를 다시 돌려라 (없으면\n"
               "   scripts/build_gripper_usd.py 로 만든다). 로봇 없이 간다."
-              % GRIPPER_PRIM)
+              % grip_path)
         return None
 
     import _paths
@@ -301,7 +353,7 @@ def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None):
         print("[sim_main] !! 메시가 없다: %s — 로봇 없이 간다." % missing[:3])
         return None
 
-    art = SingleArticulation(prim_path=ROBOT_PRIM, name="h2017")
+    art = SingleArticulation(prim_path=prim_path, name="h2017_%s" % str(zone).upper())
     world.reset()
     art.initialize()
 
@@ -348,10 +400,10 @@ def _bring_up_robot(world, stage, cfg, zone, spawner=None, cur=None):
         return (float(np.dot(c - face, zax)) - half_h) * 1000.0
 
     import robot_motion as RM
-    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=GRIPPER_PRIM,
+    rm = RM.RobotMotion(art, lula, cfg, ee=EE_FRAME, gripper_path=grip_path,
                         gap_fn=_gap_mm)
     print("[sim_main] 로봇 %s  베이스 %s mm  EE %s  그리퍼 %s"
-          % (ROBOT_PRIM, got_mm, EE_FRAME, GRIPPER_PRIM))
+          % (prim_path, got_mm, EE_FRAME, grip_path))
     return rm
 
 
