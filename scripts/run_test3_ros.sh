@@ -99,6 +99,10 @@ export PL_CAMROS="${PL_CAMROS:-1}"
 #   PL_SPAWN=0 으로 끌 수 있다.
 export PL_SPAWN="${PL_SPAWN:-8}"       # 초 간격. 0 = 안 넣는다
 export PL_SPAWN_N="${PL_SPAWN_N:-0}"   # 총 개수. 0 = 무제한
+# ★ 협곡 낙하 (2026-08-27). system.yaml 의 drop_max_kg 3.5 는 로봇의 PL_DROP_KG 와
+#   같아야 한다 (yaml 주석의 경고). 이걸 안 켜고 돌리면 계획은 협곡 안에 자리를
+#   주는데 로봇은 낙하 없이 내려가다 옆 박스를 쓸어 친다 (B섹터 이상현상.mp4 실측).
+export PL_DROP_KG="${PL_DROP_KG:-3.5}"
 
 ARGS=(--stage "$PL_STAGE" --zones "$PL_ZONES" --ros --autorun
       --spawn-period "$PL_SPAWN" --spawn-count "$PL_SPAWN_N")
