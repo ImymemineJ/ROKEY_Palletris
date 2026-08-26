@@ -76,6 +76,15 @@ class Router:
         #   다른 박스가 있으면 이번 바퀴는 보낸다 (규칙 4 계량과 같은 처리).
         #   0 = 검사 안 함 (기존 동작).
         self.tail_gap_m = float(rt.get("divert_tail_gap_mm", 0)) / 1000.0
+        # ★ 갭핑(세퍼레이터) (2026-08-27 김병직 문제 제기 — "밀착 쌍은 속도차로
+        #   영원히 안 벌어진다"). 간격은 벨트 속도차가 **비율로** 늘리므로 0(밀착)
+        #   이면 리턴을 몇 바퀴 돌아도 0 이다 — 뒤차 간격 검사에 매번 걸려 못
+        #   꺾고 소멸할 때까지 돈다. 실물 라인의 갭핑 컨베이어를 소터 패치로
+        #   구현한다: 앞차가 패치를 빠져나가고 뒤차가 패치 위일 때 패치를 잠깐
+        #   세우면 간격 = 정지시간 x 본선속도. 0 = 꺼짐 (기존 동작).
+        self.gap_min_m = float(rt.get("gap_min_mm", 0)) / 1000.0
+        self._gap_hold = {}              # zone -> 정지 시작 시각
+        self._sorter_div = set()         # 지금 꺾는 중인 소터 (갭핑 금지)
         _mly = rt.get("main_line_y_mm") or MAIN_LINE_Y_DEFAULT
         self.y_lo, self.y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
         self.thru = list(rt.get("thru_world", [-1, 0, 0]))
@@ -142,6 +151,10 @@ class Router:
     def _turn(self, zone, seg, want_div):
         """규칙 7 — 소터면 **항상 mps 를 같이 준다.**"""
         if self.use_sorter and self._h_sorter:
+            # 갭핑과의 조율: 꺾는 동안은 갭핑이 이 소터를 안 건드린다
+            (self._sorter_div.add(zone) if want_div
+             else self._sorter_div.discard(zone))
+            self._gap_hold.pop(zone, None)
             return self._h_sorter({"zone": zone, "divert": bool(want_div),
                                    "mps": self.belt_mps}) or {}
         if self._h_dir:
@@ -170,6 +183,38 @@ class Router:
         poses = {b: q for b, q in allpos.items() if self.state.get(b) != "done"}
 
         self._count_laps(poses)
+
+        # ── 갭핑 (__init__ 의 gap_min_m 주석 참조) ──────────────────────────
+        #   본선은 -X 흐름: 앞차의 x 가 더 작다. "앞차는 패치를 벗어났고(계속
+        #   가고) 뒤차는 패치 위(세우면 선다)" 일 때만 세운다 — 둘 다 패치 위면
+        #   같이 서 버려 분리가 안 되므로 앞차가 나갈 때까지 기다린다.
+        if self.gap_min_m > 0 and self.use_sorter and self._h_sorter:
+            for gz, (slo, shi) in self.sortx.items():
+                if gz in self._sorter_div:
+                    continue
+                pair = False
+                for b, q in allpos.items():
+                    if not (slo <= q[0] <= shi and self.y_lo <= q[1] <= self.y_hi):
+                        continue                      # 뒤차 후보: 패치 위 박스만
+                    for b2, q2 in allpos.items():
+                        if b2 == b or not (self.y_lo <= q2[1] <= self.y_hi):
+                            continue
+                        if q2[0] < slo and 0.0 < q[0] - q2[0] < self.gap_min_m:
+                            pair = True               # 앞차가 패치 밖 + 간격 부족
+                            break
+                    if pair:
+                        break
+                held = self._gap_hold.get(gz)
+                if pair and held is None:
+                    self._h_sorter({"zone": gz, "divert": False, "mps": 0.0})
+                    self._gap_hold[gz] = now
+                    self.log("[router] 소터 %s 갭핑 — 밀착 쌍 분리 (뒤차 잠깐 정지)"
+                             % gz)
+                elif held is not None and (not pair or now - held > 2.0):
+                    self._h_sorter({"zone": gz, "divert": False,
+                                    "mps": self.belt_mps})
+                    self._gap_hold.pop(gz, None)
+                    self.log("[router] 소터 %s 갭핑 해제" % gz)
 
         for bid, p in list(poses.items()):
             z = self.zone_of(bid)
