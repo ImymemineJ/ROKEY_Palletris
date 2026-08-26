@@ -228,7 +228,18 @@ class RosSide:
             #     실패 재시도 중 뒤차가 접근하는 창은 남지만 지선 0.3 에서
             #     흡착 실패 자체가 드물다 (간극 2.1~2.4mm 실측).
             if _spur_stop and act == 0:
-                self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
+                # ★ 딜레이 재가동 (2026-08-27 2차 수정, 김병직). PICK 은 **흡착까지**
+                #   고 들어올리기는 PLACE 첫 구간이다 — 즉시 돌리면 문 채 바닥에
+                #   있는 박스1을 뒤차가 들이받는다 (실측: B·C 정지). 성공 시
+                #   PL_SPUR_DELAY(기본 3초, 벽시계) 뒤에 돌린다 — 그 사이 상승이
+                #   끝난다. 실패 시엔 즉시 (박스가 그대로 있고, 폐기 경로 교착 방지).
+                if ev.get("ok"):
+                    threading.Timer(
+                        float(os.environ.get("PL_SPUR_DELAY", "3.0")),
+                        lambda: self.link.call(cmd="set_velocity", seg=seg,
+                                               mps=self._belt_mps)).start()
+                else:
+                    self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
             if act == 1:                                        # PLACE — 성공/실패 무관
                 self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
             self._push(ev)
