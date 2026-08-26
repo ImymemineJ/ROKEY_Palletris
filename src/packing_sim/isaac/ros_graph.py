@@ -752,10 +752,18 @@ def compute(db):
     #   핸들러는 **즉시 반환**해야 한다 — 오래 걸리는 일은 큐에 넣고 돌아온다.
     req = {{}}
     _miss = []
+    # ★★ 값은 **Req 노드의 outputs:Request:<필드>** 에서 직접 읽는다 (2026-08-27).
+    #   `db.inputs.<필드>` 는 string 은 전달되는데 **float32 는 연결값이 안 오고
+    #   기본값 0.0 이 나온다** — 실측: 재가동 set_velocity(0.5) 가 왕복은 되는데
+    #   항상 0.0 으로 처리됐다. 정지(0.0)만 있던 동안은 증상이 안 보였다
+    #   ("bad mps 수정 이후 성공" 도 전부 0.0 이었다). Req 출력을 직접 읽으면
+    #   연결 전달에 의존하지 않는다.
+    _rq = _og.Controller.node(_M.GRAPH + "/{key}_Req")
     # ★ 모듈 표에서 **내 것만** 꺼낸다. 최상단 변수로 두면 다른 ScriptNode 가 덮는다.
     for f in _M._SRV_FIELDS.get("{key}", []):
         try:
-            v = getattr(db.inputs, f)
+            _at = _og.Controller.attribute("outputs:Request:" + f, _rq)
+            v = _at.get() if _at is not None else getattr(db.inputs, f)
         except Exception as e:
             # ★ 조용히 넘기면 안 된다. 필드 하나가 빠지면 핸들러가
             #   "bad mps" 같은 **엉뚱한 사유**로 실패하고, 진짜 원인(그 필드를
