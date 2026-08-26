@@ -44,9 +44,25 @@ class MainQueue:
         self._log = log
         self._q = []
         self._lk = threading.Lock()
+        # ★ 메인 스레드가 누구인지 기억한다. 생성자는 sim_main.main() 안이라
+        #   보통 여기가 메인이고, pump() 가 매 스텝 갱신하므로 확실해진다.
+        self._main_tid = threading.get_ident()
 
     def run(self, fn):
-        """메인 스레드에서 fn() 을 돌리고 결과를 받아 온다. **소켓 스레드에서 호출.**"""
+        """메인 스레드에서 fn() 을 돌리고 결과를 받아 온다.
+
+        ★ **메인 스레드에서 불러도 안전하다** (2026-08-26 김병직).
+          원래는 소켓 스레드 전용이었다. 그런데 ROS 2 로 옮기면서 서비스 핸들러가
+          **Action Graph 의 ScriptNode 안**, 즉 **메인 스레드**에서 돌게 됐다
+          (`ros_graph.py` docstring 3번). 거기서 여기를 부르면 큐에 넣고
+          `evt.wait()` 로 기다리는데, 그 큐를 비우는 `pump()` 도 같은 메인
+          스레드라 **자기가 자기를 기다린다.** 타임아웃까지 멎었다가
+          "sim 메인 루프가 응답하지 않는다" 를 돌려준다 — 실측 2026-08-26,
+          `/conveyor/set_velocity` 가 항상 ok=false 였다.
+          이미 메인이면 큐를 거칠 이유가 없으므로 **그 자리에서 실행한다.**
+        """
+        if threading.get_ident() == self._main_tid:
+            return fn()
         evt, out = threading.Event(), {}
         with self._lk:
             self._q.append((fn, evt, out))
@@ -58,6 +74,8 @@ class MainQueue:
 
     def pump(self):
         """쌓인 작업을 처리한다. **메인 스레드에서 매 물리 스텝 한 번.**"""
+        # 여기를 부르는 스레드가 메인이다 — run() 이 이 값으로 판별한다.
+        self._main_tid = threading.get_ident()
         with self._lk:
             pending, self._q = self._q, []
         for fn, evt, out in pending:

@@ -34,7 +34,6 @@
     ros2 run packing_robot robot_node --ros-args -p zones:="['b']"
 """
 import threading
-import time
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -44,11 +43,13 @@ from rclpy.node import Node
 from packing_common.config import load
 from packing_msgs.msg import RobotCmd, RobotEvent
 
-from packing_robot.cycle import Cycle, MotionError
+from packing_robot.cmd_adapter import ACTION_NAME, run_cmd
+from packing_robot.cycle import Cycle
 from packing_robot.sim_link import SimLink
 
-ACTION_NAME = {RobotCmd.PICK: "PICK", RobotCmd.PLACE: "PLACE",
-               RobotCmd.HOME: "HOME", RobotCmd.STOP: "STOP"}
+# ★ 규칙(seq 복사 · has_actual 게이트 · 예외에도 답하기)은 여기 없다 —
+#   `cmd_adapter.run_cmd` 하나에 있다. 최종 구조에서는 Isaac 안의 sim_main 이
+#   같은 함수를 부른다. 두 군데서 유도하면 한쪽이 반드시 틀린다.
 
 
 class _NoSvc:
@@ -99,87 +100,48 @@ class ZoneRobot:
         if not self.busy.acquire(blocking=False):
             self.log.error(f"이미 모션 중인데 {ACTION_NAME[c.action]} seq={c.seq} 가 왔다 "
                            f"— ok=false 로 답한다")
-            self._answer(c, False, "ABORTED", None, 0.0)
+            ev = run_cmd(self.cycle, {"action": -1, "seq": int(c.seq),
+                                      "box_id": str(c.box_id)},
+                         log=lambda m: self.log.warn(str(m)))
+            ev["action"] = int(c.action)
+            self._publish(ev)
             return
         threading.Thread(target=self._work, args=(c,), daemon=True).start()
 
     # ── 워커 스레드: 여기서만 블로킹한다 ──
     def _work(self, c):
-        t0 = time.time()
-        ok, reason, actual = False, "ABORTED", None
         try:
-            ok, reason, actual = self._dispatch(c)
-        except MotionError as e:
-            reason = "IK_UNSOLVABLE" if e.state == "IK_FAIL" else "COLLISION"
-            self.log.error(f"{ACTION_NAME[c.action]} seq={c.seq} 이동 실패 {e.state}")
-        except Exception as e:                       # noqa: BLE001
-            # ★ 여기서 삼키면 관제탑이 20초를 통째로 버린다. 반드시 답한다.
-            reason = "ABORTED"
-            self.log.error(f"{ACTION_NAME[c.action]} seq={c.seq} 예외 {e!r}")
+            ev = run_cmd(self.cycle, _cmd_to_dict(c),
+                         log=lambda m: self.log.info(str(m)))
+            self._publish(ev)
         finally:
-            self._answer(c, ok, reason, actual, time.time() - t0)
+            # ★ 무슨 일이 있어도 락을 놓는다. 안 놓으면 다음 명령이 영영 안 돈다.
             self.busy.release()
 
-    def _dispatch(self, c):
-        name = ACTION_NAME[c.action]
-        self.log.info(f"[{self.zone}] ← {name} seq={c.seq} {c.box_id} "
-                      f"({c.x_mm}, {c.y_mm}, {c.z_mm}) yaw={c.yaw_deg:.1f}")
+    def _publish(self, ev):
+        m = RobotEvent()
+        m.seq = int(ev["seq"])
+        m.action = int(ev["action"])
+        m.box_id = str(ev["box_id"])
+        m.ok = bool(ev["ok"])
+        m.reason = str(ev["reason"])
+        m.has_actual = bool(ev["has_actual"])
+        m.actual_x_mm = int(ev["actual_x_mm"])
+        m.actual_y_mm = int(ev["actual_y_mm"])
+        m.actual_z_mm = int(ev["actual_z_mm"])
+        m.actual_yaw_deg = float(ev["actual_yaw_deg"])
+        m.duration_s = float(ev["duration_s"])
+        self.pub.publish(m)
 
-        if c.action == RobotCmd.PICK:
-            h = int(c.size_h_mm)
-            # ★ RobotCmd.z_mm 은 **박스 밑면**이다 (RobotCmd.msg 정본).
-            #   Cycle.pick 은 박스 **중심**을 받으므로 h/2 를 더한다.
-            pose = {"pos_m": [c.x_mm / 1000.0, c.y_mm / 1000.0, (c.z_mm + h / 2.0) / 1000.0],
-                    "yaw_deg": float(c.yaw_deg)}
-            r = self.cycle.pick(c.box_id, pose, h)
-            return (r == "PICKED"), ("" if r == "PICKED" else "GRASP_FAILED"), None
 
-        if c.action == RobotCmd.PLACE:
-            # ★ PLACE 의 좌표는 **팔레트 기준**이다 (PlacePose 를 그대로 실어 보낸다).
-            #   z 는 밑면. pallet_place_to_world 가 그 규약으로 월드 중심을 만든다.
-            place = {"x_mm": int(c.x_mm), "y_mm": int(c.y_mm), "z_mm": int(c.z_mm),
-                     "yaw_deg": float(c.yaw_deg)}
-            r, actual, measured = self.cycle.place(
-                c.box_id, place, int(c.size_w_mm), int(c.size_d_mm), int(c.size_h_mm))
-            if r != "PLACED":
-                return False, "DROPPED", None
-            # ★ 씬에서 **실제로 읽은** 경우에만 실어 보낸다. 못 읽었으면 actual 은
-            #   계획값이고, 그걸 has_actual=true 로 보내면 §3-4 규약 3 위반이다.
-            if not measured:
-                self.log.warn(f"{c.box_id} 실측 pose 를 못 읽었다 — has_actual=false 로 보낸다")
-            return True, "", (actual if measured else None)
-
-        if c.action == RobotCmd.HOME:
-            # ★ 진짜 홈 관절값은 아직 없다 — 적재물 위로 팔만 뺀다.
-            #   `Cycle.retreat_home()` 주석에 왜인지 적어 뒀다.
-            self.cycle.retreat_home()
-            return True, "", None
-
-        # STOP — `robot_motion.handlers()` 에 stop 이 없다 (move_ee · motion_status ·
-        # grasp · release · is_holding · tcp_speed 여섯뿐). 없는 API 를 부르지 않는다.
-        # 지금 관제탑도 STOP 을 안 보낸다. 보내기 시작하면 여기와 robot_motion 을
-        # 같이 채운다 — 조용히 ok 로 답하면 "멈췄다"고 오해하게 만든다.
-        self.log.error(f"STOP seq={c.seq} — 아직 구현되지 않았다 (robot_motion 에 핸들러 없음)")
-        return False, "ABORTED", None
-
-    def _answer(self, c, ok, reason, actual, dt):
-        ev = RobotEvent()
-        ev.seq, ev.action, ev.box_id = c.seq, c.action, c.box_id   # ★ seq 그대로 복사
-        ev.ok, ev.reason = bool(ok), ("" if ok else reason)
-        # ★ PLACE 성공 때만 실측을 싣는다. 계획값을 되보내지 않는다 (§3-4 규약 3).
-        if ok and c.action == RobotCmd.PLACE and actual is not None:
-            ev.has_actual = True
-            ev.actual_x_mm = int(actual["x_mm"])
-            ev.actual_y_mm = int(actual["y_mm"])
-            ev.actual_z_mm = int(actual["z_mm"])          # 밑면 기준
-            ev.actual_yaw_deg = float(actual.get("yaw_deg", c.yaw_deg))
-        ev.duration_s = float(dt)
-        self.pub.publish(ev)
-        self.log.info(f"[{self.zone}] → {ACTION_NAME[c.action]} seq={ev.seq} ok={ev.ok}"
-                      + (f" {ev.reason}" if ev.reason else "")
-                      + (f" 실측({ev.actual_x_mm},{ev.actual_y_mm},{ev.actual_z_mm})"
-                         if ev.has_actual else "")
-                      + f" {dt:.1f}s")
+def _cmd_to_dict(c):
+    """RobotCmd 메시지 -> 어댑터가 받는 순수 dict."""
+    return {"action": int(c.action), "seq": int(c.seq), "box_id": str(c.box_id),
+            "x_mm": int(c.x_mm), "y_mm": int(c.y_mm), "z_mm": int(c.z_mm),
+            "yaw_deg": float(c.yaw_deg),
+            "size_w_mm": int(c.size_w_mm), "size_d_mm": int(c.size_d_mm),
+            "size_h_mm": int(c.size_h_mm),
+            "approach_z_mm": int(c.approach_z_mm)}
 
 
 class RobotNode(Node):

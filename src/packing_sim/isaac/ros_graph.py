@@ -6,9 +6,9 @@
     Python 버전 차이(3.11 vs 3.12)를 우회하므로 rclpy 가 필요 없다.
 
 세우는 것 (`/World/PalletrisROS`)
-    OnPlaybackTick ─┬─> ROS2Subscriber  /robot/cmd            (packing_msgs/RobotCmd)
+    OnPlaybackTick ─┬─> ROS2Subscriber  /zone_<z>/robot/cmd   (packing_msgs/RobotCmd)
                     ├─> [서비스 4종]     Req -> Script -> Res
-                    └─> EventGate ─────> ROS2Publisher /robot/event  (RobotEvent)
+                    └─> EventGate ─────> ROS2Publisher /zone_<z>/robot/event (RobotEvent)
 
     `/clock` · `/tf` · 카메라는 **여기서 안 만든다.** 김학민(A)의 기존 그래프 소관이다.
     `/zone_*/box_at_pickup` 도 아니다 — §3-2 에서 **인식 노드(D)** 가 발행한다.
@@ -61,8 +61,23 @@ SERVICES = [
     ("set_spawn_enabled", "SetSpawnEnabled", "/sim/set_spawn_enabled"),
     ("swap_pallet",       "SwapPallet",      "/sim/swap_pallet"),
 ]
-CMD_TOPIC = "/robot/cmd"
-EVT_TOPIC = "/robot/event"
+# ★ 구역 접두어가 붙는다 — 관제탑이 `/zone_b/robot/cmd` 로 발행한다.
+#   ⚠ 2026-08-26 수정 (김병직): 여기가 `/robot/cmd` 였다. 관제탑은 구역을
+#   인스턴스로 나눠 들고 있어(ZoneCycle) 토픽마다 구역이 붙는데 여기만 안 붙어서
+#   **아무것도 연결되지 않았다.** 그런데 에러가 안 난다 — 관제탑이 명령을 쏘고
+#   20초 타임아웃 뒤 계획을 버리는 것을 무한 반복한다 (CLAUDE.md §10).
+#   RobotCmd 에 구역 칸이 없으므로 구역은 토픽 이름으로만 갈린다.
+def cmd_topic(zone):
+    return "/zone_%s/robot/cmd" % str(zone).lower()
+
+
+def evt_topic(zone):
+    return "/zone_%s/robot/event" % str(zone).lower()
+
+
+# 하위호환용 기본값 (zone="B"). 새 코드는 위 함수를 쓴다.
+CMD_TOPIC = cmd_topic("B")
+EVT_TOPIC = evt_topic("B")
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.
 _OG_TYPE = {
@@ -172,11 +187,11 @@ def build(zone="B"):
     values = [
         # ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
         ("Ctx.inputs:useDomainIDEnvVar", True),
-        ("CmdSub.inputs:topicName", CMD_TOPIC),
+        ("CmdSub.inputs:topicName", cmd_topic(zone)),
         ("CmdSub.inputs:messagePackage", PKG),
         ("CmdSub.inputs:messageSubfolder", "msg"),
         ("CmdSub.inputs:messageName", "RobotCmd"),
-        ("EvtPub.inputs:topicName", EVT_TOPIC),
+        ("EvtPub.inputs:topicName", evt_topic(zone)),
         ("EvtPub.inputs:messagePackage", PKG),
         ("EvtPub.inputs:messageSubfolder", "msg"),
         ("EvtPub.inputs:messageName", "RobotEvent"),
@@ -328,7 +343,20 @@ def compute(db):
     q = _M._EVENTS
     if not q:
         db.outputs.execOut = _og.ExecutionAttributeState.DISABLED
-        return True
+        # ⚠ **미해결 (2026-08-26 김병직 실측).** 이 게이트가 하류를 못 막는다.
+        #   `execOut = DISABLED` 로도, `compute` 가 False 를 돌려줘도 **EvtPub 이
+        #   매 틱 그대로 실행돼 마지막 값을 다시 쏜다.**
+        #     실측 A (return True):  PICK 1건 -> RobotEvent 2811건 · 빈 것 396건
+        #     실측 B (return False): PICK 1건 -> RobotEvent 2013건 · 빈 것 535건
+        #   즉 반환값과 무관하다. 배선은 맞다 — EvtPub 은 Tick 에 안 물려 있고
+        #   `EvtGate.outputs:execOut` 만 받는다 (위 conn 참조). 원인 미상.
+        #   ★ 관제탑은 `seq` 로 걸러 내므로(§3-4 규약 2) **깨지지는 않는다.**
+        #     다만 토픽이 60 Hz 로 더러워지고, 같은 seq 가 상태 전이 도중 두 번
+        #     들어오면 사이클이 겹칠 수 있다. 통합 전에 잡는다.
+        #   다음에 볼 것: ScriptNode 의 execOut 이 execution 평가기에서 실제로
+        #   게이트가 되는지 / EvtPub 을 Branch 노드 뒤로 옮기기 / 발행 뒤 한 틱만
+        #   켜고 바로 끄는 방식.
+        return False
     ev = q.pop(0)                       # 한 틱에 하나. 순서가 뒤집히면 seq 가 꼬인다
     node = _og.Controller.node(_M.GRAPH + "/EvtPub")
     for k, v in ev.items():

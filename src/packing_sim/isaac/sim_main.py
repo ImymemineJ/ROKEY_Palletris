@@ -80,6 +80,11 @@ def main():
     ap.add_argument("--gui", action="store_true", help="창을 띄운다")
     ap.add_argument("--no-robot", action="store_true",
                     help="로봇 없이 씬만 (벨트·스포너 시험용)")
+    # ★ ROS 2 통로를 연다 (CLAUDE.md §2 — Isaac 안팎을 잇는 통로는 ROS 2 하나뿐).
+    #   켜면 Action Graph 가 /zone_<z>/robot/cmd 를 구독하고 씬 서비스 4종을 낸다.
+    #   끄면 예전처럼 소켓만 연다 (demo_stack15 · 과도기 robot_node 용).
+    ap.add_argument("--ros", action="store_true",
+                    help="ROS 2 Action Graph 를 세운다 (관제탑과 직접 대화)")
     ap.add_argument("--autorun", action="store_true",
                     help="뜨자마자 벨트를 사양 속도로 돌린다")
     ap.add_argument("--no-render", action="store_true",
@@ -146,10 +151,16 @@ def main():
         server = SS.SimServer(port=a.port)
         server.register({"ping": lambda req: {"ok": True}})
 
+        # ★ ROS 쪽(ros_side)도 같은 핸들러를 써야 하므로 한 표에 모아 둔다.
+        #   소켓과 ROS 가 서로 다른 함수를 부르면 둘이 어긋난다.
+        H = {"ping": lambda req: {"ok": True}}
+
         sp = SP.Spawner(stage, cfg, q, zone=a.zone)
+        H.update(sp.handlers())
         server.register(sp.handlers())
 
         cc = conveyor_ctl.ConveyorCtl(stage, cfg, q)
+        H.update(cc.handlers())
         server.register(cc.handlers())
 
         # ── 로봇 (B 소유 핸들러) ─────────────────────────────
@@ -172,7 +183,21 @@ def main():
                         cur["box"] = None   # 사이클 밖에서 옛 박스로 재지 않는다
 
                 _h["grasp"] = h_grasp
+                H.update(_h)
                 server.register(_h)
+
+        # ── ROS 2 통로 (트랙 B — ros_side.py) ────────────────
+        # ★ build() 는 **Play 전**, wire() 는 **Play + 몇 프레임 뒤**다.
+        #   메시지 필드가 Play 후에야 생겨서 그 전에 이으면 죽는다 (TS-022 2번).
+        ros = None
+        if a.ros:
+            for _e in ("isaacsim.core.nodes", "isaacsim.ros2.bridge",
+                       "omni.graph.scriptnode"):
+                enable_extension(_e)
+            kit.update()
+            import ros_side
+            ros = ros_side.RosSide(cfg, a.zone, H)
+            ros.build()
 
         world.reset()
         if rm is not None:
@@ -197,10 +222,18 @@ def main():
                   % np.round(np.degrees(rm.art.get_joint_positions()[:6]), 1).tolist())
         # 벨트는 **멈춘 채로** 시작한다. 오케스트레이터가 set_velocity 로 돌린다.
         # (뜨자마자 돌면 머리가 붙기 전에 박스가 라인 끝까지 흘러가 버린다.)
+        if ros is not None:
+            # 정착 스텝(SETTLE_STEPS)에서 이미 프레임이 돌았지만, 로봇이 없으면
+            # (--no-robot) 한 번도 안 돌았을 수 있어 여기서 확실히 채운다.
+            for _ in range(60):
+                world.step(render=not a.no_render)
+            ros.wire()
+
         cc.run_all() if a.autorun else cc.stop_all()
         print("[sim_main] 벨트 %s" % ("가동" if a.autorun else "정지 — set_velocity 대기"))
         print("[sim_main] cmd %s" % server.cmds())
-        print("[sim_main] 준비 완료. 소켓 127.0.0.1:%d" % a.port)
+        print("[sim_main] 준비 완료. 소켓 127.0.0.1:%d%s"
+              % (a.port, " · ROS 2 켬" if ros is not None else ""))
 
         # ── 메인 루프: 물리만 돌린다 ─────────────────────────
         while kit.is_running():
@@ -208,6 +241,8 @@ def main():
             if rm is not None:
                 rm.step()                  # ★ world.step() 앞
             sp.step()
+            if ros is not None:
+                ros.step()             # ★ 논블로킹. 모션은 워커가 돈다 (§9)
             # ★★ **헤드리스에서도 render=True 로 돈다.**
             #
             # `IsaacConveyor` 노드는 `OnTick` 으로 도는데 `OnTick` 은 **렌더 틱에**
