@@ -256,8 +256,10 @@ def main():
         # ★ 그래프는 하나, 서비스는 한 벌, 구역별 `RosSide` 는 step() 만 각자 돈다.
         ros = []
         if a.ros:
+            # ★ omni.replicator.core 는 **카메라용**이다 — `ROS2CameraHelper` 가
+            #   요구하는 renderProduct 를 여기서 만든다 (ros_graph.build_cameras).
             for _e in ("isaacsim.core.nodes", "isaacsim.ros2.bridge",
-                       "omni.graph.scriptnode"):
+                       "omni.graph.scriptnode", "omni.replicator.core"):
                 enable_extension(_e)
             kit.update()
             import ros_side
@@ -410,7 +412,13 @@ class _Feeder:
         # 스폰 지점이 아직 안 비었으면 **겹쳐 스폰된다.** 다음 틱에 다시 본다.
         if st.get("on_belt", 0) >= self.cap or not st.get("spawn_clear", True):
             return
-        bid = "BOX%05d" % self.i
+        # ★★ **3 자리다** (`BOX001`). 5 자리로 내면 조용히 다 막힌다 (2026-08-26 실측):
+        #   · 마스터 DB(`boxes_master`)가 3 자리라 관제탑이 "DB 에 없음 -> 폐기"
+        #   · QR 라벨 PNG 도 `qr_labels/BOX001.png` 라 라벨이 안 붙는다
+        #     -> 픽업 카메라가 QR 을 못 읽어 `box_id` 가 빈 채 나가고,
+        #        관제탑이 "box_at_pickup 에 box_id 가 비어 있다 — 무시" 로 버린다
+        #   ⚠ `demo_stack15_test1_1.py:134` 은 `BOX%05d` 인데 그쪽은 DB 를 안 쓴다.
+        bid = "BOX%03d" % (self.i + 1)
         kw = {"box_id": bid, "type": self.types[self.i], "yaw_deg": 0}
         if self.dests[self.i]:
             kw["dest"] = self.dests[self.i]

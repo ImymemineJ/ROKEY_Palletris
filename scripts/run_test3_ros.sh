@@ -80,6 +80,9 @@ fi
 export PL_STAGE="${PL_STAGE:-$HOME/isaac_scenes/project_1/test_3.usd}"
 export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-$WS/src/packing_bringup/config/test_3.yaml}"
 export PL_ZONES="${PL_ZONES:-A,B,C}"
+# ★ 픽업 카메라를 **우리가** ROS 로 쏠지. 씬(Action Graph)에서 직접 배선하기로
+#   했으면 0 으로 끈다 — 발행자가 둘이면 vision 이 두 이미지를 번갈아 받는다.
+export PL_CAMROS="${PL_CAMROS:-1}"
 
 # ★ 급송 — `--ros` 경로에는 박스를 넣는 주체가 없다 (씬이 아직 안 낸다).
 #   PL_SPAWN=0 으로 끌 수 있다.
