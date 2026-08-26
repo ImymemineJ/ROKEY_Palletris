@@ -78,6 +78,13 @@ EVT_TOPIC_FMT = "/zone_%s/robot/event"
 #   (algo · db · 로봇 · 반출)이 통째로 안 돈다. 카메라를 기다리는 동안 나머지를
 #   못 재는 것이 더 큰 손해다.
 PICK_TOPIC_FMT = "/zone_%s/box_at_pickup"
+# ★ PL_GTPICK=2 — **신원 대역 모드** (2026-08-27 김병직 설계).
+#   풀 비전에서 좌표는 존 인식 카메라가 내지만, 픽업 카메라로 박스 윗면 QR 을
+#   읽는 건 사양(§5) 밖이고 실측도 실패한다 (3/202). 신원은 씬 실측이 계속
+#   내되 **다른 토픽**으로 낸다 — 관제탑이 "좌표=카메라 · 신원=이 토픽" 으로
+#   합친다. 같은 토픽에 발행자 둘이 서는 사고(§ gtpick 주석)가 원천 차단된다.
+if os.environ.get("PL_GTPICK") == "2":
+    PICK_TOPIC_FMT = "/zone_%s/box_ident"
 
 
 def cmd_topic(zone):

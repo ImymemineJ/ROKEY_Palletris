@@ -188,6 +188,16 @@ class ZoneCycle:
             BoxAtPickup, f"/zone_{self.zone}/box_at_pickup",
             self.on_box_arrived, 10, callback_group=self.cbg)
 
+        # ── 구독: 신원 대역 (PL_GTPICK=2 일 때만 씬이 낸다) ──
+        # ★ 풀 비전에서 존 인식이 QR 을 못 읽어 box_id 가 빈 채 오면 (사양상
+        #   픽업 카메라 몫이 아니다 — §5 는 "픽업 좌표 실측"만), 씬 실측이
+        #   /zone_*/box_ident 로 낸 신원을 붙여 준다 (2026-08-27 김병직 설계).
+        #   대역 토픽이 없으면 이 구독은 조용히 놀고 기존 동작 그대로다.
+        self._ident = None               # (box_id, 받은 시각) — 스토퍼 박스 신원
+        self.node.create_subscription(
+            BoxAtPickup, f"/zone_{self.zone}/box_ident",
+            self._on_ident, 10, callback_group=self.cbg)
+
         # ── 구독: 로봇 결과 ──
         # ★ 로봇 토픽도 구역별이다: /zone_a/robot/cmd · /zone_b/... · /zone_c/...
         #   RobotCmd 에는 구역 칸이 없다. 구역이 셋인데 토픽이 하나면 A 구역 명령을
@@ -228,6 +238,13 @@ class ZoneCycle:
     # ══════════════════════════════════════════════════════════
     # ① IDLE → ② FETCHING : 박스가 스토퍼에 도착했다
     # ══════════════════════════════════════════════════════════
+    def _on_ident(self, msg):
+        """신원 대역 수신 — 스토퍼 박스의 box_id 만 기억한다 (좌표는 안 쓴다)."""
+        if msg.present and msg.box_id:
+            self._ident = (msg.box_id, time.time())
+        elif not msg.present:
+            self._ident = None           # 스토퍼가 비었다 — 낡은 신원을 안 붙인다
+
     def on_box_arrived(self, msg):
         """BoxAtPickup 수신. ★ 여기서는 판단만 하고 무거운 일을 하지 않는다 (§1.5)."""
         if self.state != IDLE:
@@ -255,11 +272,19 @@ class ZoneCycle:
         # 다음 단계가 /db/get_box_info(box_id) 인데 빈 문자열로는 조회가 안 된다.
         # detector 가 색 → box_id 매칭에 실패하면 이렇게 온다.
         if not msg.box_id:
-            # ★ once 로 억누르지 않는다. 이 상태가 이어지면 라인이 막히는데
-            #   경고가 한 번만 뜨면 조용히 선 것처럼 보인다.
-            self.log.warn("box_at_pickup 에 box_id 가 비어 있다 — 무시",
-                          throttle_duration_sec=5.0)
-            return
+            # ★ 신원 대역 (2026-08-27): /zone_*/box_ident 가 방금(3초 안) 준
+            #   스토퍼 박스 신원이 있으면 그걸 붙인다 — 좌표는 카메라 실측 그대로.
+            _id = self._ident
+            if _id is not None and time.time() - _id[1] < 3.0:
+                msg.box_id = _id[0]
+                self.log.info("box_id 를 신원 대역에서 보충: %s" % msg.box_id,
+                              throttle_duration_sec=5.0)
+            else:
+                # ★ once 로 억누르지 않는다. 이 상태가 이어지면 라인이 막히는데
+                #   경고가 한 번만 뜨면 조용히 선 것처럼 보인다.
+                self.log.warn("box_at_pickup 에 box_id 가 비어 있다 — 무시",
+                              throttle_duration_sec=5.0)
+                return
 
         # ── ②-b 방금 버렸거나 방금 다 쌓은 박스면 씬이 치울 때까지 건드리지 않는다 ──
         if msg.box_id in (self._rejected_id, self._done_id):

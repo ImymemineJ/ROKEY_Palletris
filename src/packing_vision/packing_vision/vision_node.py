@@ -33,6 +33,7 @@ CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현�
 """
 
 import collections
+import time
 
 import numpy as np
 import rclpy
@@ -633,6 +634,18 @@ class ZoneDetector(Node):
         self._min_dt = 1.0 / max(0.1, float(self.get_parameter("infer_rate_hz").value))
         self._last = 0.0
         self._present = False
+        # ★ 스토퍼 창·자리잡음 필터 (2026-08-27 김병직 — gtpick 대역과 같은 규칙).
+        #   실측: 도착 전 박스를 보고했다 — y 3405(스토퍼 -586mm)·yaw 179→88.7 로
+        #   널뛰는 좌표에 로봇이 출발해 흡착·IK 실패. ① 가장 큰 박스가 스토퍼에
+        #   닿았을 때 중심보다 60mm 여유 밖이면 아직 도착 전, ② 직전 추론과
+        #   5mm·1.5도 안으로 같아야 자리잡은 것. ③ 같은 박스가 15초째 걸려
+        #   있으면(뒤집힘 등) 강제 보고 — 관제탑 재시도 상한이 치워 준다.
+        _ax = str(cfg["conveyor"].get("pickup_axis", "x")).lower()
+        self._axis_i = 1 if _ax == "y" else 0
+        _half = max(max(t["w_mm"], t["d_mm"]) for t in self.types) / 2000.0
+        self._win_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0 - _half - 0.060
+        self._stab_prev = None       # (x_mm, y_mm, yaw)
+        self._stab_first = None      # 처음 필터에 걸린 시각 (monotonic)
         self._idle = True          # 관제탑이 놀고 있는가
         self._seen = None          # 직전에 발행한 box_id (중복 로그 억제)
 
@@ -749,6 +762,25 @@ class ZoneDetector(Node):
         #   토픽에 실을 때 여기서 한 번만 mm 로 바꾼다.
         #   z 는 싣지 않는다 — 벨트 상면(800mm)은 고정이라 관제탑이 안다.
         cx, cy, cz = out["center_m"]
+
+        # ── 스토퍼 창·자리잡음 필터 (__init__ 주석 참조) ──
+        _now = time.monotonic()
+        _cur = (m_to_mm(cx), m_to_mm(cy), round(float(out["yaw_deg"]), 1))
+        if self._stab_first is None:
+            self._stab_first = _now
+        _force = (_now - self._stab_first) > 15.0
+        _prev, self._stab_prev = self._stab_prev, _cur
+        if not _force:
+            if out["center_m"][self._axis_i] < self._win_m:
+                return                   # 아직 스토퍼에 도착 전 — 보고하지 않는다
+            if (_prev is None or abs(_prev[0] - _cur[0]) > 5
+                    or abs(_prev[1] - _cur[1]) > 5
+                    or abs(_prev[2] - _cur[2]) > 1.5):
+                return                   # 아직 자리잡는 중 — 다음 추론에서 다시
+        elif not self._present:
+            self.get_logger().warn(
+                "15초째 창밖/불안정 — 강제 보고 (집기 실패하면 관제탑 상한이 치운다)")
+
         self.pub.publish(BoxAtPickup(
             present=True, box_id=box_id,
             x_mm=m_to_mm(cx), y_mm=m_to_mm(cy),
@@ -805,6 +837,8 @@ class ZoneDetector(Node):
         if self._present:
             self.get_logger().info("픽업 자리 비었다")
         self._present, self._seen = False, None
+        # ★ 필터 상태도 함께 리셋 — 다음 박스를 새 박스로 본다 (창·안정 필터)
+        self._stab_prev = self._stab_first = None
         self.pub.publish(BoxAtPickup(present=False, box_id=""))
 
 
