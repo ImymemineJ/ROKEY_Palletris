@@ -162,7 +162,77 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 8. 인터페이스 — 타입 확정
+## 8. DB — 파일은 **하나**, 표가 여럿
+
+`palletris.db` **하나**뿐이다. "DB 두 개" 로 기억하기 쉬운데, 실제로는 **한 파일 안의
+역할이 다른 표 둘**이다.
+
+```
+palletris.db  (SQLite, 파일 1 개)
+├── boxes_master   150 행   ← 1차 "정답지"   운송장번호 → 주소
+├── zone_map        10 행   ←     동 → 구역 배정표
+├── boxes_sorted           ← 2차 "작업 기록"  실제 흘러간 박스
+├── box_events            ←     상태 전이 이력 (지표가 전부 여기서 나온다)
+├── scan_misses           ←     인식 실패
+└── recirculation         ←     재순환
+```
+
+조회 순서는 실제 택배 분류와 같다:
+
+```
+QR "BOX001" → boxes_master 로 주소 → 그 주소의 동 → zone_map 으로 구역 → boxes_sorted 에 기록
+```
+
+**왜 파일을 안 나누나** — `db_service_node` 가 유일 writer 여야 한다 (§7). 파일이 둘이면
+커넥션도 둘이라 `database is locked` 위험이 는다. 한 파일이라 인식률을 SQL 한 방에 낸다:
+
+```sql
+SELECT box_id FROM boxes_master
+ WHERE box_id NOT IN (SELECT box_id FROM boxes_sorted)   -- 정답지에 있는데 안 온 박스
+```
+
+### 헷갈리기 쉬운 파일 3종
+
+| 파일 | 무엇 | 편집기로 열면 |
+|---|---|---|
+| `palletris.db` | **진짜 DB** (SQLite) | **깨져 보인다 — 정상이다** |
+| `packing_db/data/boxes_master.csv` | 정답지 **재료** (git 에 올라간다) | 엑셀로 열린다 |
+| `packing_db/schema.sql` | 표 **설계도** | 텍스트 |
+
+```
+schema.sql → 표를 만들고   ·   CSV → 내용을 채우고   ·   palletris.db → 결과물
+```
+
+⚠ `.db` 는 바이너리다. 텍스트 편집기로 **열어서 저장하면 깨진다.** 읽을 때는:
+
+```bash
+python3 scripts/db_peek.py          # SQL 몰라도 표로 보여 준다
+```
+
+VS Code 를 쓰면 `SQLite Viewer` 확장으로 더블클릭해 표로 볼 수 있다.
+
+### 초기화 — 실행할 때마다
+
+```bash
+ros2 run packing_db gen_master_db --reset      # ★ 그래프를 내린 상태에서
+```
+
+|  | 어떻게 되나 |
+|---|---|
+| 정답지 (`boxes_master`·`zone_map`) | 지웠다 CSV 에서 다시 깔린다 → 결과적으로 그대로 |
+| 실행 기록 (나머지 4 개) | **비워진다** |
+
+**`--reset` 없이 돌리면 지우지 않고 경고만 한다.** 기록이 섞이면 지표가 통째로
+망가진다 — `metrics` 의 `elapsed_s` 가 `MAX(ts) - MIN(ts)` 라 어제 실행까지 포함되고,
+실측으로 `robot_idle_rate` 가 **100 %** 로 굳는 것을 봤다 (`box_events` 시간 범위가
+17.8 억 초가 됐다). **에러는 안 뜨고 숫자만 조용히 틀린다.**
+
+⚠ 그래프가 떠 있으면 `DB 가 잠겨 있다` 로 막는다 — `db_service_node` 가 유일 writer 라
+`gen_master_db` 는 두 번째 writer 다. 노드를 먼저 내릴 것.
+
+---
+
+## 9. 인터페이스 — 타입 확정
 
 **토픽에 JSON 문자열을 쓰지 않는다.** 전부 전용 타입이다.
 
@@ -188,7 +258,7 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 9. 코딩 규칙
+## 10. 코딩 규칙
 
 - **모든 서비스 호출은 `call_async` + `future.add_done_callback`.**
   `spin_until_future_complete` 금지 — 콜백 안에서 부르면
@@ -203,7 +273,7 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 10. 자주 나오는 증상 → 원인
+## 11. 자주 나오는 증상 → 원인
 
 | 증상 | 원인 후보 |
 |---|---|
@@ -224,7 +294,7 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 11. 하지 말 것
+## 12. 하지 말 것
 
 - ❌ 공용 파일(`packing_msgs/`, `config/system.yaml`, 씬 USD)을 **승인 없이** 수정
 - ❌ **코드에 숫자 상수 박기** — 전부 `system.yaml` 에서 읽는다
@@ -238,7 +308,7 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 12. 평가 항목과의 대응 (참고)
+## 13. 평가 항목과의 대응 (참고)
 
 | 평가 항목 | 우리 대응 |
 |---|---|
@@ -253,7 +323,7 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 13. 팀 · 트랙
+## 14. 팀 · 트랙
 
 | 트랙 | 담당 | 범위 |
 |---|---|---|
@@ -266,7 +336,7 @@ Isaac 안에 rclpy 커스텀 노드를 만들지 마라.
 
 ---
 
-## 14. 미결 (확인 필요 — 추측 금지)
+## 15. 미결 (확인 필요 — 추측 금지)
 
 | 항목 | 담당 | 왜 |
 |---|---|---|

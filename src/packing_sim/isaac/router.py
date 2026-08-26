@@ -36,6 +36,12 @@
   7. 꺾을 때 **속도를 같이 준다.** A47 의 `SorterSpeed` 기본값이 0.0 이고
      `h_set_sorter` 는 "mps 를 안 주면 안 건드린다" 라, 안 주면 소터가 0 인 채
      남는다. 본선 롤러에는 소터 자리에 구멍이 있어 **선 소터는 라인을 막는다.**
+  8. **지선 벨트가 서 있으면 안 꺾는다** (2026-08-26 추가). 지선을 세우는 것은
+     관제탑이다 — 집기 전에 반드시 세운다 (§2.5). 서 있는 지선으로 밀어 넣으면
+     박스가 입구(Y 0.7 언저리)에서 멎었다가 45 s 뒤 되돌아온다. 실측:
+       `!! BOX004 가 45 s 안에 지선 C 에 못 올라갔다 (Y 0.68)` (진입 판정 Y 1.2)
+     ⚠ 그래서 꺾은 뒤 **지선 벨트를 켜지 않는다.** 켜면 로봇이 흡착하는 동안
+       박스가 끌려간다 — 그 벨트는 이제 관제탑 소유다.
 """
 import os
 import time
@@ -44,7 +50,7 @@ MAIN_LINE_Y_DEFAULT = [-500, 500]
 
 
 class Router:
-    """`sim_main` 메인 루프가 매 프레임 `step(time.time())` 을 부른다."""
+    """`sim_main` 메인 루프가 매 프레임 `step(시뮬 시간)` 을 부른다 (2026-08-27 벽시계에서 변경)."""
 
     #: 폴링 주기 [s]. 데모판과 같다 — 이보다 잦으면 물리 스텝만 갉아먹는다.
     PERIOD_S = 0.15
@@ -63,6 +69,22 @@ class Router:
         self.segx = {k: (min(v) / 1000.0, max(v) / 1000.0)
                      for k, v in (rt.get("main_seg_x_mm") or {}).items()}
         self.y_done = float(rt.get("divert_done_y_mm", 1200)) / 1000.0
+        # ★ 뒤차 간격 검사 (2026-08-27 김병직, 영상 '소터에서 다른박스까지 걸림').
+        #   소터가 앞차를 꺾는 동안 뒤차가 너무 가까우면 **소터에 같이 걸려**
+        #   딸려 나간다 — 지선에 박스가 나란히 두 줄로 내려오고(실측 x 205mm 차),
+        #   본선 밖으로 떨어지기도 한다. 꺾기 직전 소터 상류(+X) 이 거리 안에
+        #   다른 박스가 있으면 이번 바퀴는 보낸다 (규칙 4 계량과 같은 처리).
+        #   0 = 검사 안 함 (기존 동작).
+        self.tail_gap_m = float(rt.get("divert_tail_gap_mm", 0)) / 1000.0
+        # ★ 갭핑(세퍼레이터) (2026-08-27 김병직 문제 제기 — "밀착 쌍은 속도차로
+        #   영원히 안 벌어진다"). 간격은 벨트 속도차가 **비율로** 늘리므로 0(밀착)
+        #   이면 리턴을 몇 바퀴 돌아도 0 이다 — 뒤차 간격 검사에 매번 걸려 못
+        #   꺾고 소멸할 때까지 돈다. 실물 라인의 갭핑 컨베이어를 소터 패치로
+        #   구현한다: 앞차가 패치를 빠져나가고 뒤차가 패치 위일 때 패치를 잠깐
+        #   세우면 간격 = 정지시간 x 본선속도. 0 = 꺼짐 (기존 동작).
+        self.gap_min_m = float(rt.get("gap_min_mm", 0)) / 1000.0
+        self._gap_hold = {}              # zone -> 정지 시작 시각
+        self._sorter_div = set()         # 지금 꺾는 중인 소터 (갭핑 금지)
         _mly = rt.get("main_line_y_mm") or MAIN_LINE_Y_DEFAULT
         self.y_lo, self.y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
         self.thru = list(rt.get("thru_world", [-1, 0, 0]))
@@ -129,6 +151,10 @@ class Router:
     def _turn(self, zone, seg, want_div):
         """규칙 7 — 소터면 **항상 mps 를 같이 준다.**"""
         if self.use_sorter and self._h_sorter:
+            # 갭핑과의 조율: 꺾는 동안은 갭핑이 이 소터를 안 건드린다
+            (self._sorter_div.add(zone) if want_div
+             else self._sorter_div.discard(zone))
+            self._gap_hold.pop(zone, None)
             return self._h_sorter({"zone": zone, "divert": bool(want_div),
                                    "mps": self.belt_mps}) or {}
         if self._h_dir:
@@ -157,6 +183,38 @@ class Router:
         poses = {b: q for b, q in allpos.items() if self.state.get(b) != "done"}
 
         self._count_laps(poses)
+
+        # ── 갭핑 (__init__ 의 gap_min_m 주석 참조) ──────────────────────────
+        #   본선은 -X 흐름: 앞차의 x 가 더 작다. "앞차는 패치를 벗어났고(계속
+        #   가고) 뒤차는 패치 위(세우면 선다)" 일 때만 세운다 — 둘 다 패치 위면
+        #   같이 서 버려 분리가 안 되므로 앞차가 나갈 때까지 기다린다.
+        if self.gap_min_m > 0 and self.use_sorter and self._h_sorter:
+            for gz, (slo, shi) in self.sortx.items():
+                if gz in self._sorter_div:
+                    continue
+                pair = False
+                for b, q in allpos.items():
+                    if not (slo <= q[0] <= shi and self.y_lo <= q[1] <= self.y_hi):
+                        continue                      # 뒤차 후보: 패치 위 박스만
+                    for b2, q2 in allpos.items():
+                        if b2 == b or not (self.y_lo <= q2[1] <= self.y_hi):
+                            continue
+                        if q2[0] < slo and 0.0 < q[0] - q2[0] < self.gap_min_m:
+                            pair = True               # 앞차가 패치 밖 + 간격 부족
+                            break
+                    if pair:
+                        break
+                held = self._gap_hold.get(gz)
+                if pair and held is None:
+                    self._h_sorter({"zone": gz, "divert": False, "mps": 0.0})
+                    self._gap_hold[gz] = now
+                    self.log("[router] 소터 %s 갭핑 — 밀착 쌍 분리 (뒤차 잠깐 정지)"
+                             % gz)
+                elif held is not None and (not pair or now - held > 2.0):
+                    self._h_sorter({"zone": gz, "divert": False,
+                                    "mps": self.belt_mps})
+                    self._gap_hold.pop(gz, None)
+                    self.log("[router] 소터 %s 갭핑 해제" % gz)
 
         for bid, p in list(poses.items()):
             z = self.zone_of(bid)
@@ -195,6 +253,20 @@ class Router:
             if busy:
                 continue                                # 규칙 3
 
+            # ── 뒤차 간격 (위 tail_gap_m 주석). 본선은 -X 로 흐르므로 상류 = +X ──
+            if self.tail_gap_m > 0:
+                tail = [b2 for b2, q in allpos.items()
+                        if b2 != bid and self.y_lo <= q[1] <= self.y_hi
+                        and shi < q[0] <= shi + self.tail_gap_m]
+                if tail:
+                    if now - self.t_log.get("t" + z, 0.0) >= 10.0:
+                        self.t_log["t" + z] = now
+                        self.log("[router] %s 뒤차 %s 가 %d mm 안 — 이번 바퀴는"
+                                 " 보낸다 (소터 걸림 방지)"
+                                 % (bid, tail[0],
+                                    round(self.tail_gap_m * 1000)))
+                    continue
+
             if self.meter_max > 0 and self._zone_load(z, allpos) >= self.meter_max:
                 if now - self.t_log.get("z" + z, 0.0) >= 10.0:
                     self.t_log["z" + z] = now
@@ -202,16 +274,46 @@ class Router:
                              % (z, self._zone_load(z, allpos), bid))
                 continue                                # 규칙 4
 
+            # ── 규칙 8: **지선 벨트가 서 있으면 안 꺾는다** (2026-08-26) ──
+            #   지선을 세우는 것은 관제탑이다 — 집기 전에 반드시 세운다 (§2.5).
+            #   서 있는 지선으로 밀어 넣으면 박스가 입구(Y 0.7 언저리)에서 멎었다가
+            #   45 s 뒤 본선으로 되돌아온다. 실측 2026-08-26:
+            #       [router] !! BOX004 가 45 s 안에 지선 C 에 못 올라갔다 (Y 0.68)
+            #       [router] !! BOX005 가 45 s 안에 지선 B 에 못 올라갔다 (Y 0.82)
+            #   (진입 판정선은 Y 1.2 다.) 안 꺾인 박스는 루프를 한 바퀴 돌고 다시 온다
+            #   — 규칙 4(계량)와 같은 처리라 라인은 계속 흐른다.
+            spd = self._spur_mps(z)
+            if spd is not None and abs(spd) < 1e-6:
+                if now - self.t_log.get("v" + z, 0.0) >= 10.0:
+                    self.t_log["v" + z] = now
+                    self.log("[router] 존 %s 지선이 서 있다 (관제탑이 집는 중)"
+                             " — %s 는 한 바퀴 돈다" % (z, bid))
+                continue
+
             r = self._turn(z, seg, True)
             if r.get("ok"):
                 self.state[bid] = "divert"
                 self.t_div[bid] = now
-                if seg and self._h_vel:                 # 계량이 세워 뒀을 수 있다
-                    self._h_vel({"seg": seg, "mps": self.belt_mps})
+                # ★★ 여기서 지선 벨트를 **켜지 않는다** (2026-08-26).
+                #   예전에는 "계량이 세워 뒀을 수 있다"며 다시 켰는데, ROS 경로에서
+                #   지선을 세우는 것은 **관제탑**이다. 라우터가 도로 켜면 로봇이
+                #   흡착하는 동안 박스가 끌려간다 (§2.5 가 금지하는 그 상황).
+                #   서 있으면 위 규칙 8 에서 이미 안 꺾고 돌려보낸다.
                 self.log("[router] %s -> 존 %s   X %.2f m 에서 꺾는다"
                          % (bid, z, p[0]))
             else:
                 self.log("[router] !! 분류 명령 실패 (존 %s) -> %r" % (z, r))
+
+    def _spur_mps(self, zone):
+        """그 구역 지선(`<z>_pickup`)의 현재 속도 [m/s]. 모르면 None.
+
+        ★ `conveyor_ctl.speed_of` 는 **마지막으로 지시한 값**이다. USD 에서 되읽으면
+          조각마다 배율이 달라 원값을 못 되돌린다 — 필요한 것은 "누가 뭘 시켰나" 다.
+        """
+        fn = getattr(self.cc, "speed_of", None)
+        if fn is None:                      # 옛 conveyor_ctl 과도 돌아가게 둔다
+            return None
+        return fn("%s_pickup" % str(zone).lower())
 
     def _count_laps(self, poses):
         """리턴 라인을 `max_laps` 바퀴 돌면 치운다.

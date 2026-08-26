@@ -43,13 +43,32 @@ ISAAC_DIR="${ISAAC_DIR:-$HOME/isaac-sim-5.1.0}"
 #          어긋나면: symbol lookup error
 #   셋 다 `source install/setup.bash` 한 줄이 해 준다 (install/setup 이 /opt/ros 를
 #   같이 물고 온다). 직접 손으로 맞추려 들지 말 것.
+# ★★ 2026-08-26 수정 — **둘 다** 소스한다. 예전에는 `install/setup.bash` 하나만
+#   걸고 "그게 /opt/ros 를 같이 물고 온다" 고 봤는데 **그 전제가 깨질 수 있다.**
+#   colcon 을 ROS 안 잡힌 셸에서 돌리면 `install/setup.bash` 가 **언더레이 없이**
+#   다시 쓰인다. 그러면 이 스크립트는 멀쩡히 돌고 Isaac 만 조용히 이렇게 된다
+#   (실측 2026-08-26):
+#       Using backup internal ROS2 jazzy distro
+#       Could not load ... librmw_implementation.so: libament_index_cpp.so 없음
+#       ROS2 Bridge startup failed
+#       -> OmniGraphError: unrecognized type 'isaacsim.ros2.bridge.ROS2Context'
+#   증상이 브리지가 아니라 **그래프 노드 타입**으로 나와서 원인이 안 보인다.
 set +e                       # ROS setup 스크립트는 비0 종료를 흘린다
-if [ -f "$WS/install/setup.bash" ]; then
-    . "$WS/install/setup.bash"
-elif [ -f "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" ]; then
+if [ -f "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" ]; then
     . "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 fi
+if [ -f "$WS/install/setup.bash" ]; then
+    . "$WS/install/setup.bash"
+fi
 set -e
+
+# ★ 여기서 **멈춘다.** 이대로 두면 Isaac 이 11 초 뒤 엉뚱한 에러로 죽는다.
+if [ -z "${ROS_DISTRO:-}" ] || [ -z "${AMENT_PREFIX_PATH:-}" ]; then
+    echo "✖ 시스템 ROS 2 가 안 잡혔다 (ROS_DISTRO='${ROS_DISTRO:-}')." >&2
+    echo "  이대로 띄우면 Isaac 이 내장 배포판으로 가서 ROS2 브리지가 죽는다." >&2
+    echo "  고치는 법:  source /opt/ros/jazzy/setup.bash && colcon build --symlink-install" >&2
+    exit 1
+fi
 
 if [ -z "${AMENT_PREFIX_PATH:-}" ]; then
     # 시스템 ROS 가 아예 없다 — 내장으로 간다. packing_msgs 는 못 쓴다.
@@ -80,6 +99,18 @@ export PL_CAMROS="${PL_CAMROS:-1}"
 #   PL_SPAWN=0 으로 끌 수 있다.
 export PL_SPAWN="${PL_SPAWN:-8}"       # 초 간격. 0 = 안 넣는다
 export PL_SPAWN_N="${PL_SPAWN_N:-0}"   # 총 개수. 0 = 무제한
+# ★ 협곡 낙하 (2026-08-27). system.yaml 의 drop_max_kg 3.5 는 로봇의 PL_DROP_KG 와
+#   같아야 한다 (yaml 주석의 경고). 이걸 안 켜고 돌리면 계획은 협곡 안에 자리를
+#   주는데 로봇은 낙하 없이 내려가다 옆 박스를 쓸어 친다 (B섹터 이상현상.mp4 실측).
+export PL_DROP_KG="${PL_DROP_KG:-3.5}"
+# ★ /clock·/tf 강제 발행 (2026-08-27). 씬의 ROS2Bridge/Clock 노드가 발행자 0 실측 —
+#   PL_CAMROS=2 와 같은 사연. 씬이 진짜로 내는 게 확인되면 1(자동)로 되돌릴 것.
+export PL_CLOCKTF="${PL_CLOCKTF:-2}"
+# ★ 흡착 간극 허용 4 -> 5 (2026-08-27 강의실 실측). 풀 비전은 픽 좌표가 카메라
+#   실측이라 중심이 10~20 mm 어긋나고, 패드가 살짝 비껴 닿으면 정착 간극이
+#   4.0~4.6 mm 로 나온다 — 이 판의 흡착 실패 10건이 전부 이 구간이었고, 전부
+#   Closed 에 박스를 물고 있었다(진짜 실패 서명은 6.40). 슬롯 5 mm 가 상한.
+export PL_GRIP_TOL_MM="${PL_GRIP_TOL_MM:-5}"
 
 ARGS=(--stage "$PL_STAGE" --zones "$PL_ZONES" --ros --autorun
       --spawn-period "$PL_SPAWN" --spawn-count "$PL_SPAWN_N")
@@ -89,4 +120,15 @@ echo "[run_test3_ros] 씬     $PL_STAGE"
 echo "[run_test3_ros] 오버레이 $PL_CONFIG_OVERLAY"
 echo "[run_test3_ros] 구역   $PL_ZONES · DOMAIN $ROS_DOMAIN_ID"
 cd "$WS"
-exec "$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@"
+# ★ 로그 자동 저장 (2026-08-26 밤, 김병직 요청) — 터미널 스크롤이 잘려서 전체
+#   로그를 못 보는 문제. 저장소 **밖**(~/palletris_logs)에 두므로 git 에 안 걸린다.
+#   bringup 쪽은 ROS 가 이미 ~/.ros/log/ 에 자동 저장한다 — 여기만 채우면 된다.
+LOG_DIR="$HOME/palletris_logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/isaac_$(date +%Y%m%d_%H%M%S).log"
+echo "[run_test3_ros] 로그   $LOG"
+# ★ 파이프에 물리면 파이썬 stdout 이 4 KB 블록 버퍼가 되어 로그가 한참 뒤처진다
+#   (첫 시도 실측: 실행 몇 분째인데 파일은 BOX001 스폰에서 끊겨 있었다).
+#   demo_stack15 의 Tee 가 당한 것과 같은 함정 — 줄 단위로 강제한다.
+export PYTHONUNBUFFERED=1
+stdbuf -oL -eL "$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@" 2>&1 | tee "$LOG"

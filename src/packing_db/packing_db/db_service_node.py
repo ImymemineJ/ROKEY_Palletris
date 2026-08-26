@@ -51,8 +51,10 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from packing_common.config import find_config, load
+from packing_common.config import load
+from packing_common.paths import default_db_path, find_data
 from packing_db.gen_master_db import dong_of
+from packing_db.master_data import run_table_counts
 from packing_db.metrics import collect, fmt_rate
 from packing_msgs.msg import BoxInfo, MetricsSummary, ZoneStatus
 from packing_msgs.srv import (DiverterDecide, DiverterRequest, GetBoxInfo,
@@ -68,16 +70,11 @@ TS_COLUMN = {"SPAWNED": "spawned_at", "SCANNED": "scanned_at",
              "PICKED": "picked_at", "PLACED": "placed_at"}
 
 
-def default_db_path():
-    """워크스페이스 루트의 palletris.db.
-
-    system.yaml 이 <ws>/src/packing_bringup/config/system.yaml 이므로 4 단계 위가 루트다.
-    상대경로를 쓰면 실행 디렉터리마다 다른 빈 DB 가 생겨 "master 에 없는 박스" 만
-    찍힌다 (트랙 D 가이드 D1 경고).
-    """
-    cfg_path = os.path.realpath(find_config())
-    ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(cfg_path))))
-    return os.path.join(ws, "palletris.db")
+# ★ default_db_path 는 packing_common.paths 로 옮겼다 (2026-08-26).
+#   여기와 gen_master_db 에 "config 경로에서 4 단계 위" 산술이 **두 벌** 있었는데,
+#   find_config() 가 share 를 돌려주는 순간 둘 다 엉뚱한 곳을 가리킨다. DB 는 없으면
+#   그냥 새로 만들어지므로 빈 DB 를 조용히 쓰게 된다 — "master 에 없는 박스" 증상이다.
+#   이제 워크스페이스 표식으로 찾고, PALLETRIS_DB 로 덮어쓸 수 있다.
 
 
 class DbService(Node):
@@ -95,9 +92,65 @@ class DbService(Node):
         self._max_retry = int(self.cfg["recognition"]["max_retry"])
 
         # ── DB ──
-        self.db = sqlite3.connect(self.db_path, check_same_thread=False)
+        # ★★ 커넥션 접근 **전부** 직렬화 (2026-08-27, 김병직 — 세그폴트 실측).
+        #   원래는 "쓰기만 Lock" 이었는데 읽기(SELECT)가 락 밖에서 같은 커넥션을
+        #   동시에 썼다. 평소엔 경합이 드물어 버텼지만, cam1 SIZE_MISMATCH 홍수
+        #   (report_miss 1200건+/10분)가 읽기·쓰기 동시 접근을 상시화하자
+        #   프로세스가 exit -11 (네이티브 세그폴트) 로 죽었다 — DB 가 죽으면
+        #   관제탑 3존이 전부 "서비스 없음" 으로 서고 라인이 통째로 멈춘다.
+        #   커넥션을 RLock 프록시로 감싸 execute/commit 이 항상 락 안에서 돈다.
+        #   기존 `with self._w:` 블록은 RLock 이라 그대로 둬도 재진입만 된다.
+        _conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        _lk = threading.RLock()
+
+        class _Rows:
+            """락 **안에서** 미리 읽어 둔 결과 (2026-08-27 2차 수정).
+
+            1차 수정은 execute 만 락으로 감쌌는데, 커서를 돌려주고 락을 푼 뒤
+            호출부가 fetchone() 을 불렀다 — 그 틈에 다른 스레드의 commit() 이
+            커서를 리셋해 COUNT(*) 의 fetchone 이 None 이 됐다 (int(None)
+            TypeError 로 프로세스 사망, 실측). execute 시점에 결과를 다 읽어
+            평범한 리스트로 들고 있으면 커서 수명 문제가 사라진다.
+            이 파일의 사용처는 fetchone()/rowcount 뿐이다 (전수 확인)."""
+            def __init__(self, rows, rowcount, lastrowid):
+                self._rows, self.rowcount, self.lastrowid = rows, rowcount, lastrowid
+                self._i = 0
+
+            def fetchone(self):
+                if self._i < len(self._rows):
+                    self._i += 1
+                    return self._rows[self._i - 1]
+                return None
+
+            def fetchall(self):
+                out, self._i = self._rows[self._i:], len(self._rows)
+                return out
+
+        class _LockedConn:
+            """sqlite3 Connection 의 스레드 직렬화 프록시 (위 주석 참조)."""
+            def __init__(self, conn, lock):
+                self._c, self._lk = conn, lock
+
+            def execute(self, *a, **k):
+                with self._lk:
+                    cur = self._c.execute(*a, **k)
+                    rows = cur.fetchall() if cur.description is not None else []
+                    return _Rows(rows, cur.rowcount, cur.lastrowid)
+
+            def executescript(self, *a, **k):
+                with self._lk:
+                    return self._c.executescript(*a, **k)
+
+            def commit(self):
+                with self._lk:
+                    return self._c.commit()
+
+            def __getattr__(self, n):       # close 등 나머지는 그대로 위임
+                return getattr(self._c, n)
+
+        self.db = _LockedConn(_conn, _lk)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self._w = threading.Lock()          # 쓰기 직렬화
+        self._w = _lk                       # 쓰기 직렬화 (커넥션 락과 같은 것)
         self._ensure_schema()
 
         n = self.db.execute("SELECT COUNT(*) FROM boxes_master").fetchone()[0]
@@ -144,31 +197,50 @@ class DbService(Node):
         self.get_logger().info(
             f"db_service_node 준비 — {self.db_path} · master {n} 행 · "
             f"max_retry {self._max_retry}")
+        self._warn_leftover_run()
+
+    def _warn_leftover_run(self):
+        """이전 실행 기록이 남아 있으면 알린다. **지우지는 않는다.**
+
+        ★ 왜 경고만 하나
+          파일을 소유한 프로세스가 남의 기록을 말없이 지우면 안 된다. 지우는 것은
+          사람이 `gen_master_db --reset` 으로 시킬 일이다.
+
+        ★ 왜 알려야 하나 (2026-08-26 실측)
+          metrics 의 elapsed_s 는 `MAX(ts) - MIN(ts)` 다. 어제 실행의 box_events 가
+          남아 있으면 elapsed 가 며칠이 되고, robot_idle_rate 가 100 % 로 굳는다.
+          실제로 그 상태였다 — box_events 시간 범위 17.8 억 초, 로봇 작업 0.1 초.
+          지표가 조용히 쓰레기가 되는데 에러는 안 뜬다.
+        """
+        try:
+            n = run_table_counts(self.db)
+        except sqlite3.Error:
+            return
+        if not any(n.values()):
+            return
+        left = " · ".join(f"{k} {v} 행" for k, v in n.items() if v)
+        self.get_logger().warn(
+            f"이전 실행 기록이 남아 있다 — {left}. 지표가 섞인다 "
+            f"(elapsed_s 가 MAX(ts)-MIN(ts) 라 어제 실행까지 포함된다). "
+            f"새로 재려면: ros2 run packing_db gen_master_db --reset")
 
     # ══════════════════════════════════════════════════════════════
     # 공통
     # ══════════════════════════════════════════════════════════════
     def _ensure_schema(self):
-        """schema.sql 을 적용한다. CREATE TABLE IF NOT EXISTS 라 여러 번 돌아도 안전하다."""
-        here = os.path.dirname(os.path.realpath(__file__))
-        # ★ 설치본에서는 이 파일이 lib/python3.12/site-packages/packing_db/ 에 있고
-        #   schema.sql 은 share/packing_db/ 에 깔린다 — 사이가 네 단계라 `..` 하나로는
-        #   못 간다 (실측 2026-08-25: `schema.sql 을 찾지 못했다` 로 노드가 죽었다).
-        #   ament 인덱스로 share 경로를 직접 물어보는 것이 정본이다.
-        cands = [os.path.join(here, "schema.sql")]
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            cands.append(os.path.join(
-                get_package_share_directory("packing_db"), "schema.sql"))
-        except Exception:
-            pass                                  # 소스 트리에서 바로 돌릴 때
-        cands.append(os.path.join(here, "..", "share", "packing_db", "schema.sql"))
-        for cand in cands:
-            if os.path.isfile(cand):
-                with open(cand, encoding="utf-8") as f, self._w:
-                    self.db.executescript(f.read())
-                return
-        raise SystemExit("schema.sql 을 찾지 못했다")
+        """schema.sql 을 적용한다. CREATE TABLE IF NOT EXISTS 라 여러 번 돌아도 안전하다.
+
+        ★ 옛 코드는 `<here>/../share/packing_db/schema.sql` 을 봤다. 설치본에서
+          share 는 모듈 기준 **4 단계 위**라 그 경로는 존재하지 않는다 —
+          일반 colcon build 로는 여기서 죽었다. paths.find_data 가 그걸 안다.
+
+        ★ 김학민님도 같은 날 같은 버그를 찾아 ament 인덱스로 고쳤다 (main ff5c5d0).
+          여기서는 그 수정을 paths.find_data 로 흡수했다 — 같은 버그가
+          gen_master_db · config.py · 정답지 CSV 에도 있어 한 곳으로 모아야 했다.
+        """
+        with open(find_data("packing_db", "schema.sql", __file__),
+                  encoding="utf-8") as f, self._w:
+            self.db.executescript(f.read())
 
     def _now(self):
         """타임스탬프. use_sim_time 이면 sim 시계를 따른다 (CLAUDE.md §3-4 규약 1).
@@ -331,7 +403,16 @@ class DbService(Node):
                 "  zone=excluded.zone, size_w_mm=excluded.size_w_mm,"
                 "  size_d_mm=excluded.size_d_mm, size_h_mm=excluded.size_h_mm,"
                 "  mass_g=excluded.mass_g, color=excluded.color, dest=excluded.dest,"
-                "  qr_payload=excluded.qr_payload",
+                "  qr_payload=excluded.qr_payload,"
+                # ★ 이전 바퀴의 흔적을 반드시 지운다 (2026-08-26).
+                #   재등록은 "같은 박스가 라인을 다시 돈다" 는 뜻이다. 예전에는 status 만
+                #   SCANNED 로 돌아가고 적재 좌표와 시각은 그대로 남았다 —
+                #   실측: 재등록 뒤에도 place=(111,222,333) 이 살아 있었다.
+                #   그러면 plan_route.py · pallet_access.py 가 **존재하지 않는 더미**를
+                #   계산하고, cycle_avg_s 는 옛 placed_at-picked_at 을 계속 평균에 넣는다.
+                "  status='SCANNED',"
+                "  place_x_mm=NULL, place_y_mm=NULL, place_z_mm=NULL, place_yaw_deg=NULL,"
+                "  scanned_at=NULL, picked_at=NULL, placed_at=NULL",
                 (box_id, zone, size[0], size[1], size[2], mass,
                  req.color, dest, req.qr_payload))
             self.db.commit()

@@ -16,6 +16,14 @@ CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현�
   `recognition.pick_cam` 에는 x_mm 이 아예 없고(§15 미결), tf 프레임 이름 규약도
   미정이다. 이미지 헤더의 frame_id 를 그대로 tf 에 물어보면 둘 다 안 막힌다.
 
+★ 깊이 교차검증 (2026-08-26 추가)
+  RGB 만으로는 박스 높이를 **추측**한다 — 사양 3종 평면에 각각 투영해 제일 잘
+  맞는 것을 고른다. 종류를 틀리면 평면이 60~130 mm 어긋나고 **중심 x, y 까지
+  같이 틀어진다.** 그래서 같은 카메라의 `<ns>/depth` 를 같이 받아 윗면 z 를
+  **직접 재고**, 두 결과를 대조한다 (`depth.py`). 결과는 `VisionCheck` 토픽으로 나간다.
+  ⚠ 깊이가 없으면 **지금까지의 동작 그대로** 돈다. 붙였다가 라인이 서면 안 되므로
+    없을 때가 기본 경로이고, 있을 때만 확인이 하나 더 붙는 구조다.
+
 ★ 토픽 이름
   기존 손목 카메라 배선과 같은 규약이다 — `<ns>/rgb` + `<ns>/camera_info`,
   frameId 는 카메라 이름 (demo_stack15_test1_1.py 의 ROS2CameraHelper 참고).
@@ -23,6 +31,9 @@ CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현�
     은 트랙 A 가 같은 방식으로 CameraHelper 를 붙여야 이 노드가 그림을 받는다.
     토픽 이름은 전부 파라미터라 씬 쪽 이름이 정해지면 launch 에서 맞추면 된다.
 """
+
+import collections
+import time
 
 import numpy as np
 import rclpy
@@ -36,11 +47,13 @@ from tf2_ros import Buffer, TransformListener
 
 from packing_common.config import load
 from packing_common.units import m_to_mm   # ★ 직접 *1000 금지 (CLAUDE.md §4)
-from packing_msgs.msg import BoxAtPickup, ZoneStatus
+from packing_msgs.msg import BoxAtPickup, VisionCheck, ZoneStatus
 from packing_msgs.srv import GetBoxInfo, RegisterBox, ReportMiss, VerifyBox
 
+from packing_vision import depth as depthlib
 from packing_vision.detect import dominant_color_name, find_box, read_qr
 from packing_vision.label import parse_payload
+from packing_vision import geometry as _geo
 from packing_vision.geometry import box_pose_from_corners, quat_to_R
 
 
@@ -58,21 +71,96 @@ class CameraSub:
     붙여야 한다 — 씬 쪽에 이미 그 선례가 있다 (손목 카메라).
     """
 
-    def __init__(self, node, ns, on_image, cb_group):
+    def __init__(self, node, ns, on_image, cb_group, depth_suffix=""):
         self.node, self.ns, self._on_image = node, ns, on_image
         self.K = None
         self.frame_id = ""
         self.bridge = CvBridge()
+        # ★ 깊이는 **최근 몇 장**을 stamp 와 함께 들고, 호출부가 처리 중인 RGB
+        #   프레임에 가장 가까운 것을 고른다 (`depth_at`).
+        #
+        #   왜 "최신 한 장" 이면 안 되나 (실측): RGB 콜백이 QR 디코드로 100 ms 가량
+        #   붙잡혀 있는 동안 다음 깊이 프레임이 들어와 최신 자리를 덮는다. 그러면
+        #   짝이 한 프레임 어긋나 그 프레임의 교차검증이 통째로 버려진다 —
+        #   8 박스 실행에서 **깊이 사용률이 38 %** 까지 떨어졌다. 최근 몇 장을
+        #   들고 있으면 같은 실행이 100 % 가 된다. 유실이 아니라 **지연**이었다.
+        #
+        #   왜 오래된 것을 그냥 쓰면 안 되나: 벨트가 0.5 m/s 다. 한 틱(0.1 초)이면
+        #   50 mm 다. 그래서 고르되 **허용 시차 밖이면 안 쓴다** (max_stamp_skew_s).
+        self._depth_buf = collections.deque(maxlen=6)   # [(stamp, img), ...]
+        self.rgb_stamp = None
         # ★ 카메라 토픽은 반드시 BEST_EFFORT 다. 기본 RELIABLE 로 구독하면
         #   이미지가 하나도 안 온다 (CLAUDE.md §3-4 규약 5).
         node.create_subscription(Image, f"{ns}/rgb", self._image,
                                  qos_profile_sensor_data, callback_group=cb_group)
         node.create_subscription(CameraInfo, f"{ns}/camera_info", self._info,
                                  qos_profile_sensor_data, callback_group=cb_group)
+        if depth_suffix:
+            # ★ message_filters 로 시각 동기를 하지 않는다. 동기화기를 쓰면 짝이
+            #   안 맞을 때 **RGB 까지 같이 버린다** — 깊이 토픽이 아예 없는 씬에서
+            #   인식이 통째로 멎는다는 뜻이다. 여기서는 깊이가 부록이라
+            #   "최신 것 + 시차 검사" 가 맞는 구조다. 시차가 크면 그 프레임만
+            #   깊이를 안 쓰고 RGB 로 간다.
+            # ★ RGB 와 **같은 QoS** 로 받는다 (BEST_EFFORT · 큐 5).
+            #   한때 "최신 한 장만 필요하다"고 큐를 1 로 좁혔는데, 그게 오히려
+            #   깊이만 24 % 를 떨어뜨렸다 (실측: rgb 5.1 Hz 수신 vs depth 3.9 Hz).
+            #   콜백이 늦게 도는 동안 두 장이 겹치면 큐 1 은 한 장을 버린다.
+            #   지금은 아래 링 버퍼가 stamp 로 짝을 고르므로 **여러 장 받는 편이 낫다** —
+            #   버릴지 말지는 짝 맞추기가 정하지, 큐가 정할 일이 아니다.
+            #   ⚠ RELIABLE 로 바꾸면 안 된다. 씬이 BEST_EFFORT 로 내므로 QoS 가
+            #     안 맞아 **한 장도 안 온다** (CLAUDE.md §3-4 규약 5).
+            node.create_subscription(Image, f"{ns}/{depth_suffix}", self._depth,
+                                     qos_profile_sensor_data, callback_group=cb_group)
+
+    @staticmethod
+    def _stamp(header):
+        return header.stamp.sec + header.stamp.nanosec * 1e-9
 
     def _info(self, msg):
         self.K = np.array(msg.k, float).reshape(3, 3)
         self.frame_id = msg.header.frame_id
+
+    def _depth(self, msg):
+        """32FC1(m) 또는 16UC1(mm) 을 받아 float32 · m 로 통일해 둔다.
+
+        ★ 16UC1 을 같이 받는 이유: Isaac 은 32FC1 을 내지만 실기 RealSense 드라이버
+          기본값은 16UC1(mm) 이다. 여기서 안 받아 두면 실기로 옮길 때 깊이가
+          **에러 없이 0** 이 된다 — uint16 을 m 로 읽으면 전부 범위 밖이라
+          "TOO_FEW_PIXELS" 로만 보이고 원인이 안 드러난다.
+        """
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except Exception as e:                      # noqa: BLE001
+            self.node.get_logger().warn(f"{self.ns} 깊이 변환 실패: {e}", once=True)
+            return
+        if img is None or img.size == 0:
+            return
+        img = np.asarray(img)
+        if img.ndim == 3 and img.shape[2] == 1:
+            img = img[:, :, 0]
+        if img.dtype == np.uint16:
+            img = img.astype(np.float32) / 1000.0
+        self._depth_buf.append((self._stamp(msg.header),
+                                img.astype(np.float32, copy=False)))
+
+    def depth_at(self, stamp, tol_s):
+        """`stamp` 에 가장 가까운 깊이 프레임. 허용 시차 밖이면 (None, skew).
+
+        반환: (img, skew_s) — img 가 None 이면 못 찾은 것이고, skew 는 그때
+        **가장 가까웠던 값**이다 (진단용. 얼마나 빗나갔는지 알아야 고칠 수 있다).
+        """
+        if not self._depth_buf:
+            return None, None
+        best_img, best = None, None
+        for st, img in self._depth_buf:
+            d = abs(st - stamp)
+            if best is None or d < best:
+                best, best_img = d, img
+        return (best_img if best <= tol_s else None), best
+
+    @property
+    def has_depth(self):
+        return bool(self._depth_buf)
 
     def _image(self, msg):
         # 구독 콜백은 입력을 검증한다. rclpy 가 예외를 삼켜서, 잘못된 프레임 하나에
@@ -84,6 +172,7 @@ class CameraSub:
             return
         if bgr is None or bgr.size == 0:
             return
+        self.rgb_stamp = self._stamp(msg.header)
         try:
             self._on_image(bgr, msg.header)
         except Exception as e:                      # noqa: BLE001
@@ -96,6 +185,162 @@ def camera_pose(tf_buf, world_frame, frame_id):
     q = tr.transform.rotation
     t = tr.transform.translation
     return quat_to_R(q.x, q.y, q.z, q.w), np.array([t.x, t.y, t.z])
+
+
+class DepthCrossCheck:
+    """깊이 교차검증 한 벌 — 설정 · 판정 · 발행을 한 곳에 모은다.
+
+    ★ 왜 클래스 하나로 묶나
+      라인 인식(cam1·cam2)과 구역 인식(pick_cam)이 **같은 확인을 해야** 한다.
+      함수로 흩어 두면 한쪽만 고쳐지고, 그 상태로도 에러가 안 난다 —
+      이 저장소가 반복해서 데인 종류의 버그다 (CLAUDE.md §10-3 "돌아갈 때만 낮았다").
+      노드마다 이 객체를 하나씩 갖고, 바뀌는 것은 생성 인자뿐이다.
+
+    ★ 설정 3층: DEFAULTS(코드) ← recognition.depth(yaml) ← ROS 파라미터(런치).
+      런치에서 `-p depth.mode:=off` 한 줄로 되돌릴 수 있다. 통합 중에 깊이가
+      말썽이면 코드를 안 고치고 끄는 길이 있어야 한다.
+    """
+
+    # 런타임에 덮어쓸 수 있는 것들. 자료형이 곧 ROS 파라미터 자료형이다.
+    PARAMS = ("enabled", "mode", "topic_suffix", "is_range", "shrink_ratio",
+              "min_valid_ratio", "min_px", "plane_gate_mm", "mad_k",
+              "max_spread_mm", "h_weight", "z_tol_mm", "xy_tol_mm", "yaw_tol_deg",
+              "max_stamp_skew_s", "reject_on_disagree")
+
+    def __init__(self, node, cfg, topic, zone=""):
+        self.node, self.zone = node, zone
+        base = depthlib.merged_cfg(cfg.get("recognition"))
+        # ★ 파라미터 기본값을 **yaml 이 이긴 값**으로 선언한다. 그래야 아무것도
+        #   안 주면 yaml 이, 주면 런치가 이긴다 — 3층 우선순위가 이 한 줄에 있다.
+        over = {}
+        for k in self.PARAMS:
+            node.declare_parameter(f"depth.{k}", base[k])
+            over[k] = node.get_parameter(f"depth.{k}").value
+        self.cfg = depthlib.merged_cfg(cfg.get("recognition"), over)
+        self.types = cfg["boxes"]["types"]
+        self.belt_top_m = cfg["conveyor"]["belt_top_z_mm"] / 1000.0
+        self.pub = node.create_publisher(VisionCheck, topic, 10)
+        # 지표용 누계. 로그만 남기면 발표에서 셀 수가 없다.
+        self.n_total = self.n_agree = self.n_nodepth = 0
+        node.get_logger().info(
+            f"깊이 교차검증: {'켬' if self.on else '끔'} · mode={self.cfg['mode']} "
+            f"· 허용 z {self.cfg['z_tol_mm']}mm / xy {self.cfg['xy_tol_mm']}mm "
+            f"/ yaw {self.cfg['yaw_tol_deg']}도 → {topic}")
+
+    @property
+    def on(self):
+        return bool(self.cfg["enabled"]) and self.cfg["mode"] != "off"
+
+    @property
+    def depth_suffix(self):
+        """CameraSub 에 넘길 깊이 토픽 꼬리. 꺼져 있으면 "" — 구독조차 안 만든다."""
+        return str(self.cfg["topic_suffix"]) if self.on else ""
+
+    def measure(self, cam, corners_px, R, t, rgb_stamp=None, source_hint=""):
+        """깊이로 윗면을 재고 자세를 뽑는다. (dep, plane, reason)."""
+        if not self.on:
+            return None, None, "DISABLED"
+        if not cam.has_depth:
+            return None, None, "NO_DEPTH_TOPIC"
+        # ★ 짝 맞추기. **지금 처리 중인 프레임**의 stamp 로 고른다 —
+        #   `cam.rgb_stamp`(마지막으로 **받은** 프레임)가 아니다. 둘은 다를 수 있다:
+        #   MultiThreadedExecutor + ReentrantCallbackGroup 이라 이 함수가 도는 동안
+        #   다음 RGB 가 들어와 `cam.rgb_stamp` 를 앞으로 민다. 실측에서 관측됐다.
+        ref = rgb_stamp if rgb_stamp is not None else cam.rgb_stamp
+        if ref is None:
+            return None, None, "STALE"
+        dimg, skew = cam.depth_at(ref, float(self.cfg["max_stamp_skew_s"]))
+        if dimg is None:
+            # 허용 시차 밖이다. 그 프레임만 건너뛴다 — 다음 프레임에 또 온다.
+            # 자주 뜨면 씬의 깊이 발행이 느리거나 stamp 규약이 다른 것이다.
+            self.node.get_logger().debug(
+                f"{source_hint}: 깊이 짝이 없다 (최소 시차 "
+                f"{(skew or 0.0) * 1000:.0f} ms)", throttle_duration_sec=5.0)
+            return None, None, "STALE"
+        plane, reason = depthlib.top_plane_z(dimg, corners_px,
+                                             cam.K, R, t, self.cfg)
+        if plane is None or reason:
+            # NOT_FLAT 은 plane 값이 같이 온다 — 진단 토픽에 실어야 원인이 보인다.
+            return None, plane, reason or "TOO_FEW_PIXELS"
+        dep = depthlib.pose_from_plane(corners_px, cam.K, R, t, plane["z_m"],
+                                       self.types, self.belt_top_m,
+                                       self.cfg["h_weight"])
+        return dep, plane, ""
+
+    def evaluate(self, cam, corners_px, rgb_out, R, t, source, box_id="",
+                 rgb_stamp=None):
+        """확인하고 발행한다. **최종 채택할 pose** 와 판정을 돌려준다.
+
+        반환: (out, res). out 이 None 이면 좌표를 내지 말라는 뜻이다
+        (reject_on_disagree 가 켜져 있고 어긋난 경우뿐).
+        """
+        if not self.on:
+            return rgb_out, {"verdict": "NO_DEPTH", "used": "RGB", "agree": False}
+
+        dep, plane, reason = self.measure(cam, corners_px, R, t, rgb_stamp, source)
+        res = depthlib.cross_check(rgb_out, dep, self.cfg)
+        if dep is None:
+            res["verdict"] = reason or res["verdict"]
+        self._publish(source, box_id, rgb_out, dep, plane, reason, res)
+
+        self.n_total += 1
+        if dep is None:
+            self.n_nodepth += 1
+        elif res["agree"]:
+            self.n_agree += 1
+        else:
+            # ★ 경고는 여기 한 곳에서만 낸다. 호출부마다 쓰면 문구가 갈린다.
+            self.node.get_logger().warn(
+                f"{source} 교차검증 불일치 [{res['verdict']}] {box_id or '(미상)'} — "
+                f"RGB {rgb_out['type']['name'] if rgb_out else '(없음)'} vs "
+                f"깊이 {dep['type']['name']} · "
+                f"dz {res['dz_mm']:+.1f}mm · dxy {res['dxy_mm']:.1f}mm · "
+                f"dyaw {res['dyaw_deg']:.1f}도")
+
+        if res["used"] == "DEPTH" and dep is not None:
+            return depthlib.as_rgb_shape(dep), res
+        if res["used"] == "NONE":
+            return None, res
+        return rgb_out, res
+
+    def _publish(self, source, box_id, rgb, dep, plane, reason, res):
+        m = VisionCheck()
+        m.stamp = self.node.get_clock().now().to_msg()
+        m.source, m.zone, m.box_id = source, self.zone, box_id or ""
+        if rgb is not None:
+            cx, cy, cz = rgb["center_m"]
+            m.rgb_ok = True
+            m.rgb_type = str(rgb["type"]["name"])
+            m.rgb_x_mm, m.rgb_y_mm = m_to_mm(cx), m_to_mm(cy)
+            # ★ 윗면으로 바꿔 싣는다. 깊이가 재는 것이 윗면이라 그래야 나란히 놓인다.
+            m.rgb_top_z_mm = m_to_mm(cz + rgb["type"]["h_mm"] / 2000.0)
+            m.rgb_yaw_deg = float(rgb["yaw_deg"])
+            m.rgb_fit_err_mm = float(rgb["fit_err_m"] * 1000.0)
+        if plane is not None:
+            m.depth_spread_mm = float(plane["spread_mm"])
+            m.depth_px_used = int(plane["px_used"])
+            m.depth_valid_ratio = float(plane["valid_ratio"])
+        if dep is not None:
+            dx, dy, dz = dep["center_m"]
+            m.depth_ok = True
+            m.depth_type = str(dep["type"]["name"])
+            m.depth_x_mm, m.depth_y_mm = m_to_mm(dx), m_to_mm(dy)
+            m.depth_top_z_mm = m_to_mm(dz)
+            m.depth_yaw_deg = float(dep["yaw_deg"])
+            m.depth_h_mm = float(dep["h_m"] * 1000.0)
+        else:
+            m.depth_reason = str(reason or "")
+        m.agree = bool(res["agree"])
+        m.dz_mm, m.dxy_mm = float(res["dz_mm"]), float(res["dxy_mm"])
+        m.dyaw_deg = float(res["dyaw_deg"])
+        m.verdict, m.used = str(res["verdict"]), str(res["used"])
+        self.pub.publish(m)
+
+    def summary(self):
+        """지표 한 줄. 종료 로그와 하네스가 같이 쓴다."""
+        return (f"교차검증 {self.n_total} 건 · 일치 {self.n_agree} · "
+                f"깊이없음 {self.n_nodepth} · 불일치 "
+                f"{self.n_total - self.n_agree - self.n_nodepth}")
 
 
 class LineDetector(Node):
@@ -132,10 +377,14 @@ class LineDetector(Node):
         self._armed1 = True         # 빈 화면을 한 번 봐야 다음 박스를 센다
         self._armed2 = True
 
+        # ★ 깊이 교차검증. 라인 두 대가 **같은 판정기**를 쓴다 — 카메라마다 따로
+        #   두면 임계값이 갈리고, 갈린 줄도 모른다.
+        self.xcheck = DepthCrossCheck(self, cfg, "/line/vision_check")
+        sfx = self.xcheck.depth_suffix
         self.cam1 = CameraSub(self, self.get_parameter("cam1_ns").value,
-                              self._on_cam1, cb)
+                              self._on_cam1, cb, depth_suffix=sfx)
         self.cam2 = CameraSub(self, self.get_parameter("cam2_ns").value,
-                              self._on_cam2, cb)
+                              self._on_cam2, cb, depth_suffix=sfx)
         self.get_logger().info("line_detector 시작 — cam1 등록 · cam2 검증")
 
     # ── 공통: 그림에서 박스 하나를 읽어 종류까지 정한다 ──────────────
@@ -150,35 +399,95 @@ class LineDetector(Node):
         """
         det = find_box(bgr)
         if det is None:
-            return None, None
+            return None, None, None
         if cam.K is None:
             self.get_logger().warn(f"{cam.ns}: camera_info 대기 중", once=True)
-            return None, None
+            return None, None, None
         if det["clipped"]:
             self.get_logger().warn(f"{cam.ns}: 박스가 화면 밖으로 잘렸다 — 건너뛴다")
-            return None, None
+            return None, None, None
+        # ★ 중앙 게이트 (2026-08-27 김병직 실측). 박스가 카메라 축에서 벗어날수록
+        #   **옆면이 실루엣에 껴서** 측정이 부푼다 — 이동 중 실측이 343.8 -> 368.6
+        #   -> 397.7 로 자라는 스트림이 그 증거이고, 가장자리에서 3호(340)가
+        #   400을 넘는 순간 **4호(410)로 오등록**됐다 (BOX018: 실물 3호 -> DB 4호
+        #   -> 로봇이 70mm 위에서 흡착 3연속 실패 -> 폐기). 프레임 중앙 1/3 에
+        #   있을 때만 판정한다 — 벨트 위라 중앙 프레임은 반드시 온다.
+        _c = np.mean(np.asarray(det["corners_px"], float), axis=0)
+        _H, _W = bgr.shape[0], bgr.shape[1]
+        # ★ 2차: 2/3 -> **1/3 폭** (같은 날). 2/3 안에서도 최대 부풀기 +39mm 라
+        #   3호가 375mm 까지 밀리는데 3/4호 분류 경계가 정확히 375 다 — 시드 고정
+        #   지터가 그 구간인 BOX015/018 이 재현성 있게 4호로 넘어갔다 (실측 2판).
+        #   1/3 폭이면 최대 +19mm, 경계까지 16mm 여유.
+        if abs(_c[0] - _W / 2.0) > _W / 6.0 or abs(_c[1] - _H / 2.0) > _H / 6.0:
+            return None, None, None         # 중앙 아님 — 다음 프레임에서 판정
         try:
             R, t = camera_pose(self.tf_buf, self.world_frame,
                                cam.frame_id or cam.ns.strip("/"))
         except Exception as e:                  # noqa: BLE001
             self.get_logger().warn(f"{cam.ns}: tf 조회 실패 — {e}", once=True)
-            return None, None
+            return None, None, None
         out = box_pose_from_corners(det["corners_px"], cam.K, R, t,
                                     self.belt_top_m, self.types)
         if out is None:
+            # ★ 여기서 `_report_miss` 를 부르지 않는다 (2026-08-26).
+            #   `rescue` 모드면 이 박스를 깊이가 살릴 수 있는데, 여기서 미리
+            #   실패로 세면 **같은 박스가 실패로도 세지고 등록으로도 세어**
+            #   인식률의 분모가 부푼다 (분모 = 등록 성공 + 여기로 온 실패).
+            #   보고는 **살리기를 시도한 뒤** 호출부가 한다.
             self.get_logger().warn(f"{cam.ns}: 사양 3종과 안 맞는다")
-            self._report_miss(cam.ns.strip("/"), "SIZE_MISMATCH")
-            return None, None
-        return det, out
+            # 카메라 자세는 그래도 돌려준다 — RGB 가 포기한 자리야말로 깊이가
+            # 답을 갖고 있을 수 있다. 호출부가 깊이 단독으로 한 번 더 본다.
+            return det, None, (R, t)
+        # ★ 원시 측정값을 남긴다. 위에서 사양 3종 중 하나로 **스냅**하기 때문에
+        #   DB 에 들어가는 것은 사양 치수(340x250 …)지 잰 값이 아니다.
+        #   카메라 교정·인식 정확도를 볼 때 필요한 건 스냅 전 숫자다.
+        #   info 가 아니라 debug 인 이유: 프레임마다 나오면 다른 로그가 안 보인다.
+        #     보려면  --ros-args --log-level debug
+        lo, sh = out["measured_m"]
+        bt = out["type"]
+        self.get_logger().debug(
+            f"{cam.ns}: 실측 {lo * 1000:.1f} x {sh * 1000:.1f} mm "
+            f"→ {bt['name']} ({bt['w_mm']}x{bt['d_mm']}) "
+            f"오차 {out['fit_err_m'] * 1000:.1f} mm")
+        return det, out, (R, t)
 
     def _on_cam1(self, bgr, header):
-        det, out = self._measure(bgr, self.cam1)
-        if det is None:
-            self._armed1 = True                 # 빈 벨트 — 다음 박스를 받을 준비
+        det, out, ctx = self._measure(bgr, self.cam1)
+        if det is None or (out is None and not self.xcheck.on):
+            # ★ arming 을 되돌린다 = **다음 프레임에 다시 본다.** 깊이를 붙이기
+            #   전과 같은 뜻이다. 여기서 arming 을 소비해 버리면 RGB 가 한 번
+            #   실패한 박스가 영원히 등록되지 않는다 — 박스는 계속 지나가는데
+            #   에러는 안 뜬다.
+            if det is not None:
+                # 박스는 봤는데 사양 3종과 안 맞았다. 깊이가 꺼져 있어 살릴 길도 없다.
+                self._report_miss("cam1", "SIZE_MISMATCH")
+            self._armed1 = True
             return
         if not self._armed1:
             return                              # 같은 박스를 계속 보고 있다
         self._armed1 = False
+        # ★ 교차검증은 arming 뒤에 한다. `_measure` 안에 넣으면 30 Hz 로 발행돼
+        #   진단 토픽이 쓰레기가 된다 — 박스 하나에 판정 하나면 충분하다.
+        had_rgb = out is not None
+        out, _res = self.xcheck.evaluate(self.cam1, det["corners_px"], out,
+                                         ctx[0], ctx[1], "cam1",
+                                         rgb_stamp=CameraSub._stamp(header))
+        if out is None:
+            # 채택할 자세가 없다. 다음 프레임에 다시 본다 (위와 같은 이유).
+            self._armed1 = True
+            if had_rgb:
+                # RGB 는 답을 냈는데 깊이와 갈렸다 = reject_on_disagree 가 켜져 있다.
+                self.get_logger().warn("cam1: 교차검증이 막았다 — 등록 건너뜀")
+                self._report_miss("cam1", "DEPTH_DISAGREE")
+            else:
+                # RGB 가 포기했고 깊이도 못 살렸다. **이제서야** 실패로 센다.
+                self._report_miss("cam1", "SIZE_MISMATCH")
+            return
+        if not had_rgb:
+            # ★ 깊이가 살린 박스다. RGB 단독이었으면 여기까지 못 왔다.
+            self.get_logger().info(
+                f"cam1: RGB 는 포기했는데 깊이가 살렸다 — {out['type']['name']} "
+                f"(윗면 실측 기준)")
         bt = out["type"]
 
         qr = read_qr(bgr, det["corners_px"])
@@ -211,7 +520,21 @@ class LineDetector(Node):
         """박스를 봤는데 식별 못 했다 — DB 에 알린다 (인식률의 분모).
 
         ★ 응답을 기다리지 않는다. 이건 통계용이라 라인을 세울 이유가 없다.
+        ★ 쿨다운 2초 (2026-08-27 김병직). 프레임마다 부르니 같은 박스 하나가
+          지나가는 동안 수십 번 쌓였다 — 실측 10분에 1200건, 인식률 분모가
+          프레임 수로 왜곡(11%)되고 DB 만 두들긴다 (db_service 사망 사고의
+          방아쇠였다). 같은 (지점, 사유)는 2초에 한 번만 보낸다 — 벨트 0.55 m/s
+          에서 박스 하나가 시야를 지나는 시간보다 길어 사실상 박스당 1건이 된다.
         """
+        import time as _t
+        k = (where_at, reason)
+        now = _t.monotonic()
+        last = getattr(self, "_miss_last", {}).get(k, 0.0)
+        if now - last < 2.0:
+            return
+        if not hasattr(self, "_miss_last"):
+            self._miss_last = {}
+        self._miss_last[k] = now
         if not self.cli_miss.service_is_ready():
             self.get_logger().warn("/db/report_miss 가 아직 없다 — 통계에서 빠진다",
                                    once=True)
@@ -228,13 +551,23 @@ class LineDetector(Node):
             f"cam1 등록 {box_id} ({bt['name']}) → {res.message} · 누계 {self._n_reg}")
 
     def _on_cam2(self, bgr, header):
-        det, _ = self._measure(bgr, self.cam2)
-        if det is None:
+        det, out, ctx = self._measure(bgr, self.cam2)
+        if det is None or (out is None and not self.xcheck.on):
+            if det is not None:
+                self._report_miss("cam2", "SIZE_MISMATCH")
             self._armed2 = True
             return
         if not self._armed2:
             return
         self._armed2 = False
+        # cam2 는 검증 카메라라 좌표를 안 쓴다. 그래도 교차검증은 돌린다 —
+        # 여기서 어긋나면 cam1 이 등록한 치수가 틀렸다는 두 번째 증거가 된다.
+        fixed, _res = self.xcheck.evaluate(self.cam2, det["corners_px"], out,
+                                           ctx[0], ctx[1], "cam2",
+                                           rgb_stamp=CameraSub._stamp(header))
+        if out is None and fixed is None:
+            # RGB 가 포기했고 깊이도 못 살렸다 (cam1 과 같은 회계 규칙).
+            self._report_miss("cam2", "SIZE_MISMATCH")
 
         qr = read_qr(bgr, det["corners_px"])
         box_id = parse_payload(qr)
@@ -316,6 +649,18 @@ class ZoneDetector(Node):
         self._min_dt = 1.0 / max(0.1, float(self.get_parameter("infer_rate_hz").value))
         self._last = 0.0
         self._present = False
+        # ★ 스토퍼 창·자리잡음 필터 (2026-08-27 김병직 — gtpick 대역과 같은 규칙).
+        #   실측: 도착 전 박스를 보고했다 — y 3405(스토퍼 -586mm)·yaw 179→88.7 로
+        #   널뛰는 좌표에 로봇이 출발해 흡착·IK 실패. ① 가장 큰 박스가 스토퍼에
+        #   닿았을 때 중심보다 60mm 여유 밖이면 아직 도착 전, ② 직전 추론과
+        #   5mm·1.5도 안으로 같아야 자리잡은 것. ③ 같은 박스가 15초째 걸려
+        #   있으면(뒤집힘 등) 강제 보고 — 관제탑 재시도 상한이 치워 준다.
+        _ax = str(cfg["conveyor"].get("pickup_axis", "x")).lower()
+        self._axis_i = 1 if _ax == "y" else 0
+        _half = max(max(t["w_mm"], t["d_mm"]) for t in self.types) / 2000.0
+        self._win_m = cfg["conveyor"]["stopper_x_mm"] / 1000.0 - _half - 0.060
+        self._stab_prev = None       # (x_mm, y_mm, yaw)
+        self._stab_first = None      # 처음 필터에 걸린 시각 (monotonic)
         self._idle = True          # 관제탑이 놀고 있는가
         self._seen = None          # 직전에 발행한 box_id (중복 로그 억제)
 
@@ -330,7 +675,13 @@ class ZoneDetector(Node):
         self.create_subscription(
             ZoneStatus, f"/zone_{self.zone}/status", self._on_status, 10,
             callback_group=cb)
-        self.cam = CameraSub(self, ns, self._on_image, cb)
+        # ★ 여기가 깊이가 실제로 값을 하는 자리다. 이 노드의 좌표는 관제탑을 거쳐
+        #   **로봇이 집으러 가는 자리**가 된다. 종류를 틀려 평면이 60~130 mm
+        #   어긋나면 x, y 가 같이 틀어지고, 그건 흡착 실패로 나타난다.
+        self.xcheck = DepthCrossCheck(self, cfg, f"/zone_{self.zone}/vision_check",
+                                      zone=self.zone)
+        self.cam = CameraSub(self, ns, self._on_image, cb,
+                             depth_suffix=self.xcheck.depth_suffix)
         self.get_logger().info(
             f"detector_zone_{self.zone} 시작 — {ns} -> /zone_{self.zone}/box_at_pickup")
 
@@ -342,11 +693,65 @@ class ZoneDetector(Node):
     def _now(self):
         return self.get_clock().now().nanoseconds / 1e9
 
+    def _pickup_roi(self, header, shape):
+        """픽업 창의 픽셀 ROI. 한 번 계산해 캐시한다 (카메라·스토퍼 둘 다 정적).
+
+        ★ 왜 (2026-08-27 김병직·라이브 캡처 실측): 픽업 카메라 시야에 **팔레트**가
+          들어온다. 방금 쌓은 박스가 같은 분홍이라 검출이 그쪽(더 높아 더 크게
+          보임 — 팔레트 950+340=상면 1290, x1.15 확대)을 잡았다 — C존 기각
+          541x445 = 정확히 팔레트 위 5호였다. 스포너의 pickup_range 상한과
+          같은 원리로, 검출 **전에** 픽업 창 밖을 지운다.
+        """
+        if getattr(self, "_roi", None) is not None:
+            return self._roi
+        if self.cam.K is None:
+            return None
+        try:
+            R, t = camera_pose(self.tf_buf, self.world_frame,
+                               header.frame_id or self.cam.frame_id)
+        except Exception:                                       # noqa: BLE001
+            return None                     # tf 가 아직 — 다음 프레임에 다시
+        cw = (self.cfg["zones"].get("pickup_cross_mm") or {}).get(self.zone.upper())
+        if not cw:
+            return None
+        stop = self.cfg["conveyor"]["stopper_x_mm"] / 1000.0
+        along = (self._win_m - 0.35, stop + 0.05)   # 도착 직전 여유 ~ 스토퍼 앞면
+        cross = (cw[0] / 1000.0, cw[1] / 1000.0)
+        maxh = max(bt["h_mm"] for bt in self.types) / 1000.0
+        us, vs = [], []
+        for a in along:
+            for c in cross:
+                for Z in (self.belt_top_m, self.belt_top_m + maxh):
+                    w = (np.array([c, a, Z]) if self._axis_i == 1
+                         else np.array([a, c, Z]))
+                    pc = R.T @ (w - t)
+                    if pc[2] <= 1e-6:
+                        continue
+                    uv = self.cam.K @ (pc / pc[2])
+                    us.append(uv[0]); vs.append(uv[1])
+        if len(us) < 4:
+            return None
+        H, W = shape[0], shape[1]
+        M = 25                              # 픽셀 여유
+        self._roi = (max(0, int(min(us)) - M), max(0, int(min(vs)) - M),
+                     min(W, int(max(us)) + M), min(H, int(max(vs)) + M))
+        self.get_logger().info("픽업 ROI 확정 %s (팔레트 등 시야 밖 배제)"
+                               % (self._roi,))
+        return self._roi
+
     def _on_image(self, bgr, header):
         t = self._now()
         if not self._idle or (t - self._last) < self._min_dt:
             return
         self._last = t
+
+        # ── 픽업 창 밖(팔레트 쪽)을 지우고 검출한다 (_pickup_roi 주석) ──
+        roi = self._pickup_roi(header, bgr.shape)
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            m = np.zeros_like(bgr)
+            m[y0:y1, x0:x1] = bgr[y0:y1, x0:x1]
+            bgr = m
 
         det = find_box(bgr)
         if det is None:
@@ -379,10 +784,22 @@ class ZoneDetector(Node):
 
         out = box_pose_from_corners(det["corners_px"], self.cam.K, R, t_vec,
                                     self.belt_top_m, self.types)
-        if out is None:
-            self.get_logger().warn("사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다")
+        if out is None and not self.xcheck.on:
+            self.get_logger().warn(
+                "사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다 [실측 %s]"
+                % (_geo.LAST_REJECT or "?"))
             self._publish_absent()
             return
+
+        # ★ 원시 측정값 (스냅 전). LineDetector._measure 의 같은 로그와 짝이다.
+        #   여기 값이 로봇이 실제로 집으러 갈 때 쓰는 판정이다.
+        if out is not None:
+            _lo, _sh = out["measured_m"]
+            self.get_logger().debug(
+                f"실측 {_lo * 1000:.1f} x {_sh * 1000:.1f} mm "
+                f"→ {out['type']['name']} "
+                f"({out['type']['w_mm']}x{out['type']['d_mm']}) "
+                f"오차 {out['fit_err_m'] * 1000:.1f} mm")
 
         # ★ box_id 는 여기서 읽는다. 다른 노드에서 받아오지 않는다.
         #
@@ -402,10 +819,39 @@ class ZoneDetector(Node):
             self.get_logger().warn("픽업 QR 판독 실패 — box_id 없이 발행한다",
                                    throttle_duration_sec=2.0)
 
+        # ★ 발행 **직전**에 교차검증한다. box_id 를 읽은 뒤라 진단 토픽에 어느
+        #   박스인지가 실리고, 앞이라 mode:prefer 면 깊이가 잰 평면의 좌표가
+        #   그대로 로봇에게 간다. 순서를 바꾸면 둘 중 하나를 잃는다.
+        out, res = self.xcheck.evaluate(self.cam, det["corners_px"], out,
+                                        R, t_vec, "pick_cam", box_id,
+                                        rgb_stamp=CameraSub._stamp(header))
+        if out is None:
+            self._hold_coordinates(res["verdict"])
+            return
+
         # ★ 계약은 mm 정수다 (CLAUDE.md §3-2). 내부 계산은 m 로 하지만
         #   토픽에 실을 때 여기서 한 번만 mm 로 바꾼다.
         #   z 는 싣지 않는다 — 벨트 상면(800mm)은 고정이라 관제탑이 안다.
         cx, cy, cz = out["center_m"]
+
+        # ── 스토퍼 창·자리잡음 필터 (__init__ 주석 참조) ──
+        _now = time.monotonic()
+        _cur = (m_to_mm(cx), m_to_mm(cy), round(float(out["yaw_deg"]), 1))
+        if self._stab_first is None:
+            self._stab_first = _now
+        _force = (_now - self._stab_first) > 15.0
+        _prev, self._stab_prev = self._stab_prev, _cur
+        if not _force:
+            if out["center_m"][self._axis_i] < self._win_m:
+                return                   # 아직 스토퍼에 도착 전 — 보고하지 않는다
+            if (_prev is None or abs(_prev[0] - _cur[0]) > 5
+                    or abs(_prev[1] - _cur[1]) > 5
+                    or abs(_prev[2] - _cur[2]) > 1.5):
+                return                   # 아직 자리잡는 중 — 다음 추론에서 다시
+        elif not self._present:
+            self.get_logger().warn(
+                "15초째 창밖/불안정 — 강제 보고 (집기 실패하면 관제탑 상한이 치운다)")
+
         self.pub.publish(BoxAtPickup(
             present=True, box_id=box_id,
             x_mm=m_to_mm(cx), y_mm=m_to_mm(cy),
@@ -415,13 +861,17 @@ class ZoneDetector(Node):
                 f"도착 {box_id or '(미상)'} {out['type']['name']} "
                 f"({m_to_mm(cx)}, {m_to_mm(cy)}, {m_to_mm(cz)}) mm "
                 f"yaw {out['yaw_deg']:.1f}° · 맞춤오차 {out['fit_err_m']*1000:.1f} mm")
-            self._crosscheck(box_id, out["type"])
+            self._check_against_db(box_id, out["type"])
         self._present = True
         if box_id:
             self._seen = box_id
 
-    def _crosscheck(self, box_id, btype):
+    def _check_against_db(self, box_id, btype):
         """투입부가 등록한 치수와 픽업에서 잰 치수가 같은가 — 비동기로 확인만.
+
+        ★ 이것도 교차검증이지만 **축이 다르다.** 깊이(`self.xcheck`)는 같은 순간
+          같은 카메라를 두 방식으로 보고, 이쪽은 **다른 시각 다른 카메라**(cam1)의
+          기록과 대조한다. 둘을 한 이름으로 부르면 어느 쪽이 울렸는지 못 가린다.
 
         ★ 발행을 여기에 매달지 않는다. 서비스 응답을 기다렸다가 좌표를 내면
           로봇이 그만큼 늦게 움직인다. 어긋나면 경고만 남기고 지표로 쓴다.
@@ -443,10 +893,23 @@ class ZoneDetector(Node):
 
         fut.add_done_callback(done)
 
+    def _hold_coordinates(self, verdict):
+        """믿을 수 없는 좌표를 "없다" 로 낸다. 침묵하면 관제탑이 영원히 기다린다.
+
+        ★ present=False 는 거짓말이 아니다 — 계약상 "무시하고 사이클을 시작하지
+          말 것" 이라는 뜻이고(§3-2), 믿을 수 없는 좌표에 대해 정확히 그 뜻이다.
+          로봇이 빗나간 자리를 집는 쪽이 훨씬 나쁘다 (`clipped` 처리와 같은 판단).
+        """
+        self.get_logger().warn(f"픽업 좌표 보류 [{verdict}] — 좌표를 내지 않는다",
+                               throttle_duration_sec=2.0)
+        self._publish_absent()
+
     def _publish_absent(self):
         if self._present:
             self.get_logger().info("픽업 자리 비었다")
         self._present, self._seen = False, None
+        # ★ 필터 상태도 함께 리셋 — 다음 박스를 새 박스로 본다 (창·안정 필터)
+        self._stab_prev = self._stab_first = None
         self.pub.publish(BoxAtPickup(present=False, box_id=""))
 
 
@@ -459,7 +922,11 @@ def _spin(node):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # ★ `rclpy.ok()` 로 감싼다. SIGTERM 으로 내리면 컨텍스트가 이미 닫혀 있어
+        #   `rcl_shutdown already called` 트레이스백이 남는다 — 노드가 정상 종료해도
+        #   로그 끝에 예외가 찍혀 **뭔가 죽은 것처럼 보인다.** (검증 중 실측)
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def main(args=None):

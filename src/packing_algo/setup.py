@@ -26,6 +26,8 @@ setup(
             'report = packing_algo.report:main',
             'ceiling = packing_algo.ceiling:main',
             'dump_plan = packing_algo.dump_plan:main',
+            'tuning = packing_algo.tuning:main',
+            'compare_families = packing_algo.compare_families:main',
         ],
     },
 )

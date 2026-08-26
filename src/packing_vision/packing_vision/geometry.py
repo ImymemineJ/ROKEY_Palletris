@@ -69,7 +69,21 @@ def rect_from_corners(pts_w):
     return p.mean(axis=0), long_mm, short_mm, yaw
 
 
-def box_pose_from_corners(corners_px, K, R, t, belt_top_m, types, tol_m=0.030):
+def box_pose_from_corners(corners_px, K, R, t, belt_top_m, types, tol_m=0.085):
+    # ★ 0.055 -> 0.085 (2026-08-27 2차). gtpick 이 "정위치·yaw 0·단독" 을 보증한
+    #   5호가 541x445(오차 126~133)로 측정됐다 — 카메라 축이 스토퍼에서 비껴
+    #   키 큰 박스의 옆면이 실루엣에 끼는 원근 부풀기다. cap 170 -> 340mm.
+    #   안전한 이유: 존 인식의 종류는 **좌표 투영 평면**에만 쓰이고, 로봇 치수·
+    #   높이는 DB(cam1 등록, 중앙 게이트로 정확)에서 온다 — 오분류 해악은
+    #   중심 수십 mm 로 흡착 패드 여유 안이다. 병합(700mm대)은 여전히 걸러진다.
+    # ★ tol 0.030 -> 0.055 (2026-08-27 김병직 실측). 박스가 카메라 축에서 옆으로
+    #   치우치면(소터가 옆으로 쳐 보내 스토퍼 도착 오프셋 실측 ±155~177mm) 먼 쪽
+    #   **옆면이 실루엣에 끼어** 측정이 부푼다 — 부풀기 ≈ 높이 x 오프셋 / 카메라높이,
+    #   5호(340mm) 170mm 오프셋이면 +40mm 라 옛 상한(60mm)을 노이즈와 함께 넘었다
+    #   (5호 인식 0/443 의 원인). 종류 간 간격이 70mm(장변 340/410/480)라 상한을
+    #   110mm 로 올려도 **가장 가까운 종류는 안 바뀐다** — 부푼 5호 520 은 5호
+    #   오차 80 vs 4호 오차 220. 대가는 중심이 부풀기의 절반(~20mm)만큼 먼 쪽으로
+    #   밀리는 것인데 흡착 패드 접촉에는 여유가 있다.
     """박스 윗면 네 모서리(픽셀) → 월드 박스 **중심** + yaw + 종류.
 
     ★ 닭-달걀 문제: 높이를 모르면 투영 평면을 못 정하고, 평면을 못 정하면 크기를
@@ -103,5 +117,15 @@ def box_pose_from_corners(corners_px, K, R, t, belt_top_m, types, tol_m=0.030):
         return None
     if best["fit_err_m"] > tol_m * 2:
         # 사양 3종 어느 것과도 안 맞는다. 억지로 고르면 엉뚱한 높이로 집으러 간다.
+        # ★ 기각 사유를 남긴다 (2026-08-27). 호출부의 "사양 3종 안 맞는다" 경고가
+        #   측정값 없이는 원인을 못 가른다 — 병합(700mm대)인지 부풀기(+40)인지
+        #   완전 오측인지. 모듈 전역이라 ROS 의존성 0 이 유지된다.
+        global LAST_REJECT
+        LAST_REJECT = ("%.0fx%.0f mm (최근접 %s 오차 %.0f)"
+                       % (best["measured_m"][0] * 1000, best["measured_m"][1] * 1000,
+                          best["type"]["name"], best["fit_err_m"] * 1000))
         return None
     return best
+
+
+LAST_REJECT = None   # 마지막 기각의 측정값 문자열 — 진단 전용 (box_pose_from_corners)
