@@ -50,7 +50,7 @@ MAIN_LINE_Y_DEFAULT = [-500, 500]
 
 
 class Router:
-    """`sim_main` 메인 루프가 매 프레임 `step(time.time())` 을 부른다."""
+    """`sim_main` 메인 루프가 매 프레임 `step(시뮬 시간)` 을 부른다 (2026-08-27 벽시계에서 변경)."""
 
     #: 폴링 주기 [s]. 데모판과 같다 — 이보다 잦으면 물리 스텝만 갉아먹는다.
     PERIOD_S = 0.15

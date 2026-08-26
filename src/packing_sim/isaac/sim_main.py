@@ -130,6 +130,17 @@ def main():
 
     from isaacsim import SimulationApp
     kit = SimulationApp({"headless": not a.gui})
+    # ★ vsync·프레임 제한 해제 (2026-08-27). GUI 모드에서 app.update() 가
+    #   화면 주사율에 묶이면 물리가 아무리 빨라도 렌더 프레임이 벽시계를 먹는다
+    #   (실측: 렌더 프레임당 33 ms → PL_RENDER_EVERY=2 로도 1.0 배속에 정체).
+    #   이미 꺼져 있으면 아무 일도 없다.
+    try:
+        import carb.settings
+        _cs = carb.settings.get_settings()
+        _cs.set("/app/vsync", False)
+        _cs.set("/app/runLoops/main/rateLimitEnabled", False)
+    except Exception as _e:                                     # noqa: BLE001
+        print("[sim_main] vsync 해제 실패 (무시): %r" % (_e,))
 
     server = None
     rms = {}                     # {zone: RobotMotion}. 예외로 빠져도 finally 가 안 죽게
@@ -334,9 +345,9 @@ def main():
         # ★ PL_RENDER_EVERY=N — N 프레임에 1 번만 그린다 (기본 1 = 매 프레임).
         #   GUI 병목은 렌더링이라 2 면 체감 약 2 배속. 물리(60 Hz)는 그대로다.
         #   채택 실행(demo_stack15 --render-every 2)과 같은 장치다.
-        #   ⚠ 라우터 폴링(벽시계 0.15 s) 대비 분기 창(시뮬 0.58 s)이 배속만큼
-        #     좁아진다 — 2 배속이면 벽시계 0.29 s 로 아직 2 번은 본다. 3 이상은
-        #     소터가 박스를 놓칠 수 있으니 화면으로 확인할 것.
+        #   ★ 2026-08-27: 라우터·급송·gtpick 이 **시뮬 시간**으로 돌게 바꿔서
+        #     이제 3 이상도 분기 창을 안 놓친다 (아래 _tsim 주석). 상한은 화면
+        #     끊김을 얼마나 참을 수 있느냐 뿐이다 — 4 면 15 fps 로 보인다.
         _rn = max(1, int(os.environ.get("PL_RENDER_EVERY", "1")))
         if _rn > 1:
             print("[sim_main] 렌더 %d 프레임당 1 회 — 체감 약 %d 배속" % (_rn, _rn))
@@ -346,12 +357,18 @@ def main():
             for _rm in rms.values():
                 _rm.step()                 # ★ world.step() 앞. 로봇 전부
             sp.step()
+            # ★★ 벽시계가 아니라 **시뮬 시간**을 준다 (2026-08-27). 벽시계로 주면
+            #   배속(PL_RENDER_EVERY)에 따라 라우터 폴링 대비 분기 창이 좁아져
+            #   3 배속부터 소터가 박스를 놓쳤다. 시뮬 시간이면 폴링·스폰 간격이
+            #   전부 시뮬 기준이라 **배속과 무관하게 같은 동작**이 된다
+            #   (급송 8 초도 시뮬 8 초 — 재현성에도 이게 맞다).
+            _tsim = world.current_time
             if router is not None:
-                router.step(time.time())   # ★ 논블로킹 (§9). 급송보다 먼저.
+                router.step(_tsim)         # ★ 논블로킹 (§9). 급송보다 먼저.
             if feeder is not None:
-                feeder.step(time.time())
+                feeder.step(_tsim)
             if gtpick is not None:
-                gtpick.step(time.time())   # ★ ros.step 앞. 이번 틱에 반영되게
+                gtpick.step(_tsim)         # ★ ros.step 앞. 이번 틱에 반영되게
             for _r in ros:
                 _r.step()              # ★ 논블로킹. 모션은 워커가 돈다 (§9)
             # ★★ **헤드리스에서도 render=True 로 돈다.**

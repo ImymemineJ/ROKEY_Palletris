@@ -460,6 +460,15 @@ def build_cameras(cfg, zones, log=print):
     """
     import omni.usd
 
+    # ★ PL_CAMROS=0 — 카메라 발행을 **아예 안 만든다** (2026-08-27).
+    #   렌더 프로덕트는 발행 주기와 무관하게 **렌더 프레임마다** GPU 로 그려져서,
+    #   1280x720 5 대가 프레임당 약 33 ms 를 먹었다 (실측 — 렌더 스킵 2 로도
+    #   벽시계 1.0 배속에 묶인 원인). vision:=false + gtpick 대역으로 도는 동안은
+    #   이미지 소비자가 없으니 끄는 게 순이득이다. 카메라 붙일 때 2 로 되돌릴 것.
+    if os.environ.get("PL_CAMROS") == "0":
+        log("[ros_graph] PL_CAMROS=0 — 카메라 발행 없음 (렌더 비용 절감)")
+        return 0
+
     rec = (cfg.get("recognition") or {})
     res = list(rec.get("resolution") or [1280, 720])
     st = omni.usd.get_context().get_stage()
