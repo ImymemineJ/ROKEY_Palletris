@@ -182,3 +182,14 @@ class ExtremePointPacker(HeightmapPacker):
                     new_eps.append((cx, cy, cz))
 
         self.eps = new_eps
+
+    @property
+    def current_height(self):
+        return float(self.hm.max()) / 1000.0 if hasattr(self, 'hm') else 0.0
+
+    @property
+    def max_height(self):
+        return float(self.max_stack) / 1000.0 if hasattr(self, 'max_stack') else 1.3
+
+    def volume_utilization(self):
+        return self.capacity_rate()

@@ -774,11 +774,11 @@ def main():
     ap.add_argument("--boxes", type=int, default=None,
                     help="기본은 system.yaml boxes.stage1.total_count (=15)")
     ap.add_argument("--plan-mode", default="offline",
-                    choices=["offline", "online", "algo"],
+                    choices=["offline", "online", "algo", "ep"],
                     help="offline = 15개 계획을 미리 만들어 z 오름차순으로 실행한다 (기본, 검증됨). "
-                         "online = 박스마다 비전으로 적재 상태를 다시 보고 자리를 정한다 "
-                         "— 카메라가 붙었을 때의 구조다. **지금은 오프라인보다 나쁘다**, "
-                         "results/issues/19 참조")
+                         "online = 박스마다 비전으로 적재 상태를 다시 보고 자리를 정한다. "
+                         "algo = 최종 튜닝 HeightmapPacker 코어 사용. "
+                         "ep = Extreme Point (EP 3D 극점 관리) 학술 대조군 패커로 로봇팔 구동 시뮬레이션")
     ap.add_argument("--plan", default=None, help="계획 JSON 을 직접 넣는다 (offline 강제)")
     ap.add_argument("--dump-plan", default=None, help="쓴 계획을 JSON 으로 저장")
     ap.add_argument("--plan-only", action="store_true",
@@ -907,6 +907,32 @@ def main():
         fed = [types[p["box_type"]] for p in plan]
         dropped = []
         print("계획  %s (%d 박스)" % (a.plan, len(plan)))
+    elif a.plan_mode == "ep":
+        from packing_algo.extreme_point import ExtremePointPacker
+        pk = ExtremePointPacker(cfg, use_rotation=True, use_corridor=False)
+        boxes = manifest(cfg, n)
+        _vol = lambda b: b["w_mm"] * b["d_mm"] * b["h_mm"]
+        if a.order == "volume":
+            boxes.sort(key=lambda b: -_vol(b))
+        elif a.order == "small-first":
+            boxes.sort(key=_vol)
+        plan, fed, dropped = [], [], []
+        for i, b in enumerate(boxes):
+            ok, pose, _, msg = pk.plan(f"B{i}", b["w_mm"], b["d_mm"], b["h_mm"])
+            if not ok:
+                dropped.append(b["name"])
+                continue
+            plan.append({
+                "box_type": b["name"],
+                "x_mm": pose["x_mm"],
+                "y_mm": pose["y_mm"],
+                "z_mm": pose["z_mm"],
+                "yaw_deg": int(pose["yaw_deg"]),
+                "support": 1.0
+            })
+            fed.append(b)
+        print("계획  ExtremePointPacker (EP 3D 극점 학술대조군)  seed %s · 급송 %s"
+              % (cfg["boxes"]["random_seed"], a.order))
     else:
         ped_now = a.pedestal if a.pedestal is not None else cfg["robot"]["pedestal_height_mm"]
         plan, fed, dropped, pk = build_plan(cfg, n, a.clearance, a.halo, a.order,
