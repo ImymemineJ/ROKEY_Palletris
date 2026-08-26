@@ -1391,6 +1391,16 @@ def router_thread(specs, ids):
     segx = {k: (min(v) / 1000.0, max(v) / 1000.0)
             for k, v in (ROUTE.get("main_seg_x_mm") or {}).items()}
     y_done = float(ROUTE.get("divert_done_y_mm", 1200)) / 1000.0
+    # ★★ 소터를 **먼저** 본선으로 되돌리는 선 (2026-08-26).
+    #   예전에는 `y_done`(1200) 까지 꺾어 두었다. 그런데 박스는 지선 롤러에
+    #   올라타는 순간(`spur_entry_y_mm` 513) 지선 벨트가 실어 간다 — 그 뒤로는
+    #   소터를 붙들 이유가 없다.
+    #   4~8 초를 꺾은 채로 두면 그동안 본선에서 들어오는 박스가 **같이 옆으로
+    #   밀린다.** 그게 소터 구간 걸림이고, 남의 존 지선에 올라가는 원인이다
+    #   (2026-08-26 영상 260826error2.mp4 · MISROUTE 4 건).
+    #   기본 900 = 본선 레일(790) 을 확실히 벗어난 뒤.
+    y_release = float(ROUTE.get("divert_release_y_mm", 900)) / 1000.0
+    released = {}                       # bid -> 소터를 이미 되돌렸나
     _mly = ROUTE.get("main_line_y_mm") or [-500, 500]
     y_lo, y_hi = min(_mly) / 1000.0, max(_mly) / 1000.0
     thru = list(ROUTE.get("thru_world", [-1, 0, 0]))
@@ -1494,12 +1504,20 @@ def router_thread(specs, ids):
                 seg = mseg[z]
                 if p[1] >= y_done:                       # 지선에 올라탔다
                     if state.get(bid) == "divert":
-                        turn(z, seg, False)
+                        if not released.pop(bid, False):
+                            turn(z, seg, False)
                         _S["diverting"] = max(0, _S.get("diverting", 1) - 1)
-                        log("   [라우팅] %s 지선 %s 진입 (Y %.2f m) — 본선 복귀"
-                            % (bid, z, p[1]))
+                        log("   [라우팅] %s 지선 %s 진입 (Y %.2f m)" % (bid, z, p[1]))
                     state[bid] = "done"
                     continue
+                # ★ 소터는 **여기서** 본선으로 돌린다. 박스는 이미 지선 롤러 위라
+                #   지선 벨트가 실어 간다 — 소터를 더 붙들면 뒤차가 같이 밀린다.
+                if (state.get(bid) == "divert" and not released.get(bid)
+                        and p[1] >= y_release):
+                    turn(z, seg, False)
+                    released[bid] = True
+                    log("   [라우팅] %s 지선 %s 올라탐 (Y %.2f m) — 소터 즉시 복귀"
+                        % (bid, z, p[1]))
                 if state.get(bid) == "divert":
                     # 진행을 1 초마다 남긴다. 어디서 걸리는지 봐야 고칠 수 있다.
                     now = time.time()
@@ -1508,7 +1526,8 @@ def router_thread(specs, ids):
                         log("   [라우팅]   %s 이동 중  X %.2f  Y %.3f  (%.0f s)"
                             % (bid, p[0], p[1], now - t_div.get(bid, now)))
                     if now - t_div.get(bid, 0.0) > DIV_TIMEOUT_S:
-                        turn(z, seg, False)
+                        if not released.pop(bid, False):
+                            turn(z, seg, False)
                         _S["diverting"] = max(0, _S.get("diverting", 1) - 1)
                         state[bid] = "done"
                         log("   [라우팅] !! %s 가 %.0f s 안에 지선 %s 에 못 올라탔다 "
