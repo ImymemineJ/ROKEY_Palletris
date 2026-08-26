@@ -413,10 +413,14 @@ class LineDetector(Node):
         out = box_pose_from_corners(det["corners_px"], cam.K, R, t,
                                     self.belt_top_m, self.types)
         if out is None:
+            # ★ 여기서 `_report_miss` 를 부르지 않는다 (2026-08-26).
+            #   `rescue` 모드면 이 박스를 깊이가 살릴 수 있는데, 여기서 미리
+            #   실패로 세면 **같은 박스가 실패로도 세지고 등록으로도 세어**
+            #   인식률의 분모가 부푼다 (분모 = 등록 성공 + 여기로 온 실패).
+            #   보고는 **살리기를 시도한 뒤** 호출부가 한다.
             self.get_logger().warn(f"{cam.ns}: 사양 3종과 안 맞는다")
-            self._report_miss(cam.ns.strip("/"), "SIZE_MISMATCH")
-            # ★ 카메라 자세는 그래도 돌려준다. RGB 가 포기한 자리야말로 깊이가
-            #   답을 갖고 있을 수 있다 — 호출부가 깊이 단독으로 한 번 더 본다.
+            # 카메라 자세는 그래도 돌려준다 — RGB 가 포기한 자리야말로 깊이가
+            # 답을 갖고 있을 수 있다. 호출부가 깊이 단독으로 한 번 더 본다.
             return det, None, (R, t)
         # ★ 원시 측정값을 남긴다. 위에서 사양 3종 중 하나로 **스냅**하기 때문에
         #   DB 에 들어가는 것은 사양 치수(340x250 …)지 잰 값이 아니다.
@@ -438,6 +442,9 @@ class LineDetector(Node):
             #   전과 같은 뜻이다. 여기서 arming 을 소비해 버리면 RGB 가 한 번
             #   실패한 박스가 영원히 등록되지 않는다 — 박스는 계속 지나가는데
             #   에러는 안 뜬다.
+            if det is not None:
+                # 박스는 봤는데 사양 3종과 안 맞았다. 깊이가 꺼져 있어 살릴 길도 없다.
+                self._report_miss("cam1", "SIZE_MISMATCH")
             self._armed1 = True
             return
         if not self._armed1:
@@ -454,10 +461,17 @@ class LineDetector(Node):
             self._armed1 = True
             if had_rgb:
                 # RGB 는 답을 냈는데 깊이와 갈렸다 = reject_on_disagree 가 켜져 있다.
-                # RGB 도 포기한 경우는 `_measure` 가 이미 SIZE_MISMATCH 로 알렸다.
                 self.get_logger().warn("cam1: 교차검증이 막았다 — 등록 건너뜀")
                 self._report_miss("cam1", "DEPTH_DISAGREE")
+            else:
+                # RGB 가 포기했고 깊이도 못 살렸다. **이제서야** 실패로 센다.
+                self._report_miss("cam1", "SIZE_MISMATCH")
             return
+        if not had_rgb:
+            # ★ 깊이가 살린 박스다. RGB 단독이었으면 여기까지 못 왔다.
+            self.get_logger().info(
+                f"cam1: RGB 는 포기했는데 깊이가 살렸다 — {out['type']['name']} "
+                f"(윗면 실측 기준)")
         bt = out["type"]
 
         qr = read_qr(bgr, det["corners_px"])
@@ -509,6 +523,8 @@ class LineDetector(Node):
     def _on_cam2(self, bgr, header):
         det, out, ctx = self._measure(bgr, self.cam2)
         if det is None or (out is None and not self.xcheck.on):
+            if det is not None:
+                self._report_miss("cam2", "SIZE_MISMATCH")
             self._armed2 = True
             return
         if not self._armed2:
@@ -516,9 +532,12 @@ class LineDetector(Node):
         self._armed2 = False
         # cam2 는 검증 카메라라 좌표를 안 쓴다. 그래도 교차검증은 돌린다 —
         # 여기서 어긋나면 cam1 이 등록한 치수가 틀렸다는 두 번째 증거가 된다.
-        self.xcheck.evaluate(self.cam2, det["corners_px"], out,
-                             ctx[0], ctx[1], "cam2",
-                             rgb_stamp=CameraSub._stamp(header))
+        fixed, _res = self.xcheck.evaluate(self.cam2, det["corners_px"], out,
+                                           ctx[0], ctx[1], "cam2",
+                                           rgb_stamp=CameraSub._stamp(header))
+        if out is None and fixed is None:
+            # RGB 가 포기했고 깊이도 못 살렸다 (cam1 과 같은 회계 규칙).
+            self._report_miss("cam2", "SIZE_MISMATCH")
 
         qr = read_qr(bgr, det["corners_px"])
         box_id = parse_payload(qr)

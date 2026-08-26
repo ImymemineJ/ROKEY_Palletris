@@ -370,3 +370,58 @@ def test_h_weight_1_would_mistype():
     weighted = D.pose_from_plane(fat, K, R_DOWN, T_CAM, plane["z_m"], TYPES, BELT_M, 3.0)
     assert naive["type"]["name"] != bt["name"], "무게 1.0 이 이미 맞힌다 — 이 값은 장식이다"
     assert weighted["type"]["name"] == bt["name"]
+
+
+# ── ⑫ rescue 모드 — 재현성을 안 깨면서 버려질 박스만 건지는가 ────────────────
+def test_rescue_only_when_rgb_gives_up():
+    """`rescue` 는 **RGB 가 답을 낸 경우 crosscheck 와 한 글자도 달라선 안 된다.**
+
+    ★ 그게 이 모드의 존재 이유다. prefer 는 깊이 프레임이 도착한 박스만 깊이를
+      쓰기 때문에, 같은 시드로 돌려도 **박스마다 어느 경로가 쓰였는지가 네트워크
+      타이밍에 좌우된다** — 평가 항목 "재현성(Play/Stop)" 과 부딪친다.
+      rescue 는 RGB 가 답을 내는 한 결과가 항상 같다. 깊이는 **어차피 버려질 박스**만
+      건진다.
+    """
+    K = make_K()
+    bt, center, yaw = TYPES[1], (9.55, 0.22), 20.0
+    det, rgb = rgb_pose(bt, center, yaw, K)
+    dimg = render_depth(bt, center, yaw, K)
+    plane, _ = D.top_plane_z(dimg, det["corners_px"], K, R_DOWN, T_CAM, CFG_D)
+    dep = D.pose_from_plane(det["corners_px"], K, R_DOWN, T_CAM, plane["z_m"],
+                            TYPES, BELT_M, CFG_D["h_weight"])
+
+    # ① RGB 가 답을 냈다 → rescue 도 crosscheck 도 RGB 를 쓴다 (prefer 만 깊이)
+    for mode in ("crosscheck", "rescue"):
+        r = D.cross_check(rgb, dep, dict(CFG_D, mode=mode))
+        assert r["used"] == "RGB", f"{mode} 가 RGB 를 안 썼다 — 재현성이 깨진다"
+    assert D.cross_check(rgb, dep, dict(CFG_D, mode="prefer"))["used"] == "DEPTH"
+
+    # ② 깊이가 없어도 마찬가지 (강등)
+    for mode in ("crosscheck", "rescue", "prefer"):
+        assert D.cross_check(rgb, None, dict(CFG_D, mode=mode))["used"] == "RGB"
+
+
+@pytest.mark.parametrize("infl", [0.08, 0.12, 0.15])
+def test_rescue_saves_dropped_box(infl):
+    """RGB 가 포기한 박스를 rescue 가 건진다 — crosscheck 는 안 건진다 (설계대로)."""
+    K = make_K()
+    bt, center, yaw = TYPES[1], (9.55, 0.22), 20.0
+    det, _ = rgb_pose(bt, center, yaw, K)
+    dimg = render_depth(bt, center, yaw, K)
+    fat = D.shrink_polygon(det["corners_px"], -infl)
+
+    rgb = box_pose_from_corners(fat, K, R_DOWN, T_CAM, BELT_M, TYPES)
+    assert rgb is None, "RGB 가 통과시켰다 — 전제가 바뀌었다"
+    plane, _ = D.top_plane_z(dimg, fat, K, R_DOWN, T_CAM, CFG_D)
+    dep = D.pose_from_plane(fat, K, R_DOWN, T_CAM, plane["z_m"], TYPES, BELT_M,
+                            CFG_D["h_weight"])
+
+    assert D.cross_check(rgb, dep, dict(CFG_D, mode="crosscheck"))["used"] == "NONE"
+    r = D.cross_check(rgb, dep, dict(CFG_D, mode="rescue"))
+    assert r["used"] == "DEPTH", "rescue 가 못 건졌다"
+
+    saved = D.as_rgb_shape(dep)
+    err_mm = np.hypot(saved["center_m"][0] - center[0],
+                      saved["center_m"][1] - center[1]) * 1000.0
+    assert err_mm < 5.0, f"건졌는데 좌표가 {err_mm:.1f} mm 빗나갔다"
+    assert saved["type"]["name"] == bt["name"]

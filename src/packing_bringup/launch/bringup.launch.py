@@ -5,7 +5,7 @@
     ros2 launch packing_bringup bringup.launch.py use_sim_time:=false
     ros2 launch packing_bringup bringup.launch.py vision:=false      # 인식 끄고
     ros2 launch packing_bringup bringup.launch.py depth:=false       # 깊이 교차검증만 끄고
-    ros2 launch packing_bringup bringup.launch.py depth_mode:=prefer # 깊이가 좌표를 정한다
+    ros2 launch packing_bringup bringup.launch.py depth_mode:=rescue # RGB 가 포기한 박스만 깊이가 건짐
 
     # ★ 기본값은 stage 2 (3구역, system.yaml stage:2 와 짝). 예전 1구역(B만) 으로
     #   돌리려면 zones · pick_cam_ns 를 같이 좁혀야 한다 — 하나만 바꾸면
@@ -101,13 +101,16 @@ def generate_launch_description():
         # ★ 왜 launch 인자로 빼는가: 통합 중에 깊이가 말썽이면 **코드를 안 고치고**
         #   되돌릴 길이 있어야 한다. 깊이는 확인 채널이라 없어도 라인은 돈다.
         #     depth:=false        깊이 구독 자체를 안 만든다 (완전히 예전 동작)
-        #     depth_mode:=prefer  깊이가 잰 평면으로 좌표를 낸다 (RGB 는 확인 쪽)
+        #     depth_mode:=rescue  RGB 가 **포기했을 때만** 깊이가 대신 낸다
+        #                         (재현성이 안 깨지는 유일한 순이득 — depth.py 주석 참조)
+        #     depth_mode:=prefer  깊이가 있으면 언제나 깊이가 정한다
+        #                         ⚠ 아직 승격 조건 3 개가 안 채워졌다 (depth.py 주석)
         #   나머지 임계값은 노드 파라미터 `depth.*` 로 그대로 열려 있다.
         #     예) --ros-args -p depth.z_tol_mm:=30.0
         DeclareLaunchArgument("depth", default_value="true",
                               description="깊이 교차검증 사용 여부"),
         DeclareLaunchArgument("depth_mode", default_value="crosscheck",
-                              description="crosscheck | prefer | off"),
+                              description="crosscheck | rescue | prefer | off"),
         DeclareLaunchArgument("orchestrator", default_value="true"),
         # ★★ 3 구역 씬(test_3)은 좌표계가 통째로 다르다 — 팔레트가 셀 컨베이어
         #   위(z 950)고 페데스탈이 1950 이며 최대 적재가 1000 이다. 그 값들이

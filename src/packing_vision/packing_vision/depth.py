@@ -26,7 +26,7 @@
       recognition:
         depth:
           enabled: true
-          mode: crosscheck        # off | crosscheck | prefer
+          mode: crosscheck        # off | crosscheck | rescue | prefer
           topic_suffix: depth
           is_range: false
           shrink_ratio: 0.30
@@ -55,7 +55,35 @@ DEFAULTS = {
     "enabled": True,
     # off        : 깊이를 안 쓴다 (enabled:false 와 같다. 런치에서 끄기 편하라고 둘 다 둔다)
     # crosscheck : RGB 가 정하고 깊이는 확인만 한다 ← 기본
-    # prefer     : 깊이가 정한 평면으로 자세를 낸다. RGB 는 확인 쪽으로 돈다
+    # rescue     : crosscheck 와 같되, **RGB 가 포기했을 때만** 깊이가 대신 낸다
+    # prefer     : 깊이가 있으면 언제나 깊이가 정한다. RGB 는 확인 쪽으로 돈다
+    #
+    # ★★ 왜 기본이 prefer 가 아닌가 (2026-08-26 결정. 뒤집으려면 아래 조건을 먼저 볼 것)
+    #   1. **아직 진짜 깊이로 재 본 적이 없다.** 지금까지의 검증은 정답에서 만든
+    #      합성 깊이라 두 경로가 당연히 일치한다. "깊이가 더 정확하다" 는 아직
+    #      기대이지 실측이 아니다. 이 저장소는 데스크 지표와 Isaac 실측이 **부호까지**
+    #      어긋난 적이 있다 (CLAUDE.md §10-1).
+    #   2. **계통 오차에 무방비다.** tf 가 조금 틀렸거나 `is_range` 가 반대면 모든
+    #      박스가 같은 방향으로 어긋난다. crosscheck 는 그걸 불일치로 **드러내지만**,
+    #      prefer 는 그 값을 그대로 **따라간다.**
+    #   3. ★ **재현성이 깨진다.** prefer 는 깊이 프레임이 도착한 박스만 깊이를 쓴다.
+    #      실측 도착률이 8 개 중 5~7 개라, 같은 시드로 돌려도 박스마다 어느 경로가
+    #      쓰였는지가 네트워크 타이밍에 좌우된다. 평가 항목 "재현성(Play/Stop)" 과
+    #      정면으로 부딪친다 (§13).
+    #
+    #   → prefer 로 승격할 조건 3 개:
+    #      (a) 씬이 깊이를 실제로 발행한다 (트랙 A)
+    #      (b) 진짜 Isaac 깊이로 crosscheck 를 돌려 불일치 기록이 충분히 쌓인다
+    #      (c) 깊이 도착률이 100 % 에 가깝다 (rgb 와 같은 render product 면 자연히 된다)
+    #      **그 기록을 만들어 주는 것이 지금의 crosscheck 다.** 지금 prefer 로 넘기면
+    #      대조군이 사라져 승격 근거 자체를 못 만든다.
+    #
+    #   ★ `rescue` 는 그 사이에 위험 없이 이득만 가져가는 자리다.
+    #     RGB 가 답을 내는 한 결과가 **항상 같으므로 재현성이 안 깨지고**, 평소에는
+    #     깊이가 좌표를 안 정하므로 계통 오차도 안 탄다. 대신 RGB 가 포기해서
+    #     **어차피 버려질 박스**만 깊이가 건진다 — 손해 볼 것이 없는 교환이다.
+    #     실측: 윗면 모서리가 8 % 부풀면 RGB 는 포기하는데(사양 3종 허용 오차 밖),
+    #     깊이는 같은 장면에서 중심을 5 mm 안으로 잡는다.
     "mode": "crosscheck",
     "topic_suffix": "depth",      # <ns>/depth. setup_camera_graph.py 가 내는 이름
     # ★ Isaac ROS2CameraHelper 의 type:"depth" 는 **광축 방향 거리**(distance_to_
@@ -272,10 +300,12 @@ def cross_check(rgb, dep, cfg):
         return {"agree": False, "verdict": "NO_DEPTH", "used": "RGB",
                 "dz_mm": 0.0, "dxy_mm": 0.0, "dyaw_deg": 0.0}
     if rgb is None:
-        # RGB 가 사양 3종과 안 맞다고 포기한 경우다. 깊이는 평면을 실측했으므로
-        # prefer 모드면 이쪽만으로도 자세가 나온다 — RGB 단독보다 강한 지점이다.
+        # ★ RGB 가 사양 3종과 안 맞다고 **포기한** 경우다. 지금까지는 여기서 끝이었다 —
+        #   좌표가 안 나가고 그 박스는 통째로 버려졌다. 에러도 안 났다.
+        #   깊이는 평면을 실측했으므로 이쪽만으로도 자세가 나온다.
+        #   `rescue`·`prefer` 가 그걸 채택한다. RGB 단독보다 강한 유일한 지점이다.
         return {"agree": False, "verdict": "TYPE_MISMATCH",
-                "used": "DEPTH" if cfg["mode"] == "prefer" else "NONE",
+                "used": "DEPTH" if cfg["mode"] in ("rescue", "prefer") else "NONE",
                 "dz_mm": 0.0, "dxy_mm": 0.0, "dyaw_deg": 0.0}
 
     rz = rgb["center_m"][2] + rgb["type"]["h_mm"] / 2000.0    # 중심 → 윗면
@@ -295,6 +325,8 @@ def cross_check(rgb, dep, cfg):
         verdict = "YAW_MISMATCH"
 
     agree = verdict == "OK"
+    # ★ 여기(= RGB 가 답을 낸 경우) rescue 는 crosscheck 와 **한 글자도 다르지 않다.**
+    #   그게 재현성이 안 깨지는 근거다 — 깊이가 왔든 안 왔든 좌표가 같다.
     if cfg["mode"] == "prefer":
         used = "DEPTH"
     elif agree or not cfg["reject_on_disagree"]:

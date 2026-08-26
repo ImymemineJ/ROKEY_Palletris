@@ -331,7 +331,9 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
   **직접 재서** RGB 추정과 대조한다. RGB 는 사양 3종 평면 중 가장 잘 맞는 것을 고르는
   **추측**이라, 종류를 틀리면 평면이 60~130 mm 어긋나 **중심 x·y 까지 같이 틀어진다.**
   결과는 `packing_msgs/msg/VisionCheck` 로 나가고, **깊이가 없으면 예전 동작 그대로** 돈다.
-  끄기: `ros2 launch ... depth:=false`. 자세한 것은 `docs/2026-08-26_깊이_교차검증.md`.
+  끄기: `ros2 launch ... depth:=false`. 모드는 `off|crosscheck|rescue|prefer` 4가지이고
+  **기본 `crosscheck` 를 임의로 `prefer` 로 올리지 말 것** (§15 · 재현성).
+  자세한 것은 `docs/2026-08-26_깊이_교차검증.md`.
 
 ---
 
@@ -630,6 +632,7 @@ random_seed: 42             # 고정 — 절대 바꾸지 말 것
 | ~~팔레트 90° 회전으로 적재율 개선~~ **기각** | 정정인 | 실측 −3.1%p 이고, 애초에 트럭 바닥 2800 에 1200×3=3600 이 안 들어간다. **현행이 이미 돌린 결과**다 (TS-029) |
 | 적재율 표기: 실제높이 기준 + **용량 기준 병기** | 팀 | §7.8 정본은 그대로 두고 `capacity_rate` 를 보조로 추가했다. 포화 시 66.9% vs 66.3% 로 사실상 같다 — 발표에 어느 곡선을 쓸지만 정하면 된다 (TS-017) |
 | ~~`/robot/cmd` 네임스페이스~~ **해소** | 김병직/김학민 | 2026-08-26. 관제탑은 `/zone_{a|b|c}/robot/cmd` 를 쓰는데 `ros_graph.py` 가 `/robot/cmd` 단수라 **서로 못 만났다** (에러도 안 난다). `ros_graph` 를 구역별로 맞췄다. ⚠ §3-2 표는 아직 단수형이다 — 문서를 고칠지 결정할 것 |
+| ★ **`depth_mode` 를 `rescue`/`prefer` 로 올릴지** | 팀 | 2026-08-26 결정 기록. 기본은 `crosscheck`(깊이는 채점만). **`prefer` 는 아직 켜지 말 것** — 이유 3개: ① 진짜 Isaac 깊이로 잰 적이 없다(지금 검증은 합성) ② tf·`is_range` 계통 오차를 crosscheck 는 드러내지만 prefer 는 **따라간다** ③ ★ **재현성이 깨진다** — 깊이 도착률이 8개 중 5~7개라 같은 시드에 박스마다 경로가 달라진다(§13 "재현성"). 승격 조건 3개와 근거는 `docs/2026-08-26_깊이_교차검증.md` §4-1. **`rescue`(RGB 가 포기한 박스만 깊이가 건짐)는 재현성을 안 깨는 순이득이라 씬에 깊이가 들어오면 바로 켜도 된다** |
 | ★ **`packing_msgs` 에 `VisionCheck.msg` 추가** | 민범진 → 팀 | 2026-08-26. 깊이 교차검증 진단 채널(`/zone_*/vision_check`·`/line/vision_check`). **기존 타입은 한 글자도 안 바꿨고 덧붙이기만 했다.** 그래도 공용이라 **팀 전원 재빌드**가 필요하다 (§14). 로봇 동작 경로가 아니라 아무도 구독 안 해도 된다 |
 | `recognition.depth` 를 `system.yaml` 에 넣을지 | 팀 | 깊이 교차검증의 임계값. 지금은 `packing_vision/depth.py` 의 `DEFAULTS` 가 갖고 있고 **yaml 에 키가 있으면 그쪽이 이긴다.** 승인되면 블록을 붙이기만 하면 되고 코드는 안 바뀐다 (`depth.py` 머리 주석에 그대로 적어 뒀다). §11 "공용 파일 승인 없이 수정 금지" 때문에 안 넣었다 |
 | ★ **씬에 깊이 카메라 헬퍼가 없다** | 김학민 | cam1·cam2·pick_cam 에 `ROS2CameraHelper type:"depth"` 를 rgb·camera_info 와 **같은 render product** 로 붙여야 한다. 선례가 이미 있다 — `scripts/setup_camera_graph.py` 의 `cameraHelperDepth`. 같은 render product 면 stamp 가 정확히 같아 짝 맞추기가 100 % 가 된다. ⚠ 시선거리(range)로 내는 헬퍼면 `depth.is_range: true` 로 바꿀 것 |
