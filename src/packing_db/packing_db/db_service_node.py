@@ -54,6 +54,7 @@ from rclpy.node import Node
 from packing_common.config import load
 from packing_common.paths import default_db_path, find_data
 from packing_db.gen_master_db import dong_of
+from packing_db.master_data import run_table_counts
 from packing_db.metrics import collect, fmt_rate
 from packing_msgs.msg import BoxInfo, MetricsSummary, ZoneStatus
 from packing_msgs.srv import (DiverterDecide, DiverterRequest, GetBoxInfo,
@@ -140,6 +141,32 @@ class DbService(Node):
         self.get_logger().info(
             f"db_service_node 준비 — {self.db_path} · master {n} 행 · "
             f"max_retry {self._max_retry}")
+        self._warn_leftover_run()
+
+    def _warn_leftover_run(self):
+        """이전 실행 기록이 남아 있으면 알린다. **지우지는 않는다.**
+
+        ★ 왜 경고만 하나
+          파일을 소유한 프로세스가 남의 기록을 말없이 지우면 안 된다. 지우는 것은
+          사람이 `gen_master_db --reset` 으로 시킬 일이다.
+
+        ★ 왜 알려야 하나 (2026-08-26 실측)
+          metrics 의 elapsed_s 는 `MAX(ts) - MIN(ts)` 다. 어제 실행의 box_events 가
+          남아 있으면 elapsed 가 며칠이 되고, robot_idle_rate 가 100 % 로 굳는다.
+          실제로 그 상태였다 — box_events 시간 범위 17.8 억 초, 로봇 작업 0.1 초.
+          지표가 조용히 쓰레기가 되는데 에러는 안 뜬다.
+        """
+        try:
+            n = run_table_counts(self.db)
+        except sqlite3.Error:
+            return
+        if not any(n.values()):
+            return
+        left = " · ".join(f"{k} {v} 행" for k, v in n.items() if v)
+        self.get_logger().warn(
+            f"이전 실행 기록이 남아 있다 — {left}. 지표가 섞인다 "
+            f"(elapsed_s 가 MAX(ts)-MIN(ts) 라 어제 실행까지 포함된다). "
+            f"새로 재려면: ros2 run packing_db gen_master_db --reset")
 
     # ══════════════════════════════════════════════════════════════
     # 공통
@@ -316,7 +343,16 @@ class DbService(Node):
                 "  zone=excluded.zone, size_w_mm=excluded.size_w_mm,"
                 "  size_d_mm=excluded.size_d_mm, size_h_mm=excluded.size_h_mm,"
                 "  mass_g=excluded.mass_g, color=excluded.color, dest=excluded.dest,"
-                "  qr_payload=excluded.qr_payload",
+                "  qr_payload=excluded.qr_payload,"
+                # ★ 이전 바퀴의 흔적을 반드시 지운다 (2026-08-26).
+                #   재등록은 "같은 박스가 라인을 다시 돈다" 는 뜻이다. 예전에는 status 만
+                #   SCANNED 로 돌아가고 적재 좌표와 시각은 그대로 남았다 —
+                #   실측: 재등록 뒤에도 place=(111,222,333) 이 살아 있었다.
+                #   그러면 plan_route.py · pallet_access.py 가 **존재하지 않는 더미**를
+                #   계산하고, cycle_avg_s 는 옛 placed_at-picked_at 을 계속 평균에 넣는다.
+                "  status='SCANNED',"
+                "  place_x_mm=NULL, place_y_mm=NULL, place_z_mm=NULL, place_yaw_deg=NULL,"
+                "  scanned_at=NULL, picked_at=NULL, placed_at=NULL",
                 (box_id, zone, size[0], size[1], size[2], mass,
                  req.color, dest, req.qr_payload))
             self.db.commit()
