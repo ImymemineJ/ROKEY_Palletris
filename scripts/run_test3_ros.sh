@@ -108,4 +108,11 @@ echo "[run_test3_ros] 씬     $PL_STAGE"
 echo "[run_test3_ros] 오버레이 $PL_CONFIG_OVERLAY"
 echo "[run_test3_ros] 구역   $PL_ZONES · DOMAIN $ROS_DOMAIN_ID"
 cd "$WS"
-exec "$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@"
+# ★ 로그 자동 저장 (2026-08-26 밤, 김병직 요청) — 터미널 스크롤이 잘려서 전체
+#   로그를 못 보는 문제. 저장소 **밖**(~/palletris_logs)에 두므로 git 에 안 걸린다.
+#   bringup 쪽은 ROS 가 이미 ~/.ros/log/ 에 자동 저장한다 — 여기만 채우면 된다.
+LOG_DIR="$HOME/palletris_logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/isaac_$(date +%Y%m%d_%H%M%S).log"
+echo "[run_test3_ros] 로그   $LOG"
+"$ISAAC_DIR/python.sh" src/packing_sim/isaac/sim_main.py "${ARGS[@]}" "$@" 2>&1 | tee "$LOG"
