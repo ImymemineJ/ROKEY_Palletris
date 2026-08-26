@@ -580,26 +580,6 @@ else:
              float(g["y_mm"][0]), float(g["y_mm"][1]),
              float(g["z_mm"][0]), float(g["z_mm"][1]))
 
-    # ★ 커브 북쪽 가장자리 — 여기가 뚫려 있었다 (실측 2026-08-26).
-    #   루프 박스는 `_02`(X -2967~-2064)로 올라와 본선 merge_gap 으로 들어가야 하는데,
-    #   커브(`_01`, X -4009~-2064)의 북쪽 변에서 `_02` 가 덮지 않는 구간
-    #   (X -4009~-2967)이 **아무것도 없는 허공**이다. 커브에서 바깥으로 밀린 박스가
-    #   거기로 빠져 바닥에 떨어진다.
-    #   실측: 박스 6 개를 줄지어 흘리면 5 개는 통과하고 1 개가 (-3457, -731, 105) 에
-    #   떨어져 그대로 남았다. 33 박스 실행에서는 3 개가 같은 식으로 바닥에 있었고,
-    #   뒤차가 그 위에 밀려 루프가 통째로 막혔다 (본선 0 개인데 루프에서 안 나옴).
-    ce = LOOP.get("curve_exit_rail") or {}
-    if ce:
-        v1r = bb("/World/ConveyorTrack_01/Rollers")
-        v2r = bb("/World/ConveyorTrack_02/Rollers")
-        th = float(ce.get("thickness_mm", 20))
-        # 벽은 커브 북쪽 변(= `_01` 의 Y 최대)에 붙이고, `_02` 입구는 비운다.
-        y_in = v1r[4]
-        rail(str(ce["name"]), v1r[0], v2r[0], y_in, y_in + th,
-             float(ce["z_mm"][0]), float(ce["z_mm"][1]))
-        say("   커브 북쪽 벽 X %.1f~%.1f (=_02 입구 %.1f 까지) · Y %.1f~%.1f"
-            % (v1r[0], v2r[0], v2r[0], y_in, y_in + th))
-
     m = LOOP.get("main_rail") or {}
     if m:
         th = float(m.get("thickness_mm", 20))
