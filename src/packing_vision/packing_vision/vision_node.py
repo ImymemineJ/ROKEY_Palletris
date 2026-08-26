@@ -406,6 +406,16 @@ class LineDetector(Node):
         if det["clipped"]:
             self.get_logger().warn(f"{cam.ns}: 박스가 화면 밖으로 잘렸다 — 건너뛴다")
             return None, None, None
+        # ★ 중앙 게이트 (2026-08-27 김병직 실측). 박스가 카메라 축에서 벗어날수록
+        #   **옆면이 실루엣에 껴서** 측정이 부푼다 — 이동 중 실측이 343.8 -> 368.6
+        #   -> 397.7 로 자라는 스트림이 그 증거이고, 가장자리에서 3호(340)가
+        #   400을 넘는 순간 **4호(410)로 오등록**됐다 (BOX018: 실물 3호 -> DB 4호
+        #   -> 로봇이 70mm 위에서 흡착 3연속 실패 -> 폐기). 프레임 중앙 1/3 에
+        #   있을 때만 판정한다 — 벨트 위라 중앙 프레임은 반드시 온다.
+        _c = np.mean(np.asarray(det["corners_px"], float), axis=0)
+        _H, _W = bgr.shape[0], bgr.shape[1]
+        if abs(_c[0] - _W / 2.0) > _W / 3.0 or abs(_c[1] - _H / 2.0) > _H / 3.0:
+            return None, None, None         # 중앙 아님 — 다음 프레임에서 판정
         try:
             R, t = camera_pose(self.tf_buf, self.world_frame,
                                cam.frame_id or cam.ns.strip("/"))
