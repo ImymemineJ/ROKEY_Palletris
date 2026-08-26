@@ -1240,6 +1240,12 @@ def router_thread(specs, ids):
                    if r[0] <= q[0] <= r[1] and pk_y[0] <= q[1] <= pk_y[1])
 
     state = {}                      # box_id -> "divert" | "done"
+    laps = {}                       # box_id -> 리턴 라인을 돈 횟수
+    in_loop = {}                    # box_id -> 지금 루프 안에 있나
+    # PL_MAX_LAPS 로 덮어쓸 수 있다 — 소멸 경로를 짧은 실행에서 확인할 때 쓴다
+    MAX_LAPS = int(os.environ.get("PL_MAX_LAPS")
+                   or ROUTE.get("max_laps", 0) or 0)
+    LOOP_Y = float(ROUTE.get("loop_y_mm", -1500)) / 1000.0
     t_div = {}                      # box_id -> 꺾기 시작한 시각
     t_log = {}                      # box_id -> 마지막 진행 로그 시각
     # ★ 꺾은 채로 두면 그 조각 위의 뒤차가 전부 옆으로 밀린다. 실측 2026-08-24:
@@ -1260,6 +1266,23 @@ def router_thread(specs, ids):
                 if r.get("ok"):
                     allpos[bid] = r["pos_m"]
             poses = {b: q for b, q in allpos.items() if state.get(b) != "done"}
+            # ── 리턴 라인 재순환 카운트 → MAX_LAPS 바퀴면 치운다 ──────────
+            # ★ 존이 영영 안 비면 박스가 **영원히 돈다.** 장시간 실행에서 prim 이
+            #   쌓여 프레임이 떨어진다 (실측 2026-08-25: 12 개 중 8 개가 동시에
+            #   루프를 돌았다). 한 바퀴 = 루프로 내려갔다가 본선 띠로 돌아오는 것.
+            for _b, _q in poses.items():
+                if _q[1] < LOOP_Y:
+                    in_loop[_b] = True
+                elif in_loop.get(_b) and y_lo <= _q[1] <= y_hi:
+                    in_loop[_b] = False
+                    laps[_b] = laps.get(_b, 0) + 1
+                    log("   [라우팅] %s 리턴 %d 바퀴째" % (_b, laps[_b]))
+                    if MAX_LAPS > 0 and laps[_b] >= MAX_LAPS:
+                        rr = link.call(cmd="despawn_box", box_id=_b)
+                        state[_b] = "done"
+                        log("   [라우팅] %s %d 바퀴 -> 소멸 (%s)"
+                            % (_b, laps[_b],
+                               "ok" if rr.get("ok") else repr(rr)))
             for bid, p in list(poses.items()):
                 z = kind_of.get(key_of(specs[bid]))
                 if z is None or z not in jx or z not in mseg:

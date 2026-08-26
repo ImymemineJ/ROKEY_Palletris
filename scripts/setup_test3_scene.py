@@ -20,7 +20,8 @@ GUI 로 씬을 만지고 나면 이걸 돌린다. 전부 **재고 고치기(meas
   [9] 순환 루프 (방향 · 높이 · 프레임 · 레일)
   [10] 팔레트 가이드 벽 (overhang 7.8 고려 · 편도 여유 5)
   [11] ROS 2 브리지 — /clock · /tf
-  [12] 전부 검증한다
+  [12] 적재 스테이션 가이드 벽 (로봇 쪽은 비움)
+  [13] 전부 검증한다
 
 ═══ 왜 이렇게 하는가 — 실측으로 얻은 것들 ═══════════════════════════════════
 
@@ -672,59 +673,153 @@ else:
 #   그냥 적어 둘 수 없다. 별건으로 남긴다.
 say("\n[11] ROS 2 브리지 — /clock · /tf")
 ROS = (cfg.get("ros") or {})
+G = str(ROS.get("graph_path", "/World/ROS2Bridge"))
+tfc = ROS.get("tf") or {}
 if not ROS:
     say("   설정에 ros 가 없다 — 건너뛴다")
 else:
     import omni.graph.core as og
 
-    G = str(ROS.get("graph_path", "/World/ROS2Bridge"))
-    tfc = ROS.get("tf") or {}
     K, C = og.Controller.Keys, og.Controller
     NS = "isaacsim.ros2.bridge."
-    C.edit(
-        {"graph_path": G, "evaluator_name": "execution"},
-        {K.CREATE_NODES: [("Tick", "omni.graph.action.OnPlaybackTick"),
-                          ("Ctx", NS + "ROS2Context"),
-                          ("Clock", NS + "ROS2PublishClock"),
-                          ("Tf", NS + "ROS2PublishTransformTree")],
-         K.CONNECT: [("Tick.outputs:tick", "Clock.inputs:execIn"),
-                     ("Tick.outputs:tick", "Tf.inputs:execIn"),
-                     ("Ctx.outputs:context", "Clock.inputs:context"),
-                     ("Ctx.outputs:context", "Tf.inputs:context")],
-         # ★ ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
-         K.SET_VALUES: [("Ctx.inputs:useDomainIDEnvVar", True),
-                        ("Clock.inputs:topicName",
-                         str(ROS.get("clock_topic", "/clock"))),
-                        ("Tf.inputs:topicName", str(tfc.get("topic", "/tf")))]})
+    try:
+        C.edit(
+            {"graph_path": G, "evaluator_name": "execution"},
+            {K.CREATE_NODES: [("Tick", "omni.graph.action.OnPlaybackTick"),
+                              ("Ctx", NS + "ROS2Context"),
+                              ("Clock", NS + "ROS2PublishClock"),
+                              ("Tf", NS + "ROS2PublishTransformTree")],
+             K.CONNECT: [("Tick.outputs:tick", "Clock.inputs:execIn"),
+                         ("Tick.outputs:tick", "Tf.inputs:execIn"),
+                         ("Ctx.outputs:context", "Clock.inputs:context"),
+                         ("Ctx.outputs:context", "Tf.inputs:context")],
+             # ★ ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
+             K.SET_VALUES: [("Ctx.inputs:useDomainIDEnvVar", True),
+                            ("Clock.inputs:topicName",
+                             str(ROS.get("clock_topic", "/clock"))),
+                            ("Tf.inputs:topicName",
+                             str(tfc.get("topic", "/tf")))]})
+    except Exception as e:
+        say("   !! 그래프 생성 실패: %r" % (e,))
 
-    # 부모 · 대상 prim 은 **관계**라 SET_VALUES 로 못 넣는다
+    # ★ 확장이 안 켜져 있으면 노드가 안 만들어진다 (헤드리스에서 브리지 .so 경로가
+    #   없을 때). 그대로 만지면 `Accessed invalid null prim` 으로 **죽는다** —
+    #   실측 2026-08-26. 그러면 뒤 단계까지 통째로 못 돈다.
     tf_node = st.GetPrimAtPath(G + "/Tf")
-    par = str(tfc.get("parent_prim", "/World"))
-    if st.GetPrimAtPath(par).IsValid():
-        tf_node.GetRelationship("inputs:parentPrim").SetTargets([Sdf.Path(par)])
+    if not tf_node.IsValid() or not st.GetPrimAtPath(G + "/Clock").IsValid():
+        chk("ROS2 브리지 노드 생성", False,
+            "확장 미기동 — LD_LIBRARY_PATH 에 "
+            "$ISAAC_DIR/exts/isaacsim.ros2.bridge/$ROS_DISTRO/lib 를 넣고 다시 돌려라")
     else:
-        chk("tf parentPrim %s" % par, False)
+        par = str(tfc.get("parent_prim", "/World"))
+        if st.GetPrimAtPath(par).IsValid():
+            tf_node.GetRelationship("inputs:parentPrim").SetTargets(
+                [Sdf.Path(par)])
+        else:
+            chk("tf parentPrim %s" % par, False)
 
-    tgts, miss = [], []
-    for tp in (tfc.get("target_prims") or []):
-        (tgts if st.GetPrimAtPath(str(tp)).IsValid() else miss).append(str(tp))
-    tf_node.GetRelationship("inputs:targetPrims").SetTargets(
-        [Sdf.Path(t) for t in tgts])
+        tgts, miss = [], []
+        for tp in (tfc.get("target_prims") or []):
+            (tgts if st.GetPrimAtPath(str(tp)).IsValid()
+             else miss).append(str(tp))
+        tf_node.GetRelationship("inputs:targetPrims").SetTargets(
+            [Sdf.Path(t) for t in tgts])
 
-    say("   그래프 %s" % G)
-    say("   /clock  %s" % st.GetPrimAtPath(G + "/Clock")
-        .GetAttribute("inputs:topicName").Get())
-    say("   /tf     %s  · 부모 프레임 %s"
-        % (tf_node.GetAttribute("inputs:topicName").Get(), par.rsplit("/", 1)[-1]))
-    for t in tgts:
-        say("       -> 프레임 %s" % t.rsplit("/", 1)[-1])
-    for t in miss:
-        chk("tf 대상 %s" % t, False, "씬에 없다")
+        say("   그래프 %s" % G)
+        say("   /clock  %s" % st.GetPrimAtPath(G + "/Clock")
+            .GetAttribute("inputs:topicName").Get())
+        say("   /tf     %s  · 부모 프레임 %s"
+            % (tf_node.GetAttribute("inputs:topicName").Get(),
+               par.rsplit("/", 1)[-1]))
+        for t in tgts:
+            say("       -> 프레임 %s" % t.rsplit("/", 1)[-1])
+        for t in miss:
+            chk("tf 대상 %s" % t, False, "씬에 없다")
+
+# ══ [12] 적재 스테이션 가이드 벽 ═══════════════════════════════════════════
+# 팔레트 옆에 세워 **적재 중 박스 낙하를 막는다.**
+# 반출용 합류 라인 가이드([10])와 다른 물건이다 — 그건 팔레트를 트럭까지
+# 곧게 보내는 것이고, 이건 로봇이 쌓는 동안 박스를 잡아 주는 것이다.
+#
+# ★★ 좌표를 여기 박지 않는다. `pallet_origin_world_mm` + `pallet.width/depth` 에서
+#    유도한다. 두 설정의 **팔레트 방향이 서로 다르기 때문**이다:
+#        system.yaml  1200(X) x 800(Y)   · 원점 z 150 (바닥)
+#        test_3.yaml   800(X) x 1200(Y)  · 원점 z 950 (셀 컨베이어 위)
+#    숫자를 박으면 한쪽이 반드시 틀린다.
+#
+# ★ 벽은 **진행 방향과 나란한 두 면**에만 선다. 팔레트가 셀을 타고 +Y 로
+#   빠져나가야 하므로 앞뒤를 막으면 반출이 안 된다.
+#
+# ★ 로봇 쪽은 **비운다** (팀 결정 2026-08-26). 흡착 툴 반경 122.5 에 가장 좁은
+#   박스 변 250 이면 가장자리 배치에서 여유가 7.5 mm 뿐이다:
+#       박스 중심 400 - 125 = 275  ->  툴 바깥 275 + 122.5 = 397.5  vs  벽 405
+#   어느 쪽이 로봇 쪽인지는 `robot_base_world_mm` 과 팔레트 중심을 비교해 정한다.
+#
+# ★ 유효 적재 면적은 **안 줄어든다** — 벽이 팔레트 바깥에 서므로 배치 가능
+#   면적은 팔레트 그대로다. clearance 는 면적이 아니라 **허용 오버행**이다.
+say("\n[12] 적재 스테이션 가이드 벽")
+GW = ((cfg.get("pallet") or {}).get("guide_wall") or {})
+if not GW.get("enabled"):
+    say("   꺼져 있다 (pallet.guide_wall.enabled)")
+else:
+    pal = cfg["pallet"]
+    pw, pd = float(pal["width_mm"]), float(pal["depth_mm"])
+    clr = float(GW.get("clearance_mm", 5))
+    th = float(GW.get("thickness_mm", 20))
+    z0 = float(GW.get("z_from_mm", cfg["conveyor"]["belt_top_z_mm"]))
+    fmt = str(GW.get("name_fmt", "/World/PalletWall_%s_%s"))
+    origins = cfg["zones"]["pallet_origin_world_mm"]
+    robots = cfg["zones"]["robot_base_world_mm"]
+    say("   팔레트 %.0f(X) x %.0f(Y) · 여유 %.0f -> 벽 안쪽 간격 **%.0f x %.0f**"
+        % (pw, pd, clr, pw + 2 * clr, pd + 2 * clr))
+    say("   유효 적재 면적은 팔레트 그대로 %.0f x %.0f (%.0f mm2)" % (pw, pd, pw * pd))
+
+    for z in sorted(origins):
+        ox, oy, oz = [float(v) for v in origins[z]]
+        cx, cy = ox + pw / 2.0, oy + pd / 2.0
+        z1 = oz + float(pal["max_stack_mm"]) if str(GW.get("z_to")) == "stack" \
+            else float(GW.get("z_to_mm", oz))
+        rx = float(robots[z][0])
+        # 로봇이 팔레트의 어느 쪽(X)에 있나. 그쪽 벽을 비운다.
+        robot_side = "hi" if rx > cx else "lo"
+        made = []
+        for suf, sign in (("lo", -1.0), ("hi", +1.0)):
+            name = fmt % (z, suf)
+            if GW.get("skip_robot_side", True) and suf == robot_side:
+                old = st.GetPrimAtPath(name)
+                if old.IsValid():
+                    old.SetActive(False)      # 전에 세웠다면 끈다
+                continue
+            inner = cx + sign * (pw / 2.0 + clr)
+            x0, x1 = sorted((inner, inner + sign * th))
+            cu = UsdGeom.Cube.Define(st, name)
+            cu.GetSizeAttr().Set(1.0)
+            pr = cu.GetPrim()
+            pr.SetActive(True)
+            # ★ 순서는 반드시 [translate, scale] — 반대면 translate 가 scale 만큼
+            #   곱해져 나간다 (실측 2026-08-25, [10] 에서 겪었다).
+            xf = UsdGeom.Xformable(pr)
+            xf.ClearXformOpOrder()
+            for a in ("xformOp:translate", "xformOp:scale"):
+                if pr.HasAttribute(a):
+                    pr.RemoveProperty(a)
+            xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Vec3d((x0 + x1) / 2000.0, cy / 1000.0, (z0 + z1) / 2000.0))
+            xf.AddScaleOp().Set(Gf.Vec3f((x1 - x0) / 1000.0, pd / 1000.0,
+                                         (z1 - z0) / 1000.0))
+            if not pr.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI.Apply(pr)
+            v = bb(name)
+            made.append("%s X %.1f~%.1f" % (suf, v[0], v[3]))
+        say("   %s  팔레트 중심 X %.1f · 로봇 X %.1f -> **%s 쪽 비움**"
+            % (z, cx, rx, robot_side))
+        say("       %s  ·  Y %.1f~%.1f  Z %.1f~%.1f"
+            % (" / ".join(made) or "(없음)", cy - pd / 2, cy + pd / 2, z0, z1))
 
 st.GetRootLayer().Save()
 say("\n저장했다: %s" % CUR)
 
-# ══ [12] 검증 ════════════════════════════════════════════════════════════════
+# ══ [13] 검증 ════════════════════════════════════════════════════════════════
 say("\n" + "=" * 74)
 say("=== 검증 ===")
 for z, p in sorted(JUNC.items()):
