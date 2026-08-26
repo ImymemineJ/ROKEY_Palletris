@@ -111,5 +111,15 @@ def box_pose_from_corners(corners_px, K, R, t, belt_top_m, types, tol_m=0.055):
         return None
     if best["fit_err_m"] > tol_m * 2:
         # 사양 3종 어느 것과도 안 맞는다. 억지로 고르면 엉뚱한 높이로 집으러 간다.
+        # ★ 기각 사유를 남긴다 (2026-08-27). 호출부의 "사양 3종 안 맞는다" 경고가
+        #   측정값 없이는 원인을 못 가른다 — 병합(700mm대)인지 부풀기(+40)인지
+        #   완전 오측인지. 모듈 전역이라 ROS 의존성 0 이 유지된다.
+        global LAST_REJECT
+        LAST_REJECT = ("%.0fx%.0f mm (최근접 %s 오차 %.0f)"
+                       % (best["measured_m"][0] * 1000, best["measured_m"][1] * 1000,
+                          best["type"]["name"], best["fit_err_m"] * 1000))
         return None
     return best
+
+
+LAST_REJECT = None   # 마지막 기각의 측정값 문자열 — 진단 전용 (box_pose_from_corners)

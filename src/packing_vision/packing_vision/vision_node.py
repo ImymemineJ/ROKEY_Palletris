@@ -53,6 +53,7 @@ from packing_msgs.srv import GetBoxInfo, RegisterBox, ReportMiss, VerifyBox
 from packing_vision import depth as depthlib
 from packing_vision.detect import dominant_color_name, find_box, read_qr
 from packing_vision.label import parse_payload
+from packing_vision import geometry as _geo
 from packing_vision.geometry import box_pose_from_corners, quat_to_R
 
 
@@ -716,7 +717,9 @@ class ZoneDetector(Node):
         out = box_pose_from_corners(det["corners_px"], self.cam.K, R, t_vec,
                                     self.belt_top_m, self.types)
         if out is None and not self.xcheck.on:
-            self.get_logger().warn("사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다")
+            self.get_logger().warn(
+                "사양 3종 어느 것과도 안 맞는다 — 좌표를 내지 않는다 [실측 %s]"
+                % (_geo.LAST_REJECT or "?"))
             self._publish_absent()
             return
 
