@@ -92,9 +92,40 @@ class DbService(Node):
         self._max_retry = int(self.cfg["recognition"]["max_retry"])
 
         # ── DB ──
-        self.db = sqlite3.connect(self.db_path, check_same_thread=False)
+        # ★★ 커넥션 접근 **전부** 직렬화 (2026-08-27, 김병직 — 세그폴트 실측).
+        #   원래는 "쓰기만 Lock" 이었는데 읽기(SELECT)가 락 밖에서 같은 커넥션을
+        #   동시에 썼다. 평소엔 경합이 드물어 버텼지만, cam1 SIZE_MISMATCH 홍수
+        #   (report_miss 1200건+/10분)가 읽기·쓰기 동시 접근을 상시화하자
+        #   프로세스가 exit -11 (네이티브 세그폴트) 로 죽었다 — DB 가 죽으면
+        #   관제탑 3존이 전부 "서비스 없음" 으로 서고 라인이 통째로 멈춘다.
+        #   커넥션을 RLock 프록시로 감싸 execute/commit 이 항상 락 안에서 돈다.
+        #   기존 `with self._w:` 블록은 RLock 이라 그대로 둬도 재진입만 된다.
+        _conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        _lk = threading.RLock()
+
+        class _LockedConn:
+            """sqlite3 Connection 의 스레드 직렬화 프록시 (위 주석 참조)."""
+            def __init__(self, conn, lock):
+                self._c, self._lk = conn, lock
+
+            def execute(self, *a, **k):
+                with self._lk:
+                    return self._c.execute(*a, **k)
+
+            def executescript(self, *a, **k):
+                with self._lk:
+                    return self._c.executescript(*a, **k)
+
+            def commit(self):
+                with self._lk:
+                    return self._c.commit()
+
+            def __getattr__(self, n):       # close 등 나머지는 그대로 위임
+                return getattr(self._c, n)
+
+        self.db = _LockedConn(_conn, _lk)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self._w = threading.Lock()          # 쓰기 직렬화
+        self._w = _lk                       # 쓰기 직렬화 (커넥션 락과 같은 것)
         self._ensure_schema()
 
         n = self.db.execute("SELECT COUNT(*) FROM boxes_master").fetchone()[0]
