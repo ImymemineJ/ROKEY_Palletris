@@ -356,10 +356,32 @@ class ZoneCycle:
             # ★ 여기서 끝내면 안 된다. 다음 박스는 들어갈 수 있다.
             if res.message == "NO_FEASIBLE_POSE" or not res.ok:
                 _b = self.box
-                self.log.info("NO_FEASIBLE_POSE: %s → 폐기"
-                              % (_b["box_id"] if _b else "?"))
+                # ★ 연속 폐기 가드 (2026-08-27 실측). A존이 62%/1260mm 에서
+                #   **가장 작은 3호까지 19연속 NO_FEASIBLE** 인데 PALLET_FULL 은
+                #   안 나왔다 — algo 의 만재 판정은 높이만 보고, 지지율·통로가
+                #   다 막은 상태는 못 본다. 그 사이 오는 박스를 전부 버리며
+                #   존이 사실상 죽는다. 서로 다른 박스가 이만큼 연속으로
+                #   거부되면 만재로 간주하고 판갈이 경로를 탄다.
+                self._nfp_streak = getattr(self, "_nfp_streak", 0) + 1
+                if self._nfp_streak >= int(os.environ.get("PL_NFP_FULL", "6")):
+                    self.log.warn("NO_FEASIBLE %d연속 — 사실상 만재. 판갈이"
+                                  % self._nfp_streak)
+                    self._nfp_streak = 0
+                    self.pallets_done += 1
+                    if self.pallets_done >= self.max_pallets:
+                        self.log.info("PALLET_FULL(연속폐기) — %d 판째, 시나리오 종료"
+                                      % self.pallets_done)
+                        self.finish()      # 정상 만재 경로와 동일 (박스는 안 버린다)
+                    else:
+                        self.log.info("PALLET_FULL(연속폐기) — %d 판째. 팔레트를 간다"
+                                      % self.pallets_done)
+                        self.swap_pallet()
+                    return
+                self.log.info("NO_FEASIBLE_POSE: %s → 폐기 (연속 %d)"
+                              % (_b["box_id"] if _b else "?", self._nfp_streak))
                 self.discard_box("NO_FEASIBLE_POSE")
                 return
+            self._nfp_streak = 0           # 배치가 계획되면 연속 카운트 리셋
 
             self.plan = res.pose
             self.log.info(
@@ -680,10 +702,15 @@ class ZoneCycle:
             res = fut.result()
             if not getattr(res, "ok", False):
                 self.log.error("swap_pallet 실패 — 그래도 heightmap 은 비운다")
-            self.call_async("/algo/reset_heightmap", {"zone": self.zone}, on_reset)
+            # ★ zone 은 **대문자**(zone_id)로 보낸다 (2026-08-27 실측 사고).
+            #   algo 의 packer 표와 스포너의 존 목록이 대문자 키다. 소문자 'b' 를
+            #   보냈더니 reset 이 아무것도 안 비우고 ok=False 만 돌아왔고, 하이트맵이
+            #   가득 찬 채 재계획 -> 즉시 또 PALLET_FULL -> **0.6초에 3판을 태우고
+            #   시나리오가 끝났다** (plan 은 원래 zone_id 를 보내고 있어서 멀쩡했다).
+            self.call_async("/algo/reset_heightmap", {"zone": self.zone_id}, on_reset)
 
         def on_spawn_off(fut):
-            self.call_async("/sim/swap_pallet", {"zone": self.zone}, on_swap)
+            self.call_async("/sim/swap_pallet", {"zone": self.zone_id}, on_swap)
 
         self.call_async("/sim/set_spawn_enabled", {"enabled": False}, on_spawn_off)
 

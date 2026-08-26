@@ -410,7 +410,9 @@ class Spawner:
         ★ 부르는 쪽이 반드시 같이 해야 하는 것: `/algo/reset` 으로 하이트맵을 비운다.
           안 비우면 패커가 **없어진 박스 위에** 다음 자리를 잡는다.
         """
-        zone = (req or {}).get("zone", self.zone)
+        # ★ 대소문자 정규화 (2026-08-27). 관제탑 토픽 규약은 소문자('zone_b')라
+        #   소문자 'b' 가 올 수 있다 — 실측: 거부돼 판갈이가 통째로 실패했다.
+        zone = str((req or {}).get("zone", self.zone)).upper()
         if zone not in self.zones:
             return {"ok": False, "error": "이 스포너는 존 %s 다 (요청 %s)"
                     % (",".join(self.zones), zone), "removed": 0}

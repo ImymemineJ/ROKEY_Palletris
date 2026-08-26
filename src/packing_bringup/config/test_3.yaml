@@ -72,7 +72,9 @@ conveyor:
   #   ⚠ 관찰 항목: 커브 출구에서 박스가 원심으로 날아가면 _01/_04 만 되돌릴 것.
   belt_velocity_raw:
     /World/ConveyorTrack_01/ConveyorBeltGraph: 0.6    # A02 커브 (본선 -> 리턴 진입)
-    /World/ConveyorTrack_05/ConveyorBeltGraph: 0.2    # X -21737~-3853 (+X) — raw 0.2 실측 1.4 m/s
+    /World/ConveyorTrack_05/ConveyorBeltGraph: 0.15   # X -21737~-3853 (+X) — raw 0.2 실측 1.4 m/s
+    # ★ 0.2 -> 0.15 (2026-08-27 김병직 — "진짜 조금만 더"). 0.2 에서도 커브
+    #   진입 속도가 높아 뒤집힘이 남았다.
     # ★ 0.3 -> 0.6 -> 0.3 -> **0.2 정본 원복** (2026-08-27 김병직, 영상 '리턴쪽
     #   긴레일 속도 너무빠름'). 0.3 도 빨라서 박스가 회전구간 진입에서 뒤집어졌다.
     #   이 조각은 raw 배율이 커서 (0.2 = 실측 1.4 m/s) 숫자를 아끼는 게 맞다.
