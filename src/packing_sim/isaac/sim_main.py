@@ -352,11 +352,22 @@ def main():
         if _rn > 1:
             print("[sim_main] 렌더 %d 프레임당 1 회 — 체감 약 %d 배속" % (_rn, _rn))
         _fr = 0
+        # ★ PL_PROF=1 — 프레임 시간이 어디로 가는지 300 프레임마다 찍는다
+        #   (2026-08-27). 렌더 스킵 3 에서도 0.8 배속이라 병목이 렌더가 아닌
+        #   것으로 보인다 — §10-2 "어디서 쓰는지 먼저 재라".
+        _prof = os.environ.get("PL_PROF", "0") == "1"
+        _pt = {"rm": 0.0, "sp": 0.0, "etc": 0.0, "ros": 0.0,
+               "step_r": 0.0, "step_p": 0.0, "n_r": 0, "n_p": 0}
         while kit.is_running():
+            _t0 = time.perf_counter() if _prof else 0.0
             q.pump()                       # 소켓 스레드가 맡긴 USD 작업
             for _rm in rms.values():
                 _rm.step()                 # ★ world.step() 앞. 로봇 전부
+            if _prof:
+                _t1 = time.perf_counter(); _pt["rm"] += _t1 - _t0
             sp.step()
+            if _prof:
+                _t2 = time.perf_counter(); _pt["sp"] += _t2 - _t1
             # ★★ 벽시계가 아니라 **시뮬 시간**을 준다 (2026-08-27). 벽시계로 주면
             #   배속(PL_RENDER_EVERY)에 따라 라우터 폴링 대비 분기 창이 좁아져
             #   3 배속부터 소터가 박스를 놓쳤다. 시뮬 시간이면 폴링·스폰 간격이
@@ -369,8 +380,12 @@ def main():
                 feeder.step(_tsim)
             if gtpick is not None:
                 gtpick.step(_tsim)         # ★ ros.step 앞. 이번 틱에 반영되게
+            if _prof:
+                _t3 = time.perf_counter(); _pt["etc"] += _t3 - _t2
             for _r in ros:
                 _r.step()              # ★ 논블로킹. 모션은 워커가 돈다 (§9)
+            if _prof:
+                _t4 = time.perf_counter(); _pt["ros"] += _t4 - _t3
             # ★★ **헤드리스에서도 render=True 로 돈다.**
             #
             # `IsaacConveyor` 노드는 `OnTick` 으로 도는데 `OnTick` 은 **렌더 틱에**
@@ -383,7 +398,24 @@ def main():
             #   **정지(0)는 정확하다.** 속도 검증은 `isaac-sim.sh` +
             #   `scripts/verify_belt_speed.py` 로 한다. conveyor_ctl docstring 참조.
             _fr += 1
-            world.step(render=(not a.no_render) and (_fr % _rn == 0))
+            _rend = (not a.no_render) and (_fr % _rn == 0)
+            world.step(render=_rend)
+            if _prof:
+                _t5 = time.perf_counter()
+                if _rend:
+                    _pt["step_r"] += _t5 - _t4; _pt["n_r"] += 1
+                else:
+                    _pt["step_p"] += _t5 - _t4; _pt["n_p"] += 1
+                if _fr % 300 == 0 and _fr:
+                    _tot = sum(v for k, v in _pt.items() if not k.startswith("n_"))
+                    print("[prof] 300프레임 %.1fs (배속 %.2f) | 로봇 %.1f 스폰 %.1f "
+                          "잡무 %.1f ros %.1f | step렌더 %.1fms x%d step물리 %.1fms x%d"
+                          % (_tot, 300 / 60.0 / max(_tot, 1e-9),
+                             _pt["rm"], _pt["sp"], _pt["etc"], _pt["ros"],
+                             _pt["step_r"] * 1000 / max(_pt["n_r"], 1), _pt["n_r"],
+                             _pt["step_p"] * 1000 / max(_pt["n_p"], 1), _pt["n_p"]))
+                    for k in _pt:
+                        _pt[k] = 0 if k.startswith("n_") else 0.0
     except KeyboardInterrupt:
         print("\n[sim_main] 종료")
     except Exception:
