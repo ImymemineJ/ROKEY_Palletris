@@ -72,7 +72,10 @@ conveyor:
   #   ⚠ 관찰 항목: 커브 출구에서 박스가 원심으로 날아가면 _01/_04 만 되돌릴 것.
   belt_velocity_raw:
     /World/ConveyorTrack_01/ConveyorBeltGraph: 0.6    # A02 커브 (본선 -> 리턴 진입)
-    /World/ConveyorTrack_05/ConveyorBeltGraph: 0.3    # X -21737~-3853 (+X) — raw 0.2 실측 1.4 m/s
+    /World/ConveyorTrack_05/ConveyorBeltGraph: 0.6    # X -21737~-3853 (+X) — raw 0.2 실측 1.4 m/s
+    # ★ 0.3 -> 0.6 (2026-08-27, 영상 '리턴벨트 직선구간 이슈'). _01 커브 출구와
+    #   _05 이음매에서 박스가 뒤엉켜 쌓였다 — 커브가 내려놓는 속도보다 직선이
+    #   실어가는 속도가 느려서다. 직선이 커브보다 빨라야 이음매가 빈다.
     /World/ConveyorTrack_04/ConveyorBeltGraph: 0.7    # A11 루프 코너 (리턴 -> 본선 복귀)
     # ★ 0.5/0.35/0.2 를 오갔지만 커브가 서던 건 **속도가 아니라** 회전축(curve_dir)
     #   누락이었다 (아래 loop.curve_dir 주석).
