@@ -151,8 +151,19 @@ class DbService(Node):
     def _ensure_schema(self):
         """schema.sql 을 적용한다. CREATE TABLE IF NOT EXISTS 라 여러 번 돌아도 안전하다."""
         here = os.path.dirname(os.path.realpath(__file__))
-        for cand in (os.path.join(here, "schema.sql"),
-                     os.path.join(here, "..", "share", "packing_db", "schema.sql")):
+        # ★ 설치본에서는 이 파일이 lib/python3.12/site-packages/packing_db/ 에 있고
+        #   schema.sql 은 share/packing_db/ 에 깔린다 — 사이가 네 단계라 `..` 하나로는
+        #   못 간다 (실측 2026-08-25: `schema.sql 을 찾지 못했다` 로 노드가 죽었다).
+        #   ament 인덱스로 share 경로를 직접 물어보는 것이 정본이다.
+        cands = [os.path.join(here, "schema.sql")]
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            cands.append(os.path.join(
+                get_package_share_directory("packing_db"), "schema.sql"))
+        except Exception:
+            pass                                  # 소스 트리에서 바로 돌릴 때
+        cands.append(os.path.join(here, "..", "share", "packing_db", "schema.sql"))
+        for cand in cands:
             if os.path.isfile(cand):
                 with open(cand, encoding="utf-8") as f, self._w:
                     self.db.executescript(f.read())

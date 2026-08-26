@@ -61,8 +61,21 @@ SERVICES = [
     ("set_spawn_enabled", "SetSpawnEnabled", "/sim/set_spawn_enabled"),
     ("swap_pallet",       "SwapPallet",      "/sim/swap_pallet"),
 ]
-CMD_TOPIC = "/robot/cmd"
-EVT_TOPIC = "/robot/event"
+# ★ 로봇 토픽은 **구역별**이다 (2026-08-26 정합).
+#   CLAUDE.md §3-2 는 `/robot/cmd` 단수로 적혀 있지만 로봇이 3 대라 관제탑이
+#   `/zone_{a|b|c}/robot/cmd` 로 나눠 쓴다 (`orchestrator_node.py:161-171`).
+#   여기가 단수로 남아 있어서 **관제탑과 Isaac 이 서로 못 만났다** — 에러도 안 난다.
+#   구역 문자는 관제탑과 같게 **소문자**로 맞춘다 (`self.zone = str(zone).lower()`).
+CMD_TOPIC_FMT = "/zone_%s/robot/cmd"
+EVT_TOPIC_FMT = "/zone_%s/robot/event"
+
+
+def cmd_topic(zone):
+    return CMD_TOPIC_FMT % str(zone).lower()
+
+
+def evt_topic(zone):
+    return EVT_TOPIC_FMT % str(zone).lower()
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.
 _OG_TYPE = {
@@ -172,11 +185,11 @@ def build(zone="B"):
     values = [
         # ROS_DOMAIN_ID 를 씬에 박지 않는다 — 팀이 값을 바꾸면 씬도 고쳐야 한다
         ("Ctx.inputs:useDomainIDEnvVar", True),
-        ("CmdSub.inputs:topicName", CMD_TOPIC),
+        ("CmdSub.inputs:topicName", cmd_topic(zone)),
         ("CmdSub.inputs:messagePackage", PKG),
         ("CmdSub.inputs:messageSubfolder", "msg"),
         ("CmdSub.inputs:messageName", "RobotCmd"),
-        ("EvtPub.inputs:topicName", EVT_TOPIC),
+        ("EvtPub.inputs:topicName", evt_topic(zone)),
         ("EvtPub.inputs:messagePackage", PKG),
         ("EvtPub.inputs:messageSubfolder", "msg"),
         ("EvtPub.inputs:messageName", "RobotEvent"),
