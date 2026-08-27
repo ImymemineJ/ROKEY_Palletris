@@ -37,6 +37,7 @@ pip 설치를 요구하는 순간 위험이 늘기 때문이다.
    고쳐졌다 (2026-08-27). 응답에 `run` 을 실어 화면이 "언제부터의 값인가" 를 띄운다.
 """
 import argparse
+import array
 import errno
 import json
 import os
@@ -150,9 +151,11 @@ class Live:
     구독 콜백은 메시지가 올 때 뜨므로 시계와 무관하다.
     """
 
-    def __init__(self, zones):
+    def __init__(self, zones, hm_topic="/algo/heightmap"):
         self.zones = zones
         self.data = {}          # zone -> dict(ZoneStatus 필드)
+        self.hm = {}            # zone -> dict(w, d, cell_mm, grid, recv_wall)
+        self.hm_topic = hm_topic
         self.ok = False
         self.reason = "시작 안 함"
         self._t = None
@@ -172,6 +175,9 @@ class Live:
             from rclpy.callback_groups import ReentrantCallbackGroup
             from rclpy.executors import MultiThreadedExecutor
             from rclpy.node import Node
+            from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                                   ReliabilityPolicy)
+            from sensor_msgs.msg import Image
             from packing_msgs.msg import ZoneStatus
         except Exception as e:                             # noqa: BLE001
             self.reason = f"packing_msgs 없음 ({e}) — colcon build 후 source 할 것"
@@ -200,6 +206,40 @@ class Live:
             for z in self.zones:
                 node.create_subscription(ZoneStatus, f"/zone_{z}/status",
                                          make(z), 10, callback_group=cb)
+
+            # ── heightmap (algo 의 진짜 격자) ───────────────────────
+            # ★ **TRANSIENT_LOCAL 로 구독한다.** 발행이 TRANSIENT_LOCAL 이라
+            #   VOLATILE 로도 연결은 되지만, 그러면 **늦게 띄웠을 때 마지막 상태를
+            #   못 받아** 다음 박스가 놓일 때까지 화면이 빈다.
+            # ★ 이 토픽은 algo 를 `-p heightmap_topic:=/algo/heightmap` 으로 띄워야
+            #   나온다 (기본 꺼짐). 없으면 그냥 안 올 뿐 아무것도 안 깨진다.
+            if self.hm_topic:
+                hq = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                                reliability=ReliabilityPolicy.RELIABLE,
+                                durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+                def mk_hm(z):
+                    def on(msg):
+                        try:
+                            # 16UC1 · little-endian · height=W(Px), width=D(Py)
+                            g = array.array("H")
+                            g.frombytes(bytes(msg.data))
+                            if sys.byteorder == "big":
+                                g.byteswap()
+                            W, D = msg.height, msg.width
+                            if len(g) < W * D:
+                                return
+                            self.hm[z] = {"w": W, "d": D, "grid": list(g[:W * D]),
+                                          "frame": msg.header.frame_id,
+                                          "recv_wall": time.time()}
+                        except Exception:            # noqa: BLE001 — 시각화는 부가 기능
+                            pass
+                    return on
+
+                for z in self.zones:
+                    node.create_subscription(Image, f"{self.hm_topic}/{z}",
+                                             mk_hm(z), hq, callback_group=cb)
+
             self.ok, self.reason = True, "구독 중"
             ex = MultiThreadedExecutor()         # CLAUDE.md §9
             ex.add_node(node)
@@ -214,7 +254,13 @@ class Live:
         now = time.time()
         fresh = {z: v for z, v in self.data.items()
                  if now - v.get("recv_wall", 0) <= stale_s}
-        return {"ok": self.ok and bool(fresh), "reason": self.reason, "zones": fresh}
+        # ★ heightmap 은 **오래됐다고 버리지 않는다.** 박스가 놓일 때만 갱신되므로
+        #   30 초 넘게 그대로인 게 정상이다 (ZoneStatus 는 2 Hz 라 판정이 다르다).
+        return {"ok": self.ok and bool(fresh), "reason": self.reason,
+                "zones": fresh, "heightmap": dict(self.hm)}
+
+    def heightmap(self, zone):
+        return self.hm.get(zone)
 
 
 class Store:
@@ -280,11 +326,17 @@ class Store:
             #   그러면 조용히 틀린 그림이 나온다 — 그걸 화면이 말하게 한다.
             "out_of_pallet": _out_of_pallet(cur, pal["width_mm"], pal["depth_mm"]),
             "overlay": os.environ.get("PL_CONFIG_OVERLAY", ""),
+            # ★ algo 가 내는 **진짜** 격자. 없으면 None — 화면이 DB 좌표로 다시
+            #   계산한 것을 그린다. 둘 다 있으면 대조해서 어긋남을 잡을 수 있다.
+            "algo_heightmap": (Handler.live.heightmap(zone.lower())
+                               if Handler.live else None),
         }
 
     def unload(self, zone):
         """꺼내기 쉬운 순서. 현재 판만 본다 — 나간 판은 이미 트럭에 있다."""
-        cur = self.pallet(zone)["boxes"]
+        return self._unload_from(self.pallet(zone)["boxes"])
+
+    def _unload_from(self, cur):
         order = accessibility.unload_order(cur)
         by_id = {b["box_id"]: b for b in cur}
         return [{"seq": b["seq"], "layer": b["layer"], "box_id": b["box_id"],
@@ -376,9 +428,32 @@ class Store:
             con.close()
         return m
 
+    # ---------- 화면 한 장을 한 번에 ----------
+    def state(self, zone, live, events=200):
+        """★ 화면이 필요한 걸 **한 요청에** 다 준다.
+
+        전에는 한 주기에 `/api/truck`·`/api/pallet/{z}`·`/api/live`·`/api/events`·
+        `/api/pallet/{z}/unload` 를 따로 불렀다 — 다섯 번이다. 화면 하나를 그리는 데
+        왕복이 다섯이면 느린 것보다 **상태가 어긋나는 게** 문제다. 각 응답이 서로
+        다른 순간의 DB 를 보게 되어, 카드의 적재 수와 3D 의 박스 수가 안 맞는
+        순간이 생긴다.
+
+        박스 이력(`/api/box/{id}`)만 따로 둔다 — 눌렀을 때만 필요하고, 여기 넣으면
+        매 주기에 안 쓰는 데이터를 실어 나른다.
+        """
+        pal = self.pallet(zone)
+        return {
+            "live": live,
+            "truck": self.truck(pallets={zone: pal}),
+            "pallet": pal,
+            "unload": self._unload_from(pal["boxes"]),
+            "events": self.events(events),
+        }
+
     # ---------- 트럭 1대 요약 ----------
-    def truck(self):
-        pallets = {z: self.pallet(z) for z in ZONES}
+    def truck(self, pallets=None):
+        # ★ 이미 계산한 구역은 다시 안 읽는다. `state()` 가 선택 구역을 넘겨 준다
+        pallets = {z: (pallets or {}).get(z) or self.pallet(z) for z in ZONES}
         m = self.metrics()
         return {
             "pallets": {z: {"count": len(p["boxes"]),
@@ -435,6 +510,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         try:
+            if path == "/api/state":
+                q = parse_qs(urlparse(self.path).query)
+                z = (q.get("zone") or ["b"])[0].lower()
+                if z not in ZONES:
+                    return self._json({"error": f"모르는 구역: {z}"}, 404)
+                n = int((q.get("events") or ["200"])[0])
+                return self._json(self.store.state(
+                    z, Handler.live.snapshot(), min(max(n, 1), 1000)))
             if path == "/api/truck":
                 return self._json(self.store.truck())
             if path == "/api/metrics":

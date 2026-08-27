@@ -20,7 +20,7 @@
 
 const API = '';                                   // 같은 서버가 정적 파일도 준다
 const ZONES = ['a', 'b', 'c'];
-const POLL_MS = 2000;
+const POLL_MS = 1000;   // 한 요청이면 되니 더 자주 물어도 된다 (관제탑이 2 Hz)
 
 const S = {
   zone: 'b',            // 선택된 팔레트
@@ -32,6 +32,8 @@ const S = {
   lastFetch: 0,         // 마지막으로 백엔드를 읽은 시각
   lastChange: 0,        // DB 값이 마지막으로 **바뀐** 시각
   sig: '',              // 바뀜 판정용 지문
+  unload: [],           // 꺼낼 순서 (한 요청에 같이 온다)
+  events: [],           // 사건 기록 (같음)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -56,8 +58,16 @@ async function getJSON(path) {
 
 async function refresh() {
   try {
-    S.truck = await getJSON('/api/truck');
-    S.pallet[S.zone] = await getJSON(`/api/pallet/${S.zone}`);
+    // ★ 한 요청에 다 받는다. 전에는 truck·pallet·live·events·unload 를 따로 불러
+    //   왕복이 다섯이었고, 각 응답이 서로 다른 순간의 DB 를 봐서 카드의 적재 수와
+    //   3D 의 박스 수가 어긋나는 순간이 있었다.
+    const st = await getJSON(`/api/state?zone=${S.zone}`);
+    S.truck = st.truck;
+    S.pallet[S.zone] = st.pallet;
+    S.unload = st.unload;
+    S.events = st.events;
+    S.status = (st.live && st.live.zones) || {};
+    setConn(!!(st.live && st.live.ok), st.live && st.live.reason);
     S.lastFetch = Date.now();
     // ★ "읽은 시각" 과 "바뀐 시각" 을 따로 센다.
     //   DB 는 박스가 실제로 놓일 때만 바뀐다. 2 초마다 읽어도 값이 같으면 화면은
@@ -87,18 +97,6 @@ function ago(ms) {
 // ══════════════════════════════════════════════════════════════
 //  실시간 — 백엔드가 구독한 결과를 받아온다 (rosbridge 없음)
 // ══════════════════════════════════════════════════════════════
-async function pollLive() {
-  try {
-    const l = await getJSON('/api/live');
-    // ★ 백엔드가 이미 오래된 값을 버린다 (5초). 여기서 또 안 남긴다 —
-    //   "미연결" 이라 적힌 화면에 조금 전 값이 지금 값처럼 남으면 안 된다.
-    S.status = l.zones || {};
-    setConn(!!l.ok, l.reason);
-  } catch {
-    S.status = {}; setConn(false, '백엔드를 못 읽었다');
-  }
-  renderCards();
-}
 
 function setConn(live, reason) {
   S.ros = live;
@@ -197,35 +195,49 @@ function renderIso(P) {
 }
 
 function renderHeat(P) {
-  const B = P.boxes, PW = P.pallet_w_mm, PD = P.pallet_d_mm;
-  if (!B.length) return '<div class="empty">아직 적재된 박스가 없다</div>';
-
-  const CELL = P.cell_mm * 5;                 // 화면용으로 5칸씩 묶는다 (10mm -> 50mm)
-  const NX = Math.ceil(PW / CELL), NY = Math.ceil(PD / CELL);
-  const g = Array.from({ length: NX }, () => new Array(NY).fill(0));
-  B.forEach(b => {
-    const { w, d } = fp(b);
-    for (let i = Math.max(0, Math.floor((b.x - w/2) / CELL)); i < Math.min(NX, Math.ceil((b.x + w/2) / CELL)); i++)
-      for (let j = Math.max(0, Math.floor((b.y - d/2) / CELL)); j < Math.min(NY, Math.ceil((b.y + d/2) / CELL)); j++)
-        g[i][j] = Math.max(g[i][j], b.z + b.h);
-  });
-
-  // 단일 색상 명도 램프 = 크기(높이)를 나타내는 표준 표현
-  const RAMP = ['#e6f1fb', '#b5d4f4', '#85b7eb', '#4C9AFF', '#2b7bd0', '#185fa5', '#0c447c'];
+  const PW = P.pallet_w_mm, PD = P.pallet_d_mm;
   const cap = P.max_stack_mm || 1300;          // ★ 설정값. 코드에 안 박는다
+  const RAMP = ['#e6f1fb', '#b5d4f4', '#85b7eb', '#4C9AFF', '#2b7bd0', '#185fa5', '#0c447c'];
   const scale = Math.min(560 / PW, 280 / PD);
   const W = PW * scale, H = PD * scale;
+
+  // ★ 두 출처가 있다.
+  //   ① algo 가 직접 낸 격자 (`/algo/heightmap/<z>`) — **이게 진짜다**
+  //   ② 여기서 DB 좌표로 다시 계산한 것 — algo 발행이 꺼져 있을 때
+  //   ①이 있으면 그걸 그리고, 화면에 어느 쪽인지 적는다.
+  const A = P.algo_heightmap;
+  let NX, NY, cellW, cellH, at;
+  if (A && A.grid && A.w && A.d) {
+    // algo 격자: height=W(월드 +X), width=D(월드 +Y) — 발행 쪽 규약 그대로
+    NX = A.w; NY = A.d;
+    cellW = PW / NX; cellH = PD / NY;
+    at = (i, j) => A.grid[i * NY + j];
+  } else {
+    const CELL = (P.cell_mm || 10) * 5;        // 화면용으로 5칸씩 묶는다
+    NX = Math.ceil(PW / CELL); NY = Math.ceil(PD / CELL);
+    const g = Array.from({ length: NX }, () => new Array(NY).fill(0));
+    (P.boxes || []).forEach(b => {
+      const { w, d } = fp(b);
+      for (let i = Math.max(0, Math.floor((b.x - w/2) / CELL)); i < Math.min(NX, Math.ceil((b.x + w/2) / CELL)); i++)
+        for (let j = Math.max(0, Math.floor((b.y - d/2) / CELL)); j < Math.min(NY, Math.ceil((b.y + d/2) / CELL)); j++)
+          g[i][j] = Math.max(g[i][j], b.z + b.h);
+    });
+    cellW = CELL; cellH = CELL;
+    at = (i, j) => g[i][j];
+  }
+  if (!A && !(P.boxes || []).length) return '<div class="empty">아직 적재된 박스가 없다</div>';
 
   let s = `<svg viewBox="0 0 ${(W+28).toFixed(0)} ${(H+28).toFixed(0)}" role="img" width="100%" height="300">`
         + `<title>팔레트 ${P.zone.toUpperCase()} 를 위에서 본 높이 지도</title>`
         + `<rect x="14" y="14" width="${W.toFixed(1)}" height="${H.toFixed(1)}"`
         + ` fill="var(--pallet-top)" stroke="var(--pallet)" stroke-width="1.2"/>`;
   for (let i = 0; i < NX; i++) for (let j = 0; j < NY; j++) {
-    if (!g[i][j]) continue;
-    const idx = Math.min(RAMP.length - 1, Math.floor(g[i][j] / cap * RAMP.length));
-    s += `<rect x="${(14 + i*CELL*scale).toFixed(1)}" y="${(14 + j*CELL*scale).toFixed(1)}"`
-       + ` width="${(CELL*scale + 0.4).toFixed(1)}" height="${(CELL*scale + 0.4).toFixed(1)}"`
-       + ` fill="${RAMP[idx]}"><title>${g[i][j]}mm</title></rect>`;
+    const v = at(i, j);
+    if (!v) continue;
+    const idx = Math.min(RAMP.length - 1, Math.floor(v / cap * RAMP.length));
+    s += `<rect x="${(14 + i*cellW*scale).toFixed(1)}" y="${(14 + j*cellH*scale).toFixed(1)}"`
+       + ` width="${(cellW*scale + 0.4).toFixed(1)}" height="${(cellH*scale + 0.4).toFixed(1)}"`
+       + ` fill="${RAMP[idx]}"><title>${v}mm</title></rect>`;
   }
   return s + '</svg>';
 }
@@ -244,7 +256,10 @@ function renderStack() {
   $('legend').innerHTML = S.view === 'iso'
     ? Object.entries(TYPE_COLOR).map(([n, c]) =>
         `<span><i style="background:${c[1]}"></i>${n}</span>`).join('')
-    : `<span>연할수록 낮고 진할수록 높다 · 0 ~ ${P.max_stack_mm}mm</span>`;
+    : `<span>연할수록 낮고 진할수록 높다 · 0 ~ ${P.max_stack_mm}mm</span>`
+      + (P.algo_heightmap
+          ? ` <span style="color:var(--ok)">· 알고리즘이 낸 격자 ${P.algo_heightmap.w}×${P.algo_heightmap.d}</span>`
+          : ` <span style="color:var(--ink3)">· DB 좌표로 재계산 (algo 발행 꺼짐)</span>`);
 
   // ★ 이상한 것을 숨기지 않고 알린다
   const w = $('stack-warn');
@@ -266,19 +281,18 @@ function renderStack() {
 // ══════════════════════════════════════════════════════════════
 //  꺼낼 순서
 // ══════════════════════════════════════════════════════════════
-async function renderUnload() {
+function renderUnload() {
   const el = $('unload');
-  try {
-    const rows = await getJSON(`/api/pallet/${S.zone}/unload`);
-    el.innerHTML = rows.length ? rows.map(r => `
+  const rows = S.unload || [];
+  el.innerHTML = rows.length ? rows.map(r => `
       <div class="u-row">
         <span class="u-seq">${r.seq}</span>
         <span class="u-layer">겹${r.layer}</span>
         <span class="u-addr" title="${esc(r.address || '')}">${esc(r.address || '(주소 없음)')}</span>
         <span class="u-top">${r.top_mm}mm</span>
       </div>`).join('') : '<div class="empty">적재된 박스가 없다</div>';
-  } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
+
 
 // ══════════════════════════════════════════════════════════════
 //  사건 기록
@@ -296,13 +310,12 @@ const BADGE = {
   SCANNED: 'b-scan', VERIFIED: 'b-scan', DIVERTED: 'b-scan', SPAWNED: 'b-scan',
 };
 
-async function renderEvents() {
+function renderEvents() {
   const el = $('events');
   if (el.hidden) return;
-  try {
-    const rows = await getJSON('/api/events?limit=200');
-    if (!rows.length) { el.innerHTML = '<div class="empty">아직 사건이 없다</div>'; return; }
-    el.innerHTML = rows.map(e => `
+  const rows = S.events || [];
+  if (!rows.length) { el.innerHTML = '<div class="empty">아직 사건이 없다</div>'; return; }
+  el.innerHTML = rows.map(e => `
       <div class="e-row" data-box="${esc(e.box_id)}">
         <span class="e-t">${e.t_rel === null ? '—' : e.t_rel.toFixed(0) + 's'}</span>
         <span class="e-z">${esc((e.zone || '').toUpperCase())}</span>
@@ -313,10 +326,9 @@ async function renderEvents() {
           <span class="e-addr">${esc((e.address || '').replace('서울 구로구 ', ''))}</span>
         </span>
       </div>`).join('');
-    el.querySelectorAll('.e-row').forEach(r =>
-      r.onclick = () => showBox(r.dataset.box));
-    $('right-sub').textContent = `이번 실행 ${rows.length}건 · 최신순 · 줄을 누르면 그 박스의 이력`;
-  } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  el.querySelectorAll('.e-row').forEach(r =>
+    r.onclick = () => showBox(r.dataset.box));
+  $('right-sub').textContent = `이번 실행 ${rows.length}건 · 최신순 · 줄을 누르면 그 박스의 이력`;
 }
 
 // ── 박스 이력 (사건을 누르면) ──────────────────────────────────
@@ -429,8 +441,7 @@ function init() {
   $('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true; };
   document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').hidden = true; });
   $('note').textContent = '';
-  refresh();  pollLive();
-  setInterval(refresh, POLL_MS);
+  refresh();  setInterval(refresh, POLL_MS);
   setInterval(pollLive, 1000);
   setInterval(renderFresh, 1000);     // 시간 표시는 값이 안 바뀌어도 흐른다        // 관제탑이 2 Hz 라 1 초면 충분하다
 }
