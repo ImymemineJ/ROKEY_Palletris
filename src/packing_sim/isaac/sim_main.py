@@ -170,6 +170,23 @@ def main():
         if not Path(a.stage).exists():
             sys.exit("씬이 없다: %s" % a.stage)
         open_stage(a.stage)
+        # ★ PL_BG=0 — 장식 배경을 **끄고 연다** (2026-08-27). 새 씬(배경 추가본)을
+        #   8 GB GPU(5060)에서 열면 로드 중 `Killed`(OOM) 로 죽는다 — 실측.
+        #   `full_warehouse` 는 콜라이더 0 개인 **순수 시각** 프림이라 꺼도 물리·
+        #   좌표·반출 경로가 하나도 안 바뀐다. 시연 PC(5080/16GB)는 켜고 돌린다.
+        #   파일은 안 고친다 (`SetActive(False)` 는 열린 스테이지에만 적용).
+        if os.environ.get("PL_BG") == "0":
+            import omni.usd as _ou          # Isaac 런타임 전용 — 지역 import
+            _st0 = _ou.get_context().get_stage()
+            _off = []
+            for _n in ("full_warehouse", "PlatformLuggageCart_A01_01",
+                       "PlatformLuggageCart_A01_02"):
+                _p = _st0.GetPrimAtPath("/World/" + _n)
+                if _p and _p.IsValid() and _p.IsActive():
+                    _p.SetActive(False)
+                    _off.append(_n)
+            print("[sim_main] PL_BG=0 — 배경 %d 개 껐다 (%s)"
+                  % (len(_off), ", ".join(_off) if _off else "없음"))
         world = World(stage_units_in_meters=1.0,
                       physics_dt=1.0 / hz, rendering_dt=1.0 / hz)
         # ★ World() 를 sim_params 없이 부르면 PhysicsContext 가 기존 /physicsScene 에
