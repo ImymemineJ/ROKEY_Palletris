@@ -21,13 +21,17 @@
 const API = '';                                   // 같은 서버가 정적 파일도 준다
 const ZONES = ['a', 'b', 'c'];
 const POLL_MS = 1000;   // 한 요청이면 되니 더 자주 물어도 된다 (관제탑이 2 Hz)
+// ★ 백엔드의 --cam 기본값과 짝이다. 다른 카메라를 보려면 서버에 --cam /cam2 를 주고
+//   여기를 'cam2' 로 바꾼다. 토픽 이름(/cam2/rgb)은 백엔드만 안다.
+const CAM_NAME = 'cam1';
 
 const S = {
   zone: 'b',            // 선택된 팔레트
   view: 'iso',          // iso | heat
   truck: null,
   pallet: {},           // zone -> /api/pallet 응답
-  status: {},           // zone -> ZoneStatus (rosbridge)
+  status: {},           // zone -> ZoneStatus
+  live: null,           // /api/live 응답 전체 (cams 상태를 여기서 읽는다)
   ros: false,
   lastFetch: 0,         // 마지막으로 백엔드를 읽은 시각
   lastChange: 0,        // DB 값이 마지막으로 **바뀐** 시각
@@ -67,6 +71,7 @@ async function refresh() {
     S.unload = st.unload;
     S.events = st.events;
     S.status = (st.live && st.live.zones) || {};
+    S.live = st.live || null;              // cams(영상 상태) 를 여기서 읽는다
     setConn(!!(st.live && st.live.ok), st.live && st.live.reason);
     S.lastFetch = Date.now();
     // ★ "읽은 시각" 과 "바뀐 시각" 을 따로 센다.
@@ -80,6 +85,10 @@ async function refresh() {
     $('note').textContent = '';
   } catch (e) {
     $('note').textContent = `백엔드를 못 읽었다 — ${e.message}`;
+    // ★ 여기서 연결 배지를 꺼야 한다 (2026-08-27). 예전엔 1초마다 도는 pollLive 가
+    //   껐는데, API 를 /api/state 하나로 합치면서 그 함수가 없어졌다. 그 뒤로
+    //   백엔드가 죽어도 배지가 **초록으로 남아** 화면이 거짓말을 했다.
+    setConn(false, '백엔드를 못 읽었다');
   }
   render();
 }
@@ -125,12 +134,12 @@ function renderCards() {
       <div class="card ${z === S.zone ? 'on' : ''}" data-z="${z}">
         <div class="card-head">
           <span class="card-name">팔레트 ${z.toUpperCase()}</span>
-          <span class="state ${cls}">${esc(stateTxt)}</span>
+          <span class="state ${cls}" data-tip="관제탑 상태머신. IDLE → FETCHING → PLANNING → PICKING → PLACING → UPDATING 을 돈다. '—' 는 실시간이 안 붙어 상태를 모른다는 뜻이다.">${esc(stateTxt)}</span>
         </div>
         <div class="card-row">
-          <span>적재 <b>${p.count ?? '—'}</b></span>
-          <span>충전율 <b>${fill === null ? '—' : fill.toFixed(0) + '%'}</b></span>
-          <span>최고 <b>${fmtMm(height)}</b></span>
+          <span data-tip="지금 이 팔레트에 올라가 있는 박스 수. 트럭으로 나간 판은 세지 않는다.">적재 <b>${p.count ?? '—'}</b></span>
+          <span data-tip="관제탑이 계산해 보낸 값을 그대로 쓴다. 분모는 한도(1300mm)가 아니라 실제 더미 높이다 — 화면이 다시 계산하면 관제탑 숫자와 갈라진다.">충전율 <b>${fill === null ? '—' : fill.toFixed(0) + '%'}</b></span>
+          <span data-tip="더미 꼭대기 높이 (팔레트 상면 기준). 한도는 1300mm 다.">최고 <b>${fmtMm(height)}</b></span>
         </div>
         <div class="bar"><i style="width:${fill === null ? 0 : Math.min(100, fill)}%"></i></div>
         ${p.shipped ? `<div class="ship">트럭에 실려 나간 판 ${p.shipped}장 · 지금 ${p.pallet_index}번째</div>` : ''}
@@ -162,9 +171,18 @@ function renderIso(P) {
   const top = Math.max(P.max_stack_mm, P.max_height_mm) || 1300;
   // 화면에 맞게 배율을 잡는다. 팔레트 크기가 설정마다 다르므로 매번 계산한다.
   const k = Math.min(560 / (PW + PD), 300 / ((PW + PD) / 2 + top) * 1.15);
-  const px = (x, y, z) => [(x - y) * 0.5 * k, (x + y) * 0.25 * k - z * 0.5 * k];
+  // ★ 가로축 부호 (2026-08-27 수정). 그리는 면(+X 면·+Y 면) · 그리는 순서(먼 것
+  //   먼저) · 세로축은 셋 다 "카메라가 +X,+Y 위쪽에 있다" 는 그림인데 **가로축만
+  //   반대**였다. 그래서 어떤 시점에서도 성립하지 않는, 좌우가 뒤집힌 그림이 나왔다.
+  //   축정렬 더미라 그럴듯해 보여서 그림만 봐서는 안 드러난다 — Isaac 화면과
+  //   나란히 놓아야 보인다 (CLAUDE.md §10-3).
+  const px = (x, y, z) => [(y - x) * 0.5 * k, (x + y) * 0.25 * k - z * 0.5 * k];
 
+  // 로봇이 선 자리 (팔레트 로컬 mm). 설정에서 온다 — 로봇은 팔레트 밖에 서므로
+  // 여백 계산에 같이 넣어야 표시가 안 잘린다.
+  const R = P.robot_local_mm;
   const corners = [[0,0,0],[PW,0,0],[0,PD,0],[PW,PD,0],[0,0,top],[PW,0,top],[0,PD,top],[PW,PD,top]]
+    .concat(R ? [[R[0], R[1], 0]] : [])
     .map(c => px(...c));
   const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
   const ox = -Math.min(...xs) + 14, oy = -Math.min(...ys) + 14;
@@ -191,6 +209,17 @@ function renderIso(P) {
     s += face(`${pt(x1,y0,z1)} ${pt(x1,y1,z1)} ${pt(x1,y1,z0)} ${pt(x1,y0,z0)}`, c[1]);
     s += face(`${pt(x0,y1,z1)} ${pt(x1,y1,z1)} ${pt(x1,y1,z0)} ${pt(x0,y1,z0)}`, c[2]);
   });
+
+  // ★ 방향 표시. 좌우가 뒤집혔는지는 그림만 봐서는 알 수 없다 — 로봇이 어느 변에
+  //   서 있는지를 같이 그려야 Isaac 화면과 곧바로 대볼 수 있다.
+  if (R) {
+    const q = px(R[0], R[1], 0);
+    const cx = q[0] + ox, cy = q[1] + oy;
+    s += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="4.5"`
+       + ` fill="var(--ink3)"><title>로봇 베이스 (팔레트 기준 ${R[0]}, ${R[1]}mm)</title></circle>`
+       + `<text x="${cx.toFixed(1)}" y="${(cy - 8).toFixed(1)}" text-anchor="middle"`
+       + ` font-size="11" fill="var(--ink3)">로봇</text>`;
+  }
   return s + '</svg>';
 }
 
@@ -198,8 +227,12 @@ function renderHeat(P) {
   const PW = P.pallet_w_mm, PD = P.pallet_d_mm;
   const cap = P.max_stack_mm || 1300;          // ★ 설정값. 코드에 안 박는다
   const RAMP = ['#e6f1fb', '#b5d4f4', '#85b7eb', '#4C9AFF', '#2b7bd0', '#185fa5', '#0c447c'];
-  const scale = Math.min(560 / PW, 280 / PD);
-  const W = PW * scale, H = PD * scale;
+  // ★ 3D 그림과 **같은 방향에서** 본다 (2026-08-27). 3D 는 월드 +Y 가 화면 오른쪽,
+  //   +X 가 화면 안쪽(아래)인 시점이다. 지도도 그 방향으로 눕힌다 — 안 그러면
+  //   두 탭에서 로봇이 서로 반대편에 있어서, 고쳐 놓고도 또 헷갈린다.
+  //   즉 화면 가로 = 월드 +Y(PD) · 화면 세로 = 월드 +X(PW).
+  const scale = Math.min(560 / PD, 280 / PW);
+  const W = PD * scale, H = PW * scale;
 
   // ★ 두 출처가 있다.
   //   ① algo 가 직접 낸 격자 (`/algo/heightmap/<z>`) — **이게 진짜다**
@@ -227,17 +260,33 @@ function renderHeat(P) {
   }
   if (!A && !(P.boxes || []).length) return '<div class="empty">아직 적재된 박스가 없다</div>';
 
-  let s = `<svg viewBox="0 0 ${(W+28).toFixed(0)} ${(H+28).toFixed(0)}" role="img" width="100%" height="300">`
+  // ★ 세로축을 뒤집는다 (2026-08-27 수정). SVG 는 아래가 +y 라 월드 +Y 를 그대로
+  //   내려 그리면 **좌우가 뒤집힌 지도**가 된다 (위에서 내려다본 그림에서 +X 가
+  //   오른쪽이면 +Y 는 위쪽이어야 한다). 3D 그림과 같은 종류의 실수였다.
+  const R = P.robot_local_mm;
+  const rx = R ? R[1] * scale : 0, ry = R ? R[0] * scale : 0;
+  // 로봇은 팔레트 밖에 서므로 그림틀을 그만큼 넓힌다 (viewBox 는 음수 원점을 받는다)
+  const x0 = Math.min(0, rx) - 14, x1 = Math.max(W, rx) + 14;
+  const y0 = Math.min(0, ry) - 14, y1 = Math.max(H, ry) + 14;
+
+  let s = `<svg viewBox="${x0.toFixed(1)} ${y0.toFixed(1)} ${(x1-x0).toFixed(1)} ${(y1-y0).toFixed(1)}"`
+        + ` role="img" width="100%" height="300">`
         + `<title>팔레트 ${P.zone.toUpperCase()} 를 위에서 본 높이 지도</title>`
-        + `<rect x="14" y="14" width="${W.toFixed(1)}" height="${H.toFixed(1)}"`
+        + `<rect x="0" y="0" width="${W.toFixed(1)}" height="${H.toFixed(1)}"`
         + ` fill="var(--pallet-top)" stroke="var(--pallet)" stroke-width="1.2"/>`;
   for (let i = 0; i < NX; i++) for (let j = 0; j < NY; j++) {
     const v = at(i, j);
     if (!v) continue;
     const idx = Math.min(RAMP.length - 1, Math.floor(v / cap * RAMP.length));
-    s += `<rect x="${(14 + i*cellW*scale).toFixed(1)}" y="${(14 + j*cellH*scale).toFixed(1)}"`
-       + ` width="${(cellW*scale + 0.4).toFixed(1)}" height="${(cellH*scale + 0.4).toFixed(1)}"`
+    s += `<rect x="${(j*cellH*scale).toFixed(1)}" y="${(i*cellW*scale).toFixed(1)}"`
+       + ` width="${(cellH*scale + 0.4).toFixed(1)}" height="${(cellW*scale + 0.4).toFixed(1)}"`
        + ` fill="${RAMP[idx]}"><title>${v}mm</title></rect>`;
+  }
+  if (R) {
+    s += `<circle cx="${rx.toFixed(1)}" cy="${ry.toFixed(1)}" r="4.5" fill="var(--ink3)">`
+       + `<title>로봇 베이스 (팔레트 기준 ${R[0]}, ${R[1]}mm)</title></circle>`
+       + `<text x="${rx.toFixed(1)}" y="${(ry - 8).toFixed(1)}" text-anchor="middle"`
+       + ` font-size="11" fill="var(--ink3)">로봇</text>`;
   }
   return s + '</svg>';
 }
@@ -281,15 +330,23 @@ function renderStack() {
 // ══════════════════════════════════════════════════════════════
 //  꺼낼 순서
 // ══════════════════════════════════════════════════════════════
+/** 꺼낼 순서 목록.
+ *
+ * ★ 2026-08-27 부터 오른쪽 패널의 그 탭은 **cam1 실시간 영상**으로 바뀌었다.
+ *   데이터(`/api/state` 의 `unload`)와 이 함수는 그대로 두었다 — 되돌리려면
+ *   truck.html 의 `<div class="cam" id="cam">` 자리에 `<div class="unload"
+ *   id="unload">` 를 두고 탭 하나를 되살리면 된다. 서버는 손댈 것이 없다.
+ */
 function renderUnload() {
   const el = $('unload');
+  if (!el) return;                 // 지금 화면에는 그 자리가 없다
   const rows = S.unload || [];
   el.innerHTML = rows.length ? rows.map(r => `
       <div class="u-row">
-        <span class="u-seq">${r.seq}</span>
-        <span class="u-layer">겹${r.layer}</span>
-        <span class="u-addr" title="${esc(r.address || '')}">${esc(r.address || '(주소 없음)')}</span>
-        <span class="u-top">${r.top_mm}mm</span>
+        <span class="u-seq" title="꺼내는 순서. 1번부터 차례로 빼면 위에 얹힌 박스를 건드리지 않는다.">${r.seq}</span>
+        <span class="u-layer" title="몇 번째 겹에서 나오는가. 같은 겹끼리는 서로 위아래로 안 얹혀 있어 순서를 바꿔도 된다.">겹${r.layer}</span>
+        <span class="u-addr" title="${esc(r.address || '주소 없음')}">${esc(r.address || '(주소 없음)')}</span>
+        <span class="u-top" title="그 박스 윗면 높이 (팔레트 상면 기준).">${r.top_mm}mm</span>
       </div>`).join('') : '<div class="empty">적재된 박스가 없다</div>';
 }
 
@@ -363,24 +420,151 @@ async function showBox(id) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  cam1 실시간 영상
+//
+//  ★ 브라우저가 ROS 를 직접 상대하지 않는다. 백엔드가 `/cam1/rgb` 를 구독해
+//    최신 한 장만 들고 있다가 PNG 로 내주고, 여기서는 그냥 <img> 를 갈아 끼운다.
+//    rosbridge 도, 브라우저용 이미지 디코더도 필요 없다.
+//  ★ 왜 MJPEG 스트림이 아닌가: 한 연결을 계속 붙들면 파이썬 표준 HTTP 서버의
+//    스레드 하나가 영영 묶인다. 탭을 두 개만 열어도 다른 요청이 밀린다.
+//    한 장씩 받으면 연결이 매번 끝나고, 화면이 멈춰도 서버는 멀쩡하다.
+// ══════════════════════════════════════════════════════════════
+const CAM_MS = 250;                    // 4 Hz. 사람 눈에는 충분하고 회선은 여유롭다
+let camTimer = null, camBusy = false, camStaleHits = 0;
+
+function startCam() {
+  if (camTimer) return;
+  camTick();
+  camTimer = setInterval(camTick, CAM_MS);
+}
+function stopCam() {
+  if (camTimer) { clearInterval(camTimer); camTimer = null; }
+  showEl($('cam-ov'), false);
+}
+
+function camTick() {
+  // ★ 앞 장이 아직 안 왔으면 새로 요청하지 않는다. 느린 연결에서 요청만 쌓이면
+  //   화면은 점점 과거를 보여주면서 회선만 먹는다.
+  if (camBusy || document.hidden) return;
+  camBusy = true;
+  const img = $('cam-img'), off = $('cam-off');
+  const next = new Image();
+  next.onload = () => {
+    camBusy = false;
+    img.src = next.src; img.hidden = false; off.hidden = true;
+    // ★ 영상이 새로 왔을 때만 QR 을 물어본다. 사진과 표시가 같은 프레임을 보게
+    //   하려는 것이다 — 따로 돌리면 박스가 사진보다 한 박자 앞서거나 뒤진다.
+    drawQR(next.naturalWidth, next.naturalHeight);
+    const c = (S.live && S.live.cams && S.live.cams[CAM_NAME]) || null;
+    // ★ 서버는 마지막 프레임을 계속 내준다 — 카메라가 멎어도 그림은 그대로 보인다.
+    //   그래서 **몇 초 전 것인지**를 같이 적고, 오래되면 멈췄다고 분명히 말한다.
+    //   (30 Hz 로 오는 토픽이라 3초면 확실히 이상한 것이다)
+    // ★ 한 번 오래됐다고 바로 "멎었다" 라고 하지 않는다 (두 번 연속일 때만).
+    //   탭을 다시 열면 백엔드가 그동안 안 받아 둔 마지막 프레임을 한 번 주는데,
+    //   그걸 고장으로 읽으면 멀쩡한 카메라에 경고가 번쩍인다.
+    camStaleHits = (c && c.age_s > 3) ? camStaleHits + 1 : 0;
+    $('right-sub').textContent = !c ? '박스 등록·검증을 하는 그 화면'
+      : camStaleHits >= 2 ? `⚠ 영상이 ${c.age_s.toFixed(0)}초째 안 바뀐다 — 카메라가 멎었다`
+      : `${CAM_NAME} · ${c.w}×${c.h} · ${c.age_s.toFixed(1)}초 전 프레임`;
+  };
+  next.onerror = () => {
+    camBusy = false;
+    img.hidden = true; off.hidden = false; showEl($('cam-ov'), false);
+    // 왜 안 오는지는 백엔드가 안다 (503 본문). 그걸 그대로 띄운다.
+    fetch(`/api/cam/${CAM_NAME}.png`, { cache: 'no-store' })
+      .then(r => r.json()).then(j => { off.textContent = j.error || '영상 없음'; })
+      .catch(() => { off.textContent = '백엔드를 못 읽었다'; });
+  };
+  next.src = `/api/cam/${CAM_NAME}.png?w=640&t=${Date.now()}`;
+}
+
+/** ★ SVG 는 `el.hidden = false` 가 **안 먹는다.** `hidden` 은 HTMLElement 의
+ *  프로퍼티라, SVG 요소에 대입하면 그냥 자바스크립트 변수 하나가 생길 뿐
+ *  속성은 그대로 남는다 — 내용은 다 그려 놓고 화면에는 아무것도 안 보였다.
+ *  속성을 직접 넣고 뺀다. */
+function showEl(el, on) {
+  if (on) el.removeAttribute('hidden'); else el.setAttribute('hidden', '');
+}
+
+/** QR 을 영상 위에 그린다 — 빨간 테두리 + 번호(+배송지).
+ *
+ *  ★ 좌표는 백엔드가 **0~1 비율**로 준다. 여기서 사진의 원래 크기(naturalWidth)를
+ *    곱해 viewBox 좌표로 만든다. 창을 줄이거나 늘려도 SVG 가 사진과 같은 규칙으로
+ *    맞춰지므로(둘 다 contain) 다시 계산할 일이 없다.
+ */
+async function drawQR(natW, natH) {
+  const ov = $('cam-ov');
+  if (!natW || !natH) { showEl(ov, false); return; }
+  let r;
+  try { r = await getJSON(`/api/cam/${CAM_NAME}/qr`); }
+  catch { showEl(ov, false); return; }
+  const qrs = (r && r.qrs) || [];
+  if (!qrs.length) { showEl(ov, false); return; }
+  // ★ 구역 색은 **씬이 박스를 칠하는 색** 그대로다 (A 빨강·B 초록·C 파랑).
+  //   백엔드가 설정에서 유도해 보내 준다 — 화면에 색을 박아 두면 씬과 갈라진다.
+  const ZC = (r && r.zone_colors) || {};
+
+  ov.setAttribute('viewBox', `0 0 ${natW} ${natH}`);
+  ov.innerHTML = qrs.map(q => {
+    const pts = q.poly.map(([x, y]) => `${(x * natW).toFixed(1)},${(y * natH).toFixed(1)}`);
+    const xs = q.poly.map(p => p[0] * natW), ys = q.poly.map(p => p[1] * natH);
+    const x0 = Math.min(...xs), y0 = Math.min(...ys);
+    // 번호 + (DB 에 있으면) 배송지. 못 찾으면 "등록 안 됨" 이라고 분명히 말한다 —
+    // 빈칸으로 두면 "읽었는데 DB 에 없다" 와 "안 읽혔다" 가 화면에서 같아 보인다.
+    const b = q.box;
+    // ★ 배송지가 아니라 **구역**을 띄운다. 화면에서 궁금한 건 "저 박스가 어느
+    //   팔레트로 가나" 이고, 아파트 이름은 길어서 영상을 가린다 (배송지는
+    //   사건 기록·꺼낼 순서에 이미 있다)
+    const z = (b && b.zone || '').toLowerCase();
+    const label = (q.text || '읽음 (내용 없음)') + (z ? ` · ${z.toUpperCase()}구역` : ' · 등록 안 됨');
+    const col = ZC[z] || '#6b7280';             // 모르는 구역은 회색
+    const ty = y0 > 34 ? y0 - 10 : y0 + 30;     // 위가 좁으면 상자 안쪽에 붙인다
+    // 폭·위치는 아래에서 **재서** 정한다 (글자 수로 어림하면 한글에서 어긋난다)
+    return `<polygon class="qr-box" points="${pts.join(' ')}" stroke="${col}" fill="${col}"/>`
+         + `<rect class="qr-tag" y="${(ty - 22).toFixed(1)}" height="28" rx="5" fill="${col}"/>`
+         + `<text class="qr-txt" y="${ty.toFixed(1)}" data-x0="${x0.toFixed(1)}">${esc(label)}</text>`;
+  }).join('');
+  showEl(ov, true);
+
+  // ★ 라벨 폭을 **직접 재서** 자리를 잡는다. 글자 수 × 상수로 어림하면 한글이
+  //   섞였을 때 실제 폭의 절반밖에 안 나와, 오른쪽 끝 QR 의 번호가 잘려 나갔다.
+  //   getComputedTextLength() 는 그려진 뒤의 진짜 폭이다.
+  ov.querySelectorAll('text.qr-txt').forEach((t, i) => {
+    const w = t.getComputedTextLength() + 18;
+    const x = Math.max(0, Math.min(parseFloat(t.dataset.x0), natW - w));
+    t.setAttribute('x', (x + 9).toFixed(1));
+    const box = ov.querySelectorAll('rect.qr-tag')[i];
+    box.setAttribute('x', x.toFixed(1));
+    box.setAttribute('width', w.toFixed(1));
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
 //  지표
 // ══════════════════════════════════════════════════════════════
 function renderKPI() {
   const m = S.truck?.metrics;
   if (!m) return;
-  const grade = (v, good, bad) => {
-    const p = pct(v); if (p === null) return 'na';
-    return p >= good ? 'ok' : (p <= bad ? 'bad' : 'warn');
-  };
+  // ★ 네 번째 칸은 마우스를 올렸을 때 뜨는 설명이다. 지표 이름만으로는 분모가
+  //   무엇인지 알 수 없어서 발표 때마다 말로 답해야 했다.
   const items = [
-    ['인식률',       fmtPct(m.recognition_rate),   grade(m.recognition_rate, 95, 70)],
-    ['적재 완료',    `${S.truck.placed_total}개`,  ''],
-    ['적재 성공률',  fmtPct(m.place_success_rate), grade(m.place_success_rate, 95, 80)],
-    ['평균 사이클',  fmtSec(m.cycle_avg_s),        ''],
-    ['로봇 유휴율',  fmtPct(m.robot_idle_rate),    ''],
+    // ★ 다섯 칸을 **같은 모양**으로 둔다 (2026-08-27). 두 칸만 색을 입히니
+    //   나머지와 다른 물건처럼 보였다. 기준값은 말풍선이 그대로 알려 준다.
+    ['인식률',       fmtPct(m.recognition_rate),   '',
+     `cam1 이 읽은 박스 ${m.scanned_count}개 ÷ 라인에 올라온 박스 ${m.total_boxes}개(읽은 것 + 놓친 것 ${m.scan_miss}개). 95% 위면 초록, 70% 아래면 빨강.`],
+    ['적재 완료',    `${S.truck.placed_total}개`,  '',
+     '지금 세 팔레트에 올라가 있는 박스 수. 트럭으로 나간 판은 따로 센다.'],
+    ['적재 성공률',  fmtPct(m.place_success_rate), '',
+     `놓기 성공 ÷ 시도(성공 + 픽 실패 ${m.pick_failed_count}회). 지금까지 시도 ${m.place_attempts}회. 실패한 뒤 다시 집어 성공하면 시도는 2, 성공은 1 로 센다.`],
+    ['평균 사이클',  fmtSec(m.cycle_avg_s),        '',
+     '박스 하나를 집기 시작해서 내려놓을 때까지 걸린 평균 시간.'],
+    ['로봇 유휴율',  fmtPct(m.robot_idle_rate),    '',
+     '전체 실행 시간 중 로봇이 집지도 놓지도 않고 있던 시간의 비율. 높으면 로봇이 아니라 라인이 병목이라는 뜻이다.'],
   ];
-  $('kpis').innerHTML = items.map(([l, v, c]) =>
-    `<div class="kpi"><div class="kpi-l">${l}</div>
+  // 양 끝 칸은 말풍선을 가운데 정렬하면 화면 밖으로 나간다 — 끝에 붙인다
+  $('kpis').innerHTML = items.map(([l, v, c, tip], i) =>
+    `<div class="kpi tip-u ${i === 0 ? 'tip-l' : ''} ${i === items.length - 1 ? 'tip-r' : ''}" data-tip="${esc(tip)}">
+     <div class="kpi-l">${l}</div>
      <div class="kpi-v ${v === '—' ? 'na' : c}">${v}</div></div>`).join('');
 
   renderFresh();
@@ -420,6 +604,7 @@ function renderFresh() {
 
 function render() { renderCards(); renderStack(); renderUnload(); renderEvents(); renderKPI(); }
 
+
 // ══════════════════════════════════════════════════════════════
 function init() {
   document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
@@ -431,18 +616,20 @@ function init() {
     document.querySelectorAll('.tab2').forEach(x => x.classList.remove('on'));
     t.classList.add('on');
     const ev = t.dataset.right === 'events';
-    $('events').hidden = !ev; $('unload').hidden = ev;
-    $('right-title').textContent = ev ? '사건 기록' : '꺼낼 순서 · 배송지';
-    $('right-sub').textContent = ev ? '불러오는 중…' : '위에 아무것도 없는 것부터 한 겹씩';
-    ev ? renderEvents() : renderUnload();
+    $('events').hidden = !ev; $('cam').hidden = ev;
+    $('right-title').textContent = ev ? '사건 기록' : 'cam1 · 투입부 카메라';
+    $('right-sub').textContent = ev ? '불러오는 중…' : '박스 등록·검증을 하는 그 화면';
+    // ★ 보고 있지 않을 때는 영상을 안 받는다. 안 그러면 사건 기록을 보는 동안에도
+    //   초당 몇 MB 를 계속 끌어와 시연 PC 가 괜히 바빠진다.
+    ev ? (stopCam(), renderEvents()) : startCam();
   });
   // 모달 닫기 — X · 바깥 · Esc
   $('mb-close').onclick = () => { $('modal').hidden = true; };
   $('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true; };
   document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').hidden = true; });
   $('note').textContent = '';
+  startCam();                            // 처음 열리는 탭이 cam1 이다
   refresh();  setInterval(refresh, POLL_MS);
-  setInterval(pollLive, 1000);
   setInterval(renderFresh, 1000);     // 시간 표시는 값이 안 바뀌어도 흐른다        // 관제탑이 2 Hz 라 1 초면 충분하다
 }
 document.addEventListener('DOMContentLoaded', init);

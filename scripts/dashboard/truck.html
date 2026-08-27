@@ -11,10 +11,10 @@
 <header class="top">
   <div class="title">
     <h1>Palletris · 1대 트럭 · 팔레트 A/B/C 운영</h1>
-    <div class="run" id="run">실행 구간 —</div>
-      <div class="fresh" id="fresh"></div>
+    <div class="run" id="run" data-tip="DB 에 담긴 이번 실행이 몇 분어치인가. '멈춤' 은 최근에 값이 바뀌지 않았다는 뜻이고, 실제로 돌고 있으면 '진행 중' 으로 바뀐다.">실행 구간 —</div>
+      <div class="fresh" id="fresh" data-tip="화면은 2초마다 백엔드를 읽는다. 6초 넘게 못 읽으면 여기에 경고가 뜬다 — 값이 안 변하는 것과 화면이 멈춘 것은 다르다."></div>
   </div>
-  <div class="conn" id="conn"><span class="dot"></span><span id="conn-label">연결 확인 중</span></div>
+  <div class="conn" id="conn" data-tip="초록이면 관제탑이 2 Hz 로 보내는 구역 상태를 받고 있다는 뜻이다. 5초 넘게 안 오면 꺼지고, 그때는 DB 로 그린 화면만 남는다."><span class="dot"></span><span id="conn-label">연결 확인 중</span></div>
 </header>
 
 <!-- 팔레트 카드 3장 -->
@@ -26,11 +26,11 @@
     <div class="panel-head">
       <div>
         <h2>팔레트 <span id="sel-zone">B</span> · 적재 상태</h2>
-        <p class="sub" id="stack-sub">한 트럭에 실린 A/B/C 중 선택한 팔레트</p>
+        <p class="sub" id="stack-sub" data-tip="박스 수 · 지금 높이 / 최대 적재 한도 · 팔레트 크기. 팔레트 크기가 예상과 다르면 PL_CONFIG_OVERLAY 를 빠뜨린 것이다.">한 트럭에 실린 A/B/C 중 선택한 팔레트</p>
       </div>
       <div class="tabs">
-        <button class="tab on" data-view="iso">3D 박스</button>
-        <button class="tab" data-view="heat">높이 지도</button>
+        <button class="tab on" data-view="iso" data-tip="쌓인 모습을 비스듬히 본 그림. 회색 점이 로봇이 서 있는 변이라, Isaac 화면과 방향을 맞춰 볼 수 있다.">3D 박스</button>
+        <button class="tab" data-view="heat" data-tip="위에서 내려다본 높이. 색이 진할수록 높다. 어디가 비었는지 보기 좋다.">높이 지도</button>
       </div>
     </div>
     <div class="stage" id="stage"></div>
@@ -42,15 +42,23 @@
   <div class="panel">
     <div class="panel-head">
       <div>
-        <h2 id="right-title">꺼낼 순서 · 배송지</h2>
-        <p class="sub" id="right-sub">위에 아무것도 없는 것부터 한 겹씩</p>
+        <h2 id="right-title">cam1 · 투입부 카메라</h2>
+        <p class="sub" id="right-sub">박스 등록·검증을 하는 그 화면</p>
       </div>
       <div class="tabs">
-        <button class="tab2 on" data-right="unload">꺼낼 순서</button>
-        <button class="tab2" data-right="events">사건 기록</button>
+        <button class="tab2 on" data-right="cam" data-tip="투입부 카메라(cam1)가 지금 보고 있는 화면. 백엔드가 ROS 로 받아 넘겨준다 — 브라우저는 ROS 를 모른다.">cam1 실시간</button>
+        <button class="tab2" data-right="events" data-tip="최근에 일어난 일. 거절·픽 실패 같은 사건이 이유와 함께 쌓인다. 줄을 누르면 그 박스의 이력이 열린다.">사건 기록</button>
       </div>
     </div>
-    <div class="unload" id="unload"></div>
+    <div class="cam" id="cam">
+      <img id="cam-img" alt="cam1 실시간 영상" hidden />
+      <!-- ★ QR 표시는 영상 위에 **겹쳐** 그린다. 사진에 직접 그리지 않는 이유:
+           ① 한글 주소를 사진에 쓰려면 글꼴 라이브러리가 필요하다 (서버는 표준
+              라이브러리만 쓴다)  ② 겹쳐 그리면 글자가 화면 해상도로 또렷하다
+           ③ 사진은 손대지 않은 원본이라, 표시가 틀려도 영상은 진짜다 -->
+      <svg id="cam-ov" preserveAspectRatio="xMidYMid meet" hidden></svg>
+      <div class="cam-off" id="cam-off">불러오는 중…</div>
+    </div>
     <div class="unload" id="events" hidden></div>
   </div>
 </section>

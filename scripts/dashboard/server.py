@@ -43,9 +43,11 @@ import json
 import os
 import pathlib
 import sqlite3
+import struct
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -127,6 +129,180 @@ def _split_pallets(boxes):
     return out
 
 
+#: 카메라 프레임을 화면에 보낼 때 쓰는 PNG 인코더.
+#: ★ 왜 직접 쓰나: 이 서버는 표준 라이브러리만 쓴다(머리 주석). Pillow·OpenCV 를
+#:   요구하면 시연 PC 마다 pip 설치가 필요해지고, cv_bridge 는 ROS 가 없는 PC 에서
+#:   못 쓴다. PNG 는 zlib 한 번이면 되므로 의존성을 늘릴 이유가 없다.
+#: ★ JPEG 이 아니라 PNG 인 이유도 같다 — JPEG 인코더는 표준 라이브러리에 없다.
+def _png(rgb, w, h, level=1):
+    """RGB8 바이트 → PNG. level 1 = 빠른 쪽. 화면용이라 압축률보다 지연이 중요하다."""
+    raw = bytearray()
+    stride = w * 3
+    for y in range(h):
+        raw.append(0)                       # 필터 타입 0 (None)
+        raw += rgb[y * stride:(y + 1) * stride]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), level))
+            + chunk(b"IEND", b""))
+
+
+def _to_rgb(fr, max_w=640):
+    """sensor_msgs/Image 원본 바이트 → (rgb8 바이트, w, h).
+
+    ★ numpy 가 있으면 **줄여서** 보낸다. 1280x720 을 그대로 PNG 로 만들면 한 장에
+      1 MB 가 넘어 4 Hz 로 보내는 순간 회선과 CPU 를 다 먹는다. 화면에서는 어차피
+      가로 절반이면 충분하다. numpy 가 없으면 원본 그대로 간다 (동작은 한다).
+    ★ 인코딩 종류를 코드가 **골라서** 받는다. Isaac 은 rgb8 을 내지만 다른 노드가
+      bgr8 을 내면 색이 뒤집힌 채 그냥 보이므로, 여기서 한 번에 맞춘다.
+    """
+    w, h, enc, step = fr["w"], fr["h"], fr["enc"], fr["step"]
+    data = fr["data"]
+    try:
+        import numpy as np
+    except Exception:                       # noqa: BLE001 — 없으면 원본 rgb8 만
+        return (data, w, h) if enc == "rgb8" else (None, 0, 0)
+
+    ch = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}.get(enc)
+    if not ch or len(data) < h * step:
+        return None, 0, 0
+    a = np.frombuffer(data, dtype=np.uint8)[:h * step].reshape(h, step)[:, :w * ch]
+    a = a.reshape(h, w, ch)
+    s = max(1, -(-w // max_w))              # 정수 배율로만 줄인다 (보간 없음 = 빠르다)
+    a = a[::s, ::s]
+    if ch == 1:
+        a = np.repeat(a, 3, axis=2)
+    elif enc.startswith("bgr"):
+        a = a[:, :, [2, 1, 0]]
+    else:
+        a = a[:, :, :3]
+    return np.ascontiguousarray(a).tobytes(), a.shape[1], a.shape[0]
+
+
+def _zone_colors(cfg):
+    """구역 → 화면 색. **씬이 박스를 칠하는 색 그대로** 쓴다 (A 빨강·B 초록·C 파랑).
+
+    ★ 표를 새로 만들지 않는다. `routing.by_color`(색→존)와 `boxes.colors`(색→RGB)를
+      이어 붙여 유도한다 — test_3.yaml 이 같은 이유로 네 번째 표를 금지하고 있다.
+      화면 색이 씬과 다르면 "저 빨간 박스" 라는 말이 두 가지를 가리키게 된다.
+    """
+    out = {}
+    try:
+        by_color = cfg["routing"]["by_color"]        # {"red": "A", ...}
+        rgb = cfg["boxes"]["colors"]                 # {"red": [0.9, 0.03, 0.03], ...}
+        for name, zone in by_color.items():
+            c = rgb.get(name)
+            if not c:
+                continue
+            out[str(zone).lower()] = "#%02x%02x%02x" % tuple(
+                max(0, min(255, int(round(float(v) * 255)))) for v in c[:3])
+    except Exception:                       # noqa: BLE001 — 없으면 화면이 기본색을 쓴다
+        return {}
+    return out
+
+
+def _poly_bbox(items, w, h):
+    """찾은 QR 들을 감싸는 픽셀 사각형. 다음 프레임에서 여기만 다시 본다."""
+    xs = [pt[0] * w for it in items for pt in it["poly"]]
+    ys = [pt[1] * h for it in items for pt in it["poly"]]
+    return (min(xs), min(ys), max(xs), max(ys)) if xs else None
+
+
+def _qr_scan(fr, max_w=640, deep=True, roi=None):
+    """프레임에서 QR 을 찾는다 → [{"text", "poly": [[x,y] x4]}], 좌표는 **0~1 비율**.
+
+    ★ 왜 비율인가: 화면이 창 크기에 따라 영상을 늘렸다 줄였다 한다. 픽셀 좌표를
+      보내면 화면 쪽에서 다시 배율을 맞춰야 하고, 한 번 틀리면 박스가 엉뚱한 데
+      그려진다. 비율로 보내면 화면은 곱하기만 하면 된다.
+
+    ★ 왜 인식 노드에서 안 받고 여기서 다시 읽나: `vision_node` 는 QR **문자열만**
+      쓰고 위치는 버린다 (`detect.read_qr`). 위치를 받으려면 `packing_msgs` 에
+      필드를 늘려야 하고 그건 팀 전원 재빌드다 (§11·§14). 화면에 표시하자고
+      공용 인터페이스를 바꿀 일은 아니라, 보여주는 쪽에서 한 번 더 읽는다.
+      ⚠ 그래서 이 표시는 **"대시보드가 읽은 것"이지 "인식 노드가 등록한 것"이 아니다.**
+        둘이 다르면 인식 쪽 문제를 드러내는 단서가 된다 (같은 화면을 봤는데 다르다).
+
+    ★ cv2 가 없으면 조용히 빈 목록. 표시가 없을 뿐 영상은 그대로 나온다.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:                       # noqa: BLE001
+        return []
+    w, h, enc, step = fr["w"], fr["h"], fr["enc"], fr["step"]
+    ch = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}.get(enc)
+    if not ch or len(fr["data"]) < h * step:
+        return []
+    a = np.frombuffer(fr["data"], dtype=np.uint8)[:h * step].reshape(h, step)[:, :w * ch]
+    a = a.reshape(h, w, ch)
+    def scan(sub, off=(0, 0), step=1):
+        """한 조각을 훑는다. 좌표는 **원본 전체 기준** 0~1 비율로 돌려준다."""
+        gray = (sub[:, :, 0] if ch == 1
+                else cv2.cvtColor(np.ascontiguousarray(sub[:, :, :3]), cv2.COLOR_RGB2GRAY))
+        det = cv2.QRCodeDetector()
+        try:
+            ok, texts, pts, _ = det.detectAndDecodeMulti(gray)
+        except Exception:                   # noqa: BLE001 — 버전에 따라 없다
+            ok = False
+        if not ok or pts is None:
+            try:
+                txt, p1, _ = det.detectAndDecode(gray)
+            except Exception:               # noqa: BLE001
+                return []
+            if p1 is None:
+                return []
+            texts, pts = [txt], p1.reshape(1, -1, 2)
+        out = []
+        for txt, quad in zip(texts, pts):
+            if quad is None or len(quad) < 4:
+                continue
+            out.append({"text": txt or "",
+                        "poly": [[round((off[0] + float(x) * step) / w, 4),
+                                  round((off[1] + float(y) * step) / h, 4)]
+                                 for x, y in quad[:4]]})
+        return out
+
+    # ★ ① 직전에 찾은 자리 둘레만 먼저 본다 (2026-08-27).
+    #   화면 전체를 훑는 건 비싸서 0.4 초에 한 번밖에 못 했고, 그 사이 벨트가
+    #   0.5 m/s 로 움직여 **빨간 박스가 QR 을 뒤따라갔다.** 자리를 알고 있을 때는
+    #   그 둘레(1.6 배)만 원본 해상도로 보면 되고, 그건 몇 ms 라 매 프레임 할 수 있다.
+    #   놓치면 아래 전체 탐색이 다시 잡는다 — 잡고 나면 다시 싸진다.
+    if roi:
+        rx0, ry0, rx1, ry1 = roi
+        pw, ph = (rx1 - rx0) * 0.6 + 8, (ry1 - ry0) * 0.6 + 8
+        x0 = max(0, int(rx0 - pw)); x1 = min(w, int(rx1 + pw))
+        y0 = max(0, int(ry0 - ph)); y1 = min(h, int(ry1 + ph))
+        if x1 - x0 > 24 and y1 - y0 > 24:
+            got = scan(a[y0:y1, x0:x1], off=(x0, y0))
+            if got and all(it["text"] for it in got):
+                return got
+
+    # ★ 두 번 훑는다 — 줄인 그림 먼저, 실패하면 원본 (2026-08-27 실측).
+    #   줄여서만 훑으면 **1280 폭에서 QR 이 160 px 보다 작을 때 못 읽는다**
+    #   (실측: 240·160 성공 · 100 은 찾되 내용 못 읽음 · 70 이하 실패).
+    #   투입부 카메라가 벨트를 넓게 잡으면 QR 이 그 크기로 들어온다.
+    #   원본은 4 배 느리지만 **못 읽었을 때만** 하므로, 읽히는 동안은 비용이 그대로다.
+    sc = max(1, -(-w // max_w))
+    hit = scan(a[::sc, ::sc], step=sc) if sc > 1 else []
+    # ★ 원본 재훑기는 **비싸다.** QR 이 없는 화면에서도 매번 하면 컨베이어 그림
+    #   기준 한 장에 40 ms, 지저분한 화면은 120 ms 다 — 4 Hz 로 계속 하면 코어
+    #   하나를 절반 넘게 먹는다. 렌더가 이미 병목인 시연 PC 에서 그럴 수는 없다.
+    #   그래서 ① 뭔가 찾긴 했는데 내용을 못 읽었을 때는 바로 다시 훑고
+    #        ② 아무것도 못 찾았을 때는 **가끔만** (deep=True 인 호출에서만) 다시 훑는다.
+    partial = bool(hit) and any(not it["text"] for it in hit)
+    if partial or (deep and not hit):
+        full = scan(a)
+        if full and not any(not it["text"] for it in full):
+            return full
+        hit = hit or full
+    return hit
+
+
 class Live:
     """`/zone_*/status` 를 **백엔드가 직접** 구독한다. rosbridge 가 필요 없다.
 
@@ -151,11 +327,28 @@ class Live:
     구독 콜백은 메시지가 올 때 뜨므로 시계와 무관하다.
     """
 
-    def __init__(self, zones, hm_topic="/algo/heightmap"):
+    def __init__(self, zones, hm_topic="/algo/heightmap", cams=()):
         self.zones = zones
         self.data = {}          # zone -> dict(ZoneStatus 필드)
         self.hm = {}            # zone -> dict(w, d, cell_mm, grid, recv_wall)
         self.hm_topic = hm_topic
+        # ★ 카메라는 **원본 그대로** 들고 있다가 요청이 올 때 인코딩한다.
+        #   콜백에서 매 프레임(30 Hz) PNG 를 만들면 아무도 안 보고 있을 때도
+        #   CPU 를 태운다. 화면은 4 Hz 면 충분하다.
+        self.cams = tuple(cams)
+        self.frame = {}         # 이름 -> dict(data, w, h, enc, step, recv_wall)
+        # ★ **아무도 안 볼 때는 프레임을 붙잡지도 않는다.** 1280x720 한 장이 2.7 MB 라
+        #   30 Hz 로 복사하면 초당 80 MB 다 — 화면을 안 보는 동안 시연 PC 의 메모리
+        #   대역만 먹는다. 마지막 요청 시각을 보고 그때만 저장한다.
+        #   처음 몇 초는 무조건 받는다 (기동 로그에 해상도를 찍기 위해)
+        self.cam_want = time.time()
+        self._cam_last = {}     # 이름 -> 마지막으로 저장한 시각
+        # ★ QR 은 **프레임당 한 번만** 읽는다. 화면이 4 Hz 로 영상과 표시를 따로
+        #   가져가므로, 캐시가 없으면 같은 사진을 두 번 훑게 된다
+        self._qr = {}           # 이름 -> (프레임시각, 결과, 훑은시각, 마지막성공시각)
+        self._qr_deep = {}      # 이름 -> 마지막으로 원본까지 훑은 시각
+        self._qr_roi = {}       # 이름 -> 직전에 QR 이 있던 자리 (픽셀 bbox)
+        self.zone_colors = {}   # 구역 -> 화면 색. main() 이 설정에서 넣어 준다
         self.ok = False
         self.reason = "시작 안 함"
         self._t = None
@@ -240,6 +433,38 @@ class Live:
                     node.create_subscription(Image, f"{self.hm_topic}/{z}",
                                              mk_hm(z), hq, callback_group=cb)
 
+            # ── 카메라 영상 (cam1 등) ───────────────────────────────
+            # ★ QoS 는 반드시 BEST_EFFORT (qos_profile_sensor_data).
+            #   기본 RELIABLE 로 구독하면 이미지가 **하나도 안 온다** — 에러도 안 난다
+            #   (CLAUDE.md §3-4 규약 5).
+            if self.cams:
+                from rclpy.qos import qos_profile_sensor_data
+
+                def mk_cam(name):
+                    def on(msg):
+                        # 보는 사람이 없으면 버린다 · 있어도 12 Hz 를 넘겨 받지 않는다
+                        # (화면은 4 Hz 로 가져간다 — 더 들고 있어 봐야 안 쓴다)
+                        now = time.time()
+                        if now - self.cam_want > 5.0:
+                            return
+                        if now - self._cam_last.get(name, 0) < 0.08:
+                            return
+                        self._cam_last[name] = now
+                        try:
+                            self.frame[name] = {
+                                "data": bytes(msg.data), "w": msg.width,
+                                "h": msg.height, "enc": msg.encoding,
+                                "step": msg.step, "recv_wall": time.time()}
+                        except Exception:        # noqa: BLE001 — 영상은 부가 기능
+                            pass
+                    return on
+
+                for ns in self.cams:
+                    node.create_subscription(Image, f"{ns}/rgb",
+                                             mk_cam(ns.strip("/")),
+                                             qos_profile_sensor_data,
+                                             callback_group=cb)
+
             self.ok, self.reason = True, "구독 중"
             ex = MultiThreadedExecutor()         # CLAUDE.md §9
             ex.add_node(node)
@@ -256,11 +481,80 @@ class Live:
                  if now - v.get("recv_wall", 0) <= stale_s}
         # ★ heightmap 은 **오래됐다고 버리지 않는다.** 박스가 놓일 때만 갱신되므로
         #   30 초 넘게 그대로인 게 정상이다 (ZoneStatus 는 2 Hz 라 판정이 다르다).
+        cams = {n: {"w": f["w"], "h": f["h"], "enc": f["enc"],
+                    "age_s": round(now - f["recv_wall"], 2)}
+                for n, f in self.frame.items()}
         return {"ok": self.ok and bool(fresh), "reason": self.reason,
-                "zones": fresh, "heightmap": dict(self.hm)}
+                "zones": fresh, "heightmap": dict(self.hm),
+                # ★ 영상 자체는 /api/cam/<이름>.png 로 따로 받는다. 여기엔 "지금
+                #   들어오고 있나 · 몇 초 전 것인가" 만 싣는다 — 이걸 안 주면
+                #   화면이 멈춘 마지막 프레임을 실시간처럼 보여준다
+                "cams": cams, "cam_names": list(self.cams)}
 
     def heightmap(self, zone):
         return self.hm.get(zone)
+
+    #: QR 을 다시 훑는 최소 간격(초). 화면은 4 Hz 로 물어보지만 그대로 다 훑으면
+    #: CPU 를 낭비한다 — 벨트가 0.5 m/s 라 0.4 초면 표시가 충분히 따라간다.
+    QR_MIN_S = 0.4
+    #: 화면 **전체**를 다시 훑는 간격. 두 가지를 위해 반드시 있어야 한다 —
+    #: ① 작은 QR (줄인 그림에서는 안 보인다)  ② **새로 들어온 박스**.
+    #: ★ 이게 없으면 ROI 추적이 처음 잡은 QR 만 영영 쳐다본다. 실측으로 확인했다:
+    #:   QR 3 개가 나란히 있는데 1 개만 표시됐다. 라인에서는 박스가 계속 들어오므로
+    #:   추적만 하면 두 번째 박스부터 화면에 안 뜬다.
+    QR_SWEEP_S = 0.7
+    #: 방금 읽은 QR 을 잠깐 붙잡아 둔다. 한 프레임 실패마다 표시가 깜빡이면
+    #: 읽히고 있는데도 "안 읽힌다" 처럼 보인다.
+    QR_HOLD_S = 1.2
+
+    def qr(self, name):
+        """최신 프레임의 QR.
+
+        ★ 자리를 알고 있을 때(`roi`)는 **속도 제한을 걸지 않는다.** 둘레만 보는 건
+          싸고, 여기서 아끼면 표시가 QR 을 뒤따라간다 — 그게 정확히 고치려던 것이다.
+          자리를 모를 때만 전체 탐색이라 그건 제한을 건다.
+        """
+        now = self.cam_want = time.time()
+        n = name.strip("/")
+        fr = self.frame.get(n)
+        if not fr:
+            return None
+        key, hit, when, last_ok = self._qr.get(n, (None, [], 0.0, 0.0))
+        roi = self._qr_roi.get(n)
+        sweep = now - self._qr_deep.get(n, 0.0) >= self.QR_SWEEP_S
+        if key != fr["recv_wall"] and (roi or sweep or now - when >= self.QR_MIN_S):
+            if sweep:
+                # 전체 훑기 — 새로 들어온 QR·작은 QR 을 여기서 잡는다
+                fresh = _qr_scan(fr, deep=True)
+                self._qr_deep[n] = now
+            else:
+                # 아는 자리 둘레만 — 싸다. 표시가 QR 을 그대로 따라간다
+                fresh = _qr_scan(fr, deep=False, roi=roi)
+            if fresh:
+                hit, last_ok = fresh, now
+                self._qr_roi[n] = _poly_bbox(fresh, fr["w"], fr["h"])
+            else:
+                # 놓쳤다 — 다음 번엔 전체를 다시 본다. ROI 를 붙들고 있으면
+                # 박스가 사라진 자리를 영영 쳐다보게 된다
+                self._qr_roi.pop(n, None)
+                if now - last_ok > self.QR_HOLD_S:
+                    hit = []
+            self._qr[n] = (fr["recv_wall"], hit, now, last_ok)
+        return {"qrs": hit, "age_s": round(now - fr["recv_wall"], 2),
+                "zone_colors": self.zone_colors}
+
+    def png(self, name, max_w=640):
+        """이름(cam1)의 최신 프레임을 PNG 로. 없으면 (None, 이유)."""
+        self.cam_want = time.time()      # "지금 보고 있다" — 구독 콜백이 이걸 본다
+        fr = self.frame.get(name.strip("/"))
+        if not fr:
+            if not self.ok:
+                return None, f"ROS 구독이 꺼져 있다 — {self.reason}"
+            return None, f"{name} 영상이 아직 한 장도 안 왔다"
+        rgb, w, h = _to_rgb(fr, max_w)
+        if not rgb:
+            return None, f"처리할 수 없는 인코딩: {fr['enc']}"
+        return _png(rgb, w, h), None
 
 
 class Store:
@@ -330,7 +624,41 @@ class Store:
             #   계산한 것을 그린다. 둘 다 있으면 대조해서 어긋남을 잡을 수 있다.
             "algo_heightmap": (Handler.live.heightmap(zone.lower())
                                if Handler.live else None),
+            # ★ 그림이 "어느 쪽에서 본 것인가" 를 스스로 말하게 하는 표시.
+            #   설정마다 로봇이 서는 변이 다르다 — 정본은 팔레트 −Y 쪽,
+            #   test_3 오버레이는 +X 쪽이다. 화면에 박으면 한쪽이 반드시 틀린다
+            "robot_local_mm": self._robot_local(zone),
         }
+
+    def _robot_local(self, zone):
+        """로봇 베이스를 팔레트 로컬 mm 으로. 설정에 없으면 None — 표시만 안 한다."""
+        try:
+            zc = self.cfg["zones"]
+            o = zc["pallet_origin_world_mm"][zone.upper()]
+            r = zc["robot_base_world_mm"][zone.upper()]
+            return [int(r[0] - o[0]), int(r[1] - o[1])]
+        except Exception:                    # noqa: BLE001 — 부가 표시라 조용히 끈다
+            return None
+
+    def box_brief(self, qr_text):
+        """QR 원문(지금 규약은 box_id 그대로) → 화면에 한 줄 띄울 정보. 없으면 None."""
+        if not qr_text:
+            return None
+        try:
+            con = self._con()
+        except FileNotFoundError:
+            return None
+        try:
+            r = con.execute(
+                "SELECT s.box_id, s.status, s.zone, m.address FROM boxes_sorted s "
+                "LEFT JOIN boxes_master m USING(box_id) "
+                "WHERE s.box_id=? OR s.qr_payload=? LIMIT 1",
+                (qr_text, qr_text)).fetchone()
+        finally:
+            con.close()
+        if not r:
+            return None
+        return {"box_id": r[0], "status": r[1], "zone": r[2], "address": r[3]}
 
     def unload(self, zone):
         """꺼내기 쉬운 순서. 현재 판만 본다 — 나간 판은 이미 트럭에 있다."""
@@ -540,6 +868,36 @@ class Handler(BaseHTTPRequestHandler):
                 b = self.store.box(path[len("/api/box/"):].strip("/"))
                 return self._json(b if b else {"error": "그런 박스가 없다"},
                                   200 if b else 404)
+            # QR 표시용. 영상과 따로 받는다 — <img> 는 헤더를 읽을 수 없기 때문이다.
+            if path.startswith("/api/cam/") and path.endswith("/qr"):
+                name = path[len("/api/cam/"):-len("/qr")].strip("/")
+                q = Handler.live.qr(name) if Handler.live else None
+                if q is None:
+                    return self._json({"qrs": [], "age_s": None})
+                # ★ 읽은 QR 이 **DB 에 있는 박스인가** 를 같이 본다. 시연에서
+                #   "저 QR 이 뭐냐" 의 답은 번호가 아니라 배송지다.
+                for it in q["qrs"]:
+                    it["box"] = self.store.box_brief(it["text"])
+                return self._json(q)
+            # ★ 카메라 한 장. <img src> 가 직접 부르므로 JSON 이 아니라 이미지다.
+            if path.startswith("/api/cam/"):
+                name = path[len("/api/cam/"):].strip("/")
+                if name.endswith(".png"):
+                    name = name[:-4]
+                q = parse_qs(urlparse(self.path).query)
+                mw = int((q.get("w") or ["640"])[0])
+                png, why = (Handler.live.png(name, max(160, min(mw, 1920)))
+                            if Handler.live else (None, "ROS 가 꺼져 있다"))
+                if not png:
+                    # ★ 503 + JSON. 화면이 이유를 그대로 띄운다 — 빈 사진틀만
+                    #   보여주면 "카메라가 없는 것" 인지 "서버가 죽은 것" 인지 모른다
+                    return self._json({"error": why}, 503)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(png)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return self.wfile.write(png)
             if path == "/api/health":
                 return self._json({"ok": True, "db": str(self.store.db_path),
                                    "db_exists": self.store.db_path.exists()})
@@ -566,12 +924,18 @@ def main():
     ap.add_argument("--db", type=pathlib.Path, default=DEF_DB)
     ap.add_argument("--no-ros", action="store_true",
                     help="ROS 구독을 아예 시도하지 않는다 (DB 화면만)")
+    # ★ 이름이 아니라 **네임스페이스**다. 실제 토픽은 <ns>/rgb 다 (vision_node 규약).
+    ap.add_argument("--cam", default="/cam1",
+                    help="화면에 띄울 카메라 네임스페이스. 쉼표로 여러 개 "
+                         "(예: /cam1,/cam2,/pick_cam_a). 빈 문자열이면 안 받는다")
     a = ap.parse_args()
 
     cfg = _paths.system_config()          # PL_CONFIG_OVERLAY 까지 합쳐 읽는다
     Handler.store = Store(a.db, cfg)
     # ★ ROS 는 **있으면 쓰고 없으면 만다.** 없어도 DB 화면은 그대로 나온다
-    Handler.live = Live(ZONES)
+    cams = [c.strip() for c in a.cam.split(",") if c.strip()]
+    Handler.live = Live(ZONES, cams=cams)
+    Handler.live.zone_colors = _zone_colors(cfg)
     if not a.no_ros:
         Handler.live.start()
 
@@ -585,6 +949,9 @@ def main():
     time.sleep(0.6)                        # 구독이 붙을 짬
     lv = Handler.live.snapshot()
     print(f"  실시간  : {'구독 중' if Handler.live.ok else '꺼짐 — ' + lv['reason']}")
+    if cams:
+        got = ", ".join(f"{n}({v['w']}x{v['h']})" for n, v in lv["cams"].items())
+        print(f"  카메라  : {', '.join(cams)} → {got or '아직 프레임 없음'}")
     print("  Ctrl+C 로 종료")
     try:
         srv = ThreadingHTTPServer((a.host, a.port), Handler)

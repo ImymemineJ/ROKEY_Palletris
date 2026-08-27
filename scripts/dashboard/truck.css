@@ -158,3 +158,58 @@ h2{font-size:16px;font-weight:600;margin:0}
 
 /* 멈춘 기록을 보고 있을 때는 흐리게 — "지금 돌고 있다" 로 오해하지 않게 */
 .run{transition:color .2s}
+
+/* ★ 설명 말풍선 (2026-08-27). 숫자에 마우스를 올리면 그게 무슨 뜻인지 말해 준다.
+   발표 때 옆에서 나오는 질문이 대부분 "이 값이 뭐냐" 였는데, 그때마다 사람이
+   답하면 화면을 보는 흐름이 끊긴다.
+   ★ JS 를 안 쓴다 — CSS 의 attr() 만으로 그린다. 스크립트가 죽어도 설명은 뜨고,
+     내용이 마크업 안에 그대로 남아 있어 화면과 설명이 갈라질 일이 없다. */
+[data-tip]{position:relative;cursor:help}
+/* ⚠ 잘리는 자리에는 붙이지 말 것. 말풍선은 그냥 자식 요소라 조상의
+   overflow 에 잘린다 — `.unload`(스크롤 목록)와 `.u-addr`(말줄임) 안에서는
+   아예 안 보인다. 그 안은 브라우저 기본 툴팁(title=)을 쓴다. */
+[data-tip]:hover::after,[data-tip]:focus-visible::after{
+  content:attr(data-tip);
+  position:absolute;left:50%;top:calc(100% + 8px);transform:translateX(-50%);
+  width:max-content;max-width:280px;white-space:normal;text-align:left;
+  background:#1b1f24;color:#fff;font:400 12.5px/1.6 inherit;letter-spacing:0;
+  padding:8px 11px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.20);
+  z-index:60;pointer-events:none;
+}
+[data-tip]:hover::before{
+  content:"";position:absolute;left:50%;top:calc(100% + 2px);transform:translateX(-50%);
+  border:6px solid transparent;border-bottom-color:#1b1f24;z-index:60;pointer-events:none;
+}
+/* 화면 아래쪽 요소(지표 줄)는 말풍선을 위로 띄운다 — 아래로 열면 잘린다 */
+[data-tip].tip-u:hover::after{top:auto;bottom:calc(100% + 8px)}
+[data-tip].tip-u:hover::before{
+  top:auto;bottom:calc(100% + 2px);border-bottom-color:transparent;border-top-color:#1b1f24;
+}
+/* 왼쪽 끝 요소도 마찬가지 */
+[data-tip].tip-l:hover::after{left:0;transform:none}
+[data-tip].tip-l:hover::before{left:14px;transform:none}
+/* 오른쪽 끝 요소는 가운데 정렬하면 화면 밖으로 나간다 */
+[data-tip].tip-r:hover::after{left:auto;right:0;transform:none}
+[data-tip].tip-r:hover::before{left:auto;right:14px;transform:none}
+
+/* cam1 실시간 영상 — 오른쪽 패널 */
+.cam{position:relative;min-height:330px;display:flex;align-items:center;justify-content:center;
+  background:#101317;border-radius:8px;overflow:hidden}
+.cam img{width:100%;max-height:330px;object-fit:contain;display:block}
+/* ★ 영상이 없을 때 검은 사진틀만 두면 "카메라가 없는 건지 서버가 죽은 건지" 를
+   화면이 안 말해 준다. 백엔드가 준 이유(503 본문)를 그대로 여기 띄운다. */
+.cam-off{position:absolute;padding:0 24px;text-align:center;color:#9aa4b0;font-size:13px;line-height:1.7}
+
+/* QR 표시 — 영상과 **같은 상자**에 겹쳐 둔다.
+   ★ img 는 object-fit:contain, svg 는 preserveAspectRatio="xMidYMid meet" 다.
+     둘은 같은 규칙이라 상자만 같으면 좌표가 정확히 겹친다 — 여백 계산이 필요 없다.
+     상자가 다르면 창 크기를 바꿀 때마다 박스가 어긋난다. */
+.cam{height:330px}
+.cam img{width:100%;height:100%;object-fit:contain}
+#cam-ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+/* ★ 색을 여기 두지 않는다. 구역마다 다르고, 값은 그릴 때 `fill=`·`stroke=` 로 넣는다.
+   ⚠ CSS 에 fill 을 적으면 **그 인라인 값을 이겨 버린다** — SVG 의 fill/stroke 는
+     '표현 속성' 이라 어떤 CSS 규칙보다 순위가 낮다. 실제로 색을 넣었는데 전부
+     회색으로 나왔다. 모양(굵기·모서리)만 여기서 정한다. */
+.qr-box{fill-opacity:.16;stroke-width:3;stroke-linejoin:round}
+.qr-txt{fill:#fff;font:600 20px "Pretendard","Noto Sans KR",system-ui,sans-serif}
