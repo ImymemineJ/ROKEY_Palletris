@@ -42,6 +42,8 @@ import os
 import pathlib
 import sqlite3
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -121,6 +123,97 @@ def _split_pallets(boxes):
     if cur:
         out.append(cur)
     return out
+
+
+class Live:
+    """`/zone_*/status` 를 **백엔드가 직접** 구독한다. rosbridge 가 필요 없다.
+
+    ## 왜 rosbridge 를 안 쓰나
+
+    브라우저가 ROS 를 직접 상대하면 토픽 이름과 QoS 를 JS 문자열로 적게 된다.
+    기존 대시보드가 그래서 `/robot/event`(발행자 0 개)를 구독한 채 영영 빈 화면을
+    띄웠다. 여기서 rclpy 로 한 번 정확히 쓰면 그 계통의 사고가 사라진다.
+    게다가 rosbridge 는 어느 `package.xml` 에도 없는 apt 의존이라, 시연 PC 마다
+    따로 깔아야 한다.
+
+    ## ★ 없으면 없는 대로 돈다
+
+    rclpy 를 못 불러오거나 실패하면 **조용히 꺼진 채** 서버는 그대로 뜬다.
+    DB 화면은 ROS 와 무관하게 나오므로, `colcon build` 전이나 ROS 가 없는 PC 에서도
+    쓸 수 있다는 성질을 잃지 않는다.
+
+    ## /clock 함정을 피하는 법 (CLAUDE.md §10)
+
+    `use_sim_time` 을 **켜지 않는다.** 켜면 `/clock` 발행자가 없을 때 ROS 시계가
+    0 에 멈춰 타이머가 영영 안 뜬다. 여기서는 **ROS 타이머를 아예 안 쓴다** —
+    구독 콜백은 메시지가 올 때 뜨므로 시계와 무관하다.
+    """
+
+    def __init__(self, zones):
+        self.zones = zones
+        self.data = {}          # zone -> dict(ZoneStatus 필드)
+        self.ok = False
+        self.reason = "시작 안 함"
+        self._t = None
+
+    def start(self):
+        try:
+            import rclpy                                   # noqa: F401
+        except Exception as e:                             # noqa: BLE001
+            self.reason = f"rclpy 없음 ({type(e).__name__}) — install/setup.bash 를 source 했나"
+            return
+        self._t = threading.Thread(target=self._spin, daemon=True)
+        self._t.start()
+
+    def _spin(self):
+        try:
+            import rclpy
+            from rclpy.callback_groups import ReentrantCallbackGroup
+            from rclpy.executors import MultiThreadedExecutor
+            from rclpy.node import Node
+            from packing_msgs.msg import ZoneStatus
+        except Exception as e:                             # noqa: BLE001
+            self.reason = f"packing_msgs 없음 ({e}) — colcon build 후 source 할 것"
+            return
+        try:
+            rclpy.init(args=[])
+            node = Node("dashboard_live")
+            cb = ReentrantCallbackGroup()        # CLAUDE.md §9
+
+            def make(z):
+                def on(msg):
+                    self.data[z] = {
+                        "zone": msg.zone, "state": msg.state,
+                        "queue_len": msg.queue_len,
+                        "placed_count": msg.placed_count,
+                        "rejected_count": msg.rejected_count,
+                        "fill_rate": float(msg.fill_rate),
+                        "max_height_mm": msg.max_height_mm,
+                        "accepting": bool(msg.accepting),
+                        # 화면이 "얼마나 오래된 값인가" 를 알 수 있게 벽시계로 찍는다.
+                        # 메시지의 stamp 는 sim 시각이라 브라우저 시계와 못 비교한다.
+                        "recv_wall": time.time(),
+                    }
+                return on
+
+            for z in self.zones:
+                node.create_subscription(ZoneStatus, f"/zone_{z}/status",
+                                         make(z), 10, callback_group=cb)
+            self.ok, self.reason = True, "구독 중"
+            ex = MultiThreadedExecutor()         # CLAUDE.md §9
+            ex.add_node(node)
+            ex.spin()
+        except Exception as e:                             # noqa: BLE001
+            self.ok = False
+            self.reason = f"{type(e).__name__}: {e}"
+
+    def snapshot(self, stale_s=5.0):
+        """지금 값. ★ 오래된 것은 버린다 — 노드가 죽어도 마지막 값이 남으면
+        "ROS 미연결" 이라 적힌 화면에 조금 전 값이 지금 값처럼 보인다."""
+        now = time.time()
+        fresh = {z: v for z, v in self.data.items()
+                 if now - v.get("recv_wall", 0) <= stale_s}
+        return {"ok": self.ok and bool(fresh), "reason": self.reason, "zones": fresh}
 
 
 class Store:
@@ -306,6 +399,7 @@ class Store:
 
 class Handler(BaseHTTPRequestHandler):
     store: Store = None
+    live: "Live" = None
     server_version = "PalletrisDash/1.0"
 
     def log_message(self, fmt, *a):        # 접근 로그는 조용히
@@ -344,6 +438,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.store.truck())
             if path == "/api/metrics":
                 return self._json(self.store.metrics())
+            if path == "/api/live":
+                return self._json(Handler.live.snapshot())
             if path == "/api/events":
                 q = parse_qs(urlparse(self.path).query)
                 n = int((q.get("limit") or ["200"])[0])
@@ -379,10 +475,16 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="기본 로컬만. 다른 PC 에서 보려면 0.0.0.0")
     ap.add_argument("--db", type=pathlib.Path, default=DEF_DB)
+    ap.add_argument("--no-ros", action="store_true",
+                    help="ROS 구독을 아예 시도하지 않는다 (DB 화면만)")
     a = ap.parse_args()
 
     cfg = _paths.system_config()          # PL_CONFIG_OVERLAY 까지 합쳐 읽는다
     Handler.store = Store(a.db, cfg)
+    # ★ ROS 는 **있으면 쓰고 없으면 만다.** 없어도 DB 화면은 그대로 나온다
+    Handler.live = Live(ZONES)
+    if not a.no_ros:
+        Handler.live.start()
 
     pal = cfg["pallet"]
     print(f"관제탑 대시보드 — http://{a.host}:{a.port}")
@@ -391,6 +493,9 @@ def main():
           f"· 최대 {pal['max_stack_mm']} mm")
     if os.environ.get("PL_CONFIG_OVERLAY"):
         print(f"  오버레이: {os.environ['PL_CONFIG_OVERLAY']}")
+    time.sleep(0.6)                        # 구독이 붙을 짬
+    lv = Handler.live.snapshot()
+    print(f"  실시간  : {'구독 중' if Handler.live.ok else '꺼짐 — ' + lv['reason']}")
     print("  Ctrl+C 로 종료")
     try:
         srv = ThreadingHTTPServer((a.host, a.port), Handler)

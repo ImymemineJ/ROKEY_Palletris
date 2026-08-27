@@ -1,13 +1,17 @@
 /**
  * 관제탑 대시보드 — 트럭 1대 관점.
  *
- * 두 곳에서 받는다:
- *   HTTP  /api/*                    server.py  (DB 읽기 전용) — 쌓인 것
- *   WS    rosbridge /zone_b/status  관제탑                     — 살아 있는 것
+ * 전부 백엔드(server.py) 한 곳에서 받는다:
+ *   /api/live      살아 있는 것 — 백엔드가 rclpy 로 /zone_{a,b,c}/status 를 구독한다
+ *   /api/pallet …  쌓인 것     — palletris.db (읽기 전용)
+ *
+ * ★ rosbridge 를 쓰지 않는다. 브라우저가 ROS 를 직접 상대하면 토픽 이름과 QoS 를
+ *   JS 문자열로 적게 되고, 기존 dashboard.js 가 그래서 /robot/event(발행자 0 개)를
+ *   구독한 채 영영 빈 화면을 띄웠다. 백엔드가 rclpy 로 한 번 정확히 쓰면 끝난다.
+ *   게다가 rosbridge 는 어느 package.xml 에도 없는 apt 의존이다.
  *
  * ★ 의존성 0. Chart.js·roslib CDN 을 쓰지 않는다 — 시연장 인터넷이 막히면
  *   그 스크립트 하나 때문에 화면이 통째로 안 뜬다 (기존 dashboard.js 의 실측 문제).
- *   rosbridge 는 표준 WebSocket 으로 직접 말한다 (프로토콜이 JSON 몇 줄이다).
  *
  * ★ 값이 없을 때 0 을 그리지 않는다. `—` 로 둔다.
  *   "0 개" 와 "아직 모른다" 는 다르다 (metrics.py 의 UNKNOWN = -1.0 규약).
@@ -15,8 +19,6 @@
 'use strict';
 
 const API = '';                                   // 같은 서버가 정적 파일도 준다
-const WS  = new URLSearchParams(location.search).get('ws')
-         || `ws://${location.hostname}:9090`;     // ?ws= 로 다른 PC 를 가리킬 수 있다
 const ZONES = ['a', 'b', 'c'];
 const POLL_MS = 2000;
 
@@ -27,7 +29,6 @@ const S = {
   pallet: {},           // zone -> /api/pallet 응답
   status: {},           // zone -> ZoneStatus (rosbridge)
   ros: false,
-  fake: false,          // ★ 시험용 대역에 붙었나 (fake_rosbridge.py)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -62,49 +63,28 @@ async function refresh() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  rosbridge — 살아 있는 상태만. 라이브러리 없이 직접 말한다.
+//  실시간 — 백엔드가 구독한 결과를 받아온다 (rosbridge 없음)
 // ══════════════════════════════════════════════════════════════
-function connectROS() {
-  let ws;
-  try { ws = new WebSocket(WS); } catch { return setConn(false); }
-
-  ws.onopen = () => {
-    setConn(true);
-    ZONES.forEach(z => ws.send(JSON.stringify({
-      op: 'subscribe', topic: `/zone_${z}/status`,
-      type: 'packing_msgs/msg/ZoneStatus', throttle_rate: 500,
-    })));
-  };
-  ws.onmessage = (ev) => {
-    let m; try { m = JSON.parse(ev.data); } catch { return; }
-    // ★ 시험용 대역은 접속 즉시 자기를 밝힌다. rosbridge 프로토콜에 없는 op 라
-    //   진짜 rosbridge 는 절대 이걸 보내지 않는다 -> 가짜를 확실히 가른다.
-    if (m.op === 'fake_rosbridge') { S.fake = true; setConn(true); return; }
-    if (m.op !== 'publish' || !m.msg) return;
-    const z = (m.msg.zone || '').toLowerCase();
-    if (ZONES.includes(z)) { S.status[z] = m.msg; renderCards(); }
-  };
-  ws.onerror = () => setConn(false);
-  // ★ 끊겨도 화면은 산다. DB 쪽은 계속 나온다 — 이게 이 구조의 이점이다.
-  ws.onclose = () => { setConn(false); setTimeout(connectROS, 3000); };
+async function pollLive() {
+  try {
+    const l = await getJSON('/api/live');
+    // ★ 백엔드가 이미 오래된 값을 버린다 (5초). 여기서 또 안 남긴다 —
+    //   "미연결" 이라 적힌 화면에 조금 전 값이 지금 값처럼 남으면 안 된다.
+    S.status = l.zones || {};
+    setConn(!!l.ok, l.reason);
+  } catch {
+    S.status = {}; setConn(false, '백엔드를 못 읽었다');
+  }
+  renderCards();
 }
 
-function setConn(live) {
+function setConn(live, reason) {
   S.ros = live;
-  if (!live) {
-    // ★ 끊기면 **마지막 값을 버린다.** 남겨 두면 "ROS 미연결" 이라고 적힌 화면에
-    //   조금 전 값이 그대로 남아 지금 값처럼 보인다. 시험용 대역에 붙었다 끊긴
-    //   경우엔 **가짜가 진짜 얼굴로 남는다** — 실제로 그랬다.
-    //   실시간 칸은 — 로 비우고, DB 에서 온 칸(적재 개수 등)만 남긴다.
-    S.fake = false;
-    S.status = {};
-    renderCards();
-  }
   const el = $('conn');
-  // ★ 가짜를 진짜와 같은 초록으로 칠하면 안 된다. 실제로 그래서 헷갈렸다.
-  el.className = 'conn ' + (S.fake ? 'fake' : (live ? 'live' : 'dead'));
-  $('conn-label').textContent = S.fake ? '⚠ 시험용 대역 — 실시간 값은 가짜다'
-                              : (live ? 'ROS 2 실시간 연결' : 'ROS 미연결 · DB 화면만');
+  el.className = 'conn ' + (live ? 'live' : 'dead');
+  $('conn-label').textContent = live
+    ? '관제탑 실시간 연결'
+    : `실시간 없음 · DB 화면만${reason ? ' — ' + reason : ''}`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -125,11 +105,11 @@ function renderCards() {
       <div class="card ${z === S.zone ? 'on' : ''}" data-z="${z}">
         <div class="card-head">
           <span class="card-name">팔레트 ${z.toUpperCase()}</span>
-          <span class="state ${S.fake ? 'fake' : cls}">${esc(stateTxt)}${S.fake ? ' (가짜)' : ''}</span>
+          <span class="state ${cls}">${esc(stateTxt)}</span>
         </div>
         <div class="card-row">
           <span>적재 <b>${p.count ?? '—'}</b></span>
-          <span>충전율 <b>${fill === null ? '—' : fill.toFixed(0) + '%' + (S.fake ? '?' : '')}</b></span>
+          <span>충전율 <b>${fill === null ? '—' : fill.toFixed(0) + '%'}</b></span>
           <span>최고 <b>${fmtMm(height)}</b></span>
         </div>
         <div class="bar"><i style="width:${fill === null ? 0 : Math.min(100, fill)}%"></i></div>
@@ -399,8 +379,8 @@ function init() {
   $('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true; };
   document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').hidden = true; });
   $('note').textContent = '';
-  refresh();
+  refresh();  pollLive();
   setInterval(refresh, POLL_MS);
-  connectROS();
+  setInterval(pollLive, 1000);        // 관제탑이 2 Hz 라 1 초면 충분하다
 }
 document.addEventListener('DOMContentLoaded', init);
