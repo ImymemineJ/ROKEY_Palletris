@@ -54,6 +54,16 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-115}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-$WS/src/packing_bringup/config/test_3.yaml}"
 
+# ★ 씬 선택 (2026-08-27). 배경(full_warehouse·카트) 들어간 새 씬이
+#   `Collected_test_3_share/` 로 왔다 — 팀 정본 경로(`Collected_test_3/`)가
+#   아니라서 run_test3_ros.sh 기본값이 **옛 씬을 집는다.** 새 것이 있으면
+#   그쪽을 쓴다. 정본 폴더가 새 씬으로 갱신되면 이 블록은 지워도 된다.
+#   (검증 2026-08-27: share 쪽 83 프림 = 옛 80 + full_warehouse + 카트 2,
+#    로봇 3·카메라 5·ROS2Bridge 전부 유지)
+if [ -z "${PL_STAGE:-}" ] && [ -f "$HOME/isaac_scenes/Collected_test_3_share/test_3.usd" ]; then
+    export PL_STAGE="$HOME/isaac_scenes/Collected_test_3_share/test_3.usd"
+fi
+
 # ★★ 기본은 **subnet** 이다 — 노드를 한 대에 다 올려도 망까지 닫으면 안 된다.
 #   평가 항목 §1 이 "다중 PC ROS 2 통신" 이고, 팀원이 live_view·rqt·ros2 topic 으로
 #   붙어 보는 것도 여기서 끊긴다. LOCALHOST 로 가두면 **이 PC 밖에서는 토픽이
@@ -189,6 +199,7 @@ trap cleanup INT TERM EXIT
 
 # ── [1] Isaac ───────────────────────────────────────────────────────────────
 echo "[run_all_local] DOMAIN $ROS_DOMAIN_ID · 구역 ${PL_ZONES:-A,B,C} · 급송 ${PL_SPAWN}초 · 망 ${PL_NET:-subnet} · gtpick $PL_GTPICK · depth $PL_DEPTH_MODE"
+echo "[run_all_local] 씬     ${PL_STAGE:-Collected_test_3 (기본)}"
 echo "[run_all_local] [1/2] Isaac 기동 — 로그 $ISAAC_LOG"
 # ★ setsid: Isaac 은 자식(kit)을 여럿 낳는다. 프로세스 그룹째 잡아야 Ctrl-C 로
 #   전부 내려간다. 안 그러면 kit 이 살아남아 다음 실행이 8765 포트에서 막힌다.
