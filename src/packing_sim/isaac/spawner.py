@@ -831,6 +831,10 @@ class Spawner:
         op = self._translate_op(pal) if (pal and pal.IsValid()) else None
         if op is not None:
             train["pallet"], train["home"] = pal_path, op.Get()
+            # ★ **자세도 같이 기억한다** (2026-08-27 김병직 관측). 호에서 90도
+            #   돌아간 채로 위치만 되돌리면 새 빈 팔레트가 옆으로 누워 있다.
+            _oo = self._orient_op(pal)
+            train["home_q"] = _oo.Get() if _oo is not None else None
         else:
             self._log("[spawner] ⚠ 반출: 팔레트 프림 %s 를 못 찾았다 — 박스만 내보낸다"
                       % pal_path)
@@ -1015,6 +1019,11 @@ class Spawner:
                 op = self._translate_op(pal)
                 if op is not None:
                     op.Set(train["home"])
+                # ★ 자세도 되돌린다 — 호에서 90도 돈 채로 두면 새 빈 팔레트가
+                #   옆으로 누워 나온다 (2026-08-27 김병직 관측).
+                _oo = self._orient_op(pal)
+                if _oo is not None and train.get("home_q") is not None:
+                    _oo.Set(train["home_q"])
         if train in self._outfeed:
             self._outfeed.remove(train)
         self._log("[spawner] 반출 완료 %s — 트럭에 팔레트를 남기고 빈 판을 놓았다 "
