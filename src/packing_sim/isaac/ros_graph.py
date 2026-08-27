@@ -450,6 +450,47 @@ def _make_optical_frame(stage, path, cam_path):
 
 
 # ── 픽업 카메라 — 씬에 발행자가 없으면 우리가 낸다 ─────────────────────────
+def _mute_scene_camera_graphs(st, log=print):
+    """씬의 카메라 ROS 그래프를 **런타임에만** 끈다 (PL_CAMROS=2 일 때).
+
+    ★ 왜 (2026-08-27 새 씬 `test_3.usd` 09:14 실측): 씬에 `ROS_Camera` 그래프가
+      **7 개** 들어왔는데 전부 기본값 그대로라 토픽이 다 같다 —
+      `/rgb` · `/depth` · `camera_info` (frameId `sim_camera`). 문제가 둘이다:
+        ① 한 토픽에 발행자 7 개 → 서로 다른 카메라 이미지가 섞여 나온다.
+           우리 인식은 `/cam1` · `/pick_cam_a` 를 보므로 쓰이지도 않는다.
+        ② **렌더 프로덕트가 7 개 더 생긴다.** 렌더는 이미 병목이고(프레임당
+           30~60 ms) 1280x720 5 대가 33 ms 를 먹은 실측이 있다 — 배속이 무너진다.
+           `_03`·`_04` 는 `_01`·`_02` 와 **같은 카메라**를 가리키는 중복이다.
+    ★ 파일을 고치지 않는다. `SetActive(False)` 는 열린 스테이지에만 적용되고
+      디스크의 USD 는 그대로다 (씬은 김학민 소유 — CLAUDE.md §11).
+      되살리려면 `PL_SCENE_CAMS=1`.
+    ★ `/World/ROS2Bridge` 의 clock·tf 는 **안 건드린다.** 여기서는 그래프 안에
+      `ROS2CameraHelper` 가 있는 것만 고른다.
+    """
+    if os.environ.get("PL_SCENE_CAMS") == "1":
+        log("[ros_graph] PL_SCENE_CAMS=1 — 씬 카메라 그래프를 그대로 둔다")
+        return 0
+    from pxr import Usd            # 이 파일은 Isaac 안에서만 도므로 지역 import
+    muted = []
+    for prim in st.Traverse():
+        if prim.GetTypeName() != "OmniGraph":
+            continue
+        has_cam = False
+        for n in Usd.PrimRange(prim):
+            t = n.GetAttribute("node:type")
+            if t and str(t.Get() or "").endswith("ROS2CameraHelper"):
+                has_cam = True
+                break
+        if has_cam and prim.IsActive():
+            prim.SetActive(False)
+            muted.append(prim.GetName())
+    if muted:
+        log("[ros_graph] 씬 카메라 그래프 %d 개를 껐다 (%s) — 토픽이 전부 /rgb 로 "
+            "겹치고 렌더 프로덕트만 늘린다. 되살리려면 PL_SCENE_CAMS=1"
+            % (len(muted), ", ".join(muted)))
+    return len(muted)
+
+
 def build_cameras(cfg, zones, log=print):
     """`/pick_cam_{a|b|c}/rgb` + `/camera_info` 를 런타임에 발행한다.
 
@@ -508,6 +549,7 @@ def build_cameras(cfg, zones, log=print):
                     return 0
     else:
         log("[ros_graph] PL_CAMROS=2 — 씬 노드와 무관하게 우리가 쏜다")
+        _mute_scene_camera_graphs(st, log)
 
     try:
         import omni.replicator.core as rep
