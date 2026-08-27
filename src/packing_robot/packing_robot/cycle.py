@@ -1,5 +1,15 @@
 """pick & place 한 사이클 — 작업명세서 §2.5 / §2.6 (B4).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ⑤ 벨트 정지 → ⑦ 집기 → ⑧ 놓기 → ⑩ 재가동 (한 사이클 전체)
+    ║     불러 주는 쪽        : cmd_adapter (관제탑 명령 1건 = 이 클래스 호출 1회)
+    ║     이 파일이 부르는 쪽 : robot_motion(관절) · gripper(흡착) · 씬 서비스
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 **전송에 의존하지 않는다.** 소켓은 `link`(→ `robot_motion.py`), ROS 서비스는 `svc`
 (덕 타이핑)로 받는다. `orchestrator.py` 가 rclpy 구현을 꽂고, `scripts/verify_b4_cycle.py`
 가 §2.7 Mock 을 꽂는다. **검증이 실제 상태머신을 그대로 돌린다** — 테스트 전용 사본이
@@ -198,6 +208,26 @@ def nearest_equiv_yaw(target_deg, ref_deg):
 
 
 class Cycle:
+    """구역 하나의 pick & place. **구역당 하나를 만들어 끝까지 재사용한다.**
+
+    ★ 명령마다 새로 만들면 안 된다. 아래 상태가 PICK 과 PLACE 사이를 넘어가고,
+      그중 `_stack_top_m` 이 0 으로 돌아가면 **팔이 적재물 위를 낮게 지나 스택을 친다** —
+      CLAUDE.md §10-3 이 기록한 knock 700.8 mm 사고가 정확히 그 경로다.
+
+        _stack_top_m   이송 고도의 바닥. 갈 때도 **올 때도** 이 높이를 넘어야 한다
+        _obstacles     놓은 박스들의 월드 AABB. `move_ee` 가 IK 가지를 고를 때 쓴다
+        _pick_yaw      PLACE 의 yaw 기준. 없으면 손목이 먼 쪽으로 180° 돈다
+        _pick_c/_top   이송 고도 계산의 한 항
+
+    ★ 흡착 직전 **간극을 실측해 한 번 보정한다** (`GRASP_GAP_MM` · `GAP_FIX_TOL_MM`).
+      패드의 transZ 슬롯이 5 mm 뿐이라, 더 벌어진 채 닫으면 박스가 떠서 붙는다.
+
+    ★ 가벼운 박스(`drop_max_kg` 이하)는 **협곡 입구에서 놓고 떨어뜨린다.**
+      `_corridor_ok` 가 존재하는 이유가 "팔이 박스를 따라 내려가야 해서" 인데,
+      떨어뜨리면 팔이 안 내려가므로 그 제약이 풀린다. 적재율 70.8 → 75.5 %.
+      ⚠ 무거운 박스는 낙하 충격이 스택을 친다 — 그래서 질량 상한이 있다.
+    """
+
     def __init__(self, link, svc, cfg, zone="B", log=print):
         self.link = link
         self.svc = svc
@@ -387,6 +417,15 @@ class Cycle:
             return "BLOCKED"
 
     def _run(self, box_id, pick_pose, t0):
+        """한 사이클의 본체. `run()` 이 예외를 잡아 `BLOCKED` 로 바꾸는 안쪽이다.
+
+            벨트 정지 → 크기 조회 → 자리 계산 → 접근·흡착 → 이송 → 하강·해제
+            → 실측 pose 회수 → heightmap 갱신 → 벨트 재가동
+
+        ★ 어느 단계에서 빠져나가든 `_abort()` 를 거쳐 **`cancel_plan` 을 부른다**.
+          안 부르면 알고리즘이 stale plan 을 들고 있게 되고, 다음 박스의 계획이
+          그 위에 쌓인다.
+        """
         # 1) 벨트 정지. ★ ok 를 확인한 뒤 진행한다 — 안 멈춘 채 흡착하면 박스가 끌려간다.
         if not self.svc.set_velocity(self.belt_seg, 0.0):
             self._log("[cycle] 벨트 정지 실패")
@@ -649,10 +688,20 @@ class Cycle:
         return float(face[2]) - top_m
 
     def _grasp(self, box_id):
+        """흡착. **`call_slow` 로 부른다** — 그리퍼가 닫기를 시도하는 총 시간
+        (`suction.retry_interval_s`, 기본 10 s)만큼 걸릴 수 있어서, 기본 2 s 타임아웃으로
+        부르면 정상 동작인데도 실패로 오판한다."""
         return bool(self.link.call_slow(self.grasp_budget_s,
                                         cmd="grasp", box_id=box_id).get("ok"))
 
     def _release(self):
+        """흡착 해제. `_grasp` 와 같은 이유로 `call_slow` 다.
+
+        해제 뒤 곧바로 팔을 빼면 박스가 딸려 온다. 실측(놓은 뒤 100 ms 구간 이동량):
+        0~0.5 s 는 0.00~0.03 mm 로 **아예 안 움직이다가**, 0.5 s 흡착 해제 →
+        0.7 s 에 자리잡고(0.39~2.26 mm) 0.8 s 부터 조용하다. 그 값들이
+        `release_*`/`settle_wait_s` 로 yaml 에 있다.
+        """
         return bool(self.link.call_slow(self.release_budget_s, cmd="release").get("ok"))
 
     def _actual_place(self, box_id, h_mm):
@@ -664,6 +713,8 @@ class Cycle:
         return world_to_pallet_place(r["pos_m"], r.get("yaw_deg", 0.0), h_mm, self.origin_mm)
 
     def _resume_belt(self):
+        """벨트 재가동. **모든 이탈 경로에서 불러야 한다** — 안 부르면 라인이 선 채로
+        관제탑만 IDLE 로 돌아가고, 다음 박스가 영영 안 온다."""
         self.svc.set_velocity(self.belt_seg, self.belt_mps)
 
     def _abort(self, box_id):

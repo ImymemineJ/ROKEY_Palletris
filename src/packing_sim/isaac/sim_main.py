@@ -1,5 +1,58 @@
 #!/usr/bin/env python3
-"""PC1 Isaac 프로세스 — 씬을 열고 소켓 명령 서버를 띄운다 (공통가이드 §3). **김학민 소유.**
+"""PC1 Isaac 프로세스 — 씬을 열고 명령을 받는다 (공통가이드 §3). **김학민 소유.**
+
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : **몸 전체** — 씬을 열고 ①~⑩ 이 일어날 무대를 돌린다
+    ║     불러 주는 쪽        : scripts/run_test3_ros.sh
+    ║     이 파일이 부르는 쪽 : spawner · conveyor_ctl · robot_motion · camera_pick · ros_side
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
+═══════════════════════════════════════════════════════════════════════════
+★ 최종 구조 (2026-08-26 이후) — 아래 원문보다 **이쪽이 지금 도는 경로**다
+═══════════════════════════════════════════════════════════════════════════
+
+`--ros` 를 주면 **Action Graph 가 직접 ROS 2 로 말한다.** 소켓을 안 거친다
+(CLAUDE.md §2 가 폐기한 그 소켓이다). 최종 실행은 껍데기 하나로 끝난다:
+
+    ./scripts/run_test3_ros.sh              # A,B,C · 창 · 자동 Play
+
+    # 손으로 돌릴 때 (환경변수는 kit 이 **시작 때만** 읽는다 — 안에서 고치면 늦다)
+    source install/setup.bash && export ROS_DOMAIN_ID=115
+    PL_STAGE=~/isaac_scenes/project_1/test_3.usd \
+    PL_CONFIG_OVERLAY=$PWD/src/packing_bringup/config/test_3.yaml \
+    ~/isaac-sim-5.1.0/python.sh src/packing_sim/isaac/sim_main.py \
+        --zones A,B,C --ros --autorun --gui --spawn-period 8
+
+이 프로세스가 ROS 2 로 내는 것 / 받는 것 (`ros_side.py` + `ros_graph.py`):
+
+    낸다 : /clock · /tf · 카메라 Image  ·  /zone_{a,b,c}/robot/event
+    받는다: /zone_{a,b,c}/robot/cmd     ·  씬 서비스 4종
+            (/conveyor/set_velocity · /sim/despawn_box
+             /sim/set_spawn_enabled · /sim/swap_pallet)
+
+판단은 **하나도 여기서 안 한다.** 어디에 놓을지는 algo 가, 언제 집을지는 관제탑이
+정한다. 이 파일은 몸이고 머리는 Isaac 밖 rclpy 노드들이다.
+
+⚠ **Isaac 내장 ROS 2 를 쓰면 안 된다.** `packing_msgs` 는 `/opt/ros/jazzy` 로
+  빌드돼 있어 내장 배포판에 물리면 fastcdr ABI 가 달라 `symbol lookup error`
+  또는 SEGFAULT 로 죽는다. `source install/setup.bash` 한 줄이 셋
+  (`AMENT_PREFIX_PATH` · `LD_LIBRARY_PATH` · 배포판 일치)을 한꺼번에 잡는다.
+
+⚠ `--autorun` 을 빠뜨리면 벨트가 안 돈다. `--no-render` 도 벨트를 멈춘다.
+  **둘 다 에러 없이** 박스만 안 온다.
+
+⚠ `PL_CONFIG_OVERLAY` 를 안 주면 **경고 없이 어긋난다** — 관제탑·algo 는 test1-1
+  좌표로 계획하고 Isaac 은 test_3 좌표로 움직인다. 뜰 때 찍히는 "로봇 베이스"
+  줄이 사양과 다르면 거기서 멈추고 볼 것.
+
+─────────────────────────────────────────────────────────────────────────
+아래는 소켓 시절의 원문이다. 소켓 경로(`--ros` 없이)는 데모 스크립트
+(`demo_stack15_test1_1.py`)를 위해 **아직 살아 있다** — 지우지 말 것.
+─────────────────────────────────────────────────────────────────────────
 
     ~/isaacsim/python.sh src/packing_sim/isaac/sim_main.py
     ~/isaacsim/python.sh src/packing_sim/isaac/sim_main.py --gui
@@ -86,6 +139,20 @@ SETTLE_STEPS = 90                  # READY 수렴 (60 Hz 에서 1.5 s). 게이�
 
 
 def main():
+    """씬을 열고 → 로봇을 물리고 → (`--ros` 면) ROS 2 를 배선하고 → 틱을 돈다.
+
+    한 틱의 순서가 중요하다 (뒤집으면 한 스텝씩 늦게 따라간다):
+
+        q.pump()      소켓/워커 스레드가 맡긴 USD 작업을 **메인에서** 처리
+        rm.step()     이번 스텝에 걸 관절 드라이브 목표 ★ world.step() 앞이어야 한다
+        sp.step()     스포너·컨베이어·소터
+        ros.step()    명령 회수 + 결과 발행 (**논블로킹**)
+        world.step()  물리 1스텝
+
+    ★ `ros.step()` 은 절대 블로킹하면 안 된다. 모션 판정을 내리는 `rm.step()` 도
+      메인 스레드라, 여기서 결과를 기다리면 서로를 기다려 **100 % 데드락**이다.
+      그래서 실제 모션은 `ros_side` 의 워커 스레드가 돌린다.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default=DEFAULT_STAGE)
     ap.add_argument("--zone", default="B", choices=["A", "B", "C"])

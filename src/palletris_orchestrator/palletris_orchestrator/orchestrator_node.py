@@ -1,15 +1,52 @@
 #!/usr/bin/env python3
 """
-orchestrator_node.py — 관제탑 (1차: B구역 전용)
+
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ★ ①~⑩ 전 구간을 **조율**한다 (직접 하는 일은 없다)
+    ║     불러 주는 쪽        : launch (bringup.launch.py)
+    ║     이 파일이 부르는 쪽 : algo · db · 씬 서비스 · 로봇 토픽
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+orchestrator_node.py — 관제탑 (트랙 B 김병직). **최종 구조: 3구역 · 노드 하나.**
 
 박스 하나를 처리하는 7단계를 순서대로 진행한다.
-"지금 몇 단계인가"를 self.state 하나에 적어두고, 응답이 오면 다음 단계로 넘긴다.
+"지금 몇 단계인가"를 `ZoneCycle.state` 하나에 적어두고, 응답이 오면 다음으로 넘긴다.
 
-★ 설계 원칙 (이거 지키지 않으면 조용히 멈춘다)
-  1. 모든 서비스 호출은 call_async + done_callback. 절대 spin_until_future_complete 금지
-     → 콜백 안에서 응답을 기다리면 executor가 자기 자신을 기다리는 꼴이 된다
-  2. MultiThreadedExecutor + ReentrantCallbackGroup 사용
-  3. 로봇에게 명령하는 노드는 여기 하나뿐. algo도 detector도 로봇을 부르지 않는다
+    IDLE → FETCHING → PLANNING → PICKING → PLACING → UPDATING → IDLE / DONE
+
+## ★ 프로세스도 노드도 **하나**다 (CLAUDE.md §8)
+
+구역이 A·B·C 셋이어도 늘어나는 것은 `ZoneCycle` **객체**뿐이다. 구역마다 노드를
+띄우면 "로봇 명령의 유일한 발신자" 라는 규약이 깨진다 — 누가 먼저 보냈는지 알 수
+없게 되고, 그때 나는 버그는 에러 없이 엉뚱한 팔레트에 쌓는 형태로 나타난다.
+(인식 노드는 반대다. 이미지 추론이라 GIL 때문에 구역마다 프로세스를 나눈다.)
+
+## 이 노드가 말을 거는 상대
+
+    ← /zone_{a,b,c}/box_at_pickup   인식 노드가 픽업 좌표를 실어 보낸다
+    → /zone_{a,b,c}/robot/cmd       ★ 로봇 명령. **여기 말고 아무도 안 낸다**
+    ← /zone_{a,b,c}/robot/event     결과 + PLACE 실측 pose (seq 로 대조한다)
+    → /zone_{a,b,c}/status          2 Hz. 중재자가 `accepting` 한 칸만 본다
+    ↔ 서비스 8종                     아래 SERVICES 표
+
+## ★ 설계 원칙 4개 — 어기면 **에러 없이** 멈춘다
+
+  1. 모든 서비스 호출은 `call_async` + `add_done_callback`.
+     `spin_until_future_complete` 금지 — 콜백 안에서 응답을 기다리면 executor 가
+     자기 자신을 기다리는 꼴이 된다. 예외도 로그도 없이 그냥 선다.
+  2. `MultiThreadedExecutor` + `ReentrantCallbackGroup`.
+  3. 로봇에게 명령하는 노드는 여기 하나뿐. algo 도 detector 도 로봇을 안 부른다.
+  4. **노드가 죽으면 안 된다.** 이탈 3경로(`NO_FEASIBLE_POSE` · `PALLET_FULL` ·
+     실패/타임아웃 20초)가 전부 `CancelPlan` 을 거쳐 IDLE 로 돌아온다.
+
+## ⚠ `use_sim_time:=true` 인데 `/clock` 발행자가 없으면 이 노드는 **무력해진다**
+
+ROS 시계가 0 에 멎어 `create_timer` 가 영원히 안 뜬다. ZoneStatus 발행도,
+아래 `check_robot_timeout` 의 **20초 감시도** 안 돈다 — 로봇이 답을 안 해도 영원히
+기다린다. 노드는 살아 있고 에러도 안 난다. Isaac 을 **먼저** 띄울 것.
 """
 
 import threading
@@ -269,6 +306,15 @@ class ZoneCycle:
     # ② FETCHING : DB에 "이 박스 크기 뭐야?" 물어본다
     # ══════════════════════════════════════════════════════════
     def fetch_box_info(self):
+        """② FETCHING — `/db/get_box_info` 로 이 박스의 **치수**를 받아 온다.
+
+        픽업 좌표는 인식 노드가 이미 줬다. 여기서 받는 것은 w·d·h 뿐이고, 그게 그대로
+        `PlanPlacement` 요청과 `RobotCmd.size_*` 로 흘러간다.
+
+        ★ `found=false` 는 "인식이 실패했다" 는 뜻이다 — 집지 않고 버린다.
+          모르는 크기로 계획하면 algo 가 0 을 받아 필터가 죽거나(`_bad_size`),
+          로봇이 엉뚱한 높이로 내려간다.
+        """
         def on_response(future):
             res = future.result()
             if not res.found:
@@ -292,6 +338,18 @@ class ZoneCycle:
     # ③ PLANNING : algo에 "어디 놓을까?" 물어본다
     # ══════════════════════════════════════════════════════════
     def request_plan(self):
+        """③ PLANNING — `/algo/plan_placement` 에 "어디 놓을까" 를 묻는다.
+
+        ★ 응답의 `message` 세 가지가 **서로 다른 처리**로 갈린다 (CLAUDE.md §7):
+
+            "OK"                → PICKING 으로. 이 pose 를 RobotCmd 에 그대로 싣는다
+            "NO_FEASIBLE_POSE"  → **이 박스만** 버리고 계속. ★ 여기서 끝내면
+                                  팔레트가 반만 찬 채 데모가 멈춘다
+            "PALLET_FULL"       → 시나리오 종료 (트럭 상차)
+
+        ★ 응답 pose 는 **팔레트 기준**이고 `z_mm` 은 박스 **밑면**이다.
+          중심으로 오해하면 팔레트에 절반 파묻힌다.
+        """
         def on_response(future):
             res = future.result()
 
@@ -374,6 +432,19 @@ class ZoneCycle:
         self.pub_robot.publish(cmd)
 
     def on_robot_event(self, ev):
+        """④⑤ — 로봇의 답을 받는다. `PICK` 성공이면 PLACE 로, `PLACE` 성공이면 UPDATING 으로.
+
+        ★ **`seq` 대조를 무엇보다 먼저 한다** (CLAUDE.md §3-4 규약 2).
+          20초 타임아웃으로 손을 뗀 뒤 로봇이 뒤늦게 답하면, 그 실패가 **다음 박스의
+          결과로 둔갑한다.** 에러도 안 나고 엉뚱하게 도는 버그다.
+
+        ★ `has_actual == true` 일 때만 `actual_*` 를 `UpdateHeightmap` 으로 넘긴다
+          (규약 3). 계획값을 되보내면 오차가 누적돼 알고리즘은 1300 안이라 믿는데
+          실제 더미가 넘는다.
+
+        실패(`ok=false`)는 이탈 경로 C 다 — `CancelPlan` + `SetStatus(PICK_FAILED)`
+        후 IDLE 로. **여기서 예외가 나가면 안 된다** (rclpy 가 콜백 예외를 삼킨다).
+        """
         # ── ① seq 대조 ── ★ 무엇보다 먼저 한다.
         #   타임아웃으로 손을 뗀 뒤 로봇이 뒤늦게 답하면, 그 실패가 다음 박스의
         #   결과로 둔갑한다. 에러도 안 나고 엉뚱하게 도는 버그다.
@@ -453,6 +524,15 @@ class ZoneCycle:
     # ⑥ UPDATING : algo에 "여기 놨다" 알려준다
     # ══════════════════════════════════════════════════════════
     def update_heightmap(self, actual_pose):
+        """⑥ UPDATING — 실측 pose 로 heightmap 을 갱신하고 DB 에 적재를 기록한다.
+
+        **자기교정의 핵심**이다. 계획대로 놓였다고 가정하지 않고, 로봇이 씬에서
+        실제로 읽은 좌표를 알고리즘에 되먹인다. 그래야 배치 오차가 누적되지 않는다.
+
+        `ok=false` 는 **경고**지 실패가 아니다 (yaw 오차 5° 초과 등). algo 가
+        외접 사각형으로 안전하게 기록해 두었으므로 로그만 남기고 계속 진행한다 —
+        여기서 멈추면 멀쩡히 놓인 박스 하나 때문에 라인이 선다.
+        """
         def on_response(future):
             res = future.result()
             if not res.ok:
@@ -536,9 +616,26 @@ class ZoneCycle:
             f"  소요: {elapsed:.1f}초")
 
     def send_robot_cmd_home(self):
+        """팔을 적재물 위로 뺀다. 종료 시 화면에 팔이 스택을 가리지 않게 하는 목적도 있다.
+
+        ★ 진짜 "홈 관절값" 이 아니다 — 그런 값이 아무 데도 정의돼 있지 않다.
+          로봇 쪽 `Cycle.retreat_home()` 이 현재 자세에서 위로만 뺀다.
+        """
         self.send_robot_cmd(RobotCmd.HOME)
 
     def publish_status(self):
+        """`/zone_*/status` 2 Hz 발행 + **감시 두 가지를 같이 돈다.**
+
+        타이머를 따로 두지 않는 이유: 0.5 초 주기면 20초 판정에 충분하고, 상태를
+        먼저 정리한 뒤 발행해야 방금 끊긴 것이 그 프레임에 바로 보인다.
+
+          · `check_robot_timeout()`  PICKING/PLACING 이 20초를 넘겼나
+          · `check_stuck_box()`      IDLE 인데 스토퍼에 박스가 서 있나 (12초)
+            — 아무도 안 치우면 뒤 박스가 밀려 **라인이 통째로 막힌다**
+
+        ★ `accepting` 한 칸이 중재자가 보는 전부다. 버퍼 잔량을 중재자가 따로
+          계산하던 옛 방식은 관제탑과 어긋나면 조용히 잘못 보낸다.
+        """
         # 로봇 타임아웃도 이 타이머로 같이 본다 (0.5초면 20초 판정에 충분하다).
         # 상태를 먼저 정리하고 나서 발행해야 방금 끊긴 것이 바로 보인다.
         self.check_robot_timeout()
@@ -736,6 +833,15 @@ class ZoneCycle:
             self._handle_timeout(call)
 
     def _handle_timeout(self, call):
+        """제한 시간(2초)을 넘긴 서비스 호출 하나를 정리하고 IDLE 로 되돌린다.
+
+        ★ 되돌릴 때 **계획을 반드시 버린다.** 안 버리면 algo 의 `plans` 에 그 자리가
+          영원히 예약된 채 남고, 그 박스가 리턴 라인을 돌아 다시 왔을 때 옛 계획과
+          yaw 를 비교해 멀쩡한 배치를 거절한다.
+        ★ 단 타임아웃 난 게 `cancel_plan` 자신이면 또 부르지 않는다 — 무한 반복이 된다.
+        ★ `on_response is None`(보내고 잊는 호출)이면 상태를 안 건드린다. 벨트 재가동
+          같은 것이라 실패해도 사이클을 되돌릴 이유가 없다.
+        """
         srv_name = call["srv"]
         future = call["future"]
         if future is not None:
@@ -821,6 +927,11 @@ class Orchestrator(Node):
 
 
 def main():
+    """`ros2 run palletris_orchestrator orchestrator_node`.
+
+    보통은 launch 가 띄운다 — 거기서 `use_sim_time` 과 `zones` 를 같이 준다:
+        ros2 launch packing_bringup bringup.launch.py zones:="['a','b','c']"
+    """
     rclpy.init()
     node = Orchestrator()
     # ★ MultiThreadedExecutor가 아니면 서비스 응답 콜백이 서로를 막는다.

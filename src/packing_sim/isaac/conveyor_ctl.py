@@ -1,5 +1,15 @@
 """벨트 속도 제어 — `set_velocity` 핸들러 (공통가이드 §3, 작업명세서 §2.2). **김학민 소유.**
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ③ 소터 분기 구동 · ⑤ 벨트 정지 · ⑩ 재가동
+    ║     불러 주는 쪽        : 관제탑(/conveyor/set_velocity) · sim_main
+    ║     이 파일이 부르는 쪽 : OmniGraph 벨트 변수 (mainq 경유)
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
     cc = ConveyorCtl(stage, cfg)
     server.register(cc.handlers())
 
@@ -77,6 +87,22 @@ ROLLER_LEN_PER_SCALE = 1.98724
 
 
 class ConveyorCtl:
+    """시나리오 ③(소터 분기) · ⑤(벨트 정지) · ⑩(재가동)을 맡는 씬 핸들러.
+
+    ★ **월드 속도 = `graph:variable:Velocity` × 그 조각의 `xformOp:scale.x`** 다.
+      요청 m/s 를 변수에 그대로 쓰면 조각이 스케일된 만큼 빨라진다 —
+      실측: scale.x 2.5161 · Velocity 0.5 에서 월드 **1.2588 m/s**.
+      그래서 조각마다 **자기 scale.x 로 나눠서** 써넣는다.
+      조각별 scale.x 가 3배까지 다르므로, 한 값을 양쪽에 쓰면 픽업 벨트가 본선의
+      3배로 돈다.
+
+    ★ 한 `seg` 에 조각이 여러 개면 **동시에** 켜고 끈다. 본선 4조각 중 하나만
+      안 서면 박스가 조각 경계에서 계속 끌려간다.
+
+    ★ USD 쓰기는 전부 `mainq` 를 거친다 — 소켓/워커 스레드에서 직접 쓰면
+      메인의 `world.step()` 과 겹쳐 **행이 걸리거나 스테이지가 깨진다.**
+    """
+
     def __init__(self, stage, cfg, mainq, log=print):
         self.stage = stage
         self.cfg = cfg
@@ -236,6 +262,7 @@ class ConveyorCtl:
 
     # ── 핸들러 ──────────────────────────────────────────────
     def handlers(self):
+        """이 모듈이 제공하는 씬 명령표. 소켓과 ROS 서비스가 같은 함수를 공유한다."""
         return {"set_velocity": self.h_set_velocity,
                 "set_direction": self.h_set_direction,
                 "set_sorter": self.h_set_sorter}
@@ -407,6 +434,12 @@ class ConveyorCtl:
 
     # ── 내부. **메인 스레드 전용** ──────────────────────────
     def set_velocity(self, seg, mps):
+        """⑤⑩ 벨트 한 구간의 속도를 바꾼다. **`0.0` 이 곧 정지다.**
+
+        관제탑이 ⑤에서 `0.0`, ⑩에서 원래 속도로 두 번 부른다.
+        ★ 흡착 전에 **반드시 서야 한다.** 안 세우고 흡착하면 박스가 끌려가면서
+          패드가 미끄러진다.
+        """
         paths = self.graphs.get(seg)
         if not paths:
             return {"ok": False, "error": "unknown seg %r (있는 것: %s)"
@@ -434,6 +467,8 @@ class ConveyorCtl:
         return {"ok": True, "actual": mps}
 
     def stop_all(self):
+        """모든 벨트 정지. **소터도 같이 끈다** — 소터가 서 있으면 본선 롤러의
+        구멍 때문에 라인이 막힌다."""
         for seg in self.graphs:
             self.set_velocity(seg, 0.0)
         # ★ 소터도 같이 세운다. 안 세우면 본선이 멎은 뒤에도 소터 구간의 박스만
@@ -442,6 +477,7 @@ class ConveyorCtl:
             self.set_sorter_velocity(zn, 0.0)
 
     def run_all(self):
+        """모든 벨트를 사양 속도로 기동. 소터도 같이 켠다 (`stop_all` 의 짝)."""
         for seg in self.graphs:
             self.set_velocity(seg, self.nominal)
         # ★ 소터를 반드시 같이 돌린다. 본선 롤러에는 소터 자리에 구멍이 있어

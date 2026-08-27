@@ -1,5 +1,15 @@
 """A 소유 소켓 핸들러 — 박스 스폰 · 스토퍼 감지 · pose 조회 (작업명세서 §5.5~§5.6).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ① 스폰 · ④ 픽업 도착 감지 · 폐기(despawn) · 팔레트 교체
+    ║     불러 주는 쪽        : sim_main (매 틱) · 씬 서비스
+    ║     이 파일이 부르는 쪽 : USD 스테이지 (mainq 경유)
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
     q  = mainq.MainQueue()
     sp = Spawner(stage, cfg, q, zone="B")
     server.register(sp.handlers())
@@ -114,6 +124,21 @@ def _yaw_deg(quat):
 
 
 class Spawner:
+    """시나리오 ①(스폰) · ④(도착 감지) · 폐기 · 팔레트 교체를 맡는 씬 핸들러.
+
+    **이 클래스가 라인 위 박스의 유일한 장부다.** `self.boxes` 가 "지금 살아 있는
+    박스", `self._snap` 이 "그 박스들의 마지막 pose" 다. 다른 모듈은 전부 여기에 묻는다.
+
+    ★ **매 틱 `_refresh()` 한 번**에 모든 것이 걸려 있다. 스냅샷을 메인 스레드가
+      갱신해 두면, 소켓/워커 스레드의 읽기 핸들러(`pickup_check` · `get_box_pose`)는
+      큐를 안 거치고 바로 답할 수 있다 — USD 를 안 만지기 때문이다.
+      반대로 **쓰는 핸들러(스폰·폐기)는 전부 `mainq.run()` 을 거친다.**
+
+    ★ 박스 프림 경로는 `/World/boxes/<box_id>` 다. `robot_motion.BOX_PRIM_FMT` 와
+      **글자 하나까지** 같아야 한다 — USD 경로는 대소문자를 구분하고, 어긋나면
+      `grasp(box_id)` 가 프림을 못 찾는다.
+    """
+
     def __init__(self, stage, cfg, mainq, zone="B", log=print, zones=None):
         self.stage = stage
         self.cfg = cfg
@@ -220,6 +245,11 @@ class Spawner:
 
     # ── 등록 ────────────────────────────────────────────────
     def handlers(self):
+        """이 모듈이 제공하는 씬 명령표. `sim_main` 이 소켓과 ROS 양쪽에 같은 표를 꽂는다.
+
+        ★ 같은 함수를 둘이 공유해야 한다. 소켓용과 ROS 용을 따로 만들면 한쪽만
+          고쳐졌을 때 **경로에 따라 다르게 도는** 버그가 된다.
+        """
         return {"spawn_box": self.h_spawn_box,
                 "spawn_status": self.h_spawn_status,
                 "set_spawn_enabled": self.h_set_spawn_enabled,
@@ -365,6 +395,16 @@ class Spawner:
         return self.mainq.run(lambda: self._spawn(box_id, tname, yaw, color, dest))
 
     def h_despawn_box(self, req):
+        """박스 하나를 라인에서 치운다 — `/sim/despawn_box`.
+
+        불리는 자리 셋:
+          · `NO_FEASIBLE_POSE` 로 되돌려진 박스 (⑦ 이탈)
+          · 스토퍼에 12초째 서 있는 박스 (관제탑의 stuck 감시)
+          · 리턴 라인을 3바퀴 돈 박스
+
+        ★ **안 치우면 라인이 통째로 막힌다.** 스토퍼에 박스가 남으면 뒤 박스가
+          밀려 본선까지 선다.
+        """
         box_id = req.get("box_id")
         if box_id not in self.boxes:
             return {"ok": False, "error": "없는 box_id %s" % box_id}
@@ -446,6 +486,11 @@ class Spawner:
                 "spawn_clear": spawn_clear, "lost": list(self.lost)}
 
     def h_set_spawn_enabled(self, req):
+        """투입을 켜고 끈다 — `/sim/set_spawn_enabled`.
+
+        `PALLET_FULL` 처리 순서의 첫 단계다:
+        **투입 정지 → `swap_pallet` → `/algo/reset_heightmap` → 투입 재개.**
+        """
         self.enabled = bool(req.get("enabled", True))
         self._log("[spawner] 스폰 %s" % ("ON" if self.enabled else "OFF"))
         return {"ok": True}
@@ -470,6 +515,13 @@ class Spawner:
                     {"present": False, "box_id": "", "pose": None})
 
     def h_get_box_pose(self, req):
+        """⑨ 실측 pose 회수 — 놓인 박스가 **실제로** 어디에 있나.
+
+        ★ 자기교정의 출발점이다. 여기서 읽은 값이 `RobotEvent.actual_*` 로 실려
+          `UpdateHeightmap` 에 들어간다. 계획값을 되보내면 오차가 누적돼
+          알고리즘은 1300 안이라 믿는데 실제 더미가 넘는다.
+        ★ 읽기 전용이라 `mainq` 를 안 거친다 — 메인 스레드가 갱신해 둔 스냅샷을 본다.
+        """
         box_id = req.get("box_id")
         e = self._snap.get(box_id)
         if e is None:
@@ -478,6 +530,13 @@ class Spawner:
 
     # ── 내부 ────────────────────────────────────────────────
     def _ensure_roots(self):
+        """박스 루트 · 머티리얼 루트 · **물리 머티리얼**이 있는지 확인하고 없으면 만든다.
+
+        ★ 물리 머티리얼이 왜 여기 있나: 정본은 씬 빌더가 만들지만, 씬을 아직 다시
+          안 만든 경우의 보험이다. 이게 없으면 박스가 PhysX **기본 마찰**로 돌고
+          `system.yaml` 의 0.6/0.5 가 아무 데도 안 걸린다 —
+          스택이 서느냐 미끄러지느냐를 직접 가르는 값이다.
+        """
         if not self.stage.GetPrimAtPath(BOX_ROOT):
             UsdGeom.Xform.Define(self.stage, BOX_ROOT)
         if not self.stage.GetPrimAtPath(LOOKS_ROOT):

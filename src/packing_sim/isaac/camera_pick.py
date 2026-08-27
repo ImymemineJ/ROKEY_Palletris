@@ -1,5 +1,15 @@
 """픽업 하향 카메라 — depth 로 박스 좌표를 뽑는다 (프로토콜 cmd `camera_detect`).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ④ 픽업 좌표 — **카메라로** 답하는 판 (spawner 는 ground truth 판)
+    ║     불러 주는 쪽        : sim_main · 씬 서비스
+    ║     이 파일이 부르는 쪽 : Isaac Camera 프림 · depth
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 ## 무엇을 하는가
 
 집는 자리 위 2.3 m 에 달린 카메라가 아래를 본다. 매 호출마다
@@ -61,6 +71,15 @@ DEPTH_STRIDE = int(os.environ.get("PL_CAM_STRIDE", "2"))
 
 
 class PickCamera:
+    """④ 픽업 좌표를 **카메라로** 답한다. `spawner.pickup_check` 의 대응물이다.
+
+    ★ 두 판이 같은 질문에 다르게 답한다:
+        `spawner.pickup_check` — 씬 프림에서 자세를 그대로 읽는다 (**ground truth**)
+        `PickCamera.detect`    — depth 로 본 것만 쓴다 (**실물에 있는 것**)
+      둘을 나란히 찍으면 **인식 오차가 그대로 보인다**(`compare` 필드).
+      사양이 ground truth 를 "검증용" 이라고 못박은 이유가 이것이다.
+    """
+
     def __init__(self, stage, cfg, mainq, prim_path=None, zone=None, log=print):
         if prim_path is None:
             _tbl = (cfg.get("cameras") or {}).get("pick_prim")
@@ -115,10 +134,15 @@ class PickCamera:
         return True
 
     def handlers(self):
+        """씬 명령표 — `camera_detect` 하나."""
         return {"camera_detect": self.h_detect}
 
     # ── 프로토콜 ────────────────────────────────────────────
     def h_detect(self, req=None):
+        """④ 한 번 찍어 박스 좌표를 낸다. **본체는 메인 스레드에서 돈다.**
+
+        ★ 렌더·depth 접근은 메인 스레드 전용이라 `mainq.run()` 으로 넘긴다.
+        """
         if self.cam is None:
             return {"ok": False, "error": "카메라가 없다"}
         return self.mainq.run(self.detect)
@@ -176,6 +200,18 @@ class PickCamera:
 
     # ── 본체. **메인 스레드 전용** ──────────────────────────
     def detect(self):
+        """④ depth → 점군 → 윗면 → 최소면적 사각형. **메인 스레드 전용.**
+
+            depth ─▶ 월드 점군 ─▶ ROI 로 벨트면·팔 제거 ─▶ 윗면만
+                  ─▶ minAreaRect ─▶ 중심 · 치수 · yaw · 윗면 높이
+
+        ★ **z 천장이 핵심이다.** 없으면 시야를 가로지르는 **로봇 팔**이 가장 높은
+          점군이 되어 팔을 박스로 인식한다.
+        ★ ROI 의 가로 방향도 픽업 축을 따라야 한다 — +X 라인이면 x, +Y 지선이면 y 를
+          잘라야 한다. 엉뚱한 축으로 자르면 점군이 0 이 된다.
+
+        좌표는 **월드 mm**, 흡착 지점은 **윗면 중심**이다.
+        """
         pts = self._pointcloud_world()
         if pts is None or len(pts) == 0:
             return {"ok": False, "error": "깊이 영상에서 점을 못 만들었다", "n_pts": 0}

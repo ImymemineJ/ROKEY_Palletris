@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """db_service_node — palletris.db 의 유일한 writer + 중재자.
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ② 등록·검증 · ③ 목적지 판단(중재자) · ⑨ 기록
+    ║     불러 주는 쪽        : 인식 노드 · 관제탑 · 씬
+    ║     이 파일이 부르는 쪽 : palletris.db (유일 writer) · metrics · route
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 제공하는 것
   /db/register_box · /db/get_box_info · /db/verify_box
   /db/set_status   · /db/mark_placed  · /db/zone_queue      (CLAUDE.md §3-3)
@@ -81,6 +91,19 @@ def default_db_path():
 
 
 class DbService(Node):
+    """`palletris.db` 를 여는 **유일한 프로세스** + 중재자.
+
+    ★ 이 노드만 `.db` 를 연다. 두 프로세스가 같은 파일을 열면 `database is locked`
+      가 뜬다 — WAL 을 켜도 writer 는 하나여야 한다. 읽기 전용 도구
+      (`scripts/report.py` · `db_peek.py`)는 `mode=ro` 로 열어 이 규칙을 지킨다.
+
+    ★ 중재자가 여기 같이 사는 이유는 **0.6 초 제한** 때문이다 (§3-4 규약 4).
+      별 프로세스로 빼면 판단에 필요한 `retry_count`·`dest`·`zone_map` 을 서비스로
+      왕복해야 하고, 그 왕복이 제한 시간을 먹는다. 같은 커넥션이면 마이크로초다.
+
+    테이블 다섯: `boxes_master`(정답지) · `zone_map`(동→구역) · `boxes_sorted`(실행 중)
+    · `box_events`(상태 전이 이력) · `scan_misses`(**인식률의 분모**).
+    """
 
     def __init__(self, db_path=None, config_path=None):
         super().__init__("db_service_node")
@@ -200,6 +223,7 @@ class DbService(Node):
             self.db.commit()
 
     def _master_zone(self, box_id):
+        """정답지에 이 운송장번호가 있나. 없으면 None = "우리 라인 박스가 아니다"."""
         row = self.db.execute("SELECT zone FROM boxes_master WHERE box_id=?",
                               (box_id,)).fetchone()
         return row[0] if row else None
@@ -228,6 +252,12 @@ class DbService(Node):
         return (z[0] if z else None), addr, dong
 
     def _retry_count(self, box_id):
+        """리턴 라인을 몇 바퀴 돌았나. `BoxInfo.retry_count` 로 나간다.
+
+        ★ `bypass_count`(버퍼가 차서 우회한 횟수)와 **절대 합치지 않는다.**
+          우회는 정상 흐름이지 실패가 아니다 — 합치면 멀쩡한 박스가 세 바퀴 돌았다는
+          이유로 폐기된다.
+        """
         row = self.db.execute("SELECT retry_count FROM recirculation WHERE box_id=?",
                               (box_id,)).fetchone()
         return int(row[0]) if row else 0
@@ -251,6 +281,12 @@ class DbService(Node):
             f"SELECT {column} FROM recirculation WHERE box_id=?", (box_id,)).fetchone()[0]
 
     def _on_zone_status(self, msg):
+        """관제탑의 `ZoneStatus` 를 받아 두 가지를 캐시한다.
+
+          · `accepting`  → 중재자가 "이 구역에 더 보낼지" 를 정하는 **유일한 근거**
+          · `fill_rate` · `max_height_mm` → 지표에 얹는다. DB 는 이 둘을 모른다.
+            heightmap 을 가진 algo 만 알고, 관제탑이 중계하는 이 토픽이 유일한 유입로다.
+        """
         z = msg.zone.upper()
         self._accepting[z] = bool(msg.accepting)
         self._zone_cache[z] = (float(msg.fill_rate), int(msg.max_height_mm))
@@ -259,6 +295,12 @@ class DbService(Node):
     # /db/report_miss  — 인식 실패. **인식률의 분모**가 여기서 나온다
     # ══════════════════════════════════════════════════════════════
     def on_report_miss(self, req, res):
+        """`ReportMiss` — 박스는 봤는데 식별을 못 했다. **인식률의 분모**가 여기서 나온다.
+
+        ★ 분모를 `boxes_sorted`(등록 성공)로 잡으면 놓친 박스는 안 세어져 인식률이
+          **언제나 100 %** 다. 맞는 분모는 "라인에 실제로 올라온 박스 수"
+          = 등록 성공 + 여기 기록이다.
+        """
         at = (req.where_at or "").strip() or "unknown"
         with self._w:
             self.db.execute(
@@ -276,6 +318,16 @@ class DbService(Node):
     # /db/register_box  — cam1 판독 결과. 여기서 boxes_sorted 행이 처음 생긴다
     # ══════════════════════════════════════════════════════════════
     def on_register(self, req, res):
+        """`RegisterBox` — cam1 판독 결과. **`boxes_sorted` 행이 여기서 처음 생긴다.**
+
+        요청에 없는 두 가지를 여기서 채운다:
+          · `weight_g` — 치수로 `system.yaml` 의 박스 3종을 역인덱스한다.
+            3종의 (w,d,h) 가 겹치지 않아 유일하게 결정된다. 숫자를 코드에 박지 않는다.
+          · `zone` — QR 이 읽은 `dest`. 없으면 배송지 주소로 유도한다.
+
+        ★ 사양 3종에 없는 치수여도 **거부하지 않는다.** 인식 오차로 몇 mm 틀어졌을
+          뿐인데 박스를 버리면 라인이 막힌다. `weight_g=0` 으로 남기고 경고만 한다.
+        """
         t0 = time.perf_counter()
         box_id = req.box_id.strip()
 
@@ -347,6 +399,12 @@ class DbService(Node):
     # /db/get_box_info
     # ══════════════════════════════════════════════════════════════
     def on_get_info(self, req, res):
+        """`GetBoxInfo` — 관제탑이 ② FETCHING 에서 부른다. 치수가 여기서 나간다.
+
+        ★ `found=false` 면 관제탑은 집지 않고 버린다. 모르는 크기로 계획하면 algo 가
+          0 을 받아 필터가 죽거나 로봇이 엉뚱한 높이로 내려간다.
+        ★ 스키마 컬럼은 `mass_g`, 인터페이스 필드는 `weight_g` 다. **매핑은 여기 한 줄뿐**이다.
+        """
         row = self.db.execute(
             "SELECT size_w_mm, size_d_mm, size_h_mm, mass_g, color, dest,"
             " qr_payload, status FROM boxes_sorted WHERE box_id=?",
@@ -367,6 +425,11 @@ class DbService(Node):
     # /db/verify_box  — cam2 재판독. 등록값과 같은지 본다
     # ══════════════════════════════════════════════════════════════
     def on_verify(self, req, res):
+        """`VerifyBox` — cam2 재판독. 같은 QR 을 등록한 박스가 그 박스가 맞나.
+
+        불일치는 **실패로 세되 라인은 안 세운다.** 어느 쪽(cam1/cam2)이 틀렸는지는
+        `box_events` 이력으로 되짚는다.
+        """
         row = self.db.execute(
             "SELECT box_id FROM boxes_sorted WHERE qr_payload=? AND qr_payload<>''",
             (req.qr_payload,)).fetchone()
@@ -386,6 +449,14 @@ class DbService(Node):
     # /db/set_status  — 관제탑이 PICKED / PICK_FAILED 등을 올린다
     # ══════════════════════════════════════════════════════════════
     def on_set_status(self, req, res):
+        """`SetStatus` — 관제탑이 `PICKED` · `PICK_FAILED` · `REJECTED` 등을 올린다.
+
+        `status` 를 덮어쓰는 동시에 `box_events` 에 **한 줄을 더 쌓는다.**
+        단일 컬럼은 덮어써져 이력이 안 남는데, 인식률·성공률·사이클타임이 전부
+        그 이력에서 나온다 (작업명세서 §8.6).
+
+        모르는 status 는 거부한다 — 오타 하나가 지표 쿼리에서 조용히 빠진다.
+        """
         status = (req.status or "").strip().upper()
         if status not in VALID_STATUS:
             self.get_logger().error(f"모르는 status: {req.status!r}")
@@ -403,6 +474,13 @@ class DbService(Node):
     # /db/mark_placed  — 실측 pose 를 남긴다
     # ══════════════════════════════════════════════════════════════
     def on_mark_placed(self, req, res):
+        """`MarkPlaced` — 적재 완료 + **실측** 배치 좌표를 남긴다.
+
+        ★ 계획 pose 가 아니라 로봇이 씬에서 읽은 값이다 (`MarkPlaced.srv` 정본).
+          발표의 "최종 배치도" 와 알고리즘 계획을 대조하려면 실측이어야 한다.
+
+        등록 안 된 박스면 `ok=false` — `UPDATE` 가 0행을 고친 것으로 알 수 있다.
+        """
         p = req.actual_pose
         with self._w:
             cur = self.db.execute(
@@ -426,6 +504,11 @@ class DbService(Node):
     # /db/zone_queue
     # ══════════════════════════════════════════════════════════════
     def on_zone_queue(self, req, res):
+        """`ZoneQueue` — 그 구역 대기 수 · 적재 수.
+
+        ★ 대기열은 `DIVERTED`·`PICKED` 만 센다. `SCANNED` 를 넣으면 **아직 분기도 안 된**
+          박스가 구역 부하로 잡혀 중재자가 멀쩡한 구역을 막는다.
+        """
         z = req.zone.upper()
         # ★ 대기열은 DIVERTED·PICKED 만 센다. SCANNED 를 넣으면 아직 분기도 안 된
         #   박스가 구역 부하로 잡혀 중재자가 멀쩡한 구역을 막는다.
@@ -536,6 +619,12 @@ class DbService(Node):
         return zone, "OK"
 
     def _diverter_done(self, res, box_id, t0):
+        """중재자 응답을 내보내기 직전에 **0.6 초 제한을 지켰는지 잰다.**
+
+        넘었으면 씬이 이미 `NORMAL` 로 통과시킨 뒤다 — 답을 못 쓴 것이나 같으므로
+        `error` 로 남긴다. 조용히 넘어가면 "분류가 가끔 안 된다" 로만 보이고 원인이
+        여기라는 게 안 드러난다.
+        """
         dt = (time.perf_counter() - t0) * 1e3
         limit = float(self.cfg["arbiter"]["decision_timeout_s"]) * 1e3
         if dt > limit:
@@ -553,6 +642,13 @@ class DbService(Node):
     #   복붙하면 실시간 화면과 최종 보고서의 숫자가 갈린다.
     # ══════════════════════════════════════════════════════════════
     def _publish_metrics(self):
+        """`/metrics/summary` 1 Hz. 쿼리는 `packing_db.metrics.collect` **하나를 공유한다.**
+
+        `scripts/report.py`(최종 보고서)도 같은 함수를 쓴다 — 복붙하면 실시간 화면과
+        발표 자료의 숫자가 갈린다. 발표 자리에서 그러면 곤란하다.
+
+        ★ 지표 하나 때문에 노드가 죽으면 안 된다 (§9). 계산이 실패해도 로그만 남긴다.
+        """
         try:
             m = collect(self.db, self._metrics_zone)
         except Exception as e:                      # noqa: BLE001

@@ -1,5 +1,15 @@
 """Isaac 안 ROS 2 통로 — Action Graph 하나로 끝낸다. **소켓 없음** (CLAUDE.md §2).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : (전 구간) Isaac ↔ ROS 2 **유일한 통로**. Action Graph 를 세운다
+    ║     불러 주는 쪽        : ros_side
+    ║     이 파일이 부르는 쪽 : OmniGraph ROS2 노드
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 이 파일이 대체하는 것
     `sim_server.py` 의 JSON 소켓(localhost:8765). §2 가 폐기했다.
     Isaac 안팎을 잇는 통로는 ROS 2 하나뿐이다 — Action Graph 의 C/rcl 백엔드가
@@ -72,10 +82,16 @@ EVT_TOPIC_FMT = "/zone_%s/robot/event"
 
 
 def cmd_topic(zone):
+    """구역의 로봇 **명령** 토픽 이름. ★ 관제탑과 **글자 하나까지** 같아야 한다.
+
+    한때 관제탑은 `/zone_b/robot/cmd` 를 쓰는데 여기가 `/robot/cmd` 단수라 서로
+    못 만났다 — **에러도 안 났다.** 그래서 이름을 함수 하나로 모았다.
+    """
     return CMD_TOPIC_FMT % str(zone).lower()
 
 
 def evt_topic(zone):
+    """구역의 로봇 **결과** 토픽 이름. `cmd_topic` 과 짝이다."""
     return EVT_TOPIC_FMT % str(zone).lower()
 
 # ROS 원시형 -> OmniGraph 타입. TS-022 에서 string->token, float32->float 실측 확인.

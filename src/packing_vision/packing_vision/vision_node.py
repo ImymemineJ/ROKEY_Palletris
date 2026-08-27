@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """인식 노드 — 투입부 등록·검증(cam1·cam2) + 픽업 좌표(pick_cam).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ② 투입부 인식(cam1·cam2) · ④ 픽업 좌표(pick_cam)
+    ║     불러 주는 쪽        : launch
+    ║     이 파일이 부르는 쪽 : db 서비스 · 관제탑 토픽
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 CLAUDE.md §8 의 "라인 인식 노드 2 · 구역 인식 노드 3" 을 구현한다.
 
 ★ 왜 한 프로세스에 같이 두나
@@ -71,10 +81,21 @@ class CameraSub:
                                  qos_profile_sensor_data, callback_group=cb_group)
 
     def _info(self, msg):
+        """`camera_info` — 내부 파라미터 K 와 **프레임 이름**을 받는다.
+
+        ★ `frame_id` 를 여기서 챙기는 게 핵심이다. 이 이름으로 tf 를 조회하므로
+          씬 prim 이름이 바뀌어도 코드를 안 고친다. 카메라 자세를 코드에 박지 않는
+          유일한 방법이다.
+        """
         self.K = np.array(msg.k, float).reshape(3, 3)
         self.frame_id = msg.header.frame_id
 
     def _image(self, msg):
+        """`<ns>/rgb` 구독 콜백. BGR 로 바꿔 상위 핸들러에 넘긴다.
+
+        ★ **예외를 여기서 다 잡는다.** rclpy 는 콜백 예외를 삼키므로, 잘못된 프레임
+          하나에 인식이 통째로 멎는데 에러는 한 줄도 안 뜬다 (CLAUDE.md §9).
+        """
         # 구독 콜백은 입력을 검증한다. rclpy 가 예외를 삼켜서, 잘못된 프레임 하나에
         # 인식이 통째로 멎는데 에러는 안 뜬다 (CLAUDE.md §9).
         try:
@@ -172,6 +193,20 @@ class LineDetector(Node):
         return det, out
 
     def _on_cam1(self, bgr, header):
+        """cam1 — 크기 측정 + QR 운송장번호 판독 → `/db/register_box`.
+
+        ★ **`box_id` 를 세어서 만들지 않는다.** QR 이 정본이다. 순번으로 만들면
+          한 개만 놓쳐도 그 뒤 전부가 한 칸씩 밀려 DB 의 다른 박스 기록을 덮어쓴다 —
+          에러 없이 전부 틀리는 쪽이다.
+        ★ QR 을 못 읽으면 **등록하지 않고 흘려보낸다.** 등록 안 된 박스는 중재자가
+          미등록으로 보고 `RETURN` 시킨다. 설계결정서가 요구한 "리젝트 라인이 실제로
+          발동" 이 이 경로다 — 인위적 드롭률을 주입할 필요가 없다.
+        ★ `dest` 는 비워 보낸다. 구역은 DB 가 **배송지 주소의 동**으로 정한다.
+          여기서 추측해 채우면 실제 분류 근거와 어긋나도 아무도 모른다.
+
+        `_armed1` 는 **박스 하나당 한 번만** 등록하기 위한 빗장이다. 30 Hz 로 들어오는
+        같은 박스를 매 프레임 등록하면 안 된다.
+        """
         det, out = self._measure(bgr, self.cam1)
         if det is None:
             self._armed1 = True                 # 빈 벨트 — 다음 박스를 받을 준비
@@ -219,6 +254,7 @@ class LineDetector(Node):
         self.cli_miss.call_async(ReportMiss.Request(where_at=where_at, reason=reason))
 
     def _reg_done(self, res, box_id, bt):
+        """`RegisterBox` 응답. 실패해도 **라인을 세우지 않는다** — 로그만 남긴다."""
         if res is None or not res.ok:
             self.get_logger().error(
                 f"register_box 실패 {box_id}: {getattr(res, 'message', 'no response')}")
@@ -228,6 +264,11 @@ class LineDetector(Node):
             f"cam1 등록 {box_id} ({bt['name']}) → {res.message} · 누계 {self._n_reg}")
 
     def _on_cam2(self, bgr, header):
+        """cam2 — 재판독해 `/db/verify_box` 로 교차 검증한다.
+
+        ★ QR 을 못 읽으면 **`VerifyBox` 를 아예 안 부른다.** `box_id` 를 추측해서
+          부르면 엉뚱한 박스를 통과시킨다. 안 부르는 쪽이 안전하다.
+        """
         det, _ = self._measure(bgr, self.cam2)
         if det is None:
             self._armed2 = True
@@ -250,6 +291,11 @@ class LineDetector(Node):
                    lambda r, b=box_id: self._ver_done(r, b))
 
     def _ver_done(self, res, box_id):
+        """`VerifyBox` 응답. 불일치는 **기록만** 하고 판단은 미룬다.
+
+        여기서 버리면 멀쩡한 박스를 죽일 수 있다 — cam2 쪽이 잘못 읽었을 수도 있다.
+        불일치가 늘어나는지는 `scan_misses` 지표로 보인다.
+        """
         if res is None:
             return
         if res.match:
@@ -268,6 +314,11 @@ class LineDetector(Node):
     #   콜백 안에서 spin_until_future_complete 를 부르면 executor 가 자기 자신을
     #   기다려 에러 한 줄 없이 멈춘다 (CLAUDE.md §9).
     def _call(self, cli, req, done):
+        """서비스 호출 한 번. **`call_async` + `done_callback` 만 쓴다.**
+
+        콜백 안에서 `spin_until_future_complete` 를 부르면 executor 가 자기 자신을
+        기다려 **에러 한 줄 없이** 멈춘다 (CLAUDE.md §9).
+        """
         if not cli.service_is_ready():
             self.get_logger().warn(f"{cli.srv_name} 서버가 아직 없다 — 건너뛴다")
             return
@@ -335,14 +386,41 @@ class ZoneDetector(Node):
             f"detector_zone_{self.zone} 시작 — {ns} -> /zone_{self.zone}/box_at_pickup")
 
     def _on_status(self, msg):
+        """관제탑 `ZoneStatus` 로 **추론을 켜고 끈다** — 평가 항목 "처리 효율" 이 이것이다.
+
+        IDLE 일 때만 추론한다. 집는 중에는 새 좌표가 필요 없고, 오히려 팔이 화면에
+        들어와 오검출을 만든다.
+        """
         # IDLE 일 때만 추론한다. 집는 중에는 새 좌표가 필요 없고, 오히려 팔이
         # 화면에 들어와 오검출을 만든다.
         self._idle = (msg.state == "IDLE")
 
     def _now(self):
+        """★ 벽시계가 아니라 **ROS 시계**다. `use_sim_time` 이면 Isaac 의 sim time 을 따른다.
+
+        헤드리스는 시뮬이 실시간의 몇 배로 도는데, 추론 간격(`_min_dt`)을 벽시계로
+        재면 시뮬 시간으로는 훨씬 촘촘해진다.
+        """
         return self.get_clock().now().nanoseconds / 1e9
 
     def _on_image(self, bgr, header):
+        """pick_cam — 스토퍼에 선 박스의 **픽업 좌표를 실측**해 `BoxAtPickup` 으로 낸다.
+
+        이 노드의 전부다. 순서:
+
+            ① 게이트   IDLE 이 아니거나 최소 간격 전이면 **추론 자체를 안 한다**
+            ② find_box 빨간 윤곽 → minAreaRect. 시야에 **잘렸으면 좌표를 안 낸다**
+            ③ tf       이미지 헤더의 frame_id 로 카메라 자세를 조회
+            ④ 역투영    코너 4점 + K + 벨트 상면 높이(800) → 월드 중심 · yaw
+            ⑤ QR       운송장번호. **한 번 읽으면 박스가 떠날 때까지 기억한다**
+            ⑥ 발행      mm 정수로 변환해 publish. z 는 안 싣는다 (벨트 높이는 고정)
+
+        ★ 좌표를 못 믿을 때는 **"안 보인다"(present=false) 를 낸다.** 잘린 사각형의
+          중심은 진짜 중심이 아니다 — 틀린 좌표를 주면 로봇이 빗나간 자리를 집는다.
+        ★ QR 해독 실패는 무작위가 아니라 **자세에 따라 결정적**이다. 나쁜 자세로 멈춘
+          박스는 몇 번을 다시 봐도 계속 실패한다(실측: 한 자세로 굳으면 0% 아니면 100%).
+          그래서 재시도가 아니라 **기억**으로 덮는다.
+        """
         t = self._now()
         if not self._idle or (t - self._last) < self._min_dt:
             return
@@ -444,6 +522,12 @@ class ZoneDetector(Node):
         fut.add_done_callback(done)
 
     def _publish_absent(self):
+        """"픽업 자리가 비었다" 를 알린다.
+
+        ★ 이 신호가 관제탑의 **빗장을 푼다.** 방금 적재한 박스·방금 버린 박스가
+          `present=false` 를 한 번 봐야 다음 박스를 받는다 — 안 그러면 큐에 남아 있던
+          이전 프레임 때문에 **같은 박스를 두 번 쌓는다** (실측으로 확인된 버그다).
+        """
         if self._present:
             self.get_logger().info("픽업 자리 비었다")
         self._present, self._seen = False, None

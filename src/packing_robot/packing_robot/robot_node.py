@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """robot_node — 관제탑과 `Cycle` 사이를 메우는 노드 (트랙 B 김병직).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ⑦⑧ (과도기 경로) 관제탑 토픽 ↔ Cycle
+    ║     불러 주는 쪽        : launch / ros2 run
+    ║     이 파일이 부르는 쪽 : cmd_adapter → cycle → SimLink(소켓)
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 관제탑은 `RobotCmd(PICK/PLACE/HOME/STOP)` 이라는 **사이클 단위**로 말하고,
 `cycle.py` 는 `move_ee`/`grasp`/`release` 라는 **동작 단위**로 말한다.
 1:1 대응이 없어서 그 사이를 메우는 노드가 필요했다 — 이 파일이다.
@@ -92,6 +102,16 @@ class ZoneRobot:
 
     # ── 구독 콜백: 절대 블로킹하지 않는다 ──
     def on_cmd(self, c):
+        """`/zone_*/robot/cmd` 구독 콜백. **절대 블로킹하지 않는다.**
+
+        모션은 5~10초 걸린다. 여기서 기다리면 executor 스레드 하나가 그동안 묶여
+        같은 그룹의 다른 콜백이 안 돈다. 그래서 워커 스레드로 넘기고 즉시 돌아온다.
+
+        ★ 검증을 여기서 한다. rclpy 는 콜백 예외를 삼키므로, 잘못된 메시지 하나에
+          로봇이 영영 안 움직이는데 에러는 안 뜬다 (CLAUDE.md §9).
+        ★ 이미 모션 중이면 **조용히 버리지 않고 `ok=false` 로 답한다.** 답이 없으면
+          관제탑은 20초를 통째로 버린 뒤에야 안다.
+        """
         # ★ 콜백에서 검증한다. rclpy 는 콜백 예외를 삼키므로, 잘못된 메시지 하나에
         #   로봇이 영영 안 움직이는데 에러는 안 뜬다 (§9).
         if c.action not in ACTION_NAME:
@@ -110,6 +130,7 @@ class ZoneRobot:
 
     # ── 워커 스레드: 여기서만 블로킹한다 ──
     def _work(self, c):
+        """워커 스레드 — **여기서만 블로킹한다.** 규약은 `cmd_adapter.run_cmd` 가 지킨다."""
         try:
             ev = run_cmd(self.cycle, _cmd_to_dict(c),
                          log=lambda m: self.log.info(str(m)))
@@ -119,6 +140,7 @@ class ZoneRobot:
             self.busy.release()
 
     def _publish(self, ev):
+        """dict → `RobotEvent` 발행. `seq` 는 어댑터가 이미 복사해 뒀다 (§3-4 규약 2)."""
         m = RobotEvent()
         m.seq = int(ev["seq"])
         m.action = int(ev["action"])
@@ -145,6 +167,13 @@ def _cmd_to_dict(c):
 
 
 class RobotNode(Node):
+    """구역별 `ZoneRobot` 을 들고 `/zone_*/robot/{cmd,event}` 를 잇는다.
+
+    ★ **과도기 노드다.** 최종 구조에서는 Isaac 안의 `sim_main --ros` 가 같은 일을
+      소켓 없이 한다 (`ros_side.RosSide`). 둘 다 `cmd_adapter.run_cmd` 하나를 부르므로
+      전송이 바뀌어도 규약(seq 복사 · has_actual 게이트 · 예외에도 답하기)은 안 바뀐다.
+    """
+
     def __init__(self):
         super().__init__("robot_node")
         self.declare_parameter("zones", [""])
@@ -171,6 +200,10 @@ class RobotNode(Node):
 
 
 def main(args=None):
+    """`ros2 run packing_robot robot_node --ros-args -p zones:="['a','b','c']"`.
+
+    ★ Isaac(`sim_main.py`)을 **먼저** 띄워야 한다 — 뜨자마자 소켓에 붙기 때문이다.
+    """
     rclpy.init(args=args)
     try:
         node = RobotNode()

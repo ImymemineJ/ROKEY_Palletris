@@ -1,3 +1,74 @@
+"""heightmap_core.py — 적재 알고리즘의 코어 (트랙 C 정정인).
+
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ⑥ 자리 계산의 **본체** · ⑨ 실측 반영
+    ║     불러 주는 쪽        : algo_service_node · 수용 테스트 · 시드 스윕
+    ║     이 파일이 부르는 쪽 : (없음 — ROS·Isaac 의존성 0)
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
+**ROS 도 Isaac 도 import 하지 않는다.** 노트북에서 그대로 돌아가고, 수용 테스트
+(`test/test_core.py`)와 시드 스윕(`robustness.py`)이 이 파일만 불러 돈다.
+ROS 껍데기는 `algo_service_node.py` 다 — 거기서 `plan`/`update`/`cancel`/`reset`
+네 개를 서비스로 연다.
+
+## 우리 문제는 교과서 3D bin packing 이 아니다
+
+| | 교과서 (offline) | 우리 문제 |
+|---|---|---|
+| 박스 목록 | 전부 미리 안다 | **하나씩 도착한다** (online) |
+| 되돌리기 | 배치를 바꿔 가며 최적화 | **한 번 놓으면 끝** |
+| 배치 주체 | 없음 (기하만 본다) | **6축 로봇 팔** — 기하학적으로 들어가도 팔이 못 가는 자리가 있다 |
+
+세 번째가 이 파일의 성격을 정한다. `_corridor_ok` 가 여기 있는 이유이고,
+"들어가긴 하는데 놓을 수는 없는 자리"를 후보에서 빼는 것이 알고리즘의 절반이다.
+
+## 상태 — 팔레트 한 장
+
+    self.hm        (W, D) int32. 셀당 **현재 높이[mm]**. 10mm 격자라 1200x800 → 120x80
+    self.plans     box_id → 계획. `update` 가 실측과 대조하려고 들고 있다
+    self.applied   box_id → 최종 판정. **재시도 멱등**을 위한 것 (update 주석 참조)
+    self.placed    실제로 반영된 (pose, w, d, h) 목록. 적재율의 분자
+
+단위는 **내부 전부 mm 정수**다. m float 는 경계(`packing_common.units`)에서만 쓴다.
+
+## 배치 한 번의 흐름 (`plan`)
+
+    yaw 0 / 90 각각에 대해
+      ① _base_z        발자국 안 최고높이 = 놓을 밑면 높이       (슬라이딩 최대)
+      ② 높이 필터       밑면 + h <= max_stack(1300)
+      ③ _corridor_ok   **팔이 내려올 수 있나** — 주변 벽이 윗면+150 이하인가
+      ④ _tower_ok      기둥 억제 (기본 꺼짐)
+      ⑤ 가중합 점수     w_height .6 · w_support .4 · w_wall .2 · w_far .1 · w_level .05
+      ⑥ 지지율 정밀검사  점수 상위부터 — 전 후보에 돌리기엔 비싸다 (명세서 §7.9)
+      ⑦ _lookahead     상위 k개를 놓아 보고 뒤 박스를 굴려 미래 부피가 큰 쪽 (기본 꺼짐)
+    → (ok, pose, score, message)   message = "OK" | "NO_FEASIBLE_POSE" | "PALLET_FULL"
+
+★ **`NO_FEASIBLE_POSE` 와 `PALLET_FULL` 은 다르다** (CLAUDE.md §7).
+  앞은 *이 박스만* 자리가 없다는 뜻이라 관제탑이 그 박스만 되돌리고 **계속**한다.
+  뒤는 `_is_pallet_full()` 이 "가장 작은 박스로도 후보가 없다" 를 확인했을 때만 낸다.
+
+## 속도 예산
+
+`plan()` 평균 **2 ms** (95% 7ms · 최악 22ms). 명세서 §7.9 상한은 200 ms 다.
+이 여유는 전부 `scipy.ndimage.maximum_filter1d` 에서 나온다 — 모든 시작셀에 대한
+발자국 최댓값을 파이썬 루프 없이 한 번에 낸다. 루프로 바꾸면 100배 느려진다.
+(앞보기를 켜면 평균 131 ms 로 올라가 상한에 붙는다. 그래서 기본이 꺼짐이다.)
+
+## 이 파일을 고칠 때
+
+- **숫자를 여기 박지 않는다.** 전부 `cfg`(= `system.yaml`)에서 읽는다.
+- **새 항은 기본값 0 으로 넣는다.** 그래야 켜기 전까지 기존 결과가 안 바뀌고,
+  A/B 를 같은 코드로 잴 수 있다. w_wall · w_far · w_level · 낙하 완화 · 기둥 억제가
+  전부 그렇게 들어왔다.
+- **판정은 Isaac 이 한다** (CLAUDE.md §10-1). 데스크 스윕은 후보를 좁히는 용도다 —
+  데스크에서는 배치 실패가 박스 1개 손해지만, 실측에서는 실패 2건이 적재 3개를
+  깎은 적이 있다(팔이 스택을 63mm 밀고, 무너진 지형이 뒤 박스 자리까지 죽였다).
+  부호까지 반대로 나온 항이 실제로 있었다.
+"""
 import math
 import random
 
@@ -400,6 +471,16 @@ class HeightmapPacker:
         return int(round(w_mm * c + d_mm * sn)), int(round(w_mm * sn + d_mm * c))
 
     def _support_ratio(self, i, j, wc, dc, base_z):
+        """발자국 셀 중 **밑면 높이와 같은 높이**인 칸의 비율 (0~1).
+
+        "밑면이 얼마나 받쳐지나" 다. `min_support_ratio`(0.7) 미만이면 후보에서 뺀다 —
+        외팔보처럼 걸쳐 놓으면 팔이 손을 떼는 순간 기운다.
+
+        ★ `tol` 은 반드시 `cell_mm` 과 같아야 한다 (둘 다 10). 높이는 셀 격자로
+          양자화돼 저장되므로 같은 평면이어도 한 칸(10mm)까지 어긋날 수 있다.
+          5 로 줄이면 **2층부터 전부 지지율 미달**이 되어 `NO_FEASIBLE_POSE` 만 나온다
+          (CLAUDE.md §10 의 증상표에 있는 그 항목이다).
+        """
         foot = self.hm[i:i + wc, j:j + dc]
         return float((np.abs(foot - base_z) <= self.tol).mean())   # ★ tol=10 필수
 
@@ -543,8 +624,20 @@ class HeightmapPacker:
         self.applied[box_id] = ok
         return ok, self.fill_rate(), len(self.placed)
 
-    def cancel(self, box_id): self.plans.pop(box_id, None)
+    def cancel(self, box_id):
+        """계획만 버린다. `hm` 은 안 건드린다 — 아직 아무것도 안 놓았기 때문이다.
+
+        관제탑의 **이탈 3경로**(`NO_FEASIBLE_POSE` · `PALLET_FULL` · 실패/타임아웃)가
+        전부 여기로 온다 (CLAUDE.md §8). 안 부르면 `plans` 에 stale plan 이 남고,
+        그 박스가 리턴 라인을 돌아 다시 왔을 때 `update` 가 **옛 계획과 yaw 를 비교**해
+        멀쩡한 배치를 거절한다.
+
+        없는 box_id 여도 조용히 넘어간다 — 서비스 재시도 1회가 규약이라 두 번 들어온다.
+        """
+        self.plans.pop(box_id, None)
+
     def reset(self):
+        """팔레트를 갈았다. 상태 넷을 **다 같이** 비운다 (`/algo/reset_heightmap`)."""
         # ★ applied 도 같이 비운다. 안 비우면 팔레트를 갈고 나서 같은 box_id 가
         #   다시 와도 "이미 반영됨" 으로 무시된다.
         self.hm[:] = 0

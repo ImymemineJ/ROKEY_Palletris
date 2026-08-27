@@ -1,5 +1,15 @@
 """B 소유 소켓 명령 핸들러 — Isaac 프로세스 안에서 돈다 (공통가이드 §3, 작업명세서 6.4).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ⑦⑧ 관절 구동의 **본체** — IK · 웨이포인트 보간 · 도착 판정
+    ║     불러 주는 쪽        : cycle (move_ee · motion_status)
+    ║     이 파일이 부르는 쪽 : Lula IK · Articulation 드라이브
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
     move_ee · motion_status · grasp · release · is_holding · tcp_speed
 
 `sim_main.py`(김학민)가 이 모듈을 import 해서 `RobotMotion` 을 만들고,
@@ -493,10 +503,20 @@ class RobotMotion:
         return {"ok": bool(res)}
 
     def h_is_holding(self, req=None):
+        """⑦⑧ 지금 박스를 물고 있나. **캐시를 읽는다 — 그리퍼를 직접 안 찌른다.**
+
+        메인 스레드가 매 틱 갱신해 두므로 워커 스레드가 락만 잡고 바로 답한다.
+        여기서 물리를 조회하면 메인과 겹쳐 스테이지가 흔들린다.
+        """
         with self._lk:
             return {"holding": self._holding_cache}
 
     def h_tcp_speed(self, req=None):
+        """현재 툴 속도 [m/s]. **접촉 감지의 재료**다.
+
+        Lula IK 는 충돌 회피를 못 하므로(`supports_collision_avoidance() == False`),
+        "목표에 못 갔는데 속도가 0 에 수렴" 을 보고 걸린 것으로 판정한다.
+        """
         with self._lk:
             return {"mps": self._tcp_mps}
 
@@ -521,6 +541,11 @@ class RobotMotion:
         return self.suction_face()[0]
 
     def _update_tcp_speed(self):
+        """매 틱 툴 속도를 갱신한다 (이전 위치와의 거리 ÷ dt).
+
+        ★ 접촉 감지가 이 값 하나에 걸려 있다. FK 를 한 번만 돌려 위치·속도를
+          같이 얻으므로 비용이 거의 없다.
+        """
         cur = self.tool_pose()
         with self._lk:
             if self._prev_tool is not None:
@@ -958,6 +983,12 @@ class RobotMotion:
             self._reach_done(err, p)
 
     def _warn_residual(self, p, err, dyaw=0.0):
+        """허용 오차 안에 못 들어온 채 한도에 걸렸다 — 잔차를 남기고 **넘어간다.**
+
+        ★ **여기서 영원히 기다리면 안 된다.** 정상상태 오차가 남는 제어기에서는
+          임계값에 영영 못 들어간다. 예전 RMPflow 판이 정확히 그렇게 멈췄다
+          (오차 15 mm 가 남는데 도착 판정이 그보다 작았다).
+        """
         # ⚠ 여기서 영원히 기다리면 안 된다 — 정상상태 오차가 남는 제어기에서는
         #   임계값에 영영 못 들어간다 (구 저장소 RMPflow 교훈). 한도를 두고
         #   잔차를 로그로 남긴 뒤 넘어간다.
@@ -969,6 +1000,18 @@ class RobotMotion:
                      np.round(self._goal_face, 4), p["miss"], p["over"]))
 
     def _reach_done(self, err, p=None):
+        """한 웨이포인트 구간을 끝내고 `REACHED` 로 넘긴다. **사이클 타임의 심장.**
+
+        ★ 도착 판정을 **절대 오차가 아니라 수렴 정체**로 바꾼 것이 사이클
+          18.3 s → 12.6 s 의 절반을 만들었다. 정착 잔차 실측이 1.03~2.05 mm 였는데
+          임계값이 **1 mm** 라 최소값보다 작았다 — 영영 안 들어오는 조건이었다.
+
+        ★ 허용 오차는 **구간마다 다르다.** 웨이포인트 8개 중 6개가 이송인데
+          하강과 같은 정밀도를 요구하고 있었다 (이송 8 mm 로 완화 → −0.9 s).
+
+        정착 로그(`SETTLE_LOG`)는 "팔이 움직이는 중이었나, 이미 멈춰 있었는데
+        로직이 붙잡은 건가" 를 가른다 — 잔차가 크게 줄었으면 전자, 그대로면 후자다.
+        """
         if SETTLE_LOG and self._s0 is not None:
             e0, d0, t0 = self._s0
             n = t0 - self._settle
@@ -992,6 +1035,13 @@ class RobotMotion:
                       % (p["miss"], p["over"]))
 
     def _advance_gripper(self):
+        """⑦⑧ 흡착·해제의 **비동기 진행**. 매 틱 폴링해 끝나면 이벤트를 깨운다.
+
+        ★ 왜 이렇게 하나: `grasp`/`release` 는 판정까지 수 초가 걸리는데, 그 판정을
+          내리는 것이 물리(`world.step()`)다. 메인 스레드에서 완료를 기다리면
+          **자기가 돌려야 할 물리를 기다리는 꼴이라 100 % 데드락**이다.
+          그래서 워커는 이벤트에서 자고, 메인이 여기서 깨운다.
+        """
         if self._g_evt is not None:
             res = self.grip.poll_grasp()
             if res is not None:

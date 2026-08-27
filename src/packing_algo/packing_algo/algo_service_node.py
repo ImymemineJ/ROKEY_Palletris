@@ -1,5 +1,15 @@
 """C5 — `/algo/*` ROS2 서비스 래퍼 (트랙 C).
 
+    ╔══ 시나리오에서의 위치 ═══════════════════════════════════════════════════╗
+    ║  ① 스폰 → ② 투입부 인식 → ③ 목적지·분기 → ④ 픽업 좌표 → ⑤ 벨트 정지     ║
+    ║  → ⑥ 자리 계산 → ⑦ 집기 → ⑧ 놓기 → ⑨ 갱신·기록 → ⑩ 벨트 재가동 → ①    ║
+    ║                                                                        ║
+    ║  ★ 이 파일이 맡는 구간 : ⑥ 자리 계산 · ⑨ 갱신
+    ║     불러 주는 쪽        : 관제탑 (/algo/*)
+    ║     이 파일이 부르는 쪽 : heightmap_core (순수 파이썬)
+    ╚════════════════════════════════════════════════════════════════════════╝
+    ※ 전체 지도는 `docs/코드_리딩가이드.md` 에 있다.
+
 **코어(`heightmap_core.HeightmapPacker`)는 한 줄도 건드리지 않는다.** 이 노드가 하는 일은
 ROS 메시지 ↔ 파이썬 자료구조 **번역**과 구역별 패커 인스턴스 관리뿐이다.
 
@@ -41,6 +51,16 @@ except ImportError as e:      # 트랙 D 의 packing_msgs 가 아직 빌드되�
 
 
 class AlgoService(Node):
+    """`/algo/*` 서비스 4종. **heightmap 3장(A·B·C)을 소유하는 유일한 노드다.**
+
+    ★ **`/robot/cmd` 를 절대 발행하지 않는다** (CLAUDE.md §8). 이 노드가 아는 것은
+      "어느 자리가 좋은가" 뿐이고, 팔을 움직일지 말지는 관제탑이 정한다. 여기서
+      로봇을 부르면 명령 발신자가 둘이 되어 순서를 보장할 수 없다.
+
+    구역별로 `HeightmapPacker` 하나 + 락 하나를 든다. 구역이 다르면 객체가 달라
+    서로 안 막고, 같은 구역의 `plan`(읽기)과 `update`(쓰기)만 직렬화된다.
+    """
+
     def __init__(self):
         super().__init__("algo_service_node")
         self.cfg = load()
@@ -117,6 +137,16 @@ class AlgoService(Node):
 
     # ---------- /algo/plan_placement ----------
     def on_plan(self, req, res):
+        """`PlanPlacement` — 이 박스를 어디에 놓을지. 코어 `plan()` 의 얇은 번역기다.
+
+        응답 `message` 는 **세 가지뿐**이다 (계약 §3-3):
+        `"OK"` · `"NO_FEASIBLE_POSE"` · `"PALLET_FULL"`. 코어가 예외를 던져도 여기서
+        `NO_FEASIBLE_POSE` 로 바꿔 답한다 — 콜백에서 예외가 나가면 rclpy 가 응답을
+        아예 안 보내고, 관제탑은 2초 뒤 재시도해 같은 예외를 또 만난다.
+        **박스 하나가 라인을 영구히 막는다.**
+
+        ★ 응답 pose 의 `z_mm` 은 박스 **밑면**이다 (`PlacePose.msg` 정본).
+        """
         t0 = time.perf_counter()
         self.t0.setdefault(req.zone, t0)          # 이 구역의 시나리오 시작 시각
         pk = self._packer(req.zone)
@@ -158,6 +188,19 @@ class AlgoService(Node):
 
     # ---------- /algo/update_heightmap ----------
     def on_update(self, req, res):
+        """`UpdateHeightmap` — **실측** pose 로 heightmap 을 갱신한다. 자기교정의 핵심.
+
+        ★ 요청의 `actual_pose` 는 로봇이 씬에서 **실제로 읽은** 값이어야 한다
+          (`RobotEvent.has_actual == true` 일 때만). 계획값을 되보내면 오차가 누적돼
+          알고리즘은 1300 안이라 믿는데 실제 더미가 넘는다 (§3-4 규약 3).
+
+        ★ 응답 `ok=false` 는 **실패가 아니라 경고**다 (yaw 오차 초과·가장자리 걸침 등).
+          코어가 외접 사각형으로 안전하게 기록해 두었으므로 관제탑은 로그만 남기고
+          계속 간다. 여기서 멈추면 멀쩡히 놓인 박스 하나 때문에 라인이 선다.
+
+        ★ **멱등이다.** 서비스 재시도 1회가 규약이라 같은 `box_id` 가 두 번 들어오는
+          일이 정상 동작 중에 생긴다. 코어의 `applied` 가 처음 판정을 그대로 돌려준다.
+        """
         t0 = time.perf_counter()
         pk = self._packer(req.zone)
         if pk is None:
@@ -224,6 +267,13 @@ class AlgoService(Node):
 
     # ---------- /algo/cancel_plan ----------
     def on_cancel(self, req, res):
+        """`CancelPlan` — 예약만 푼다. `hm` 은 안 건드린다 (아직 아무것도 안 놓았다).
+
+        관제탑의 **이탈 3경로**가 전부 여기로 온다 — `NO_FEASIBLE_POSE` ·
+        `PALLET_FULL` · 로봇 실패/20초 타임아웃. 이 호출이 빠지면 `plans` 에 stale
+        plan 이 남아, 그 박스가 리턴 라인을 돌아 다시 왔을 때 `update` 가 옛 계획과
+        yaw 를 비교해 멀쩡한 배치를 거절한다.
+        """
         pk = self._packer(req.zone)
         if pk is not None:
             with self.lock[req.zone]:
@@ -234,6 +284,12 @@ class AlgoService(Node):
 
     # ---------- /algo/reset_heightmap ----------
     def on_reset(self, req, res):
+        """`ResetHeightmap` — 팔레트를 갈았다. 그 구역 상태를 0 으로.
+
+        ★ 지우기 **전에** 최종 지표를 로그로 남긴다. 팔레트를 갈면(`PALLET_FULL` →
+          `SwapPallet`) 이 판의 결과가 영영 사라지는데, 평가 항목 "검증 및 분석"이
+          바로 그 숫자다 (적재수 · 적재율 · 최고높이 · 소요시간).
+        """
         pk = self._packer(req.zone)
         if pk is not None:
             # ★ 지우기 **전에** 최종 지표를 남긴다. 팔레트를 갈면(PALLET_FULL → SwapPallet)
@@ -260,6 +316,12 @@ class AlgoService(Node):
 
 
 def main(args=None):
+    """`ros2 run packing_algo algo_service_node`.
+
+    스냅샷(실시간 뷰어용)을 켜려면:
+        ros2 run packing_algo algo_service_node --ros-args -p snapshot_path:=/tmp/algo_state.json
+        ros2 run packing_algo live_view
+    """
     rclpy.init(args=args)
     node = AlgoService()
     executor = MultiThreadedExecutor()          # ★ 철칙 4
