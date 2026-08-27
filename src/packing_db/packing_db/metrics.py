@@ -57,6 +57,12 @@ RUN_GAP_S = 60.0
 #: 박스 하나만 흘려도 SCANNED·VERIFIED·PICKED·PLACED 로 4 행이라 30 은 넉넉히 낮다.
 RUN_MIN_EVENTS = 30
 
+#: 이 값 이상이면 **벽시계**(1970 년부터의 초), 미만이면 **sim 시각**으로 본다.
+#: `db_service_node._now()` 가 `/clock` 없을 때 벽시계로 떨어져 한 테이블에 두 계열이
+#: 섞인다. 1e8 초는 sim 으로 치면 3 년이 넘어 절대 안 나오고, 벽시계로는 1973 년이라
+#: 항상 넘는다 — 자릿수가 달라 확실히 갈린다.
+EPOCH_MIN_S = 1e8
+
 
 def _one(db, sql, args=()):
     row = db.execute(sql, args).fetchone()
@@ -154,14 +160,30 @@ def collect(db, zone=None):
                       f"AND box_id IN ({RUN_BOXES})", (z, ev0)) or 0) if z else 0
 
     # ── 실행 시간 = 이번 구간의 첫 이벤트부터 마지막 이벤트까지 ──
-    t0 = _one(db, "SELECT MIN(ts) FROM box_events WHERE id>=?", (ev0,))
-    t1 = _one(db, "SELECT MAX(ts) FROM box_events WHERE id>=?", (ev0,))
+    # ★★ 한 구간 안에도 시계가 섞일 수 있다 (2026-08-27 실측).
+    #   `_now()` 가 `/clock` 없으면 벽시계로 떨어지므로 같은 구간에 sim 시각(10)과
+    #   벽시계(1,787,768,290)가 같이 들어온다. 그냥 MIN/MAX 를 내면
+    #   **"10~1787768290초 (29,796,138분)"** 같은 값이 화면에 찍힌다 — 실제로 찍혔다.
+    #   두 계열은 자릿수가 완전히 달라 확실히 가른다 (`EPOCH_MIN_S` 주석 참조).
+    #   -> **행이 많은 쪽만** 쓴다. 소수 쪽은 시계가 잠깐 튄 것으로 본다.
+    wall = _one(db, "SELECT COUNT(*) FROM box_events WHERE id>=? AND ts>=?",
+                (ev0, EPOCH_MIN_S)) or 0
+    sim = _one(db, "SELECT COUNT(*) FROM box_events WHERE id>=? AND ts<? AND ts IS NOT NULL",
+               (ev0, EPOCH_MIN_S)) or 0
+    clock_op, clock_ref = (">=", EPOCH_MIN_S) if wall > sim else ("<", EPOCH_MIN_S)
+    t0 = _one(db, f"SELECT MIN(ts) FROM box_events WHERE id>=? AND ts{clock_op}?",
+              (ev0, clock_ref))
+    t1 = _one(db, f"SELECT MAX(ts) FROM box_events WHERE id>=? AND ts{clock_op}?",
+              (ev0, clock_ref))
     elapsed = float(t1 - t0) if (t0 is not None and t1 is not None) else 0.0
 
     # ── 사이클 · 로봇이 실제로 일한 시간 ─────────────────────────
     # PICKED → PLACED 구간. 이번 실행 박스로 한정한다.
+    # ★ 사이클도 같은 계열끼리만 뺀다. 한 박스의 picked_at 과 placed_at 이 서로 다른
+    #   시계면 차이가 억 단위가 되어 평균을 통째로 망친다.
     CYCLE_WHERE = (f"FROM boxes_sorted WHERE status='PLACED' "
                    f"AND picked_at IS NOT NULL AND placed_at IS NOT NULL "
+                   f"AND (picked_at>={EPOCH_MIN_S}) = (placed_at>={EPOCH_MIN_S}) "
                    f"AND box_id IN ({RUN_BOXES})")
     cycle = _one(db, f"SELECT AVG(placed_at - picked_at) {CYCLE_WHERE}", (ev0,))
     busy = _one(db, f"SELECT SUM(placed_at - picked_at) {CYCLE_WHERE}", (ev0,)) or 0.0
