@@ -52,6 +52,11 @@ UNKNOWN = -1.0
 #: 정상 진행과 헷갈릴 수 없는 폭이다.
 RUN_GAP_S = 60.0
 
+#: 실행 하나로 인정할 최소 이벤트 수. 이보다 짧은 구간은 **시계 뒤섞임**으로 본다
+#: (노드 중복 실행 시 `ts` 가 두 계열로 들어와 가짜 경계가 생긴다 — `_run_start` 참조).
+#: 박스 하나만 흘려도 SCANNED·VERIFIED·PICKED·PLACED 로 4 행이라 30 은 넉넉히 낮다.
+RUN_MIN_EVENTS = 30
+
 
 def _one(db, sql, args=()):
     row = db.execute(sql, args).fetchone()
@@ -61,11 +66,22 @@ def _one(db, sql, args=()):
 def _run_start(db, table):
     """`table` 에서 **현재 실행이 시작된 id**. 없으면 0 (= 전부 센다).
 
-    id 순으로 훑으며 `ts` 가 `RUN_GAP_S` 이상 뒤로 점프한 **마지막** 지점을 찾는다.
-    그 뒤가 지금 도는 실행이다.
+    id 순으로 훑으며 `ts` 가 `RUN_GAP_S` 이상 뒤로 점프한 지점을 모으고,
+    그중 **뒤가 충분히 긴** 마지막 것을 고른다.
 
     ★ 왜 `ts` 최댓값 기준이 아니라 점프 기준인가: 벽시계 실행(1.78e9)과 sim 실행(17.6)이
       섞여 있으면 "큰 ts" 가 최신이라는 보장이 없다. 삽입 순서(id)만이 믿을 수 있다.
+
+    ★★ 왜 "충분히 긴" 조건이 필요한가 (2026-08-27 실측):
+      단순히 **마지막** 점프를 쓰면 노드가 중복 실행될 때 무너진다. 관제탑이 두 벌
+      떠 있으면 시계가 둘이라 `ts` 가 두 계열로 뒤섞여 들어오고, 끝부분에서
+      `1075 -> 50` 다음에 `306 -> 70` 같은 가짜 점프가 생긴다. 그 마지막 점프를
+      실행 경계로 삼으면 **구간이 2 행 · 20 초**가 되어, 실제로 47 개를 적재했는데도
+      화면이 "적재 0 · 인식률 0 %" 를 띄웠다.
+
+      실행 하나는 이벤트가 수백 행이다. 뒤가 `RUN_MIN_EVENTS` 보다 짧은 경계는
+      시계 뒤섞임으로 보고 그 앞 경계를 쓴다. 실측: 이 조건 하나로 같은 DB 가
+      `2 행 / 적재 0` -> `403 행 / 적재 47` 로 바로잡혔다.
 
     ★ `--reset` 을 한 깨끗한 DB 에서는 점프가 없어 0 을 돌려준다 -> 예전과 같은 동작.
     """
@@ -73,14 +89,17 @@ def _run_start(db, table):
         rows = db.execute(f"SELECT id, ts FROM {table} ORDER BY id").fetchall()
     except Exception:                       # noqa: BLE001 — 테이블이 없을 수도 있다
         return 0
-    start, prev = 0, None
+    marks, prev = [0], None                 # 0 = "전부" (경계가 없을 때의 답)
     for rid, ts in rows:
         if ts is None:
             continue
         if prev is not None and ts < prev - RUN_GAP_S:
-            start = rid
+            marks.append(rid)
         prev = ts
-    return start
+    for b in reversed(marks):
+        if sum(1 for r in rows if r[0] >= b) >= RUN_MIN_EVENTS:
+            return b
+    return 0
 
 
 def collect(db, zone=None):

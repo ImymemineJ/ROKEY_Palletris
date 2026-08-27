@@ -121,6 +121,10 @@ h2{font-size:16px;font-weight:600;margin:0}
 /* ── 박스 이력 모달 ────────────────────────────────────── */
 .modal{position:fixed;inset:0;background:rgba(20,24,30,.34);display:flex;
   align-items:center;justify-content:center;padding:24px;z-index:20}
+/* ★ `display:flex` 가 `hidden` 속성을 덮어쓴다 — hidden 은 UA 시트의
+   `display:none` 으로 동작하는데 작성자 규칙이 이기기 때문이다.
+   이 한 줄이 없으면 모달이 **페이지 열자마자 빈 채로 떠 있는다.** 실제로 그랬다. */
+.modal[hidden]{display:none}
 .modal-box{background:var(--card);border-radius:14px;max-width:620px;width:100%;
   max-height:80vh;overflow:auto;padding:18px 20px;box-shadow:0 12px 40px rgba(0,0,0,.18)}
 .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
@@ -142,3 +146,7 @@ h2{font-size:16px;font-weight:600;margin:0}
 .conn.fake{color:var(--warn)}
 .conn.fake .dot{background:var(--warn)}
 .state.fake{color:var(--warn)}
+
+/* ★ hidden 을 쓰는 요소는 전부 못박아 둔다. 작성자 규칙이 display 를 주면
+   hidden 이 조용히 무력해진다 — 모달이 그래서 빈 채로 떠 있었다. */
+[hidden]{display:none !important}
