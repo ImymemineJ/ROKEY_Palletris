@@ -740,6 +740,44 @@ class Spawner:
                 return op
         return None
 
+    @staticmethod
+    def _orient_op(prim):
+        """프림의 xformOp:orient 를 돌려준다. 없으면 None."""
+        for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+            if op.GetOpName() == "xformOp:orient":
+                return op
+        return None
+
+    def _rotate_prim_about_z(self, prim, cx, cy, dphi):
+        """프림을 (cx, cy) 둘레로 Z 축 `dphi` [rad] 만큼 돌린다.
+
+        위치와 **자세를 같이** 돌린다. 자세를 안 돌리면 팔레트가 게걸음으로
+        커브를 지나 — 돌고 나면 가로 1.2 m 인 채 폭 0.83 m 레인에 들어가
+        가이드를 뚫는다 (2026-08-27 김병직 관측 "물리적으로 말이 안 된다").
+        """
+        op_t = self._translate_op(prim)
+        if op_t is None:
+            return
+        t = op_t.Get()
+        c, s = math.cos(dphi), math.sin(dphi)
+        dx, dy = t[0] - cx, t[1] - cy
+        op_t.Set(Gf.Vec3d(cx + c * dx - s * dy, cy + s * dx + c * dy, t[2]))
+
+        op_o = self._orient_op(prim)
+        if op_o is None:
+            return
+        cur = op_o.Get()
+        if cur is None:
+            return
+        try:
+            half = dphi / 2.0
+            qd = Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
+            new = qd * Gf.Quatd(cur.GetReal(), Gf.Vec3d(*cur.GetImaginary()))
+            im = type(cur.GetImaginary())(*new.GetImaginary())
+            op_o.Set(type(cur)(new.GetReal(), im))
+        except Exception:
+            pass          # 자세를 못 돌려도 이송은 계속한다
+
     def _bbox(self, path):
         """월드 bbox (x0, x1, y0, y1). 프림이 없거나 비면 None."""
         prim = self.stage.GetPrimAtPath(path)
@@ -769,7 +807,9 @@ class Spawner:
         """
         train = {"zone": zone, "boxes": {}, "moved": 0.0,
                  "pallet": None, "home": None,
-                 "phase": "y", "turn_y": None, "end_x": None, "hold": 0.0}
+                 "phase": "align", "turn_y": None, "end_x": None, "hold": 0.0,
+                 "arc": None, "arc_done": 0.0, "align_left": 0.0,
+                 "lane_y": None}
         for box_id in box_ids:
             rec = self.boxes.pop(box_id, None)
             if rec is None:
@@ -795,18 +835,37 @@ class Spawner:
             self._log("[spawner] ⚠ 반출: 팔레트 프림 %s 를 못 찾았다 — 박스만 내보낸다"
                       % pal_path)
 
-        # ── 상차 경로를 씬에서 잰다 (상수 주석 참조) ──
-        lo = self._bbox(PALLET_GUIDE_FMT % (zone, "lo"))
-        hi = self._bbox(PALLET_GUIDE_FMT % (zone, "hi"))
+        # ── 상차 경로: 호는 **설정**에서, 트럭은 **씬**에서 (상수 주석 참조) ──
+        arc = ((self.cfg.get("conveyor") or {}).get("curve_arc") or {}).get(zone)
         bed = self._bbox(TRUCK_BED_PRIM)
-        if lo and hi and bed:
-            train["turn_y"] = ((lo[2] + lo[3]) + (hi[2] + hi[3])) / 4.0
+        if arc and bed:
+            cx = float(arc["center_mm"][0]) / 1000.0
+            cy = float(arc["center_mm"][1]) / 1000.0
+            R = float(arc["radius_mm"]) / 1000.0
+            train["arc"] = (cx, cy, R)
+            train["turn_y"] = cy                  # 호 진입점의 y
             train["end_x"] = (bed[0] + bed[1]) / 2.0
+            # ★ 호를 나온 뒤 **레인 한가운데로 Y 를 다시 맞춘다** (김학민도 같은
+            #   보정을 했다). 호 끝과 레인 중심이 15~39 mm 어긋나는데, 돌고 난
+            #   팔레트 폭 0.80 에 레인 간격이 0.83 이라 **편도 여유가 15 mm뿐**이다
+            #   — 안 맞추면 C 존이 가이드를 문다.
+            lo = self._bbox(PALLET_GUIDE_FMT % (zone, "lo"))
+            hi = self._bbox(PALLET_GUIDE_FMT % (zone, "hi"))
+            if lo and hi:
+                train["lane_y"] = ((lo[2] + lo[3]) + (hi[2] + hi[3])) / 4.0
+            if train["home"] is not None:
+                # 진입 중심선(x = 중심 - R)까지 옆으로 얼마나 가야 하나
+                train["align_left"] = (cx - R) - train["home"][0]
+            self._log("[spawner] 반출 %s — 호 중심 (%.2f, %.2f) R %.2f · "
+                      "진입 y %.2f · 트럭 x %.2f · 옆정렬 %+.0f mm"
+                      % (zone, cx, cy, R, cy, train["end_x"],
+                         train["align_left"] * 1000))
         else:
-            # 못 재면 예전 동작(직진 2.4 m)으로 물러선다. 데모가 서는 것보다 낫다.
-            self._log("[spawner] ⚠ 반출: 레인·트럭을 못 찾았다 (가이드 %s · 트럭 %s) "
+            # 못 재면 예전 동작(직진)으로 물러선다. 데모가 서는 것보다 낫다.
+            train["phase"] = "y"
+            self._log("[spawner] ⚠ 반출: 호 설정(%s) 또는 트럭(%s) 을 못 찾았다 "
                       "— 직진 %.1f m 로 대신한다"
-                      % (bool(lo and hi), bool(bed), OUTFEED_TRAVEL_M))
+                      % (bool(arc), bool(bed), OUTFEED_TRAVEL_M))
         self._outfeed.append(train)
 
     def _outfeed_step(self, dt):
@@ -827,57 +886,105 @@ class Spawner:
                 self._outfeed_finish(train)
                 continue
 
-            # ── 이번 틱에 어느 축으로 갈지 ──
-            dx = dy = 0.0
-            if train["turn_y"] is None:            # 경로를 못 쟀다 — 직진
-                dy = step
-                train["moved"] += step
-                done = train["moved"] >= OUTFEED_TRAVEL_M
-            elif train["phase"] == "y":
-                dy = step
-                done = False
-            else:
-                dx = step
-                done = False
+            prims = self._outfeed_prims(train)
+            done = False
 
-            for box_id, path in list(train["boxes"].items()):
-                prim = self.stage.GetPrimAtPath(path)
-                if not (prim and prim.IsValid()):
-                    train["boxes"].pop(box_id, None)
-                    continue
+            # ── ③ 커브: 호를 따라 돌면서 **자세도 같이 90° 돈다** ──
+            if train["phase"] == "arc":
+                cx, cy, R = train["arc"]
+                dphi = -step / R          # 시계 방향 (φ 180도 -> 90도)
+                left = (math.pi / 2.0) - train["arc_done"]
+                if abs(dphi) > left:
+                    dphi = -left
+                train["arc_done"] += abs(dphi)
+                for prim in prims:
+                    self._rotate_prim_about_z(prim, cx, cy, dphi)
+                if train["arc_done"] >= math.pi / 2.0 - 1e-6:
+                    pal_t = self._outfeed_pallet_t(train)
+                    if train["lane_y"] is not None and pal_t is not None:
+                        train["align_left"] = train["lane_y"] - pal_t[1]
+                        train["phase"] = "lane"
+                        self._log("[spawner] 반출 %s — 커브 통과 (90도) · 레인 정렬 "
+                                  "%+.0f mm" % (train["zone"],
+                                                train["align_left"] * 1000))
+                    else:
+                        train["phase"] = "x"
+                        self._log("[spawner] 반출 %s — 커브 통과 (90도) · 트럭으로"
+                                  % train["zone"])
+                continue
+
+            # ── 그 밖: 축 이동 ──
+            dx = dy = 0.0
+            if train["phase"] == "align":
+                # ① 호 진입 중심선으로 옆정렬. 한 틱에 옮기면 순간이동으로 보인다
+                #    (김학민 `glide` 주석) — 반출 속도로 흘려보낸다.
+                left = train["align_left"]
+                dx = math.copysign(min(step, abs(left)), left) if left else 0.0
+                train["align_left"] = left - dx
+                if abs(train["align_left"]) < 1e-4:
+                    train["phase"] = "y"
+            elif train["phase"] == "lane":
+                # ③-b 호를 나온 뒤 레인 한가운데로 Y 보정 (여유 15 mm)
+                left = train["align_left"]
+                dy = math.copysign(min(step, abs(left)), left) if left else 0.0
+                train["align_left"] = left - dy
+                if abs(train["align_left"]) < 1e-4:
+                    train["phase"] = "x"
+            elif train["phase"] == "y":
+                dy = step                 # ② 셀 컨베이어를 타고 호 진입점까지
+            else:
+                dx = step                 # ④ 합류 레인을 타고 트럭까지
+
+            for prim in prims:
                 op = self._translate_op(prim)
                 if op is None:
                     continue
                 t = op.Get()
                 op.Set(Gf.Vec3d(t[0] + dx, t[1] + dy, t[2]))
 
-            pal_t = None
-            if train["pallet"]:
-                pal = self.stage.GetPrimAtPath(train["pallet"])
-                op = self._translate_op(pal) if (pal and pal.IsValid()) else None
-                if op is not None:
-                    t = op.Get()
-                    pal_t = Gf.Vec3d(t[0] + dx, t[1] + dy, t[2])
-                    op.Set(pal_t)
-
-            # ── 꺾는 지점·끝 판정은 **팔레트 위치**로 한다 ──
-            if train["turn_y"] is not None and pal_t is not None:
-                if train["phase"] == "y" and pal_t[1] >= train["turn_y"]:
-                    train["phase"] = "x"
-                    self._log("[spawner] 반출 %s — 레인에 올라섰다 (y %.2f) · 트럭으로"
-                              % (train["zone"], pal_t[1]))
-                elif train["phase"] == "x" and pal_t[0] >= train["end_x"]:
-                    train["phase"] = "hold"
-                    self._log("[spawner] 반출 %s — 트럭 적재 완료 (x %.2f)"
-                              % (train["zone"], pal_t[0]))
-                continue
-            if train["turn_y"] is not None and pal_t is None:
-                # 팔레트가 없으면 꺾을 기준이 없다 — 직진 폴백으로 떨어뜨린다
+            pal_t = self._outfeed_pallet_t(train)
+            if pal_t is None:             # 팔레트가 없다 — 직진 폴백
                 train["moved"] += step
                 done = train["moved"] >= OUTFEED_TRAVEL_M
+            elif train["turn_y"] is None:
+                train["moved"] += step
+                done = train["moved"] >= OUTFEED_TRAVEL_M
+            elif train["phase"] == "y" and pal_t[1] >= train["turn_y"]:
+                train["phase"] = "arc"
+                self._log("[spawner] 반출 %s — 커브 진입 (y %.2f)"
+                          % (train["zone"], pal_t[1]))
+            elif train["phase"] == "x" and pal_t[0] >= train["end_x"]:
+                train["phase"] = "hold"
+                self._log("[spawner] 반출 %s — 트럭 적재 완료 (x %.2f)"
+                          % (train["zone"], pal_t[0]))
 
             if done:
                 self._outfeed_finish(train)
+
+    def _outfeed_prims(self, train):
+        """반출 덩어리의 프림 목록 (팔레트 + 적재물). 사라진 박스는 정리한다."""
+        out = []
+        for box_id, path in list(train["boxes"].items()):
+            prim = self.stage.GetPrimAtPath(path)
+            if prim and prim.IsValid():
+                out.append(prim)
+            else:
+                train["boxes"].pop(box_id, None)
+        if train["pallet"]:
+            pal = self.stage.GetPrimAtPath(train["pallet"])
+            if pal and pal.IsValid():
+                out.append(pal)
+        return out
+
+    def _outfeed_pallet_t(self, train):
+        """팔레트의 지금 위치. 없으면 None."""
+        if not train["pallet"]:
+            return None
+        pal = self.stage.GetPrimAtPath(train["pallet"])
+        if not (pal and pal.IsValid()):
+            return None
+        op = self._translate_op(pal)
+        return op.Get() if op is not None else None
 
     def _outfeed_finish(self, train):
         """반출 끝 — **실린 팔레트는 트럭에 남기고**, 빈 팔레트를 제자리에 놓는다.
