@@ -150,3 +150,8 @@ h2{font-size:16px;font-weight:600;margin:0}
 /* ★ hidden 을 쓰는 요소는 전부 못박아 둔다. 작성자 규칙이 display 를 주면
    hidden 이 조용히 무력해진다 — 모달이 그래서 빈 채로 떠 있었다. */
 [hidden]{display:none !important}
+
+/* ★ "읽음 3초 전 · 값 바뀜 2분 전" — 화면이 멈춘 건지 값이 안 변하는 건지 가른다.
+   DB 는 박스가 실제로 놓일 때만 바뀌므로, 가만히 있는 게 정상일 때가 많다. */
+.fresh{font-size:12px;color:var(--ink3);margin-top:2px;font-variant-numeric:tabular-nums}
+.fresh.stale{color:var(--bad)}

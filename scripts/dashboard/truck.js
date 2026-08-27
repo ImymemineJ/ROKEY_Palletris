@@ -29,6 +29,9 @@ const S = {
   pallet: {},           // zone -> /api/pallet 응답
   status: {},           // zone -> ZoneStatus (rosbridge)
   ros: false,
+  lastFetch: 0,         // 마지막으로 백엔드를 읽은 시각
+  lastChange: 0,        // DB 값이 마지막으로 **바뀐** 시각
+  sig: '',              // 바뀜 판정용 지문
 };
 
 const $ = (id) => document.getElementById(id);
@@ -55,11 +58,27 @@ async function refresh() {
   try {
     S.truck = await getJSON('/api/truck');
     S.pallet[S.zone] = await getJSON(`/api/pallet/${S.zone}`);
+    S.lastFetch = Date.now();
+    // ★ "읽은 시각" 과 "바뀐 시각" 을 따로 센다.
+    //   DB 는 박스가 실제로 놓일 때만 바뀐다. 2 초마다 읽어도 값이 같으면 화면은
+    //   가만히 있는데, 그게 "멈춘 것" 인지 "변화가 없는 것" 인지 구분이 안 됐다.
+    const sig = JSON.stringify(S.truck.pallets) + S.truck.metrics.placed_count;
+    if (sig !== S.sig) { S.sig = sig; S.lastChange = S.lastFetch; }
     $('note').textContent = '';
   } catch (e) {
     $('note').textContent = `백엔드를 못 읽었다 — ${e.message}`;
   }
   render();
+}
+
+/** "3초 전" 처럼 사람 말로. */
+function ago(ms) {
+  if (!ms) return '—';
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 2) return '방금';
+  if (s < 60) return `${s}초 전`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}분 전` : `${Math.floor(m / 60)}시간 전`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -349,11 +368,24 @@ function renderKPI() {
     `<div class="kpi"><div class="kpi-l">${l}</div>
      <div class="kpi-v ${v === '—' ? 'na' : c}">${v}</div></div>`).join('');
 
+  renderFresh();
   const r = S.truck.run;
   $('run').textContent = (r && r.elapsed_s > 0)
     ? `실행 구간 ${r.t0.toFixed(0)}~${r.t1.toFixed(0)}초 (${(r.elapsed_s/60).toFixed(1)}분)`
       + ` · 트럭에 실린 판 ${S.truck.shipped_total}장`
     : '실행 기록 없음';
+}
+
+/** ★ 화면이 살아 있는지 / 값이 안 바뀌는 것뿐인지 구분해 준다. */
+function renderFresh() {
+  const el = $('fresh');
+  if (!el) return;
+  if (!S.lastFetch) { el.textContent = ''; return; }
+  const stale = Date.now() - S.lastFetch > 6000;   // 폴링 2초인데 6초 넘게 못 읽었다
+  el.className = 'fresh' + (stale ? ' stale' : '');
+  el.textContent = stale
+    ? `⚠ 백엔드를 ${ago(S.lastFetch)} 부터 못 읽고 있다`
+    : `읽음 ${ago(S.lastFetch)} · 값 바뀜 ${ago(S.lastChange)}`;
 }
 
 function render() { renderCards(); renderStack(); renderUnload(); renderEvents(); renderKPI(); }
@@ -381,6 +413,7 @@ function init() {
   $('note').textContent = '';
   refresh();  pollLive();
   setInterval(refresh, POLL_MS);
-  setInterval(pollLive, 1000);        // 관제탑이 2 Hz 라 1 초면 충분하다
+  setInterval(pollLive, 1000);
+  setInterval(renderFresh, 1000);     // 시간 표시는 값이 안 바뀌어도 흐른다        // 관제탑이 2 Hz 라 1 초면 충분하다
 }
 document.addEventListener('DOMContentLoaded', init);
