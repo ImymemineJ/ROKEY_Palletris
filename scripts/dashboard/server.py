@@ -6,7 +6,7 @@
 
 ## 무엇인가
 
-정적 파일(index.html 등) + `/api/*` JSON 을 내는 작은 HTTP 서버다.
+정적 파일(`/` = `truck.html`) + `/api/*` JSON 을 내는 작은 HTTP 서버다.
 **표준 라이브러리만 쓴다** — 저장소에 웹 프레임워크가 하나도 없고, 시연 PC 에
 pip 설치를 요구하는 순간 위험이 늘기 때문이다.
 
@@ -16,9 +16,10 @@ pip 설치를 요구하는 순간 위험이 늘기 때문이다.
   (CLAUDE.md §10) 을 깨지 않는다. 저장소의 다른 스크립트 10곳이 이미 같은 방식이다
   (`scripts/pallet_access.py` 등). `journal_mode=WAL` 이라 읽기가 쓰기를 안 막는다.
 
-★ **ROS 를 import 하지 않는다.** 그래서 `colcon build` 전에도 돌고, `/clock` 이
-  없어도 멎지 않는다 (CLAUDE.md §10 의 타이머 함정). 실시간 상태는 프론트가
-  rosbridge 로 따로 받는다.
+★ **ROS 는 있으면 쓰고 없으면 만다.** `Live` 가 `rclpy` 로 `/zone_*/status` 를
+  직접 구독한다 — **rosbridge 가 필요 없다.** rclpy 가 없으면 조용히 꺼진 채
+  서버는 그대로 뜨므로 `colcon build` 전에도 DB 화면은 나온다.
+  `use_sim_time` 을 켜지 않고 ROS 타이머도 안 써서 `/clock` 함정(§10)에 안 걸린다.
 
 ★ **숫자를 코드에 안 박는다.** 팔레트 치수·최대적재는 `scripts/_paths.system_config()`
   로 읽는다 — `PL_CONFIG_OVERLAY` 까지 합쳐 읽으므로 시연(test_3)에서
@@ -459,7 +460,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/health":
                 return self._json({"ok": True, "db": str(self.store.db_path),
                                    "db_exists": self.store.db_path.exists()})
-            return self._static("index.html" if path in ("/", "") else path.lstrip("/"))
+            # ★ 루트는 **이 서버의 화면**(truck.html)이다.
+            #   같은 폴더의 index.html 은 어제 올라온 다른 대시보드(6043fdf)이고
+            #   rosbridge 를 쓴다. 루트를 그쪽으로 두면 아무것도 모르고 들어온
+            #   사람이 옛 화면을 보게 된다 — 실제로 그랬다.
+            #   옛 화면은 /index.html 로 그대로 열린다 (남의 파일이라 안 건드린다).
+            return self._static("truck.html" if path in ("/", "") else path.lstrip("/"))
         except FileNotFoundError as e:
             # ★ DB 가 없어도 서버는 안 죽는다. 화면이 이유를 보여 준다
             return self._json({"error": str(e)}, 503)
@@ -487,7 +493,7 @@ def main():
         Handler.live.start()
 
     pal = cfg["pallet"]
-    print(f"관제탑 대시보드 — http://{a.host}:{a.port}")
+    print(f"관제탑 대시보드 — http://{a.host}:{a.port}/")
     print(f"  DB      : {a.db}  ({'있음' if a.db.exists() else '★ 없음'})")
     print(f"  팔레트  : {pal['width_mm']}(X) x {pal['depth_mm']}(Y) mm "
           f"· 최대 {pal['max_stack_mm']} mm")
