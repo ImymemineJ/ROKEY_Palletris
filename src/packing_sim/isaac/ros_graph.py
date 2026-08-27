@@ -466,6 +466,43 @@ def _make_optical_frame(stage, path, cam_path):
 
 
 # ── 픽업 카메라 — 씬에 발행자가 없으면 우리가 낸다 ─────────────────────────
+def _restore_lens_overrides(st, cam_paths, log=print):
+    """씬 루트 레이어에 남은 **렌즈 프림 xform 오버라이드**를 걷어낸다.
+
+    ★ 왜 (2026-08-27 정정인 실측): 새 씬(배경판)에서 rsd455_1·_2 의 Color 렌즈가
+      하늘(z 8.4 / 5.3 m)에 떠 있었다 — 리그 자체도, 같은 리그의 다른 렌즈 3개도
+      멀쩡한데 **Color 렌즈만**. GUI 에서 그 렌즈를 뷰포트 카메라로 잡고 둘러본
+      자세가 씬에 `over` 로 저장된 사고다 (orient 가 임의 방향인 것이 증거).
+      cam1 이 창고 전경을 8 m 위에서 찍고 있어 "하늘에 떠 있다" 로 보였다.
+
+    ★ 고치는 방법: 에셋(RSD455)의 원래 렌즈 배치는 리그의 **참조**가 갖고 있다.
+      루트 레이어의 xformOp 오버라이드만 지우면 합성이 에셋 기본값으로 떨어져
+      원위치가 된다. 좌표를 하드코딩해서 되돌리는 것보다 이게 맞다 — 에셋이
+      바뀌어도 따라간다.
+
+    ★ 파일은 안 고친다 — 열린 스테이지의 메모리 레이어에서만 지우고 Save() 는
+      부르지 않는다 (씬은 김학민 소유 · CLAUDE.md §11, `_mute` 와 같은 규약).
+      tf 는 라이브 pose 를 내므로 따로 손댈 것 없다.
+    """
+    lay = st.GetRootLayer()
+    fixed = []
+    for cp in cam_paths:
+        spec = lay.GetPrimAtPath(cp)
+        if spec is None:
+            continue
+        doomed = [k for k in list(spec.properties.keys())
+                  if str(k).startswith("xformOp")]
+        for k in doomed:
+            spec.RemoveProperty(spec.properties[k])
+        if doomed:
+            parts = str(cp).strip("/").split("/")
+            fixed.append(parts[1] if len(parts) > 1 else str(cp))
+    if fixed:
+        log("[ros_graph] 렌즈 xform 오버라이드 제거 — %s (GUI 둘러보기 자세가 "
+            "씬에 저장된 사고 · 에셋 기본 위치로 복원)" % ", ".join(fixed))
+    return len(fixed)
+
+
 def _mute_scene_camera_graphs(st, log=print):
     """씬의 카메라 ROS 그래프를 **런타임에만** 끈다 (PL_CAMROS=2 일 때).
 
@@ -634,6 +671,10 @@ def build_cameras(cfg, zones, log=print):
         targets.append(("Cam_L1", "/cam1", str(cams_cfg["spawn_prim"])))
     if cams_cfg.get("line2_prim"):
         targets.append(("Cam_L2", "/cam2", str(cams_cfg["line2_prim"])))
+    # ★ 렌즈 오버라이드 복원은 렌더 프로덕트를 만들기 **전**이어야 한다 —
+    #   떠 있는 자세로 프로덕트를 만들면 그 프레임이 그대로 나간다.
+    _restore_lens_overrides(st, [t[2] for t in targets], log)
+
     for gname, ns, cam_path in targets:
         if not st.GetPrimAtPath(cam_path).IsValid():
             log("[ros_graph] !! %s 가 씬에 없다 — %s 카메라 생략" % (cam_path, ns))
@@ -675,36 +716,65 @@ def build_cameras(cfg, zones, log=print):
                 " 인식이 실패할 것이다 (build_clock_tf 를 먼저 불렀나?)" % opt_path)
             frame = _rig
 
+        # ── 깊이 (2026-08-27) ────────────────────────────────────────────
+        # ★★ 왜 붙이는가: RGB 만으로는 **종류를 못 가른다.** `geometry` 는 사양 3 종
+        #   평면에 각각 투영해 가장 잘 맞는 것을 고르는 **추측**인데, 실측 정확도가
+        #   46 % 였다 (2026-08-27, 두 판 모두). 한 등급 작게 보면 로봇이 명령받은
+        #   z 로 내려가다 **진짜 박스 윗면에 얹혀** 멈추고 IK_FAIL 이 난다 —
+        #   실측 도달 z 가 실제 윗면 +5~9 mm 였다. 4호·5호가 한 개도 안 집혔다.
+        #   깊이는 윗면 z 를 **직접 재므로** 이 추측을 없앤다 (CLAUDE.md §5).
+        #
+        # ★ **rgb 와 같은 render product** 를 쓴다. 그래야 stamp 가 정확히 같아
+        #   짝 맞추기가 100 % 가 된다 — 한 프레임만 어긋나도 깊이 교차검증이
+        #   `HEIGHT_MISMATCH` 만 낸다 (CLAUDE.md §10 의 증상표).
+        #
+        # ★ `type:"depth"` 는 `distance_to_image_plane`(광축거리)를 낸다.
+        #   그래서 `recognition.depth.is_range` 는 **false**(기본) 가 맞다.
+        #   시선거리로 바꾸는 헬퍼를 쓰게 되면 그때 true 로 올릴 것.
+        #
+        #   끄기: PL_CAMDEPTH=0 (렌더 비용이 부담될 때). 끄면 예전과 완전히 같다.
+        _depth_on = os.environ.get("PL_CAMDEPTH", "1") != "0"
+        _nodes = [("Tick", "omni.graph.action.OnPlaybackTick"),
+                  ("Ctx", NS + "ROS2Context"),
+                  ("Rgb", NS + "ROS2CameraHelper"),
+                  ("Info", NS + "ROS2CameraInfoHelper")]
+        _conn = [("Tick.outputs:tick", "Rgb.inputs:execIn"),
+                 ("Tick.outputs:tick", "Info.inputs:execIn"),
+                 ("Ctx.outputs:context", "Rgb.inputs:context"),
+                 ("Ctx.outputs:context", "Info.inputs:context")]
+        _vals = [("Ctx.inputs:useDomainIDEnvVar", True),
+                 ("Rgb.inputs:renderProductPath", rp_path),
+                 ("Rgb.inputs:frameId", frame),
+                 ("Rgb.inputs:nodeNamespace", ns),
+                 ("Rgb.inputs:topicName", "rgb"),
+                 ("Rgb.inputs:type", "rgb"),
+                 ("Info.inputs:renderProductPath", rp_path),
+                 ("Info.inputs:frameId", frame),
+                 ("Info.inputs:nodeNamespace", ns),
+                 ("Info.inputs:topicName", "camera_info")]
+        if _depth_on:
+            _nodes.append(("Depth", NS + "ROS2CameraHelper"))
+            _conn += [("Tick.outputs:tick", "Depth.inputs:execIn"),
+                      ("Ctx.outputs:context", "Depth.inputs:context")]
+            _vals += [("Depth.inputs:renderProductPath", rp_path),
+                      ("Depth.inputs:frameId", frame),
+                      ("Depth.inputs:nodeNamespace", ns),
+                      ("Depth.inputs:topicName", "depth"),
+                      ("Depth.inputs:type", "depth")]
+
         g = "%s/%s" % (GRAPH, gname)
         try:
             c.edit(
                 {"graph_path": g, "evaluator_name": "execution"},
-                {K.CREATE_NODES: [
-                    ("Tick", "omni.graph.action.OnPlaybackTick"),
-                    ("Ctx", NS + "ROS2Context"),
-                    ("Rgb", NS + "ROS2CameraHelper"),
-                    ("Info", NS + "ROS2CameraInfoHelper")],
-                 K.CONNECT: [("Tick.outputs:tick", "Rgb.inputs:execIn"),
-                             ("Tick.outputs:tick", "Info.inputs:execIn"),
-                             ("Ctx.outputs:context", "Rgb.inputs:context"),
-                             ("Ctx.outputs:context", "Info.inputs:context")],
-                 K.SET_VALUES: [
-                     ("Ctx.inputs:useDomainIDEnvVar", True),
-                     ("Rgb.inputs:renderProductPath", rp_path),
-                     ("Rgb.inputs:frameId", frame),
-                     ("Rgb.inputs:nodeNamespace", ns),
-                     ("Rgb.inputs:topicName", "rgb"),
-                     ("Rgb.inputs:type", "rgb"),
-                     ("Info.inputs:renderProductPath", rp_path),
-                     ("Info.inputs:frameId", frame),
-                     ("Info.inputs:nodeNamespace", ns),
-                     ("Info.inputs:topicName", "camera_info")]})
+                {K.CREATE_NODES: _nodes,
+                 K.CONNECT: _conn,
+                 K.SET_VALUES: _vals})
         except Exception as e:                                  # noqa: BLE001
             log("[ros_graph] !! %s 카메라 그래프 실패: %r" % (ns, e))
             continue
         made += 1
-        log("[ros_graph] 카메라 %s -> %s/rgb + /camera_info  (frameId %s · %dx%d)"
-            % (cam_path, ns, frame, res[0], res[1]))
+        log("[ros_graph] 카메라 %s -> %s/rgb%s + /camera_info  (frameId %s · %dx%d)"
+            % (cam_path, ns, " + /depth" if _depth_on else "", frame, res[0], res[1]))
 
     return made
 

@@ -742,9 +742,23 @@ class ZoneCycle:
 
         def on_response(future):
             res = future.result()
+            # ★★ 배치 이상 연속 가드 (2026-08-27 실측, A존 전복).
+            #   `ok=false` 는 "박스가 계획대로 안 앉았다" 는 algo 의 자백이다
+            #   (yaw 가 허용을 넘었거나 팔레트 가장자리에 걸쳤거나).
+            #   실측 로그가 보여준 붕괴 경로:
+            #     BOX115 계획 (525,130) yaw 0 → 실측 yaw -37.4도  ok=false
+            #     BOX128 계획 **같은 자리 (525,130)** → 실측 (861,123) 가장자리 ok=false
+            #     → 33번째 박스가 1260mm 꼭대기에서 넘어졌다.
+            #   앞 박스가 틀어진 걸 알고도 그 자리를 다시 내준 것이 원인이다.
+            #   지형이 어긋난 위에 계속 쌓으면 무너지므로, 연속으로 어긋나면
+            #   **더 쌓지 않고 판을 간다.** 지지율·통로를 손대는 것보다 안전하고,
+            #   한 번만 어긋난 경우는 예전처럼 그냥 진행한다 (기본 임계 2).
+            #   ⚠ 박스는 이미 물리적으로 놓였다 — placed·mark_placed 는 그대로 한다.
             if not res.ok:
-                # ok=false = yaw 오차 5° 초과 경고. 로그만 남기고 계속 진행한다.
-                self.log.warn("yaw 오차 초과 — 계속 진행")
+                self._bad_streak = getattr(self, "_bad_streak", 0) + 1
+                self.log.warn("배치 이상(ok=false) — 연속 %d" % self._bad_streak)
+            else:
+                self._bad_streak = 0
             self.placed += 1
             self.fill_rate = res.fill_rate
             self.max_height_mm = res.max_height_mm
@@ -758,6 +772,22 @@ class ZoneCycle:
             # ★ 이 박스는 끝났다. IDLE 로 돌아간 직후에도 detector 가 보내 둔
             #   이전 프레임이 도착하므로, present=false 를 볼 때까지 빗장을 건다.
             self._done_id = box_id
+            if getattr(self, "_bad_streak", 0) >= int(
+                    os.environ.get("PL_BAD_FULL", "2")):
+                self.log.warn("배치 이상 %d연속 — 지형이 어긋났다. 더 쌓지 않고 판갈이"
+                              % self._bad_streak)
+                self._bad_streak = 0
+                self._nfp_streak = 0
+                self.pallets_done += 1
+                if self.pallets_done >= self.max_pallets:
+                    self.log.info("PALLET_FULL(배치이상) — %d 판째, 시나리오 종료"
+                                  % self.pallets_done)
+                    self.finish()
+                else:
+                    self.log.info("PALLET_FULL(배치이상) — %d 판째. 팔레트를 간다"
+                                  % self.pallets_done)
+                    self.swap_pallet()   # box 를 비우고 IDLE 까지 스스로 잇는다
+                return
             self.reset_to_idle()
 
         self.call_async("/algo/update_heightmap", {

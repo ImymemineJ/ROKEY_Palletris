@@ -127,9 +127,17 @@ cd ~/palletris_ws && source install/setup.bash \
   && export ROS_DOMAIN_ID=115 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
             RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
             PL_CONFIG_OVERLAY=src/packing_bringup/config/test_3.yaml \
-  && ros2 launch packing_bringup bringup.launch.py vision:=true depth:=false \
+  && ros2 launch packing_bringup bringup.launch.py vision:=true depth:=true \
      2>&1 | tee ~/palletris_logs/bringup_$(date +%Y%m%d_%H%M%S).log
 ```
+
+> `depth:=true` 는 **깊이 교차검증**(기본 모드 `crosscheck`)이다. 로봇이 쓰는
+> 좌표·크기 판정에는 일절 안 끼어들고 — `cross_check` 의 `used` 가 언제나 RGB 다 —
+> RGB 와 깊이의 어긋남을 `/zone_*/vision_check`·`/line/vision_check` 로 **채점만**
+> 한다 (§13 "검증 및 분석" 지표). 즉 `depth:=false` 와 로봇 동작이 같다.
+> ⚠ `depth_mode:=prefer` 로 올리는 건 다른 얘기다 — 좌표 채택원이 프레임마다
+> 바뀌어 픽업 안정화 필터(5 mm 일치)가 영영 안 잡히는 실측이 있다 (2026-08-27).
+> CLAUDE.md §15 의 승격 조건 전까지 crosscheck 로 둘 것.
 
 ### 두 대로 나눠서 (시연 구성)
 

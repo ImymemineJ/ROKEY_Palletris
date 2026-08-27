@@ -252,6 +252,15 @@ def pose_from_plane(corners_px, K, R, t, z_top_m, types, belt_top_m,
     center_xy, long_m, short_m, yaw = rect_from_corners(pts)
     h_m = z_top_m - belt_top_m
 
+    # ★★ 벨트 게이트 (2026-08-27 정정인 실측). 박스가 화면에 걸치는 프레임에서
+    #   RGB 실루엣이 벨트를 덮으면 깊이는 **벨트면**을 잰다 — h 가 -16~-9 mm 로
+    #   나오는데도 아래 최근접 스냅이 그걸 3호로 분류했고, prefer 가 채택해
+    #   4·5호가 전부 3호로 등록됐다 (한 판에서 103건). 그 등록 높이로 로봇이
+    #   내려가다 진짜 윗면에 얹혀 IK_FAIL 3연발 -> 다음 박스 포기가 났다.
+    #   사양에서 가장 낮은 박스(3호 210)의 절반도 안 되는 높이는 박스가 아니다.
+    if h_m < min(bt["h_mm"] for bt in types) / 2000.0:
+        return None
+
     best = None
     for bt in types:
         w, d = bt["w_mm"] / 1000.0, bt["d_mm"] / 1000.0

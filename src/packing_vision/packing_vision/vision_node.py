@@ -286,7 +286,10 @@ class DepthCrossCheck:
         dep = depthlib.pose_from_plane(corners_px, cam.K, R, t, plane["z_m"],
                                        self.types, self.belt_top_m,
                                        self.cfg["h_weight"])
-        return dep, plane, ""
+        # ★ None = 잰 높이가 최저 사양의 절반 미만 — **벨트를 본 것**이다
+        #   (pose_from_plane 의 벨트 게이트 주석). 박스 실측이 아니므로 깊이
+        #   없음으로 강등한다 — RGB 가 있으면 그쪽이, 없으면 그 프레임은 보류.
+        return dep, plane, "" if dep is not None else "BELT"
 
     def evaluate(self, cam, corners_px, rgb_out, R, t, source, box_id="",
                  rgb_stamp=None):
@@ -518,6 +521,25 @@ class LineDetector(Node):
                 # RGB 가 포기했고 깊이도 못 살렸다. **이제서야** 실패로 센다.
                 self._report_miss("cam1", "SIZE_MISMATCH")
             return
+        # ★★ 깊이 프레임 대기 (2026-08-27 정정인 실측). 등록은 박스당 한 번이라
+        #   **첫 armed 프레임의 품질이 전부**다. 이 PC 에서 그 프레임의 RGB 가
+        #   절반쯤 한 등급 작게 봤고(4호->3호), 깊이가 실린 프레임은 정확했다
+        #   (vision_check 실측: depth 4호 · h 279 · spread 0.1). 틀린 크기가
+        #   DB 에 들어가면 로봇이 낮은 z 로 내려가다 박스 윗면에 얹혀
+        #   IK_FAIL 3연발 -> 박스 포기가 난다.
+        #   prefer 인데 이 프레임에 깊이가 안 실렸으면(_res.used != DEPTH)
+        #   arming 을 유지한 채 최대 6프레임 더 본다 — 깊이 실린 프레임에서
+        #   등록하기 위해서다. 그래도 안 오면 RGB 로라도 등록한다
+        #   (안 하면 박스가 통째로 RETURN 된다).
+        if (self.xcheck.on and str(self.xcheck.cfg.get("mode")) == "prefer"
+                and _res.get("used") != "DEPTH"):
+            self._wait1 = getattr(self, "_wait1", 0) + 1
+            if self._wait1 <= 6:
+                self._armed1 = True
+                return
+            self.get_logger().warn(
+                "cam1: 깊이 실린 프레임을 6번 기다렸지만 안 왔다 — RGB 로 등록")
+        self._wait1 = 0
         if not had_rgb:
             # ★ 깊이가 살린 박스다. RGB 단독이었으면 여기까지 못 왔다.
             self.get_logger().info(
