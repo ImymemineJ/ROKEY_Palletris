@@ -81,8 +81,23 @@ class HeightmapPacker:
     def __init__(self, cfg):
         hm_cfg = cfg["heightmap"]; pal = cfg["pallet"]
         self.cell = hm_cfg["cell_mm"]                       # 10
-        self.W = pal["width_mm"]  // self.cell              # 120 (Px, 월드 +X)
-        self.D = pal["depth_mm"]  // self.cell              # 80  (Py, 월드 +Y = 로봇 쪽)
+        # ★★ 계획용 팔레트 여유 (= demo_stack15 의 `--overhang`). 2026-08-26,
+        #   김병직 인계 문서 §6 · 정정인 승인.
+        #   **계획만 크게 보고 씬의 팔레트는 실물 그대로다.** `plan_clearance_mm`
+        #   이 축마다 10 mm 를 먹는데 벽에는 낄 이웃이 없으니, 그 손해를
+        #   되돌려주는 값이다. 그래서 `plan_overhang_mm 5` 와
+        #   `plan_clearance_mm 10` 은 **짝이다** — 하나만 쓰면 의미가 없다.
+        #   0 이면 기존 동작과 완전히 같다.
+        #
+        #   ★ 왜 호출부가 아니라 코어 안인가: `plan_clearance_mm` 과 같은 이유다
+        #     (아래 그 주석 참조). plan 과 update 에 **똑같이** 걸어야 하는데,
+        #     호출부에서 걸면 프로세스가 셋(algo · Isaac 로봇 · robot_node)이라
+        #     하나만 어긋나도 전 박스가 5 mm 씩 밀린다.
+        #     격자만 부풀리고 **반환 좌표는 실팔레트 프레임으로 되돌리므로**
+        #     `cycle.py` · `robot_node.py` 는 한 줄도 안 건드려도 된다.
+        self.ov = int(hm_cfg.get("plan_overhang_mm", 0))
+        self.W = (pal["width_mm"] + 2 * self.ov) // self.cell   # 120 (Px, 월드 +X)
+        self.D = (pal["depth_mm"] + 2 * self.ov) // self.cell   # 80  (Py, 월드 +Y = 로봇 쪽)
         self.hm = np.zeros((self.W, self.D), dtype=np.int32)
         self.max_stack = pal["max_stack_mm"]                # ★ G1 전까지 이 값만 바꿔가며 실험
         self.w_h, self.w_s = hm_cfg["w_height"], hm_cfg["w_support"]
@@ -287,8 +302,10 @@ class HeightmapPacker:
             if not ok:
                 continue
             ww, dd = (w, d) if pose["yaw_deg"] == 0 else (d, w)
-            i = (pose["x_mm"] - ww // 2) // sub.cell
-            j = (pose["y_mm"] - dd // 2) // sub.cell
+            # ★ ② 가 뺀 `ov` 를 되붙인다 (③ 과 같은 이유). 안 하면 앞보기가
+            #   실제와 5 mm 어긋난 지형을 굴려 본다.
+            i = (pose["x_mm"] + sub.ov - ww // 2) // sub.cell
+            j = (pose["y_mm"] + sub.ov - dd // 2) // sub.cell
             sub.hm[i:i + ww // sub.cell, j:j + dd // sub.cell] = pose["z_mm"] + h
             vol += w * d * h
         return vol
@@ -445,7 +462,11 @@ class HeightmapPacker:
         # ★ int()/float() 로 감싸는 이유: i,j,z 는 numpy 배열에서 나온 int64 다.
         #   그대로 내보내면 json.dump 가 "int64 is not JSON serializable" 로 죽고
         #   (스냅샷 저장이 통째로 실패한다), ROS 메시지 대입에서도 타입 경고가 난다.
-        pose = dict(x_mm=int(i * self.cell + w // 2), y_mm=int(j * self.cell + d // 2),
+        # ★ `self.ov` 를 뺀다 — 격자는 부풀렸지만 **밖으로 나가는 좌표는 실팔레트
+        #   프레임**이어야 로봇이 그대로 쓸 수 있다. 가장자리 자리는 x_mm/y_mm 이
+        #   -5 까지 음수로 나올 수 있는데 **정상이다** (팔레트 밖으로 그만큼 걸친다).
+        pose = dict(x_mm=int(i * self.cell + w // 2) - self.ov,
+                    y_mm=int(j * self.cell + d // 2) - self.ov,
                     z_mm=int(z), yaw_deg=float(yaw))         # ★ x,y=중심 / z=밑면
         self.plans[box_id] = (pose, w_mm, d_mm, h_mm)
         return True, pose, float(best[0][0]), "OK"
@@ -587,8 +608,10 @@ class HeightmapPacker:
         #   (참값 x=170 인데 실측 167 → 내림 i=-1 / 반올림 i=0)
         #   한 칸 밀리면 원래 자리에 낡은 높이가 1셀 기둥으로 남고, base_z 는 최댓값이라
         #   다음 박스가 그 기둥 때문에 통째로 떠서 놓인다. (±3mm 에서 8개 → 10개 차이)
-        i = int(round((actual["x_mm"] - w / 2) / self.cell))
-        j = int(round((actual["y_mm"] - d / 2) / self.cell))
+        # ★ `self.ov` 를 되붙인다 — 들어오는 좌표는 실팔레트 프레임이고 격자는
+        #   부풀어 있다. plan 과 **똑같이** 걸지 않으면 발자국이 어긋난다.
+        i = int(round((actual["x_mm"] + self.ov - w / 2) / self.cell))
+        j = int(round((actual["y_mm"] + self.ov - d / 2) / self.cell))
         top_q = max(0, round((actual["z_mm"] + h_mm) / self.cell) * self.cell)   # ★ 셀 격자로 양자화
         # ★ 실측이 한계를 넘으면 조용히 넘어가면 안 된다. 그대로 기록하면 그 위로는
         #   영영 아무것도 못 놓고, 왜 그런지도 안 보인다. 실측 pose 가 잘못 왔다는

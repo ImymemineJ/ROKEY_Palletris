@@ -51,7 +51,7 @@ USD 를 고치는 일(스폰·디스폰)은 소켓 스레드에서 하면 안 �
 import math
 import os
 
-from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 BOX_ROOT = "/World/boxes"                 # ★ 규칙 5. 소문자다
 BOX_PRIM_FMT = BOX_ROOT + "/%s"
@@ -86,7 +86,16 @@ LABEL_LIFT_M = 0.001                      # 윗면에서 1 mm 띄운다 (z-fight
 # ★ 거울상 방지 스위치. QR 은 회전에는 강하지만 **좌우 반전되면 절대 안 읽힌다.**
 #   USD 의 st 원점(좌하)과 PNG 원점(좌상)이 달라서 한 번 뒤집어 주는 것이 기본이다.
 #   씬에서 라벨이 육안으로는 멀쩡한데 cam1 이 못 읽으면 **먼저 이 값을 뒤집어 볼 것.**
-LABEL_FLIP_V = True
+#
+# ★★ True -> **False** (2026-08-26 김병직 실측, test_3 픽업 카메라 프레임).
+#   True 로 두면 렌더 결과가 **거울상**이 된다. 눈으로는 완전히 멀쩡한 QR 인데
+#   디코더가 통째로 실패한다 — 파인더 패턴이 좌상·좌하·**우하**에 찍힌다
+#   (정상은 좌상·우상·좌하). 회전이면 디코더가 알아서 푸는데 반전은 못 푼다.
+#   실측: 렌더 프레임을 어느 축으로든 한 번 뒤집으면 바로 'BOX005' 로 읽힌다.
+#         원본 PNG 자체는 그대로 'BOX002' 로 읽힌다 — 굽는 쪽 문제가 아니다.
+#   증상이 "QR 판독 실패 -> box_id 빈 채 발행 -> 관제탑이 무시" 로 이어져서
+#   **인식이 다 되는데도 사이클이 한 번도 안 도는** 모습으로 나타난다.
+LABEL_FLIP_V = False
 
 # ── 분류 (2026-08-25) ──────────────────────────────────────
 # ★ 분류 기준이 **색 -> QR(배송지)** 로 바뀌었다.
@@ -112,6 +121,43 @@ DESPAWN_XYZ_M = (-50.0, -50.0, -10.0)
 # 스폰 지점 앞뒤로 이만큼 안에 박스가 있으면 "안 비었다" 로 본다.
 # 가장 긴 박스(5호 480) 보다 넉넉해야 겹치지 않는다.
 SPAWN_CLEAR_M = 0.70
+# ── 반출 연출 (2026-08-27 김병직). 만재 팔레트가 반출 컨베이어를 타고 나가는
+#    모습을 시연에 넣기 위한 것. **기본 꺼짐** — 켜야만 동작이 바뀐다.
+#    ★ 방향은 **+Y** 다 (씬 실측 2026-08-27). 팔레트(y 4.48~5.68)가 얹혀 있는
+#      셀 컨베이어가 +Y 로 뻗는다: A `/ConveyorTrack_08` y 4.28~7.61 ·
+#      B `/ConveyorTrack_07` y 4.28~8.50 · C `/World/ConveyorTrack_07` y 4.28~9.53.
+#      (conveyor_ctl 의 `a_cell`·`b_cell`·`c_cell` 이 이미 "진행 +Y" 로 잡는 그 조각들이다)
+#      ⚠ 처음에 -Y 로 넣었다가 박스가 **리턴 직선(`ConveyorTrack_05`, y -3.6~-2.4)**
+#        쪽으로 갔다 — 정반대였다. 부호를 눈대중으로 정하지 말 것.
+#    ★ 이동 거리 2.4 m: 셋 중 제일 짧은 A(7.61)에서도 벨트 위에 머무는 값이다
+#      (5.076 + 2.4 = 7.48). 더 멀리 보내고 싶으면 존별 벨트 끝을 넘지 않게 올릴 것.
+#    ⚠ 숫자를 코드에 박지 않는 규칙(§4)의 예외가 아니다 — 이건 **연출 파라미터**라
+#      system.yaml(공용, 승인 필요)이 아니라 환경변수로 뺐다. 값을 굳히면
+#      test_3.yaml 오버레이로 옮길 것.
+# ★ 이 연출의 원본은 김학민 `ship_pallet()` 이다 (`scripts/demo_stack15_test1_1.py`,
+#   커밋 `0610a00`·`e8a6c84`). 그쪽은 **소켓**(`move_prim`·`set_kinematic`·
+#   `copy_prim`)으로 demo 하네스에서 돌아 ROS 통합 경로(`sim_main`)에는 안 붙어
+#   있었다 — `/sim/swap_pallet` 은 `_swap_pallet`(제자리 despawn)만 불렀다.
+#   그래서 같은 동작을 **인프로세스로** 옮겨 놓은 것이고, 그가 실측으로 얻은
+#   교훈은 그대로 따랐다: 셀(+Y) 먼저 -> 합류(+X) 순서 · 적재물을 얼려 같은
+#   변위로 이동 · 도착 뒤에도 안 풀기 · 트럭에 사본 남기기.
+OUTFEED_ON = os.environ.get("PL_OUTFEED", "0") == "1"
+# 김학민 정본은 0.5 (실물 팔레트 컨베이어 0.2~0.5 m/s). 여기 1.0 은 2026-08-27
+# 강의실에서 김병직이 화면으로 보고 "속도 괜찮다" 한 값이다. 느리게 하려면 0.5.
+OUTFEED_MPS = float(os.environ.get("PL_OUTFEED_MPS", "1.0"))
+OUTFEED_TRAVEL_M = float(os.environ.get("PL_OUTFEED_TRAVEL_M", "2.4"))
+OUTFEED_HOLD_S = float(os.environ.get("PL_OUTFEED_HOLD_S", "2.0"))
+PALLET_PRIM_FMT = "/World/Pallet_%s"
+# ★ 상차까지 가는 전체 경로 (씬 실측 2026-08-27). ㄱ 자다:
+#     팔레트 -> (+Y) 셀 컨베이어·커브 -> (+X) 팔레트 레인 -> 트럭 적재함
+#   꺾는 y 는 **팔레트 가이드 레일 두 개의 한가운데**로 잡는다 — 레인 폭이
+#   0.83 m 라 가운데로 가야 가이드에 안 걸린다:
+#     A 8.49/9.32 · B 9.49/10.32 · C 10.49/11.32
+#   끝 x 는 **트럭 적재함 한가운데**다 (`Truck_Bed` x -2.4~-0.8, 상면 z 0.8 —
+#   팔레트 밑면과 높이차 0 이라 그대로 밀어 넣으면 된다. CLAUDE.md §4).
+#   좌표를 코드에 박지 않고 **씬에서 재서** 쓴다 — 씬이 바뀌면 따라간다.
+PALLET_GUIDE_FMT = "/World/PalletGuide_%s_%s"    # (zone, lo|hi)
+TRUCK_BED_PRIM = "/World/Truck_Bed"
 LOST_XY_M = 200.0
 LOST_Z_MIN_M = -50.0
 
@@ -210,8 +256,24 @@ class Spawner:
                        for k, rgb in _cols.items()}
         # 팔레트 영역 — `swap_pallet` 이 "이 팔레트에 실린 것" 을 가려내는 데 쓴다.
         # 원점은 **모서리**이고 z 는 **상면**이다 (작업명세서 §3.3).
-        _po = cfg["zones"]["pallet_origin_world_mm"][zone]
+        # ★★ **존마다** 만든다 (2026-08-26). 예전에는 `zone` 하나의 범위만 들고
+        #   있어서, `swap_pallet(zone="B")` 를 불러도 늘 그 하나를 비웠다.
+        #   실측(영상 claude_review): **B 를 상차하면 A 팔레트가 초기화됐다.**
+        #   `h_swap_pallet` 이 zone 을 검사만 하고 `_swap_pallet` 에 안 넘긴 것도
+        #   같이 고친다 — 검사만 하면 "받았지만 안 쓴다" 가 된다.
         _pal = cfg["pallet"]
+        _POZ = cfg["zones"]["pallet_origin_world_mm"]
+        self.pallet_box = {}
+        for _z in self.zones:
+            _p = _POZ.get(_z)
+            if _p is None:
+                continue
+            self.pallet_box[_z] = (
+                (_p[0] / 1000.0, (_p[0] + _pal["width_mm"]) / 1000.0),
+                (_p[1] / 1000.0, (_p[1] + _pal["depth_mm"]) / 1000.0),
+                _p[2] / 1000.0)
+        _po = _POZ[zone]
+        # 하위호환 — 옛 코드가 아직 이 셋을 본다
         self.pallet_x = (_po[0] / 1000.0, (_po[0] + _pal["width_mm"]) / 1000.0)
         self.pallet_y = (_po[1] / 1000.0, (_po[1] + _pal["depth_mm"]) / 1000.0)
         self.pallet_top_m = _po[2] / 1000.0
@@ -231,6 +293,8 @@ class Spawner:
         self._snap = {}                    # box_id -> {"pos_m", "yaw_deg", "vel_mps"}
         self._pickup = {"present": False, "box_id": "", "pose": None}
         self._pickup_by_zone = {}
+        self._outfeed = []                 # 반출 중인 덩어리 (팔레트 + 박스)
+        self._shipped_n = 0                # 트럭에 남긴 팔레트 사본 번호
 
         self._ensure_roots()
         self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
@@ -265,6 +329,9 @@ class Spawner:
         큐 처리는 `sim_main` 이 `mainq.pump()` 로 한다 — 여기서는 스냅샷만 갱신한다.
         """
         self._refresh()
+        if OUTFEED_ON:
+            # 물리 60 Hz 고정이라 dt 는 상수다 (sim_main 이 그렇게 띄운다).
+            self._outfeed_step(1.0 / 60.0)
 
     def _refresh(self):
         """모든 박스의 pose/속도를 한 번 읽어 스냅샷과 픽업 상태를 갱신한다.
@@ -425,11 +492,13 @@ class Spawner:
         ★ 부르는 쪽이 반드시 같이 해야 하는 것: `/algo/reset` 으로 하이트맵을 비운다.
           안 비우면 패커가 **없어진 박스 위에** 다음 자리를 잡는다.
         """
-        zone = (req or {}).get("zone", self.zone)
+        # ★ 대소문자 정규화 (2026-08-27). 관제탑 토픽 규약은 소문자('zone_b')라
+        #   소문자 'b' 가 올 수 있다 — 실측: 거부돼 판갈이가 통째로 실패했다.
+        zone = str((req or {}).get("zone", self.zone)).upper()
         if zone not in self.zones:
             return {"ok": False, "error": "이 스포너는 존 %s 다 (요청 %s)"
                     % (",".join(self.zones), zone), "removed": 0}
-        return self.mainq.run(self._swap_pallet)
+        return self.mainq.run(lambda: self._swap_pallet(zone))
 
     def h_spawn_status(self, req=None):
         """{"spawned":N, "enabled":bool, ...} — 표(공통가이드 §3)의 두 필드 + 진단용.
@@ -684,20 +753,410 @@ class Spawner:
         self._log("[spawner] despawn %s (라인 밖으로 이동)" % box_id)
         return {"ok": True}
 
-    def _swap_pallet(self):
-        """**메인 스레드 전용.** 팔레트 영역 안에 있는 박스를 전부 치운다."""
+    def _swap_pallet(self, zone=None):
+        """**메인 스레드 전용.** **그 존** 팔레트 위 박스를 전부 치운다.
+
+        ★ zone 을 반드시 받는다. 안 받으면 존이 셋이어도 늘 같은 팔레트를 비운다
+          — 실측 2026-08-26: B 를 상차했는데 A 가 초기화됐다.
+
+        ★ 반출 연출 (`PL_OUTFEED=1`, 2026-08-27 김병직): 박스를 그 자리에서
+          지우면 화면에서 **한 프레임에 사라진다** — 사양 §7 의 "트럭 상차" 가
+          시연에 안 보인다. 켜면 박스를 지우지 않고 **키네마틱으로 바꿔 반출
+          방향으로 밀어**, 팔레트가 통째로 컨베이어를 타고 나가는 것처럼 보인다.
+          다 나가면 그때 despawn 한다 (`_outfeed_step` 이 매 틱 민다).
+          기본은 꺼짐 — 켜야만 동작이 바뀐다.
+        """
+        zone = str(zone or self.zone).upper()
+        box = self.pallet_box.get(zone)
+        if box is None:
+            return {"ok": False, "removed": 0,
+                    "error": "존 %s 의 팔레트 범위를 모른다 (아는 것: %s)"
+                             % (zone, sorted(self.pallet_box))}
+        (px0, px1), (py0, py1), ptop = box
         on_pallet = []
         for box_id, e in list(self._snap.items()):
             x, y, z = e["pos_m"]
-            if (self.pallet_x[0] <= x <= self.pallet_x[1]
-                    and self.pallet_y[0] <= y <= self.pallet_y[1]
-                    and z >= self.pallet_top_m - 0.05):
+            if px0 <= x <= px1 and py0 <= y <= py1 and z >= ptop - 0.05:
                 on_pallet.append(box_id)
+        if OUTFEED_ON:
+            self._outfeed_begin(zone, on_pallet)
+            self._log("[spawner] swap_pallet %s — 팔레트와 박스 %d 개를 반출 컨베이어로 "
+                      "내보낸다 (+Y %.1f m) %s"
+                      % (zone, len(on_pallet), OUTFEED_TRAVEL_M, on_pallet))
+            return {"ok": True, "removed": len(on_pallet), "zone": zone}
         for box_id in on_pallet:
             self._despawn(box_id)
-        self._log("[spawner] swap_pallet — 박스 %d 개를 팔레트째 내보냈다 %s"
-                  % (len(on_pallet), on_pallet))
-        return {"ok": True, "removed": len(on_pallet)}
+        self._log("[spawner] swap_pallet %s — 박스 %d 개를 팔레트째 내보냈다 %s"
+                  % (zone, len(on_pallet), on_pallet))
+        return {"ok": True, "removed": len(on_pallet), "zone": zone}
+
+    # ── 반출 연출 (PL_OUTFEED=1) ─────────────────────────────
+    @staticmethod
+    def _translate_op(prim):
+        """프림의 xformOp:translate 를 돌려준다. 없으면 None."""
+        for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+            if op.GetOpName() == "xformOp:translate":
+                return op
+        return None
+
+    @staticmethod
+    def _orient_op(prim):
+        """프림의 xformOp:orient 를 돌려준다. 없으면 None."""
+        for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+            if op.GetOpName() == "xformOp:orient":
+                return op
+        return None
+
+    def _rotate_prim_about_z(self, prim, cx, cy, dphi):
+        """프림을 (cx, cy) 둘레로 Z 축 `dphi` [rad] 만큼 돌린다.
+
+        위치와 **자세를 같이** 돌린다. 자세를 안 돌리면 팔레트가 게걸음으로
+        커브를 지나 — 돌고 나면 가로 1.2 m 인 채 폭 0.83 m 레인에 들어가
+        가이드를 뚫는다 (2026-08-27 김병직 관측 "물리적으로 말이 안 된다").
+        """
+        op_t = self._translate_op(prim)
+        if op_t is None:
+            return
+        t = op_t.Get()
+        c, s = math.cos(dphi), math.sin(dphi)
+        dx, dy = t[0] - cx, t[1] - cy
+        op_t.Set(Gf.Vec3d(cx + c * dx - s * dy, cy + s * dx + c * dy, t[2]))
+
+        op_o = self._orient_op(prim)
+        if op_o is None:
+            return
+        cur = op_o.Get()
+        if cur is None:
+            return
+        try:
+            half = dphi / 2.0
+            qd = Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
+            new = qd * Gf.Quatd(cur.GetReal(), Gf.Vec3d(*cur.GetImaginary()))
+            im = type(cur.GetImaginary())(*new.GetImaginary())
+            op_o.Set(type(cur)(new.GetReal(), im))
+        except Exception:
+            pass          # 자세를 못 돌려도 이송은 계속한다
+
+    def _bbox(self, path):
+        """월드 bbox (x0, x1, y0, y1). 프림이 없거나 비면 None."""
+        prim = self.stage.GetPrimAtPath(path)
+        if not (prim and prim.IsValid()):
+            return None
+        rng = UsdGeom.Imageable(prim).ComputeWorldBound(
+            Usd.TimeCode.Default(), "default").ComputeAlignedRange()
+        if rng.IsEmpty():
+            return None
+        mn, mx = rng.GetMin(), rng.GetMax()
+        return (mn[0], mx[0], mn[1], mx[1])
+
+    def _outfeed_begin(self, zone, box_ids):
+        """팔레트와 그 위 박스를 한 덩어리로 반출 대기열에 넣는다. **메인 스레드 전용.**
+
+        ★ 팔레트도 같이 움직인다 (2026-08-27 김병직 — "팔레트와 같이 아래 컨베이어를
+          타고 내려가는" 그림). 팔레트만 두고 박스만 흘리면 실물과 정반대다.
+          팔레트 프림은 이미 **키네마틱**이라(씬 실측) translate 를 밀어도 안전하고,
+          다 나가면 **제자리로 되돌린다** — 그게 "빈 팔레트가 새로 들어온" 그림이다.
+          ⚠ 디스크의 USD 를 고치는 것이 아니라 **런타임 변환만** 바꾼다.
+        ★ 박스를 키네마틱으로 바꾸는 이유: 팔레트 위 더미를 물리로 밀면 위층이
+          무너지며 쏟아진다. 키네마틱이면 쌓인 모양 그대로 간다.
+        ★ 콜라이더는 끈다. 켜 둔 채 지나가면 지선 컨베이어·기둥과 부딪혀
+          더미가 흐트러진다 (`_detach` 와 같은 이유).
+        ★ 목록에서는 지금 뺀다 (`self.boxes`) — 반출 중인 박스를 다음 사이클이
+          픽업 후보로 보면 안 된다. 프림 경로는 이 대기열이 들고 있다.
+        """
+        train = {"zone": zone, "boxes": {}, "moved": 0.0,
+                 "pallet": None, "home": None,
+                 "phase": "align", "turn_y": None, "end_x": None, "hold": 0.0,
+                 "arc": None, "arc_done": 0.0, "align_left": 0.0,
+                 "lane_y": None}
+        for box_id in box_ids:
+            rec = self.boxes.pop(box_id, None)
+            if rec is None:
+                continue
+            prim = self.stage.GetPrimAtPath(rec["path"])
+            if not (prim and prim.IsValid()):
+                continue
+            c = UsdPhysics.CollisionAPI(prim)
+            if c:
+                c.CreateCollisionEnabledAttr(False)
+            rb = UsdPhysics.RigidBodyAPI(prim)
+            if rb:
+                rb.CreateKinematicEnabledAttr(True)
+            train["boxes"][box_id] = rec["path"]
+            self._snap.pop(box_id, None)
+
+        pal_path = PALLET_PRIM_FMT % zone
+        pal = self.stage.GetPrimAtPath(pal_path)
+        op = self._translate_op(pal) if (pal and pal.IsValid()) else None
+        if op is not None:
+            train["pallet"], train["home"] = pal_path, op.Get()
+            # ★ **자세도 같이 기억한다** (2026-08-27 김병직 관측). 호에서 90도
+            #   돌아간 채로 위치만 되돌리면 새 빈 팔레트가 옆으로 누워 있다.
+            _oo = self._orient_op(pal)
+            train["home_q"] = _oo.Get() if _oo is not None else None
+        else:
+            self._log("[spawner] ⚠ 반출: 팔레트 프림 %s 를 못 찾았다 — 박스만 내보낸다"
+                      % pal_path)
+
+        # ── 상차 경로: 호는 **설정**에서, 트럭은 **씬**에서 (상수 주석 참조) ──
+        arc = ((self.cfg.get("conveyor") or {}).get("curve_arc") or {}).get(zone)
+        bed = self._bbox(TRUCK_BED_PRIM)
+        if arc and bed:
+            cx = float(arc["center_mm"][0]) / 1000.0
+            cy = float(arc["center_mm"][1]) / 1000.0
+            R = float(arc["radius_mm"]) / 1000.0
+            train["arc"] = (cx, cy, R)
+            train["turn_y"] = cy                  # 호 진입점의 y
+            train["end_x"] = (bed[0] + bed[1]) / 2.0
+            # ★ 호를 나온 뒤 **레인 한가운데로 Y 를 다시 맞춘다** (김학민도 같은
+            #   보정을 했다). 호 끝과 레인 중심이 15~39 mm 어긋나는데, 돌고 난
+            #   팔레트 폭 0.80 에 레인 간격이 0.83 이라 **편도 여유가 15 mm뿐**이다
+            #   — 안 맞추면 C 존이 가이드를 문다.
+            lo = self._bbox(PALLET_GUIDE_FMT % (zone, "lo"))
+            hi = self._bbox(PALLET_GUIDE_FMT % (zone, "hi"))
+            if lo and hi:
+                train["lane_y"] = ((lo[2] + lo[3]) + (hi[2] + hi[3])) / 4.0
+            if train["home"] is not None:
+                # 진입 중심선(x = 중심 - R)까지 옆으로 얼마나 가야 하나
+                train["align_left"] = (cx - R) - train["home"][0]
+            self._log("[spawner] 반출 %s — 호 중심 (%.2f, %.2f) R %.2f · "
+                      "진입 y %.2f · 트럭 x %.2f · 옆정렬 %+.0f mm"
+                      % (zone, cx, cy, R, cy, train["end_x"],
+                         train["align_left"] * 1000))
+        else:
+            # 못 재면 예전 동작(직진)으로 물러선다. 데모가 서는 것보다 낫다.
+            train["phase"] = "y"
+            self._log("[spawner] ⚠ 반출: 호 설정(%s) 또는 트럭(%s) 을 못 찾았다 "
+                      "— 직진 %.1f m 로 대신한다"
+                      % (bool(arc), bool(bed), OUTFEED_TRAVEL_M))
+        self._outfeed.append(train)
+
+    def _outfeed_step(self, dt):
+        """반출 중인 덩어리를 반출 방향(+Y)으로 민다. **메인 스레드 전용.**
+
+        `OUTFEED_TRAVEL_M` 만큼 가면 박스는 despawn 하고 팔레트는 제자리로
+        되돌린다 — 안 그러면 프림이 무한히 멀어지며 남는다.
+        """
+        if not self._outfeed:
+            return
+        step = OUTFEED_MPS * dt
+        for train in list(self._outfeed):
+            # ── 트럭에 들어간 뒤 잠깐 세워 둔다 (상차 장면) ──
+            if train["phase"] == "hold":
+                train["hold"] += dt
+                if train["hold"] < OUTFEED_HOLD_S:
+                    continue
+                self._outfeed_finish(train)
+                continue
+
+            prims = self._outfeed_prims(train)
+            done = False
+
+            # ── ③ 커브: 호를 따라 돌면서 **자세도 같이 90° 돈다** ──
+            if train["phase"] == "arc":
+                cx, cy, R = train["arc"]
+                dphi = -step / R          # 시계 방향 (φ 180도 -> 90도)
+                left = (math.pi / 2.0) - train["arc_done"]
+                if abs(dphi) > left:
+                    dphi = -left
+                train["arc_done"] += abs(dphi)
+                for prim in prims:
+                    self._rotate_prim_about_z(prim, cx, cy, dphi)
+                if train["arc_done"] >= math.pi / 2.0 - 1e-6:
+                    pal_t = self._outfeed_pallet_t(train)
+                    if train["lane_y"] is not None and pal_t is not None:
+                        train["align_left"] = train["lane_y"] - pal_t[1]
+                        train["phase"] = "lane"
+                        self._log("[spawner] 반출 %s — 커브 통과 (90도) · 레인 정렬 "
+                                  "%+.0f mm" % (train["zone"],
+                                                train["align_left"] * 1000))
+                    else:
+                        train["phase"] = "x"
+                        self._log("[spawner] 반출 %s — 커브 통과 (90도) · 트럭으로"
+                                  % train["zone"])
+                continue
+
+            # ── 그 밖: 축 이동 ──
+            dx = dy = 0.0
+            if train["phase"] == "align":
+                # ① 호 진입 중심선으로 옆정렬. 한 틱에 옮기면 순간이동으로 보인다
+                #    (김학민 `glide` 주석) — 반출 속도로 흘려보낸다.
+                left = train["align_left"]
+                dx = math.copysign(min(step, abs(left)), left) if left else 0.0
+                train["align_left"] = left - dx
+                if abs(train["align_left"]) < 1e-4:
+                    train["phase"] = "y"
+            elif train["phase"] == "lane":
+                # ③-b 호를 나온 뒤 레인 한가운데로 Y 보정 (여유 15 mm)
+                left = train["align_left"]
+                dy = math.copysign(min(step, abs(left)), left) if left else 0.0
+                train["align_left"] = left - dy
+                if abs(train["align_left"]) < 1e-4:
+                    train["phase"] = "x"
+            elif train["phase"] == "y":
+                dy = step                 # ② 셀 컨베이어를 타고 호 진입점까지
+            else:
+                dx = step                 # ④ 합류 레인을 타고 트럭까지
+
+            for prim in prims:
+                op = self._translate_op(prim)
+                if op is None:
+                    continue
+                t = op.Get()
+                op.Set(Gf.Vec3d(t[0] + dx, t[1] + dy, t[2]))
+
+            pal_t = self._outfeed_pallet_t(train)
+            if pal_t is None:             # 팔레트가 없다 — 직진 폴백
+                train["moved"] += step
+                done = train["moved"] >= OUTFEED_TRAVEL_M
+            elif train["turn_y"] is None:
+                train["moved"] += step
+                done = train["moved"] >= OUTFEED_TRAVEL_M
+            elif train["phase"] == "y" and pal_t[1] >= train["turn_y"]:
+                train["phase"] = "arc"
+                self._log("[spawner] 반출 %s — 커브 진입 (y %.2f)"
+                          % (train["zone"], pal_t[1]))
+            elif train["phase"] == "x" and pal_t[0] >= train["end_x"]:
+                train["phase"] = "hold"
+                self._log("[spawner] 반출 %s — 트럭 적재 완료 (x %.2f)"
+                          % (train["zone"], pal_t[0]))
+
+            if done:
+                self._outfeed_finish(train)
+
+    def _outfeed_prims(self, train):
+        """반출 덩어리의 프림 목록 (팔레트 + 적재물). 사라진 박스는 정리한다."""
+        out = []
+        for box_id, path in list(train["boxes"].items()):
+            prim = self.stage.GetPrimAtPath(path)
+            if prim and prim.IsValid():
+                out.append(prim)
+            else:
+                train["boxes"].pop(box_id, None)
+        if train["pallet"]:
+            pal = self.stage.GetPrimAtPath(train["pallet"])
+            if pal and pal.IsValid():
+                out.append(pal)
+        return out
+
+    def _outfeed_pallet_t(self, train):
+        """팔레트의 지금 위치. 없으면 None."""
+        if not train["pallet"]:
+            return None
+        pal = self.stage.GetPrimAtPath(train["pallet"])
+        if not (pal and pal.IsValid()):
+            return None
+        op = self._translate_op(pal)
+        return op.Get() if op is not None else None
+
+    def _outfeed_finish(self, train):
+        """반출 끝 — **실린 팔레트는 트럭에 남기고**, 빈 팔레트를 제자리에 놓는다.
+
+        ★ 방법은 김학민 `e8a6c84` 그대로다 (`demo_stack15_test1_1.py` 의
+          `_h_copy_prim`). 원본을 그냥 되돌리면 **트럭 위가 비어서 "상차했다"
+          가 화면에 안 남는다.** 그래서
+            ① 지금 자리(트럭 위)에 `Sdf.CopySpec` 으로 **사본**을 뜨고
+            ② **원본**을 로봇 옆 제자리로 되돌린다
+          순서가 중요하다 — 반대로 하면 사본이 빈 팔레트 자리에 생긴다.
+        ★ 적재물 박스는 despawn 하지 않는다. 이미 트럭 위로 옮겨져 있고,
+          그대로 둬야 "실려 있는" 그림이 남는다. 키네마틱·콜라이더 꺼짐이라
+          물리에 관여하지 않고, `self.boxes`·`_snap` 에서는 이미 빠져 있어
+          다음 사이클이 픽업 후보로 보지도 않는다.
+        """
+        if train["pallet"] and train["home"] is not None:
+            pal = self.stage.GetPrimAtPath(train["pallet"])
+            if pal and pal.IsValid():
+                self._shipped_n += 1
+                dst = "/World/PalletShipped_%s_%d" % (train["zone"],
+                                                      self._shipped_n)
+                try:
+                    lay = self.stage.GetEditTarget().GetLayer()
+                    Sdf.CopySpec(lay, Sdf.Path(train["pallet"]),
+                                 lay, Sdf.Path(dst))
+                except Exception as e:      # 사본 실패해도 복귀는 해야 한다
+                    self._log("[spawner] ⚠ 반출: 팔레트 사본 실패 — %s" % e)
+                op = self._translate_op(pal)
+                if op is not None:
+                    op.Set(train["home"])
+                # ★ 자세도 되돌린다 — 호에서 90도 돈 채로 두면 새 빈 팔레트가
+                #   옆으로 누워 나온다 (2026-08-27 김병직 관측).
+                _oo = self._orient_op(pal)
+                if _oo is not None and train.get("home_q") is not None:
+                    _oo.Set(train["home_q"])
+        if train in self._outfeed:
+            self._outfeed.remove(train)
+        self._log("[spawner] 반출 완료 %s — 트럭에 팔레트를 남기고 빈 판을 놓았다 "
+                  "(적재물 %d 개)" % (train["zone"], len(train["boxes"])))
+
+    def _attach_label(self, box_path, box_id, hz):
+        """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.
+
+        ★ 콜라이더를 걸지 않는다. 걸면 흡착 패드가 1 mm 떠 있는 스티커에 먼저
+          닿아 박스를 그만큼 덜 눌러 잡는다 — 들다 놓치는 쪽이다.
+
+        ★ 부모(박스)에 RigidBodyAPI 가 걸려 있지만 이 자식은 CollisionAPI 가
+          없으므로 물리에 참여하지 않는다. 순수 시각 프림이다.
+        """
+        png = os.path.join(self.label_dir, box_id + ".png")
+        if not os.path.exists(png):
+            if not self._label_warned:      # 15 개가 다 없으면 로그가 15 줄 나온다
+                self._label_warned = True
+                self._log("[spawner] ⚠ QR 라벨 PNG 가 없다: %s\n"
+                          "           먼저: python3 scripts/gen_qr_labels.py\n"
+                          "           라벨 없이 계속한다 — cam1 이 등록을 못 해 "
+                          "전 박스가 RETURN 된다" % png)
+            return
+
+        half = self.label_m / 2.0
+        lp = box_path + "/" + LABEL_PRIM
+        m = UsdGeom.Mesh.Define(self.stage, lp)
+        z = hz + LABEL_LIFT_M
+        m.CreatePointsAttr([Gf.Vec3f(-half, -half, z), Gf.Vec3f(half, -half, z),
+                            Gf.Vec3f(half, half, z), Gf.Vec3f(-half, half, z)])
+        m.CreateFaceVertexCountsAttr([4])
+        m.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        m.CreateExtentAttr([Gf.Vec3f(-half, -half, z), Gf.Vec3f(half, half, z)])
+        m.CreateSubdivisionSchemeAttr("none")
+        # ★ st 는 정점 순서와 짝을 맞춘다. v 를 뒤집는 이유는 LABEL_FLIP_V 주석 참조.
+        v0, v1 = (1.0, 0.0) if LABEL_FLIP_V else (0.0, 1.0)
+        st = UsdGeom.PrimvarsAPI(m.GetPrim()).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+        st.Set([Gf.Vec2f(0.0, v0), Gf.Vec2f(1.0, v0),
+                Gf.Vec2f(1.0, v1), Gf.Vec2f(0.0, v1)])
+
+        if not self.stage.GetPrimAtPath(QR_LOOKS_ROOT):
+            UsdGeom.Scope.Define(self.stage, QR_LOOKS_ROOT)
+        mp = QR_LOOKS_ROOT + "/" + box_id
+        mat = UsdShade.Material.Define(self.stage, mp)
+        sh = UsdShade.Shader.Define(self.stage, mp + "/Shader")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
+        sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        # ★ 종이 라벨이라 반사가 거의 없어야 한다. 광택이 있으면 조명이 QR 위에
+        #   하이라이트를 만들어 흰 모듈과 검은 모듈의 대비가 무너진다.
+        sh.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.02, 0.02, 0.02))
+
+        reader = UsdShade.Shader.Define(self.stage, mp + "/stReader")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+        tex = UsdShade.Shader.Define(self.stage, mp + "/Tex")
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(png)
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            reader.ConnectableAPI(), "result")
+        # ★ clamp. repeat 로 두면 가장자리에서 QR 이 한 줄 되풀이돼 흰 여백을
+        #   갉아먹고, 여백이 좁아지면 디텍터가 QR 경계를 못 잡는다.
+        for w in ("wrapS", "wrapT"):
+            tex.CreateInput(w, Sdf.ValueTypeNames.Token).Set("clamp")
+        tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            tex.ConnectableAPI(), "rgb")
+        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+
+        UsdShade.MaterialBindingAPI.Apply(m.GetPrim())
+        UsdShade.MaterialBindingAPI(m.GetPrim()).Bind(mat)
 
     def _attach_label(self, box_path, box_id, hz):
         """박스 윗면에 QR 스티커(시각 전용 쿼드)를 붙인다.

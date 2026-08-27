@@ -3,7 +3,7 @@
 #
 #   ./scripts/run_test3.sh            존 A · 박스 6 개 · 라우팅 켬
 #   PL_N=33 ./scripts/run_test3.sh        박스 수 바꾸기
-#   PL_PER_PALLET=0 ./scripts/run_test3.sh 반출 없이 계속 쌓기 (알고리즘 붙인 뒤)
+#   PL_PER_PALLET=1 ./scripts/run_test3.sh 한 개만 놓고 반출까지만 보기
 #   PL_ROUTE=0 ./scripts/run_test3.sh      라우팅 끄고 존 A 지선만
 #   PL_AUTOPLAY=1 ./scripts/run_test3.sh   Play 를 자동으로 누르기
 #   PL_ZONES=A ./scripts/run_test3.sh      한 대만 (기본은 A,B,C 세 대 동시)
@@ -22,7 +22,7 @@
 #   system.yaml 은 그대로 두므로 test1-1 기준선은 영향받지 않는다.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-export PL_STAGE="${PL_STAGE:-/home/rokey/isaac_scenes/project_1/test_3.usd}"
+export PL_STAGE="${PL_STAGE:-/home/rokey/isaac_scenes/Collected_test_3/test_3.usd}"
 export PL_CONFIG_OVERLAY="${PL_CONFIG_OVERLAY:-src/packing_bringup/config/test_3.yaml}"
 export PL_ZONE="${PL_ZONE:-A}"
 # ★ 로봇 **3 대를 동시에** 돌린다. 존마다 워커·팔·팔레트가 따로다.
@@ -31,11 +31,25 @@ export PL_ZONES="${PL_ZONES:-A,B,C}"
 export PL_ROBOT_PRIM="${PL_ROBOT_PRIM:-/World/robot_$PL_ZONE}"
 export PL_STOPPER_PRIM="${PL_STOPPER_PRIM:-/World/Stopper_$PL_ZONE}"
 export PL_MODE="${PL_MODE:-demo}"
-export PL_N="${PL_N:-12}"       # 배송지 3 곳이라 한 존에 약 4 개가 간다
-# ★ 팔레트에 이만큼 놓으면 **트럭으로 내보내고 끝낸다.**
-#   패킹 알고리즘을 아직 안 받았으므로 지금은 1 개만 놓고 반출까지 보는 것이 목표다.
-#   알고리즘이 붙으면 0(반출 안 함) 또는 원하는 수로 바꾼다.
-export PL_PER_PALLET="${PL_PER_PALLET:-1}"
+# ★ 2026-08-26 12 -> 33. 반출을 끄면(PL_PER_PALLET=0) 팔레트를 채워야 적재
+#   알고리즘이 보인다. 배송지 3 곳이라 한 존에 약 11 개가 간다.
+export PL_N="${PL_N:-33}"
+# ★ 팔레트에 이만큼 놓으면 **트럭으로 내보내고 끝낸다.** 0 = 반출 안 하고 계속 쌓기.
+#   ★ 2026-08-26 기본값 1 -> **0.** 1 은 "패킹 알고리즘을 아직 안 받았으니 한 개만
+#     놓고 반출까지 보자" 던 시절의 값이다. 알고리즘(HeightmapPacker)은 이미
+#     붙어 있어서(ArmAwarePacker 가 상속한다) 1 로 두면 최적 적재가 한 개 놓고
+#     끝나 **아예 안 보인다.** 반출만 확인할 때는 PL_PER_PALLET=1 로 되돌린다.
+export PL_PER_PALLET="${PL_PER_PALLET:-0}"
+# ★ 한 존 지선에 허용할 박스 수. **1 -> 2** (2026-08-26).
+#   1 이면 로봇이 흡착·이송하는 10~16 초 동안 그 존으로 올 박스가 **전부 루프를
+#   한 바퀴 돈다** ("존 A 가 차 있다 (1 대) — BOX.. 는 한 바퀴 돈다").
+#   딜레이가 길어질 뿐 아니라 리턴 라인이 그만큼 붐빈다 — 오늘 겪은 합류 충돌·
+#   낙하의 상류 원인이다.
+#   2 면 로봇이 일하는 동안 다음 박스가 지선에 들어와 **스토퍼 뒤에 줄 선다.**
+#   ★ 안전한 근거: `spawner._step` 이 "여러 개가 줄 서면 **가장 앞선 것**" 만
+#     픽업 대상으로 올리고, 그것도 `at_stopper` + 속도 ~0 일 때만 준다.
+#     지선 길이 3668 mm 에 5 호가 480 이라 둘은 넉넉히 선다.
+export PL_METER="${PL_METER:-2}"
 export PL_ROUTE="${PL_ROUTE:-1}"
 export PL_CAM="${PL_CAM:-1}"          # 픽업 카메라 인식 — test_3 에서 5/5 · 오차 1.5 mm 확인
 export PL_CAMVIEW="${PL_CAMVIEW:-0}"

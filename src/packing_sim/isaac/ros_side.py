@@ -38,6 +38,8 @@ CLAUDE.md §2 가 폐기한 그 소켓이 이걸로 사라진다.
 """
 import threading
 
+import os
+
 import ros_graph
 
 
@@ -104,7 +106,10 @@ def _svc(fn, keep, req_map=None, res_map=None):
                 res[dst] = res.pop(src)
         # 버리기 전에 실패 사유는 로그로 남긴다 — 조용히 사라지면 안 된다.
         if not res.get("ok") and res.get("error"):
-            print("[ros_side] %s 실패: %s" % (getattr(fn, "__name__", "?"), res["error"]))
+            # ★ 받은 요청도 같이 찍는다. 사유만 있으면 "bad mps" 가 **값이 이상한
+            #   건지 아예 안 온 건지** 구분이 안 된다 (2026-08-26 실측).
+            print("[ros_side] %s 실패: %s   받은 요청=%r"
+                  % (getattr(fn, "__name__", "?"), res["error"], kw))
         return {k: v for k, v in res.items() if k in keep}
     return wrapped
 
@@ -122,6 +127,11 @@ class RosSide:
     def __init__(self, cfg, zone, handlers, log=print):
         self.zone, self.log = str(zone).upper(), log
         self.link = _InProcLink(handlers)
+        # 지선 재가동 속도 — 숫자를 박지 않는다 (conveyor.belt_velocity_mps 정본)
+        # ★ PLACE 후 지선 재가동 속도 — 지선 전용 키가 있으면 그것 (conveyor_ctl
+        #   run_all 과 같은 규칙. 없으면 본선과 동일 = 기존 동작).
+        self._belt_mps = float(cfg["conveyor"].get(
+            "spur_velocity_mps", cfg["conveyor"]["belt_velocity_mps"]))
 
         # ★ Cycle 은 **하나만** 만들어 끝까지 쓴다. 명령마다 새로 만들면
         #   _stack_top_m(이송 고도의 바닥)이 0 으로 돌아가 팔이 적재물 위를
@@ -135,6 +145,13 @@ class RosSide:
         self.cycle = Cycle(self.link, _NoSvc(), cfg, self.zone, log=log)
 
         self._busy = threading.Lock()
+        self._hold = None                # 모션 중 도착한 명령 1건 보류 (step 주석)
+        # ★ 풀 비전(PL_GTPICK=2)에서는 대기 자세를 **끈다** (2026-08-27 실측).
+        #   스토퍼 상공에 뜬 팔이 픽업 카메라와 박스 사이를 가려 존 인식이
+        #   "박스가 시야 밖으로 잘렸다"로 좌표를 못 낸다 — 3존이 차례로 섰다.
+        #   gtpick 모드에서는 카메라를 안 쓰므로 대기 자세가 순이득이라 유지.
+        self._park_ok = os.environ.get("PL_GTPICK") != "2"
+        self._parked0 = not self._park_ok  # 끄면 초기 대기 자세도 안 잡는다
         self._done = []                  # 워커가 넣고 step() 이 비운다
         self._done_lk = threading.Lock()
 
@@ -154,22 +171,41 @@ class RosSide:
         for ev in evs:
             ros_graph.send_event(self.zone, **ev)
 
-        # ② 새 명령
-        cmd = ros_graph.take_cmd(self.zone)
+        # ② 새 명령 — 보류분이 있으면 그것부터
+        cmd = self._hold or ros_graph.take_cmd(self.zone)
         if cmd is None:
+            # ★ 시작 직후 한 번, 첫 박스를 기다리는 동안 **초기 자세도 대기 자세로**
+            #   옮겨 둔다 (2026-08-27 김병직). cycle 이 명목 스토퍼 좌표로 시드해
+            #   뒀다. 명령이 먼저 오면 안 한다 — 어차피 픽이 그 자리로 간다.
+            if not self._parked0 and self._busy.acquire(blocking=False):
+                self._parked0 = True
+                threading.Thread(target=self._park0, daemon=True).start()
             return
+        self._parked0 = True                 # 초기 대기 자세는 더 이상 필요 없다
         if not self._busy.acquire(blocking=False):
-            # ★ 조용히 버리지 않는다. 답이 없으면 관제탑은 20초를 버린 뒤에야 안다.
-            self.log("[ros_side] 이미 모션 중인데 seq=%s 가 왔다 — ok=false 로 답한다"
-                     % cmd.get("seq"))
-            self._push(dict(seq=int(cmd.get("seq", 0)), action=int(cmd.get("action", 0)),
-                            box_id=str(cmd.get("box_id", "")), ok=False, reason="ABORTED",
-                            has_actual=False, actual_x_mm=0, actual_y_mm=0,
-                            actual_z_mm=0, actual_yaw_deg=0.0, duration_s=0.0))
+            # ★ 버리지 않고 **한 건 보류**한다 (2026-08-27). 대기 자세 이동(2~3 s)
+            #   중에 다음 PICK 이 오는 것이 정상 흐름이 됐다 — ABORTED 로 답하면
+            #   관제탑이 멀쩡한 박스를 실패 처리한다. 관제탑 타임아웃(20 s) 안에
+            #   이동이 끝나므로 다음 틱들에서 재시도하면 된다.
+            if self._hold is None:
+                self._hold = cmd
+                self.log("[ros_side] 모션 중 — seq=%s 보류 (끝나면 바로 실행)"
+                         % cmd.get("seq"))
             return
+        self._hold = None
         threading.Thread(target=self._work, args=(cmd,), daemon=True).start()
 
     # ── 워커 스레드 ────────────────────────────────────────
+    def _park0(self):
+        """시작 직후 초기 대기 자세. 실패해도 조용히 넘어간다 (최적화지 결과가 아니다)."""
+        try:
+            self.log("[ros_side] 초기 대기 자세로 이동 (스토퍼 상공)")
+            self.cycle.park_over_pick()
+        except Exception as e:                                  # noqa: BLE001
+            self.log("[ros_side] 초기 대기 자세 실패 (무시): %r" % (e,))
+        finally:
+            self._busy.release()
+
     def _work(self, cmd):
         """워커 스레드 — **여기서만 블로킹한다** (모션 5~10초).
 
@@ -182,10 +218,68 @@ class RosSide:
                 from cmd_adapter import run_cmd
             except ImportError:
                 from packing_robot.cmd_adapter import run_cmd
-            # ★ 규약(seq 복사 · has_actual 게이트 · 예외에도 답하기)은 여기 없다 —
-            #   `cmd_adapter.run_cmd` 하나에 있다. 과도기 노드
-            #   (`packing_robot/robot_node.py`)도 같은 함수를 부른다.
-            self._push(run_cmd(self.cycle, _clean(cmd), log=self.log))
+            # ★★ 지선 벨트는 여기서 직접 건다 (install_services 의 소유권 주석 참조).
+            #   PICK(0) 시작 전에 세우고, PLACE(1) 가 끝나면 다시 돌린다.
+            #   핸들러는 mainq 를 거치므로 워커 스레드에서 불러도 안전하다 —
+            #   소켓 스레드가 부르던 것과 같은 경로다.
+            act = int(cmd.get("action", -1))
+            seg = "%s_pickup" % self.zone.lower()
+            # ★★ 기본은 **지선을 세우지 않는다** (2026-08-27, 김병직 증언 — 학민
+            #   작업 때 검증된 방식). 스토퍼가 박스를 물리로 잡으므로 벨트가 돌아도
+            #   되고, 돌아야 다음 박스가 로봇 작업 **중에** 가이드까지 내려온다.
+            #   부수 효과: 첫 박스가 지선 진입 판정을 빨리 넘어 소터 열림 시간이
+            #   줄고, 뒤차가 딸려 들어가는 확률도 준다.
+            #   흡착 중 끌림이 다시 보이면 PL_SPUR_STOP=1 로 정지 방식 복원.
+            _spur_stop = os.environ.get("PL_SPUR_STOP", "0") == "1"
+            if act == 0 and _spur_stop:                         # PICK — 하강 전 정지
+                self.link.call(cmd="set_velocity", seg=seg, mps=0.0)
+            ev = run_cmd(self.cycle, _clean(cmd), log=self.log)
+            # ★ 재가동 시점 = **집어 올린 직후** (2026-08-27 김병직 설계).
+            #   PLACE 끝까지 세워 두면 뒤차 도착이 배치 시간만큼 늦고, 상시 가동은
+            #   뒤차가 스토퍼 앞차에 붙어 실루엣이 병합된다 (풀 비전 실측).
+            #   픽 성공 순간 돌리면 뒤차는 로봇이 배치하러 간 사이에 **홀로**
+            #   스토퍼에 도착한다 — 병합 0 · 파이프라인 손실 0.
+            #   ⚠ 픽 실패여도 재가동한다: 실패 3회 뒤 폐기(despawn) 경로에는
+            #     PLACE 가 없어서, 여기서 안 돌리면 지선이 영영 선다 (교착).
+            #     실패 재시도 중 뒤차가 접근하는 창은 남지만 지선 0.3 에서
+            #     흡착 실패 자체가 드물다 (간극 2.1~2.4mm 실측).
+            if _spur_stop and act == 0:
+                # ★ 딜레이 재가동 (2026-08-27 2차 수정, 김병직). PICK 은 **흡착까지**
+                #   고 들어올리기는 PLACE 첫 구간이다 — 즉시 돌리면 문 채 바닥에
+                #   있는 박스1을 뒤차가 들이받는다 (실측: B·C 정지). 성공 시
+                #   PL_SPUR_DELAY(기본 3초, 벽시계) 뒤에 돌린다 — 그 사이 상승이
+                #   끝난다. 실패 시엔 즉시 (박스가 그대로 있고, 폐기 경로 교착 방지).
+                if ev.get("ok"):
+                    threading.Timer(
+                        float(os.environ.get("PL_SPUR_DELAY", "3.0")),
+                        lambda: self.link.call(cmd="set_velocity", seg=seg,
+                                               mps=self._belt_mps)).start()
+                else:
+                    self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
+            if act == 1:                                        # PLACE — 성공/실패 무관
+                self.link.call(cmd="set_velocity", seg=seg, mps=self._belt_mps)
+            self._push(ev)
+            # ★ 결과를 **밀어 넣은 뒤에** 대기 자세로 간다 (2026-08-27 김병직 제안).
+            #   관제탑은 이미 다음 단계로 가고, 이동 중 오는 PICK 은 step 이 한 건
+            #   보류한다 — 아래 _hold 참조.
+            # ★ 다음 박스가 **이미 스토퍼에 와 있으면 생략한다** (2026-08-27 김병직,
+            #   2차 수정). 처음엔 보류 명령(_hold)으로 판정했는데 그걸로는 부족했다 —
+            #   관제탑은 PLACE 결과를 받은 **뒤에야** 계획을 세우고 PICK 을 보내므로,
+            #   박스가 벌써 대기 중이어도 이 시점엔 명령이 아직 없다. 그래서 명령이
+            #   아니라 **박스 실물**(pickup_check 스냅샷, 스레드 안전)을 본다.
+            #   보류분 검사는 그대로 두고 (있으면 당연히 생략) 실물 검사를 더한다.
+            if act == 1 and self._park_ok:
+                _pk = {}
+                if self._hold is None:
+                    _pk = self.link.call(cmd="pickup_check", zone=self.zone) or {}
+                if self._hold is None and not _pk.get("present"):
+                    try:
+                        self.cycle.park_over_pick()
+                    except Exception as e:                      # noqa: BLE001
+                        self.log("[ros_side] 대기 자세 실패 (무시): %r" % (e,))
+                else:
+                    self.log("[ros_side] 다음 박스 대기중 (%s) — 대기 자세 생략"
+                             % (_pk.get("box_id") or "명령 보류분"))
         finally:
             self._busy.release()
 
@@ -220,10 +314,28 @@ def install_services(handlers):
     함수를 부르면 둘이 어긋나므로 같은 표를 쓴다.
     """
     h = handlers
+
+    # ★★ 지선(_pickup) 벨트는 **어댑터가 소유한다** (2026-08-27 새벽).
+    #   브리지가 서비스 **요청의 float32 를 못 쓴다** — velocity_mps 가 항상 0.0
+    #   으로 읽혀(실측: Req 출력 직접 읽기로도 0), 관제탑의 재가동(0.5)이 전부
+    #   정지로 둔갑했다. 각 구역이 1개 놓고 멈춘 원인.
+    #   그래서 정지/재가동은 RosSide 가 PICK/PLACE 시점에 **같은 프로세스에서**
+    #   직접 건다 (값이 브리지를 안 건넌다). 관제탑의 pickup 호출은 계약(§2.5,
+    #   "ok 확인 후 흡착")만 만족시키고 실제로는 안 만진다 — 0 으로 깨진 값이
+    #   어댑터의 재가동을 도로 꺼 버리는 것을 막기 위해서다.
+    #   ⚠ pickup 외 seg (반출 등) 는 그대로 통과시킨다 — 다만 값은 여전히 0 이다.
+    _real_setvel = h["set_velocity"]
+
+    def _setvel_ros(req):
+        seg = str(req.get("seg") or "")
+        if seg.endswith("_pickup"):
+            return {"ok": True, "actual": float(req.get("mps") or 0.0)}
+        return _real_setvel(req)
+
     ros_graph.set_handlers(
         # srv SetVelocity: seg · velocity_mps -> ok · actual_mps
         # 소켓          : seg · mps          -> ok · actual
-        set_velocity=_svc(h["set_velocity"], ("ok", "actual_mps"),
+        set_velocity=_svc(_setvel_ros, ("ok", "actual_mps"),
                           req_map={"velocity_mps": "mps"},
                           res_map={"actual": "actual_mps"}),
         despawn_box=_svc(h["despawn_box"], ("ok",)),
@@ -244,6 +356,17 @@ def build(zones, cfg=None, log=print):
             % (z, ros_graph.cmd_topic(z), ros_graph.evt_topic(z)))
     if cfg is not None:
         ros_graph.build_clock_tf(cfg, log=log)
+        # ★ 픽업 카메라. 없으면 `/zone_*/box_at_pickup` 이 안 와서 관제탑이
+        #   영원히 IDLE 이다 (실측 2026-08-26). ros_graph.build_cameras docstring 참조.
+        #
+        # ⚠ **씬에서 직접 배선하기로 하면 `PL_CAMROS=0` 으로 끈다.** 씬에
+        #   `ROS2CameraHelper` 가 있으면 build_cameras 가 알아서 비켜서지만,
+        #   씬 쪽을 아직 만드는 중이라면 이 스위치로 명시적으로 끄는 편이 낫다 —
+        #   발행자가 둘이면 vision 이 두 이미지를 번갈아 받는다.
+        if os.environ.get("PL_CAMROS", "1") != "0":
+            ros_graph.build_cameras(cfg, list(zones), log=log)
+        else:
+            log("[ros_side] PL_CAMROS=0 — 픽업 카메라는 씬이 쏜다고 보고 안 만든다")
 
 
 def wire(log=print):

@@ -120,6 +120,8 @@ class ConveyorCtl:
         #   김학민 소유 파일을 남이 계속 건드리게 된다. 기본값은 test1-1 그대로다.
         table = cfg["conveyor"].get("belt_graphs") or BELT_GRAPH
         self.graphs = {}
+        # 마지막으로 지시한 seg 별 속도 [m/s]. `speed_of()` 참조.
+        self._cur = {}
         for seg, v in table.items():
             self.graphs[seg] = [v] if isinstance(v, str) else list(v)
 
@@ -176,6 +178,16 @@ class ConveyorCtl:
             a2.Set(float(v))
             self._log("[conveyor_ctl] 원시   %-46s Velocity %.4f (배율 환산 안 함)"
                       % (gp, float(v)))
+
+        # ── 순환 루프 커브/직선 방향 보정 ─────────────────
+        loop_cfg = (cfg.get("conveyor") or {}).get("loop") or {}
+        for key in ("curve_dir", "straight_dir"):
+            for tp, d in (loop_cfg.get(key) or {}).items():
+                nd = stage.GetPrimAtPath(tp + "/ConveyorBeltGraph/ConveyorNode") or stage.GetPrimAtPath(tp + "/ConveyorNode")
+                if nd and nd.IsValid():
+                    from pxr import Gf
+                    nd.GetAttribute("inputs:direction").Set(Gf.Vec3f(*[float(x) for x in d]))
+                    self._log("[conveyor_ctl] 루프 방향   %-46s direction %s" % (tp, tuple(d)))
 
         # 기본 진행/분류 방향 — 부르는 쪽이 world 를 안 주면 이걸 쓴다.
         _rt = cfg.get("routing") or {}
@@ -261,6 +273,16 @@ class ConveyorCtl:
         return gain
 
     # ── 핸들러 ──────────────────────────────────────────────
+    def speed_of(self, seg):
+        """마지막으로 지시한 속도 [m/s]. 지시한 적 없으면 None.
+
+        ★ 라우터가 "그 구역 지선이 서 있나" 를 보는 데 쓴다. 서 있는데 꺾어 넣으면
+          박스가 지선 입구(Y 0.7 언저리)에서 멎었다가 45 s 뒤 본선으로 되돌아온다
+          (실측 2026-08-26: `BOX004 가 45 s 안에 지선 C 에 못 올라갔다 (Y 0.68)`).
+          지선을 세우는 것은 관제탑이다 — 집기 전에 반드시 세운다 (§2.5).
+        """
+        return self._cur.get(seg)
+
     def handlers(self):
         """이 모듈이 제공하는 씬 명령표. 소켓과 ROS 서비스가 같은 함수를 공유한다."""
         return {"set_velocity": self.h_set_velocity,
@@ -268,16 +290,19 @@ class ConveyorCtl:
                 "set_sorter": self.h_set_sorter}
 
     def h_set_velocity(self, req):
-        """{"cmd":"set_velocity","seg":"b_pickup","mps":0.0} -> {"ok":..,"actual":..}
-
-        오케스트레이터는 **ok 를 확인한 뒤** 흡착한다 (§2.5). 안 멈춘 채 집으면
-        박스가 끌려가므로 여기서 거짓말을 하면 안 된다 — 못 쓰면 ok=false 다.
-        """
+        """{"cmd":"set_velocity","seg":"b_pickup","mps":0.0} -> {"ok":..,"actual":..}"""
         seg = req.get("seg")
+        
+        # ★ mps 가 None 이거나 전달되지 않았을 때 0.0 로 예외 처리
+        raw_mps = req.get("mps")
+        if raw_mps is None:
+            raw_mps = 0.0
+
         try:
-            mps = float(req.get("mps"))
+            mps = float(raw_mps)
         except (TypeError, ValueError):
             return {"ok": False, "error": "bad mps", "actual": 0.0}
+
         # 인자 검사는 소켓 스레드에서 끝내고, USD 쓰기만 메인 스레드로 넘긴다.
         if seg not in self.graphs:
             return {"ok": False, "error": "unknown seg %r (있는 것: %s)"
@@ -457,6 +482,14 @@ class ConveyorCtl:
                         "actual": 0.0}
             # ★ 그래프 변수 하나만 쓴다. 실측으로 이게 정확하다 (위 주석).
             attr.Set(mps / self.gain[gpath])
+        # ★ 지금 속도를 기억해 둔다. USD 에서 되읽으면 배율(gain)을 되돌려야 하고
+        #   조각마다 값이 달라 정확한 원값을 못 얻는다. **누가 마지막으로 뭘 시켰나**
+        #   가 필요한 전부다 — 라우터가 "이 지선이 서 있나" 를 이걸로 본다.
+        # ★ 값이 바뀔 때만 찍는다 (2026-08-26 밤). 재가동(0.5)이 왕복은 되는데
+        #   라우터가 계속 0 을 보는 미스터리 — 실제 도착값을 눈으로 확정하기 위함.
+        if self._cur.get(seg) != float(mps):
+            self._log("[conveyor_ctl] seg %-9s -> %.2f m/s" % (seg, float(mps)))
+        self._cur[seg] = float(mps)
         # ★★ 본선을 켜면 소터도 켠다. 안 그러면 소터가 0 으로 서 있고, 소터
         #   자리에는 본선 롤러가 **없어서** 박스가 거기서 그냥 멎는다
         #   (실측 2026-08-25: BOX00000 이 X -6.89 에서 90 s 정지, 뒤로 2 개가
@@ -477,9 +510,19 @@ class ConveyorCtl:
             self.set_sorter_velocity(zn, 0.0)
 
     def run_all(self):
-        """모든 벨트를 사양 속도로 기동. 소터도 같이 켠다 (`stop_all` 의 짝)."""
+        """모든 벨트를 사양 속도로 기동. 소터도 같이 켠다 (`stop_all` 의 짝).
+
+        본선과 지선(`*_pickup`)의 속도가 다르다 — 아래 주석 참고.
+        """
+        # ★ 지선(T자의 I 부분, `*_pickup` = ConveyorBeltGraph_01)만 따로 느리게
+        #   (2026-08-27 김병직). 풀 비전에서 뒤차가 스토퍼의 앞차에 붙으면 두
+        #   실루엣이 병합돼 치수 맞춤이 터진다 (실측 — A존 3호 2개 병합).
+        #   지선이 느리면 뒤차가 닿기 전에 인식+픽이 끝난다. 부수 이득: 스토퍼
+        #   충돌 기울어짐 감소 (0.35 시절 흡착 간극 2.1~2.4mm 실측).
+        #   키가 없으면 본선과 같은 속도 — 기존 동작 그대로.
+        spur = float(self.cfg["conveyor"].get("spur_velocity_mps", self.nominal))
         for seg in self.graphs:
-            self.set_velocity(seg, self.nominal)
+            self.set_velocity(seg, spur if seg.endswith("_pickup") else self.nominal)
         # ★ 소터를 반드시 같이 돌린다. 본선 롤러에는 소터 자리에 구멍이 있어
         #   소터가 서 있으면 **라인이 거기서 막힌다** (실측 2026-08-25: 박스가
         #   X -6.62 에서 165 s 정지).

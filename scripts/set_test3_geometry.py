@@ -63,7 +63,7 @@ from pxr import Gf, Usd, UsdGeom
 HOME = os.path.expanduser("~")
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 YAML = os.path.join(ROOT, "src/packing_bringup/config/test_3.yaml")
-SCENE = os.path.join(HOME, "isaac_scenes/project_1/test_3.usd")
+SCENE = os.path.join(HOME, "isaac_scenes/Collected_test_3/test_3.usd")
 BACKUP = os.path.join(os.path.dirname(SCENE), "backup")
 ZONES = ("A", "B", "C")
 CYL_H = 1.2                 # 기둥 원통의 자체 높이 [m]. 실제 높이 = CYL_H * scale.z
@@ -205,7 +205,7 @@ def main():
     print("씬 저장 · 백업 %s" % bak.replace(HOME, "~"))
     print()
     print("⚠ 팔레트를 옮겼으니 가이드 벽을 다시 세워야 한다:")
-    print("   PL_STAGE=$HOME/isaac_scenes/project_1/test_3.usd \\")
+    print("   PL_STAGE=$HOME/isaac_scenes/Collected_test_3/test_3.usd \\")
     print("   PL_CONFIG_OVERLAY=$HOME/palletris_ws/src/packing_bringup/config/test_3.yaml \\")
     print("   ~/isaac-sim-5.1.0/isaac-sim.sh --no-window --exec "
           "$HOME/palletris_ws/scripts/setup_test3_scene.py")

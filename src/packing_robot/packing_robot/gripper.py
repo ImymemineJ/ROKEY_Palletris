@@ -39,11 +39,23 @@ isaac_python(3.11)과 ROS 2 Jazzy(3.12)는 파이썬이 달라 한 프로세스�
 (부호만 본다).
 """
 
+import os
+
 APPROACH_GAP_MM = 2.0        # 접근 시 남길 간극. transZ 슬롯(5 mm)보다 작아야 한다
 # 흡착 후 허용 간극. **패드 transZ 슬롯 5 mm 에서 온 값이다** — 임의로 정한 것이 아니다.
 #   접근 2 mm 로 잡으면 1.2~1.4 mm, 접근 5 mm 로 잡으면 6.4 mm 가 나온다. 3 mm 가 그 사이다.
 #   ★ 2.0 으로 뒀다가 멀쩡한 흡착(2.41 mm)을 실패로 판정했다. 도착 잔차가 얹히기 때문이다.
-GRIP_TOL_MM = 3.0
+#   ★★ 2026-08-26 3.0 -> **4.0.** 같은 실수를 한 번 더 했다.
+#     ROS 경로 실측: 접근을 1.94 mm 로 보정해 놓고도 흡착 후 **3.25 mm** 가 나왔고,
+#     그리퍼는 Closed 에 박스를 물고 있는데(`잡은 것 ['/World/boxes/BOX005']`)
+#     0.25 mm 차이로 GRASP_FAILED 를 냈다. 성공률 20% 의 원인이 이것 하나였다.
+#     근거는 그대로 **패드 transZ 슬롯 5 mm** 다 — 그 안이면 구속이 아직 여유가 있다.
+#     4.0 은 접근 2 mm 계열(1.2~3.3)은 다 통과시키고 접근 5 mm 의 실패 서명(6.40)은
+#     그대로 잡는다. 슬롯 5 를 넘기면 안 되므로 **4 가 상한**이다.
+#     ⚠ 매달린 만큼 배치가 높아진다 — cycle.py 는 "딱 붙었다" 를 가정한다.
+#       3 mm 대는 배치오차 실측(최대 10 mm) 안이라 덮이지만, 이 값을 더 올리면
+#       그 가정부터 고쳐야 한다.
+GRIP_TOL_MM = float(os.environ.get("PL_GRIP_TOL_MM", "4.0"))
 
 # 릴리스 전 최소 유지 시간 [s]. TCP 정지 판정은 **툴** 속도라 매달린 박스의 진동을 못 본다.
 #   패드 rotXY 드라이브가 강성 100 · 감쇠 0 (h2017_cell.usd 정본값)이라 5호(9 kg ·
@@ -51,7 +63,9 @@ GRIP_TOL_MM = 3.0
 #   갈렸다 (2026-08-22 실측 — 지령·간극이 동일한 두 실행이 0.4 mm 와 27 mm 로 갈림).
 #   바닥 2 mm 위에서 이 시간만큼 머물면 박스가 표면에 얹혀(±3° 순응 안에서) 진동이
 #   접촉 마찰로 죽는다. 정본 패드값은 건드리지 않는다.
-RELEASE_MIN_HOLD_S = 0.5
+# ★ 2026-08-27 0.5 -> 0.3 (§10-2 --diag-release 실측: 놓기 전 0~0.5 s 동안
+#   박스 이동 0.00~0.03 mm — 기다릴 이유가 없다. 자리잡음은 0.7 s, 최악 1.0 s).
+RELEASE_MIN_HOLD_S = 0.3
 
 _STATUS = ("Open", "Closing", "Closed")
 
@@ -116,7 +130,7 @@ class Gripper:
         self.release_timeout_s = float(r.get("release_wait_timeout_s", 3.0))
         self.release_damping = float(r.get("release_damping", 5.0))
         self.release_damping_s = float(r.get("release_damping_duration_s", 0.5))
-        self.settle_s = float(r.get("settle_wait_s", 0.5))
+        self.settle_s = float(r.get("settle_wait_s", 0.3))   # §10-2 실측 0.5->0.3
         self._g = None                       # begin_grasp 진행 상태
         self._r = None                       # begin_release 진행 상태
 
@@ -180,6 +194,14 @@ class Gripper:
         else:
             self._log("[gripper] !! 흡착 실패 — %s  (상태 %s, 잡은 것 %s%s)"
                       % (why, self.status(), self.gripped() or "없음", self._gap_str()))
+            # ★ 실패 판정이어도 패드는 Closed 로 박스를 물고 있다 (2026-08-27 실측 —
+            #   "4.1mm 떠서 붙었다"는 붙긴 붙은 것이다). 안 떼면 박스가 패드에
+            #   매달린 채 스토퍼가 비어 그 존이 영원히 IDLE 이고, 다음 픽 때는
+            #   매달린 박스가 스토퍼 박스에 걸려 잔차 355mm 로 IK_FAIL 이 난다
+            #   (3존 동시 침묵 사고의 원인). 떼면 4mm 아래 제자리로 떨어져
+            #   다시 잡을 수 있다.
+            if self.is_holding():
+                self.view.apply_gripper_action([-1.0])
         return ok
 
     def begin_release(self, extra_settle_s=None):
