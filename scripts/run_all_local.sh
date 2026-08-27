@@ -145,8 +145,13 @@ export PL_DEPTH_MODE="${PL_DEPTH_MODE:-prefer}"
 # ── 남은 프로세스 정리 ──────────────────────────────────────────────────────
 # ★ 안 지우면 관제탑이 둘이 되어 같은 구역에 명령을 겹쳐 쏜다. 에러는 안 난다.
 python3 scripts/kill_ros_nodes.py || true
-for p in $(pgrep -f 'sim_main\.py' 2>/dev/null); do
-    [ "$p" = "$$" ] || kill "$p" 2>/dev/null || true
+# ★ kill_ros_nodes 는 lib/ 경로만 본다 — `python3 -m packing_algo.algo_service_node`
+#   같은 **수동 실행 잔재**는 못 잡는다. 실측(2026-08-27): 이틀 전 것 2개가 살아남아
+#   /algo/plan_placement 서버가 3개가 될 뻔했다 (어느 것이 답할지 미정).
+for pat in 'sim_main\.py' 'packing_algo\.algo_service_node' 'packing_algo/live_view'; do
+    for p in $(pgrep -f "$pat" 2>/dev/null); do
+        [ "$p" = "$$" ] || kill "$p" 2>/dev/null || true
+    done
 done
 sleep 1
 
@@ -235,6 +240,18 @@ if [ "$PL_GTPICK" = "2" ]; then
 else
     VZ=false   # 씬이 좌표까지 낸다 — 존 카메라를 켜면 발행자가 둘이 된다
 fi
+# ★ 실수 방지 (2026-08-27 — 같은 사고 2회). 2-PC 용 orchestrator:=false 를
+#   한 대 실행에 그대로 붙이면 **로봇에 명령 내릴 노드가 아무 데도 없다.**
+#   인식·알고리즘·DB 는 다 도는데 적재만 안 되고, 에러는 한 줄도 안 난다.
+case " $* " in *" orchestrator:=false "*)
+    echo ""
+    echo "⚠⚠ orchestrator:=false — 이 PC 에는 관제탑이 안 뜬다!" >&2
+    echo "   다른 PC(.4)에서 관제탑을 띄우는 2-PC 구성일 때만 쓸 것." >&2
+    echo "   한 대로 다 돌리려면 이 인자를 빼고 다시 실행:" >&2
+    echo "     PL_GTPICK=2 PL_RENDER_EVERY=10 PL_SPAWN=4 ./scripts/run_all_local.sh" >&2
+    echo "   (10초 기다렸다 계속한다 — 2-PC 가 맞으면 그대로 두면 된다)" >&2
+    sleep 10 ;;
+esac
 echo "[run_all_local] [2/2] bringup — 로그 $CTRL_LOG"
 echo "[run_all_local]       Isaac 로그는 다른 터미널에서:  tail -f $ISAAC_LOG"
 echo ""

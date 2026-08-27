@@ -450,6 +450,43 @@ def _make_optical_frame(stage, path, cam_path):
 
 
 # ── 픽업 카메라 — 씬에 발행자가 없으면 우리가 낸다 ─────────────────────────
+def _restore_lens_overrides(st, cam_paths, log=print):
+    """씬 루트 레이어에 남은 **렌즈 프림 xform 오버라이드**를 걷어낸다.
+
+    ★ 왜 (2026-08-27 정정인 실측): 새 씬(배경판)에서 rsd455_1·_2 의 Color 렌즈가
+      하늘(z 8.4 / 5.3 m)에 떠 있었다 — 리그 자체도, 같은 리그의 다른 렌즈 3개도
+      멀쩡한데 **Color 렌즈만**. GUI 에서 그 렌즈를 뷰포트 카메라로 잡고 둘러본
+      자세가 씬에 `over` 로 저장된 사고다 (orient 가 임의 방향인 것이 증거).
+      cam1 이 창고 전경을 8 m 위에서 찍고 있어 "하늘에 떠 있다" 로 보였다.
+
+    ★ 고치는 방법: 에셋(RSD455)의 원래 렌즈 배치는 리그의 **참조**가 갖고 있다.
+      루트 레이어의 xformOp 오버라이드만 지우면 합성이 에셋 기본값으로 떨어져
+      원위치가 된다. 좌표를 하드코딩해서 되돌리는 것보다 이게 맞다 — 에셋이
+      바뀌어도 따라간다.
+
+    ★ 파일은 안 고친다 — 열린 스테이지의 메모리 레이어에서만 지우고 Save() 는
+      부르지 않는다 (씬은 김학민 소유 · CLAUDE.md §11, `_mute` 와 같은 규약).
+      tf 는 라이브 pose 를 내므로 따로 손댈 것 없다.
+    """
+    lay = st.GetRootLayer()
+    fixed = []
+    for cp in cam_paths:
+        spec = lay.GetPrimAtPath(cp)
+        if spec is None:
+            continue
+        doomed = [k for k in list(spec.properties.keys())
+                  if str(k).startswith("xformOp")]
+        for k in doomed:
+            spec.RemoveProperty(spec.properties[k])
+        if doomed:
+            parts = str(cp).strip("/").split("/")
+            fixed.append(parts[1] if len(parts) > 1 else str(cp))
+    if fixed:
+        log("[ros_graph] 렌즈 xform 오버라이드 제거 — %s (GUI 둘러보기 자세가 "
+            "씬에 저장된 사고 · 에셋 기본 위치로 복원)" % ", ".join(fixed))
+    return len(fixed)
+
+
 def _mute_scene_camera_graphs(st, log=print):
     """씬의 카메라 ROS 그래프를 **런타임에만** 끈다 (PL_CAMROS=2 일 때).
 
@@ -618,6 +655,10 @@ def build_cameras(cfg, zones, log=print):
         targets.append(("Cam_L1", "/cam1", str(cams_cfg["spawn_prim"])))
     if cams_cfg.get("line2_prim"):
         targets.append(("Cam_L2", "/cam2", str(cams_cfg["line2_prim"])))
+    # ★ 렌즈 오버라이드 복원은 렌더 프로덕트를 만들기 **전**이어야 한다 —
+    #   떠 있는 자세로 프로덕트를 만들면 그 프레임이 그대로 나간다.
+    _restore_lens_overrides(st, [t[2] for t in targets], log)
+
     for gname, ns, cam_path in targets:
         if not st.GetPrimAtPath(cam_path).IsValid():
             log("[ros_graph] !! %s 가 씬에 없다 — %s 카메라 생략" % (cam_path, ns))
