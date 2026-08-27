@@ -40,6 +40,7 @@ USD 를 고치는 일(스폰·디스폰)은 소켓 스레드에서 하면 안 �
 """
 import math
 import os
+import time
 
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
@@ -137,6 +138,21 @@ OUTFEED_ON = os.environ.get("PL_OUTFEED", "0") == "1"
 OUTFEED_MPS = float(os.environ.get("PL_OUTFEED_MPS", "1.0"))
 OUTFEED_TRAVEL_M = float(os.environ.get("PL_OUTFEED_TRAVEL_M", "2.4"))
 OUTFEED_HOLD_S = float(os.environ.get("PL_OUTFEED_HOLD_S", "2.0"))
+# ★ 출발 몇 초 뒤에 빈 팔레트를 다시 보일지 (2026-08-27 정정인). 0 이면 즉시.
+#   자세한 사연은 `_outfeed_enqueue` 의 사본 주석 참조.
+OUTFEED_RESPAWN_S = float(os.environ.get("PL_OUTFEED_RESPAWN_S", "3.0"))
+
+# ── 리턴 라인 걸림 감시 (2026-08-27 정정인) ──
+# 리턴 벨트는 어떤 제어도 세우지 않는다 (갭핑·점유 제어는 본선·지선 이야기다).
+# 그런데도 이음매·전복으로 박스가 제자리에 서는 일이 남아 있다 — 지선의 12초
+# 감시(관제탑)와 합류 창의 30초 감시(sim_main._Feeder)는 **그 구역만** 본다.
+# 리턴 한복판에서 선 박스는 아무도 안 치워서 뒤차가 줄줄이 쌓였다 (강의실 실측).
+# 여기서는 리턴 조각(belt_velocity_raw 의 프림들) bbox 안에서 STALL_DESPAWN_S
+# 이상 제자리(누적 이동 < 30 mm)인 박스를 낙하물로 보고 치운다.
+# 벽시계 기준이다 — 배속(PL_RENDER_EVERY)이 걸리면 sim 시간으로는 더 길어질
+# 뿐이라 오탐 방향으로는 안 틀린다. 0 을 주면 끈다.
+STALL_DESPAWN_S = float(os.environ.get("PL_STALL_DESPAWN_S", "20.0"))
+STALL_MOVE_M = 0.03                        # 이보다 덜 움직이면 "제자리"
 PALLET_PRIM_FMT = "/World/Pallet_%s"
 # ★ 상차까지 가는 전체 경로 (씬 실측 2026-08-27). ㄱ 자다:
 #     팔레트 -> (+Y) 셀 컨베이어·커브 -> (+X) 팔레트 레인 -> 트럭 적재함
@@ -270,6 +286,8 @@ class Spawner:
         self._pickup_by_zone = {}
         self._outfeed = []                 # 반출 중인 덩어리 (팔레트 + 박스)
         self._shipped_n = 0                # 트럭에 남긴 팔레트 사본 번호
+        self._stall = {}                   # box_id -> [x, y, 마지막으로 움직인 시각]
+        self._stall_rects = None           # 리턴 조각 bbox 들 (첫 step 에서 lazy)
 
         self._ensure_roots()
         self._log("[spawner] 스폰점 %s m (밑면) · 픽업 판정 %s %.3f~%.3f%s "
@@ -299,9 +317,49 @@ class Spawner:
         큐 처리는 `sim_main` 이 `mainq.pump()` 로 한다 — 여기서는 스냅샷만 갱신한다.
         """
         self._refresh()
+        self._stall_watch()
         if OUTFEED_ON:
             # 물리 60 Hz 고정이라 dt 는 상수다 (sim_main 이 그렇게 띄운다).
             self._outfeed_step(1.0 / 60.0)
+
+    def _stall_watch(self):
+        """리턴 라인 위에서 오래 제자리인 박스를 치운다 (모듈 상수 주석 참조)."""
+        if STALL_DESPAWN_S <= 0:
+            return
+        if self._stall_rects is None:
+            # 리턴 조각 = belt_velocity_raw 의 프림들. 그래프 프림엔 형상이 없어
+            # 부모(ConveyorTrack_xx)의 bbox 를 잰다. 여유 0.1 m.
+            rects = []
+            raw = ((self.cfg.get("conveyor") or {}).get("belt_velocity_raw") or {})
+            for gp in raw:
+                bb = self._bbox(str(gp).rsplit("/", 1)[0])
+                if bb:
+                    rects.append((bb[0] - 0.1, bb[1] + 0.1,
+                                  bb[2] - 0.1, bb[3] + 0.1))
+            self._stall_rects = rects
+            if rects:
+                self._log("[spawner] 리턴 걸림 감시 켬 — 조각 %d 개 · %d초 제자리면 치운다"
+                          % (len(rects), int(STALL_DESPAWN_S)))
+        if not self._stall_rects:
+            return
+        now = time.monotonic()
+        for box_id, e in list(self._snap.items()):
+            p = e.get("pos_m")
+            if not (p and any(x0 <= p[0] <= x1 and y0 <= p[1] <= y1
+                              for x0, x1, y0, y1 in self._stall_rects)):
+                self._stall.pop(box_id, None)
+                continue
+            h = self._stall.get(box_id)
+            if h is None or abs(p[0] - h[0]) + abs(p[1] - h[1]) > STALL_MOVE_M:
+                self._stall[box_id] = [p[0], p[1], now]
+                continue
+            if now - h[2] >= STALL_DESPAWN_S:
+                # ★ 리턴 벨트에서 정지는 정상 흐름에 없다 — 걸렸거나 뒤집혔다.
+                #   뒤차는 이걸 치우면 다시 흐르기 시작해 타이머가 리셋된다.
+                self._log("[spawner] %s 가 리턴에서 %d초째 제자리 — 걸림/전복으로 "
+                          "보고 치운다" % (box_id, int(STALL_DESPAWN_S)))
+                self._stall.pop(box_id, None)
+                self._despawn(box_id)
 
     def _refresh(self):
         """모든 박스의 pose/속도를 한 번 읽어 스냅샷과 픽업 상태를 갱신한다.
@@ -806,7 +864,7 @@ class Spawner:
           픽업 후보로 보면 안 된다. 프림 경로는 이 대기열이 들고 있다.
         """
         train = {"zone": zone, "boxes": {}, "moved": 0.0,
-                 "pallet": None, "home": None,
+                 "pallet": None, "home": None, "reveal": None,
                  "phase": "align", "turn_y": None, "end_x": None, "hold": 0.0,
                  "arc": None, "arc_done": 0.0, "align_left": 0.0,
                  "lane_y": None}
@@ -830,11 +888,35 @@ class Spawner:
         pal = self.stage.GetPrimAtPath(pal_path)
         op = self._translate_op(pal) if (pal and pal.IsValid()) else None
         if op is not None:
-            train["pallet"], train["home"] = pal_path, op.Get()
-            # ★ **자세도 같이 기억한다** (2026-08-27 김병직 관측). 호에서 90도
-            #   돌아간 채로 위치만 되돌리면 새 빈 팔레트가 옆으로 누워 있다.
-            _oo = self._orient_op(pal)
-            train["home_q"] = _oo.Get() if _oo is not None else None
+            # ★★ 나가는 것은 **사본**이고 원본은 제자리에 남는다 (2026-08-27 정정인).
+            #   원본이 왕복(10~24초 + 정차)하는 동안 로봇 옆자리가 비는데, 그 사이
+            #   사이클이 재개되면 다음 박스가 **셀 컨베이어에 바로 얹힌다** —
+            #   계획 z 가 팔레트 상면(950) 기준이라서다 (실측 재현, 정정인).
+            #   원본을 남겨 두면 콜라이더가 그대로라 언제 놓아도 제 높이에 앉는다.
+            #
+            #   보이는 그림: 출발 순간 원본을 **숨겼다가** OUTFEED_RESPAWN_S(3초) 뒤
+            #   다시 보인다 — "빈 팔레트가 새로 들어온" 연출은 유지된다.
+            #   콜라이더는 **안 끈다.** 숨긴 3초 사이 놓인 박스가 잠깐 떠 보이는
+            #   쪽이, 컨베이어로 떨어지는(이 수정이 잡는 바로 그 버그) 쪽보다 낫다.
+            #
+            #   반출이 끝나면 사본은 트럭에 그대로 남는다 — 예전 finish 의
+            #   "사본 뜨고 원본 복귀" 두 단계가 필요 없어진다.
+            self._shipped_n += 1
+            dst = "/World/PalletShipped_%s_%d" % (zone, self._shipped_n)
+            try:
+                lay = self.stage.GetEditTarget().GetLayer()
+                Sdf.CopySpec(lay, Sdf.Path(pal_path), lay, Sdf.Path(dst))
+                train["pallet"] = dst              # 사본이 반출 열차를 탄다
+                UsdGeom.Imageable(pal).MakeInvisible()
+                train["reveal"] = [pal_path, OUTFEED_RESPAWN_S]
+            except Exception as e:
+                # 사본을 못 뜨면 예전 동작(원본이 나갔다 돌아온다)으로 물러선다.
+                self._log("[spawner] ⚠ 반출: 팔레트 사본 실패(%s) — 원본이 나간다" % e)
+                train["pallet"], train["home"] = pal_path, op.Get()
+                # ★ 자세도 같이 기억한다 (김병직 관측) — 호에서 90도 돌아간 채로
+                #   위치만 되돌리면 새 빈 팔레트가 옆으로 누워 있다.
+                _oo = self._orient_op(pal)
+                train["home_q"] = _oo.Get() if _oo is not None else None
         else:
             self._log("[spawner] ⚠ 반출: 팔레트 프림 %s 를 못 찾았다 — 박스만 내보낸다"
                       % pal_path)
@@ -846,8 +928,6 @@ class Spawner:
             cx = float(arc["center_mm"][0]) / 1000.0
             cy = float(arc["center_mm"][1]) / 1000.0
             R = float(arc["radius_mm"]) / 1000.0
-            train["arc"] = (cx, cy, R)
-            train["turn_y"] = cy                  # 호 진입점의 y
             train["end_x"] = (bed[0] + bed[1]) / 2.0
             # ★ 호를 나온 뒤 **레인 한가운데로 Y 를 다시 맞춘다** (김학민도 같은
             #   보정을 했다). 호 끝과 레인 중심이 15~39 mm 어긋나는데, 돌고 난
@@ -857,6 +937,23 @@ class Spawner:
             hi = self._bbox(PALLET_GUIDE_FMT % (zone, "hi"))
             if lo and hi:
                 train["lane_y"] = ((lo[2] + lo[3]) + (hi[2] + hi[3])) / 4.0
+                # ★★ 호 중심 y 는 설정이 아니라 **레인에서 유도한다** (2026-08-27
+                #   정정인). 새 씬(배경판)에서 반출 어셈블리가 ~0.3 m 옮겨져
+                #   config 의 호가 씬과 어긋났다 — 출구가 +283~335 mm 벗어나
+                #   팔레트가 가이드에 270 mm 겹친 채 옆으로 갈리며 들어갔다
+                #   (실측: 옛 씬 레인 정렬 +15~35 mm · 새 씬 +283~335 mm).
+                #   출구 y = cy + R 이므로 cy = lane_y - R 로 두면 출구가
+                #   **정의상 0** 이고, 씬이 또 옮겨져도 따라간다. 레인 중심은
+                #   이미 씬 프림(PalletGuide bbox)에서 재고 있다.
+                #   가이드가 없으면(폴백) config 값 그대로 쓴다.
+                cy_scene = train["lane_y"] - R
+                if abs(cy_scene - cy) > 0.05:
+                    self._log("[spawner] 반출 %s — 호 중심 y 를 레인에 맞춘다 "
+                              "%.2f -> %.2f (씬-설정 어긋남 %+.0f mm)"
+                              % (zone, cy, cy_scene, (cy_scene - cy) * 1000))
+                cy = cy_scene
+            train["arc"] = (cx, cy, R)
+            train["turn_y"] = cy                  # 호 진입점의 y
             if train["home"] is not None:
                 # 진입 중심선(x = 중심 - R)까지 옆으로 얼마나 가야 하나
                 train["align_left"] = (cx - R) - train["home"][0]
@@ -882,6 +979,17 @@ class Spawner:
             return
         step = OUTFEED_MPS * dt
         for train in list(self._outfeed):
+            # ── 빈 팔레트 재투입: 출발 OUTFEED_RESPAWN_S 뒤 원본을 다시 보인다 ──
+            rv = train.get("reveal")
+            if rv is not None:
+                rv[1] -= dt
+                if rv[1] <= 0.0:
+                    p = self.stage.GetPrimAtPath(rv[0])
+                    if p and p.IsValid():
+                        UsdGeom.Imageable(p).MakeVisible()
+                    train["reveal"] = None
+                    self._log("[spawner] 반출 %s — 빈 팔레트 투입 (출발 %.1f초 뒤)"
+                              % (train["zone"], OUTFEED_RESPAWN_S))
             # ── 트럭에 들어간 뒤 잠깐 세워 둔다 (상차 장면) ──
             if train["phase"] == "hold":
                 train["hold"] += dt
@@ -1004,6 +1112,16 @@ class Spawner:
           물리에 관여하지 않고, `self.boxes`·`_snap` 에서는 이미 빠져 있어
           다음 사이클이 픽업 후보로 보지도 않는다.
         """
+        # ★ 사본 모드(기본)에서는 여기서 할 일이 거의 없다 — 나간 것이 사본이라
+        #   그대로 트럭에 남기면 되고, 빈 팔레트(원본)는 출발 3초 뒤 이미 보였다.
+        #   아래 "사본 뜨고 원본 복귀" 블록은 enqueue 때 사본이 실패한
+        #   **폴백(원본이 나간 경우)** 에만 돈다 — home 이 그때만 채워진다.
+        rv = train.get("reveal")
+        if rv is not None:                 # 여정이 3초보다 짧았던 극단 보호
+            p = self.stage.GetPrimAtPath(rv[0])
+            if p and p.IsValid():
+                UsdGeom.Imageable(p).MakeVisible()
+            train["reveal"] = None
         if train["pallet"] and train["home"] is not None:
             pal = self.stage.GetPrimAtPath(train["pallet"])
             if pal and pal.IsValid():
