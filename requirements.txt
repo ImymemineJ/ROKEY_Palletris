@@ -1,0 +1,57 @@
+# =============================================================================
+#  Project Palletris — 파이썬 의존성
+#
+#  ★ 이 파일은 **Isaac 밖에서 도는 ROS 2 노드**(Python 3.12 / ROS 2 Jazzy)용이다.
+#    Isaac Sim 내장 파이썬(3.11)에는 설치하지 않는다 — 그쪽 의존성은
+#    Isaac Sim 5.1 이 통째로 들고 온다 (isaacsim · pxr · omni).
+#
+#  ★ Ubuntu 24.04 에서는 apt 판을 쓰는 쪽이 안전하다. rosdep 이 package.xml 의
+#    <exec_depend>python3-numpy</exec_depend> 등을 그 이름으로 찾는다:
+#
+#      sudo apt install python3-numpy python3-scipy python3-opencv \
+#                       python3-yaml python3-matplotlib python3-pytest
+#
+#    pip 로 넣을 때는 시스템 파이썬을 깨지 않도록 가상환경을 쓰되,
+#    rclpy 는 가상환경에서 안 보이므로 `--system-site-packages` 로 만든다:
+#
+#      python3 -m venv --system-site-packages .venv && . .venv/bin/activate
+#      pip install -r requirements.txt
+# =============================================================================
+
+# ── 적재 알고리즘 (packing_algo) ─────────────────────────────────────────────
+# numpy  : heightmap 120x80 int32 격자. 배치 후보 점수를 벡터로 한 번에 잰다
+# scipy  : scipy.ndimage.maximum_filter1d — 통로 검사(_corridor_ok)의 슬라이딩 최대
+#          plan() 평균 2 ms 가 이 한 줄에서 나온다. 파이썬 루프로 바꾸면 100배 느려진다
+numpy>=1.26
+scipy>=1.11
+
+# ── 비전 · 인식 (packing_vision) ────────────────────────────────────────────
+# opencv : HSV 마스크 -> minAreaRect 로 박스 윤곽/yaw, QRCodeDetector 로 운송장번호 판독
+#          ⚠ cv2.QRCodeEncoder 가 필요하다 (scripts/gen_qr_labels.py 가 라벨 PNG 를 굽는다).
+#            4.7 미만에는 없다. Ubuntu 24.04 의 python3-opencv 는 4.6 이상이라 문제없다
+opencv-python>=4.7
+
+# ── 설정 로더 (packing_common.config) ───────────────────────────────────────
+# system.yaml 이 모든 숫자의 단일 출처다. PL_CONFIG_OVERLAY 로 test_3.yaml 을 겹친다
+PyYAML>=6.0
+
+# ── 리포트 · 시각화 (packing_algo.viz/report/live_view, scripts/report.py) ──
+# 실행에는 필요 없다. 발표용 그림과 실시간 적재 뷰어에서만 쓴다
+matplotlib>=3.7
+
+# ── 테스트 ──────────────────────────────────────────────────────────────────
+# colcon test / pytest 로 수용 테스트(test_core.py 등)를 돌린다
+pytest>=7.0
+
+# =============================================================================
+#  pip 로 설치하지 않는 것 — 여기 적지 않는 이유
+# =============================================================================
+#  rclpy · tf2_ros · sensor_msgs · geometry_msgs · builtin_interfaces
+#      -> ROS 2 Jazzy (`sudo apt install ros-jazzy-desktop`). pip 판을 쓰면
+#         DDS 와 타입서포트가 갈려 토픽이 **에러 없이** 안 보인다
+#  packing_msgs
+#      -> 이 저장소 안에서 colcon 이 빌드한다 (`colcon build --packages-select packing_msgs`)
+#  isaacsim · pxr(USD) · omni
+#      -> Isaac Sim 5.1 내장. `~/isaac-sim-5.1.0/python.sh` 로 실행할 때만 보인다
+#  sqlite3
+#      -> 파이썬 표준 라이브러리. 별도 설치 없음 (CLI `sqlite3` 는 안 쓴다 — scripts/db_peek.py 참고)
