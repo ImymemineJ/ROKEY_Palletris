@@ -32,7 +32,24 @@ Isaac Sim 5.1 + ROS 2 Jazzy · 두산 H2017 3대 · 다중 PC ROS 2 통신.
 | 시뮬레이션 Python 코드 | [`src/`](src/) · [`scripts/`](scripts/) |
 | ROS 2 패키지 | [`src/`](src/) — 패키지 9개 |
 | 로봇 모델 (urdf) | [`src/packing_robot/urdf/`](src/packing_robot/urdf/) — `h2017.urdf` + 메시 21개 |
-| 시뮬레이션 에셋 · 메인 실행 파일 (usd) | **저장소 밖** — [§6-③](#-isaac-씬-배치) 참고 (바이너리라 git 에 넣지 않는다) |
+| 시뮬레이션 에셋 · 메인 실행 파일 (usd) | **저장소 밖** — [§6-③](#step3) 참고 (바이너리라 git 에 넣지 않는다) |
+
+> [!IMPORTANT]
+> **받은 그대로는 돌지 않는다. 설치 ②단계에서 생성물 2종을 반드시 만들어야 한다.**
+>
+> ```bash
+> python3 scripts/gen_master_db.py --reset     # palletris.db  (정답지 150건)
+> python3 scripts/gen_qr_labels.py             # qr_labels/    (QR 라벨 150장)
+> ```
+>
+> `palletris.db` 와 `qr_labels/` 는 **소스가 아니라 생성물**이라 저장소에도
+> 제출물에도 넣지 않았다. 시드가 42 로 고정돼 있고 입력 CSV 2개가
+> `src/packing_db/packing_db/data/` 에 들어 있어, **누가 언제 돌려도 같은 것이
+> 나온다.** 자세한 것은 [§6-②](#step2).
+>
+> ⚠ **안 만들어도 에러가 안 난다.** 프로그램은 멀쩡히 돌고 박스도 흘러가는데
+> 인식이 하나도 등록을 못 해 **전 박스가 RETURN 으로 빠진다.** "인식 미구현"
+> 처럼 보이지만 원인은 이 두 줄이다.
 
 > 설계 근거와 규약은 [`CLAUDE.md`](CLAUDE.md), 실측 기록은 [`docs/`](docs/) 에 있다.
 > **숫자의 정본은 `src/packing_bringup/config/system.yaml`** 이고, 시연 조건은
@@ -370,10 +387,13 @@ mkdir -p ~/palletris_logs        # 실행 로그는 저장소 밖에 쌓인다
 rm -rf build install log && colcon build --symlink-install
 ```
 
-### ② 생성물 2종 만들기 (★ 빠뜨리면 조용히 안 돈다)
+<a id="step2"></a>
 
-`palletris.db` 와 `qr_labels/` 는 **생성물이라 git 에 없다.** 둘 다 저장소 안의
-정답지 CSV 에서 만들어진다:
+### ② 생성물 2종 만들기 — 안 만들면 **에러 없이** 전 박스가 폐기된다
+
+> [!WARNING]
+> **이 단계를 건너뛰면 시스템이 "돌아가는 것처럼 보이면서" 아무것도 적재하지
+> 않는다.** 크래시도, 빨간 로그도 없다. 원인을 찾기 가장 어려운 실패다.
 
 ```bash
 cd ~/palletris_ws
@@ -381,10 +401,34 @@ python3 scripts/gen_master_db.py --reset     # palletris.db (박스 150개 · �
 python3 scripts/gen_qr_labels.py             # qr_labels/BOX001.png ... 150장
 ```
 
-- 없으면 **에러 없이** 이렇게 된다: 박스에 QR 이 안 붙어 인식이 전멸하고,
-  DB 조회가 실패해 관제탑이 전 박스를 폐기한다.
-- `palletris.db` 는 **DB 노드를 띄우는 PC**, `qr_labels/` 는 **Isaac 을 띄우는 PC**
-  에 있어야 한다.
+**왜 저장소에 없나** — 소스가 아니라 **생성물**이기 때문이다. 정답지 CSV 2개
+(`src/packing_db/packing_db/data/boxes_master.csv` 163줄 · `zone_map.csv` 21줄)와
+고정 시드(`boxes.random_seed: 42`)에서 결정론적으로 만들어지므로, **누가 언제
+돌려도 같은 것이 나온다.** 결과물 대신 **만드는 스크립트**를 커밋하는 것이 이
+저장소의 규약이다 (USD 도 같은 이유로 뺐다 — [§10](#10-저장소-구조)).
+
+**안 만들면 정확히 이렇게 된다**
+
+| | 자동으로 되나 | 없을 때 |
+|---|---|---|
+| `palletris.db` | **빈 파일만** 자동 생성 — `db_service_node` 가 `schema.sql` 을 건다 | 정답지가 비어 `GetBoxInfo`·`VerifyBox` 가 전부 실패 → 관제탑이 **전 박스 폐기** |
+| `qr_labels/` | **안 된다** | 박스 윗면에 QR 이 안 붙어 `cam1` 이 등록을 못 한다 → **전 박스 RETURN**. `spawner` 가 경고 한 줄만 찍고 라벨 없이 계속한다 |
+
+라벨 한 변은 **217 mm** 다 (QR 175 + 여백 21×2). 제일 좁은 3호 윗면(250)에 좌우
+16 mm 씩 빨간 테두리가 남는데, **그 테두리가 있어야 `find_box` 가 박스 바깥 윤곽을
+잡는다** — 라벨은 인식 대상일 뿐 아니라 검출의 기준이기도 하다.
+
+**어느 PC 에 두나** — `palletris.db` 는 **DB 노드를 띄우는 PC**, `qr_labels/` 는
+**Isaac 을 띄우는 PC** 에 있어야 한다. 한 대에서 돌리면 둘 다 워크스페이스 루트에
+생기므로 신경 쓸 것 없다.
+
+**만들어졌는지 확인**
+
+```bash
+ls -l palletris.db && ls qr_labels | wc -l      # 150 이 나와야 한다
+```
+
+<a id="step3"></a>
 
 ### ③ Isaac 씬 배치
 
@@ -406,6 +450,8 @@ export PL_STAGE=/원하는/경로/test_3.usd
 > ⚠ **에셋 폴더를 통째로 가져와야 한다.** `test_3.usd` 만 복사하면 참조가 안 풀려
 > 모든 프림이 `Selected Prim is not a Rigid Body` 로 죽고 로봇 아티큘레이션이
 > 사라진다. 팀 내부 배포는 `scripts/sync_scene.sh` (rsync) 를 쓴다.
+
+<a id="step4"></a>
 
 ### ④ 네트워크 (다중 PC 로 돌릴 때만)
 
@@ -463,7 +509,7 @@ cd ~/palletris_ws && source install/setup.bash \
 
 ### 두 대로 나눠서 (시연 구성)
 
-`ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET` + [§6-④](#-네트워크-다중-pc-로-돌릴-때만) 를
+`ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET` + [§6-④](#step4) 를
 양쪽에 적용한 뒤:
 
 - **PC1 (Isaac)** — 위 터미널 1 과 같되 `LOCALHOST` 를 `SUBNET` 으로
@@ -569,7 +615,7 @@ ros2 topic echo /zone_a/status --once     # 관제탑 상태·적재 개수
 | 이미지가 하나도 안 온다 | 구독 QoS 가 RELIABLE (센서는 BEST_EFFORT 여야 한다) |
 | 카메라 이미지가 캄캄하다 | 돔 라이트 없음 (오프스크린 렌더는 GUI 조명을 못 받는다) — `PL_LIGHT=1` |
 | 모든 박스가 3호로 축소 등록된다 | 같은 원인 — 배경 씬의 그늘. `PL_LIGHT=1` 로 `SIZE_MISMATCH` 137 → 20건 |
-| 박스에 QR 이 없다 · 전 박스 폐기 | `qr_labels/` 또는 `palletris.db` 미생성 (§6-②) |
+| **박스가 흘러가는데 하나도 안 쌓인다 · 전 박스 RETURN** | **`qr_labels/` 또는 `palletris.db` 미생성** — [§6-②](#step2). 에러가 안 나므로 이걸 **가장 먼저** 의심할 것 |
 | 로드 중 `Killed` | GPU 메모리 부족 — `PL_BG=0` |
 | `Selected Prim is not a Rigid Body` 다발 | 씬 에셋 폴더 누락 (§6-③) |
 | `database is locked` | `db_service_node` 외의 프로세스가 `.db` 를 열었다 |
@@ -599,7 +645,7 @@ ros2 topic echo /zone_a/status --once     # 관제탑 상태·적재 개수
 | | 어떻게 얻나 |
 |---|---|
 | `*.usd` — 씬 `test_3.usd` · 로봇 · 그리퍼 | 별도 배포 (§6-③). 로봇·그리퍼는 `scripts/import_h2017_usd.py` · `build_gripper_usd.py` 로 생성 |
-| `palletris.db` · `qr_labels/` | `scripts/gen_master_db.py` · `gen_qr_labels.py` (§6-②) |
+| `palletris.db` · `qr_labels/` | **★ `scripts/gen_master_db.py --reset` · `gen_qr_labels.py`** — [§6-②](#step2). 안 만들면 에러 없이 전 박스가 폐기된다 |
 | `build/` · `install/` · `log/` | `colcon build` 산출물 |
 
 ### 하지 말 것
