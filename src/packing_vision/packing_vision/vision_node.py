@@ -458,7 +458,13 @@ class LineDetector(Node):
             #   실패로 세면 **같은 박스가 실패로도 세지고 등록으로도 세어**
             #   인식률의 분모가 부푼다 (분모 = 등록 성공 + 여기로 온 실패).
             #   보고는 **살리기를 시도한 뒤** 호출부가 한다.
-            self.get_logger().warn(f"{cam.ns}: 사양 3종과 안 맞는다")
+            # ★ 실측 치수를 같이 남긴다 (2026-08-27). 숫자가 없으면 "인식이 안
+            #   된다" 로만 보여서, 병합인지 축소인지 완전 오측인지 못 가른다 —
+            #   존 인식은 이미 이렇게 하고 있다(`geometry.LAST_REJECT`).
+            _lr = getattr(_geo, "LAST_REJECT", None)
+            self.get_logger().warn(
+                f"{cam.ns}: 사양 3종과 안 맞는다"
+                + (f" [{_lr}]" if _lr else ""))
             # 카메라 자세는 그래도 돌려준다 — RGB 가 포기한 자리야말로 깊이가
             # 답을 갖고 있을 수 있다. 호출부가 깊이 단독으로 한 번 더 본다.
             return det, None, (R, t)
@@ -571,7 +577,14 @@ class LineDetector(Node):
         req = RegisterBox.Request(
             box_id=box_id, size_w_mm=int(bt["w_mm"]), size_d_mm=int(bt["d_mm"]),
             size_h_mm=int(bt["h_mm"]), color=color, dest="", qr_payload=qr)
-        self._call(self.cli_reg, req, lambda r, b=box_id, t=bt: self._reg_done(r, b, t))
+        # ★ 실측치를 등록 로그까지 들고 간다 (2026-08-27). DB 에 들어가는 건 사양
+        #   치수로 **스냅된** 값이라, 종류를 잘못 고르면 로그만 봐서는 알 수 없다.
+        #   10.10.0.2 에서 4호가 3호로 등록돼 로봇이 70 mm 낮게 내려간 사고가
+        #   있었는데, 그때 "몇 mm 로 쟀길래" 를 아무도 몰라 원인을 못 좁혔다.
+        _m = out.get("measured_m") if isinstance(out, dict) else None
+        _ms = ("%.0fx%.0f" % (_m[0] * 1000, _m[1] * 1000)) if _m else None
+        self._call(self.cli_reg, req,
+                   lambda r, b=box_id, t=bt, s=_ms: self._reg_done(r, b, t, s))
 
     def _report_miss(self, where_at, reason):
         """박스를 봤는데 식별 못 했다 — DB 에 알린다 (인식률의 분모).
@@ -598,15 +611,21 @@ class LineDetector(Node):
             return
         self.cli_miss.call_async(ReportMiss.Request(where_at=where_at, reason=reason))
 
-    def _reg_done(self, res, box_id, bt):
-        """`RegisterBox` 응답. 실패해도 **라인을 세우지 않는다** — 로그만 남긴다."""
+    def _reg_done(self, res, box_id, bt, measured=None):
+        """`RegisterBox` 응답. 실패해도 **라인을 세우지 않는다** — 로그만 남긴다.
+
+        `measured` 는 cam1 이 실제로 잰 치수다 (2026-08-27). 로그에 같이 실어
+        사양 기각이 났을 때 "무엇을 얼마로 쟀길래" 를 바로 볼 수 있게 한다.
+        """
         if res is None or not res.ok:
             self.get_logger().error(
                 f"register_box 실패 {box_id}: {getattr(res, 'message', 'no response')}")
             return
         self._n_reg += 1
         self.get_logger().info(
-            f"cam1 등록 {box_id} ({bt['name']}) → {res.message} · 누계 {self._n_reg}")
+            f"cam1 등록 {box_id} ({bt['name']}"
+            + (f" · 실측 {measured} mm" if measured else "")
+            + f") → {res.message} · 누계 {self._n_reg}")
 
     def _on_cam2(self, bgr, header):
         """cam2 — 재판독해 `/db/verify_box` 로 교차 검증한다.

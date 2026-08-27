@@ -544,6 +544,43 @@ def _mute_scene_camera_graphs(st, log=print):
     return len(muted)
 
 
+def _restore_lens_overrides(st, cam_paths, log=print):
+    """씬 루트 레이어에 남은 **렌즈 프림 xform 오버라이드**를 걷어낸다.
+
+    ★ 왜 (2026-08-27 정정인 실측): 배경판 씬(Collected_test_3_share)에서
+      rsd455_1·_2 의 Color 렌즈가 하늘(z 8.4 / 5.3 m)에 떠 있었다 — 리그도,
+      같은 리그의 다른 렌즈 3개도 멀쩡한데 **Color 렌즈만**. GUI 에서 그 렌즈를
+      뷰포트 카메라로 잡고 둘러본 자세가 씬에 `over` 로 저장된 사고다
+      (orient 가 임의 방향인 것이 증거). cam1 이 창고 전경을 8 m 위에서 찍어
+      QR 을 하나도 못 읽었다 (그 판 등록 0건).
+
+    ★ 고치는 방법: 에셋(RSD455)의 원래 렌즈 배치는 리그의 **참조**가 갖고 있다.
+      루트 레이어의 xformOp 오버라이드만 지우면 합성이 에셋 기본값으로 떨어져
+      원위치가 된다. 좌표 하드코딩보다 이게 맞다 — 에셋이 바뀌어도 따라간다.
+
+    ★ 파일은 안 고친다 — 메모리 레이어에서만 지우고 Save() 는 안 부른다
+      (씬은 김학민 소유 · CLAUDE.md §11). tf 는 라이브 pose 라 따로 손댈 것 없다.
+      오버라이드가 없는 씬(test_3 정본)에서는 아무 일도 안 한다.
+    """
+    lay = st.GetRootLayer()
+    fixed = []
+    for cp in cam_paths:
+        spec = lay.GetPrimAtPath(cp)
+        if spec is None:
+            continue
+        doomed = [k for k in list(spec.properties.keys())
+                  if str(k).startswith("xformOp")]
+        for k in doomed:
+            spec.RemoveProperty(spec.properties[k])
+        if doomed:
+            parts = str(cp).strip("/").split("/")
+            fixed.append(parts[1] if len(parts) > 1 else str(cp))
+    if fixed:
+        log("[ros_graph] 렌즈 xform 오버라이드 제거 — %s (GUI 둘러보기 자세가 "
+            "씬에 저장된 사고 · 에셋 기본 위치로 복원)" % ", ".join(fixed))
+    return len(fixed)
+
+
 def build_cameras(cfg, zones, log=print):
     """`/pick_cam_{a|b|c}/rgb` + `/camera_info` 를 런타임에 발행한다.
 
