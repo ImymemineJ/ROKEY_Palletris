@@ -85,6 +85,80 @@ EE_FRAME = "tool0"
 SETTLE_STEPS = 90                  # READY 수렴 (60 Hz 에서 1.5 s). 게이트 판과 같다
 
 
+def _add_camera_lights(cfg, log=print):
+    """`PL_LIGHT` — 카메라용 조명을 런타임에 추가한다. **기본 꺼짐.**
+
+    ★ 왜 (2026-08-27 실측, 10.10.0.2): 배경(`full_warehouse`)이 들어온 뒤
+      **cam1 이 모든 박스를 가장 작은 3호로 축소 등록**했다. 4호(높이 280)를
+      3호(210)로 알면 로봇이 70 mm 낮은 곳을 목표로 내려가 박스에 부딪히고
+      (잔차 83 mm) `IK_FAIL` 로 3회 실패 뒤 폐기된다 — 겉보기 증상은 "흡착이
+      안 된다" 지만 실제로는 **닿지를 못한 것**이다.
+      같은 코드가 배경을 끈 판(`PL_BG=0`)에서는 3·4·5호를 전부 정확히 등록했다.
+
+      원인은 조명이다. 씬 조명이 `DistantLight` 하나뿐인데(돔 라이트 없음)
+      창고 지붕·벽이 그 빛을 가려 박스가 그늘에 들어가고, 채도 기반 색 마스크가
+      박스 일부만 잡아 실루엣이 작아진다.
+
+    ★ 돔 라이트만으로는 부족할 수 있다 — 돔은 무한 원방 조명이라 **지붕이 있으면
+      그것도 막힌다.** 그래서 카메라 **바로 위**(건물 안)에 국소 구광원을 같이 둔다.
+      카메라는 아래를 보므로 그 위의 광원은 화면에 안 들어온다.
+
+    사용: `PL_LIGHT=1` (기본 세기) · `PL_LIGHT=3000` (돔 세기 지정)
+    """
+    _v = os.environ.get("PL_LIGHT", "")
+    if _v in ("", "0"):
+        return 0
+    try:
+        import omni.usd as _ou
+        from pxr import Gf, UsdGeom, UsdLux
+        st = _ou.get_context().get_stage()
+        dome_i = 1000.0 if _v == "1" else float(_v)
+
+        made = []
+        # ① 돔 라이트 — 지붕이 없거나 열린 쪽을 채운다
+        if not any(p.GetTypeName() == "DomeLight" for p in st.Traverse()):
+            d = UsdLux.DomeLight.Define(st, "/World/PalletrisDome")
+            d.CreateIntensityAttr(dome_i)
+            made.append("Dome(%.0f)" % dome_i)
+
+        # ② 카메라 위 국소 조명 — 지붕 아래라도 확실히 밝힌다.
+        #   카메라 리그 경로는 설정이 정본이다 (`cameras.*`). 리그 프림의
+        #   translate 를 읽어 그 **1 m 위**에 광원을 둔다.
+        cams = (cfg.get("cameras") or {})
+        paths = list((cams.get("pick_prim") or {}).values())
+        for k in ("spawn_prim", "line2_prim"):
+            if cams.get(k):
+                paths.append(str(cams[k]))
+        lamp_i = float(os.environ.get("PL_LIGHT_LAMP", "300000"))
+        for i, lens in enumerate(paths):
+            rig = "/" + "/".join(str(lens).strip("/").split("/")[:2])
+            prim = st.GetPrimAtPath(rig)
+            if not (prim and prim.IsValid()):
+                continue
+            t = None
+            for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+                if op.GetOpName() == "xformOp:translate":
+                    t = op.Get()
+                    break
+            if t is None:
+                continue
+            p = "/World/PalletrisLamp_%d" % i
+            if st.GetPrimAtPath(p).IsValid():
+                continue
+            s = UsdLux.SphereLight.Define(st, p)
+            s.CreateRadiusAttr(0.15)
+            s.CreateIntensityAttr(lamp_i)
+            UsdGeom.Xformable(s.GetPrim()).AddTranslateOp().Set(
+                Gf.Vec3d(t[0], t[1], t[2] + 1.0))     # 카메라 1 m 위 = 시야 밖
+            made.append(rig.rsplit("/", 1)[-1])
+        log("[sim_main] PL_LIGHT — 조명 추가: %s"
+            % (", ".join(made) if made else "없음(이미 있음)"))
+        return len(made)
+    except Exception as e:                                  # noqa: BLE001
+        log("[sim_main] !! PL_LIGHT 조명 추가 실패 — %r (그대로 진행)" % (e,))
+        return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default=DEFAULT_STAGE)
@@ -187,6 +261,7 @@ def main():
                     _off.append(_n)
             print("[sim_main] PL_BG=0 — 배경 %d 개 껐다 (%s)"
                   % (len(_off), ", ".join(_off) if _off else "없음"))
+        _add_camera_lights(cfg)
         world = World(stage_units_in_meters=1.0,
                       physics_dt=1.0 / hz, rendering_dt=1.0 / hz)
         # ★ World() 를 sim_params 없이 부르면 PhysicsContext 가 기존 /physicsScene 에
