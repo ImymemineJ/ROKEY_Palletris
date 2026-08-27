@@ -659,36 +659,65 @@ def build_cameras(cfg, zones, log=print):
                 " 인식이 실패할 것이다 (build_clock_tf 를 먼저 불렀나?)" % opt_path)
             frame = _rig
 
+        # ── 깊이 (2026-08-27) ────────────────────────────────────────────
+        # ★★ 왜 붙이는가: RGB 만으로는 **종류를 못 가른다.** `geometry` 는 사양 3 종
+        #   평면에 각각 투영해 가장 잘 맞는 것을 고르는 **추측**인데, 실측 정확도가
+        #   46 % 였다 (2026-08-27, 두 판 모두). 한 등급 작게 보면 로봇이 명령받은
+        #   z 로 내려가다 **진짜 박스 윗면에 얹혀** 멈추고 IK_FAIL 이 난다 —
+        #   실측 도달 z 가 실제 윗면 +5~9 mm 였다. 4호·5호가 한 개도 안 집혔다.
+        #   깊이는 윗면 z 를 **직접 재므로** 이 추측을 없앤다 (CLAUDE.md §5).
+        #
+        # ★ **rgb 와 같은 render product** 를 쓴다. 그래야 stamp 가 정확히 같아
+        #   짝 맞추기가 100 % 가 된다 — 한 프레임만 어긋나도 깊이 교차검증이
+        #   `HEIGHT_MISMATCH` 만 낸다 (CLAUDE.md §10 의 증상표).
+        #
+        # ★ `type:"depth"` 는 `distance_to_image_plane`(광축거리)를 낸다.
+        #   그래서 `recognition.depth.is_range` 는 **false**(기본) 가 맞다.
+        #   시선거리로 바꾸는 헬퍼를 쓰게 되면 그때 true 로 올릴 것.
+        #
+        #   끄기: PL_CAMDEPTH=0 (렌더 비용이 부담될 때). 끄면 예전과 완전히 같다.
+        _depth_on = os.environ.get("PL_CAMDEPTH", "1") != "0"
+        _nodes = [("Tick", "omni.graph.action.OnPlaybackTick"),
+                  ("Ctx", NS + "ROS2Context"),
+                  ("Rgb", NS + "ROS2CameraHelper"),
+                  ("Info", NS + "ROS2CameraInfoHelper")]
+        _conn = [("Tick.outputs:tick", "Rgb.inputs:execIn"),
+                 ("Tick.outputs:tick", "Info.inputs:execIn"),
+                 ("Ctx.outputs:context", "Rgb.inputs:context"),
+                 ("Ctx.outputs:context", "Info.inputs:context")]
+        _vals = [("Ctx.inputs:useDomainIDEnvVar", True),
+                 ("Rgb.inputs:renderProductPath", rp_path),
+                 ("Rgb.inputs:frameId", frame),
+                 ("Rgb.inputs:nodeNamespace", ns),
+                 ("Rgb.inputs:topicName", "rgb"),
+                 ("Rgb.inputs:type", "rgb"),
+                 ("Info.inputs:renderProductPath", rp_path),
+                 ("Info.inputs:frameId", frame),
+                 ("Info.inputs:nodeNamespace", ns),
+                 ("Info.inputs:topicName", "camera_info")]
+        if _depth_on:
+            _nodes.append(("Depth", NS + "ROS2CameraHelper"))
+            _conn += [("Tick.outputs:tick", "Depth.inputs:execIn"),
+                      ("Ctx.outputs:context", "Depth.inputs:context")]
+            _vals += [("Depth.inputs:renderProductPath", rp_path),
+                      ("Depth.inputs:frameId", frame),
+                      ("Depth.inputs:nodeNamespace", ns),
+                      ("Depth.inputs:topicName", "depth"),
+                      ("Depth.inputs:type", "depth")]
+
         g = "%s/%s" % (GRAPH, gname)
         try:
             c.edit(
                 {"graph_path": g, "evaluator_name": "execution"},
-                {K.CREATE_NODES: [
-                    ("Tick", "omni.graph.action.OnPlaybackTick"),
-                    ("Ctx", NS + "ROS2Context"),
-                    ("Rgb", NS + "ROS2CameraHelper"),
-                    ("Info", NS + "ROS2CameraInfoHelper")],
-                 K.CONNECT: [("Tick.outputs:tick", "Rgb.inputs:execIn"),
-                             ("Tick.outputs:tick", "Info.inputs:execIn"),
-                             ("Ctx.outputs:context", "Rgb.inputs:context"),
-                             ("Ctx.outputs:context", "Info.inputs:context")],
-                 K.SET_VALUES: [
-                     ("Ctx.inputs:useDomainIDEnvVar", True),
-                     ("Rgb.inputs:renderProductPath", rp_path),
-                     ("Rgb.inputs:frameId", frame),
-                     ("Rgb.inputs:nodeNamespace", ns),
-                     ("Rgb.inputs:topicName", "rgb"),
-                     ("Rgb.inputs:type", "rgb"),
-                     ("Info.inputs:renderProductPath", rp_path),
-                     ("Info.inputs:frameId", frame),
-                     ("Info.inputs:nodeNamespace", ns),
-                     ("Info.inputs:topicName", "camera_info")]})
+                {K.CREATE_NODES: _nodes,
+                 K.CONNECT: _conn,
+                 K.SET_VALUES: _vals})
         except Exception as e:                                  # noqa: BLE001
             log("[ros_graph] !! %s 카메라 그래프 실패: %r" % (ns, e))
             continue
         made += 1
-        log("[ros_graph] 카메라 %s -> %s/rgb + /camera_info  (frameId %s · %dx%d)"
-            % (cam_path, ns, frame, res[0], res[1]))
+        log("[ros_graph] 카메라 %s -> %s/rgb%s + /camera_info  (frameId %s · %dx%d)"
+            % (cam_path, ns, " + /depth" if _depth_on else "", frame, res[0], res[1]))
 
     return made
 
