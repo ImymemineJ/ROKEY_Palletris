@@ -946,12 +946,30 @@ class Spawner:
                 #   **정의상 0** 이고, 씬이 또 옮겨져도 따라간다. 레인 중심은
                 #   이미 씬 프림(PalletGuide bbox)에서 재고 있다.
                 #   가이드가 없으면(폴백) config 값 그대로 쓴다.
-                cy_scene = train["lane_y"] - R
+                # ★★★ 반지름도 **씬에서 잰다** (2026-08-27 저녁, 정정인 실측).
+                #   위 보정만으로는 안 맞았다. 실측: 배경 씬과 옛 씬이 트럭 위치
+                #   (x 7.04 vs -1.60)까지 다른데 레인 어긋남은 **mm 단위로 같다**
+                #   (B +268 · C +300 · A +302). 씬이 옮겨진 게 아니라 **config 의
+                #   radius_mm 이 원래 씬 기하와 다르다**는 뜻이다.
+                #   회전은 거리를 보존하므로 출구 y = cy + (진입 시 중심까지 거리)다.
+                #   그 거리는 설정 R 이 아니라 **팔레트 home 에서 호 중심까지**이고,
+                #   역산하면 1.91 이 아니라 약 1.61 이었다 — 차이가 곧 300 mm 다.
+                #   그래서 R 대신 실측 d 를 쓴다. d == R 인 씬에서는 아무 변화 없다.
+                #   ⚠ home 이 없으면(팔레트 프림 못 찾음) 예전대로 R 을 쓴다.
+                _d = (abs(train["home"][0] - cx)
+                      if train["home"] is not None else R)
+                cy_scene = train["lane_y"] - _d
+                if abs(_d - R) > 0.02:
+                    self._log("[spawner] 반출 %s — 호 반지름을 씬에서 잰다 "
+                              "%.3f -> %.3f (설정과 %+.0f mm 차 · 레인 어긋남의 정체)"
+                              % (zone, R, _d, (_d - R) * 1000))
                 if abs(cy_scene - cy) > 0.05:
                     self._log("[spawner] 반출 %s — 호 중심 y 를 레인에 맞춘다 "
                               "%.2f -> %.2f (씬-설정 어긋남 %+.0f mm)"
                               % (zone, cy, cy_scene, (cy_scene - cy) * 1000))
                 cy = cy_scene
+                # 회전은 이 반지름으로 돈다 — cy 와 짝이 안 맞으면 다시 어긋난다.
+                R = _d
             train["arc"] = (cx, cy, R)
             train["turn_y"] = cy                  # 호 진입점의 y
             if train["home"] is not None:
