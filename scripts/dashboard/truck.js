@@ -63,7 +63,10 @@ async function refresh() {
     //   DB 는 박스가 실제로 놓일 때만 바뀐다. 2 초마다 읽어도 값이 같으면 화면은
     //   가만히 있는데, 그게 "멈춘 것" 인지 "변화가 없는 것" 인지 구분이 안 됐다.
     const sig = JSON.stringify(S.truck.pallets) + S.truck.metrics.placed_count;
-    if (sig !== S.sig) { S.sig = sig; S.lastChange = S.lastFetch; }
+    // ★ 첫 읽기는 "바뀐 것" 이 아니다. 그걸 변화로 세면 관제탑이 꺼져 있는데도
+    //   화면이 "진행 중" 이라고 말한다 — 실제로 그랬다.
+    if (S.sig === '') S.sig = sig;                       // 기준만 잡고 넘어간다
+    else if (sig !== S.sig) { S.sig = sig; S.lastChange = S.lastFetch; }
     $('note').textContent = '';
   } catch (e) {
     $('note').textContent = `백엔드를 못 읽었다 — ${e.message}`;
@@ -375,9 +378,15 @@ function renderKPI() {
   const min = r ? r.elapsed_s / 60 : 0;
   const ship = S.truck.shipped_total
     ? ` · 트럭에 실린 판 ${S.truck.shipped_total}장` : '';
+  // ★ "진행" 이라고만 쓰면 **지금 돌고 있다**는 뜻으로 읽힌다. 실제로는 DB 에 담긴
+  //   기록의 길이일 뿐이고, 관제탑이 꺼져 있으면 그 숫자는 멈춰 있다.
+  //   값이 최근에 실제로 바뀐 적이 있어야 "진행 중" 이라고 말한다.
+  const moving = S.lastChange && (Date.now() - S.lastChange < 30000);
+  const dur = min < 1 ? Math.round(r ? r.elapsed_s : 0) + '초' : min.toFixed(1) + '분';
   $('run').textContent = !r || r.elapsed_s <= 0
     ? '실행 기록 없음'
-    : `${min < 1 ? Math.round(r.elapsed_s) + '초' : min.toFixed(1) + '분'} 진행${ship}`;
+    : (moving ? `진행 중 · ${dur}째${ship}`
+              : `멈춤 · ${dur} 분량의 기록${ship}`);
 }
 
 /** ★ 화면이 살아 있는지 / 값이 안 바뀌는 것뿐인지 구분해 준다. */
