@@ -369,11 +369,15 @@ function renderKPI() {
      <div class="kpi-v ${v === '—' ? 'na' : c}">${v}</div></div>`).join('');
 
   renderFresh();
+  // ★ 정상일 때는 짧게. "실행 구간 10~1075초" 같은 진단값은 발표 보는 사람에게
+  //   아무 의미가 없다 — 이상할 때만 말하게 한다 (아래 renderFresh 도 같은 원칙).
   const r = S.truck.run;
-  $('run').textContent = (r && r.elapsed_s > 0)
-    ? `실행 구간 ${r.t0.toFixed(0)}~${r.t1.toFixed(0)}초 (${(r.elapsed_s/60).toFixed(1)}분)`
-      + ` · 트럭에 실린 판 ${S.truck.shipped_total}장`
-    : '실행 기록 없음';
+  const min = r ? r.elapsed_s / 60 : 0;
+  const ship = S.truck.shipped_total
+    ? ` · 트럭에 실린 판 ${S.truck.shipped_total}장` : '';
+  $('run').textContent = !r || r.elapsed_s <= 0
+    ? '실행 기록 없음'
+    : `${min < 1 ? Math.round(r.elapsed_s) + '초' : min.toFixed(1) + '분'} 진행${ship}`;
 }
 
 /** ★ 화면이 살아 있는지 / 값이 안 바뀌는 것뿐인지 구분해 준다. */
@@ -381,11 +385,16 @@ function renderFresh() {
   const el = $('fresh');
   if (!el) return;
   if (!S.lastFetch) { el.textContent = ''; return; }
+  // ★ 정상이면 아무 말도 안 한다. 화면은 조용한 게 기본이고,
+  //   **틀렸을 때만** 말해야 한다. 정상일 때까지 떠들면 진짜 경고가 묻힌다.
   const stale = Date.now() - S.lastFetch > 6000;   // 폴링 2초인데 6초 넘게 못 읽었다
-  el.className = 'fresh' + (stale ? ' stale' : '');
-  el.textContent = stale
-    ? `⚠ 백엔드를 ${ago(S.lastFetch)} 부터 못 읽고 있다`
-    : `읽음 ${ago(S.lastFetch)} · 값 바뀜 ${ago(S.lastChange)}`;
+  const run = S.truck && S.truck.run;
+  const odd = run && run.elapsed_s > 86400;        // 하루 넘는 실행 = 시계 섞임
+  el.className = 'fresh' + (stale || odd ? ' stale' : '');
+  el.textContent = stale ? `⚠ 백엔드를 ${ago(S.lastFetch)} 부터 못 읽고 있다`
+                 : odd   ? `⚠ 실행 구간이 ${(run.elapsed_s/86400).toFixed(0)}일이다 — `
+                           + `DB 에 여러 실행이 섞여 있다. gen_master_db --reset 후 다시 볼 것`
+                 : '';
 }
 
 function render() { renderCards(); renderStack(); renderUnload(); renderEvents(); renderKPI(); }
