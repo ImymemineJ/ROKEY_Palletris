@@ -27,6 +27,7 @@ const S = {
   pallet: {},           // zone -> /api/pallet 응답
   status: {},           // zone -> ZoneStatus (rosbridge)
   ros: false,
+  fake: false,          // ★ 시험용 대역에 붙었나 (fake_rosbridge.py)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -76,6 +77,9 @@ function connectROS() {
   };
   ws.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
+    // ★ 시험용 대역은 접속 즉시 자기를 밝힌다. rosbridge 프로토콜에 없는 op 라
+    //   진짜 rosbridge 는 절대 이걸 보내지 않는다 -> 가짜를 확실히 가른다.
+    if (m.op === 'fake_rosbridge') { S.fake = true; setConn(true); return; }
     if (m.op !== 'publish' || !m.msg) return;
     const z = (m.msg.zone || '').toLowerCase();
     if (ZONES.includes(z)) { S.status[z] = m.msg; renderCards(); }
@@ -87,9 +91,20 @@ function connectROS() {
 
 function setConn(live) {
   S.ros = live;
+  if (!live) {
+    // ★ 끊기면 **마지막 값을 버린다.** 남겨 두면 "ROS 미연결" 이라고 적힌 화면에
+    //   조금 전 값이 그대로 남아 지금 값처럼 보인다. 시험용 대역에 붙었다 끊긴
+    //   경우엔 **가짜가 진짜 얼굴로 남는다** — 실제로 그랬다.
+    //   실시간 칸은 — 로 비우고, DB 에서 온 칸(적재 개수 등)만 남긴다.
+    S.fake = false;
+    S.status = {};
+    renderCards();
+  }
   const el = $('conn');
-  el.className = 'conn ' + (live ? 'live' : 'dead');
-  $('conn-label').textContent = live ? 'ROS 2 실시간 연결' : 'ROS 미연결 · DB 화면만';
+  // ★ 가짜를 진짜와 같은 초록으로 칠하면 안 된다. 실제로 그래서 헷갈렸다.
+  el.className = 'conn ' + (S.fake ? 'fake' : (live ? 'live' : 'dead'));
+  $('conn-label').textContent = S.fake ? '⚠ 시험용 대역 — 실시간 값은 가짜다'
+                              : (live ? 'ROS 2 실시간 연결' : 'ROS 미연결 · DB 화면만');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -110,11 +125,11 @@ function renderCards() {
       <div class="card ${z === S.zone ? 'on' : ''}" data-z="${z}">
         <div class="card-head">
           <span class="card-name">팔레트 ${z.toUpperCase()}</span>
-          <span class="state ${cls}">${esc(stateTxt)}</span>
+          <span class="state ${S.fake ? 'fake' : cls}">${esc(stateTxt)}${S.fake ? ' (가짜)' : ''}</span>
         </div>
         <div class="card-row">
           <span>적재 <b>${p.count ?? '—'}</b></span>
-          <span>충전율 <b>${fill === null ? '—' : fill.toFixed(0) + '%'}</b></span>
+          <span>충전율 <b>${fill === null ? '—' : fill.toFixed(0) + '%' + (S.fake ? '?' : '')}</b></span>
           <span>최고 <b>${fmtMm(height)}</b></span>
         </div>
         <div class="bar"><i style="width:${fill === null ? 0 : Math.min(100, fill)}%"></i></div>
@@ -229,13 +244,21 @@ function renderStack() {
         `<span><i style="background:${c[1]}"></i>${n}</span>`).join('')
     : `<span>연할수록 낮고 진할수록 높다 · 0 ~ ${P.max_stack_mm}mm</span>`;
 
-  // ★ 판을 갈랐는데도 겹침이 남으면 숨기지 않고 알린다
+  // ★ 이상한 것을 숨기지 않고 알린다
   const w = $('stack-warn');
+  const msgs = [];
+  if (P.out_of_pallet > 0) {
+    // 가장 흔한 원인이 설정 누락이라 그 얘기를 먼저 한다
+    msgs.push(`박스 ${P.out_of_pallet}개가 팔레트(${P.pallet_w_mm}×${P.pallet_d_mm}mm) 밖으로 나갔다.`
+      + (P.overlay ? '' : ' 서버를 PL_CONFIG_OVERLAY 없이 띄운 것 같다 —'
+        + ' 시연 씬(test_3)은 팔레트가 90° 돌아 있어 800×1200 이다.'));
+  }
   if (P.overlaps > 0) {
-    w.hidden = false;
-    w.textContent = `박스 ${P.overlaps}쌍이 서로 겹쳐 있다 — 한 팔레트에서는 불가능한 배치다.`
-                  + ` DB 에 판 번호가 없어 판을 못 가른 것일 수 있다.`;
-  } else w.hidden = true;
+    msgs.push(`박스 ${P.overlaps}쌍이 서로 겹쳐 있다 — 한 팔레트에서는 불가능한 배치다.`
+      + ` DB 에 판 번호가 없어 판을 못 가른 것일 수 있다.`);
+  }
+  w.hidden = msgs.length === 0;
+  w.textContent = msgs.join(' ');
 }
 
 // ══════════════════════════════════════════════════════════════

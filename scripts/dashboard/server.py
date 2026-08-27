@@ -84,6 +84,20 @@ def _hits(a, b, tol=20):
             and min(a["z"] + a["h"], b["z"] + b["h"]) - max(a["z"], b["z"]) > tol)
 
 
+def _out_of_pallet(boxes, pw, pd, tol=50):
+    """팔레트 밖으로 나간 박스 수. `tol` 은 계획 여유(plan_overhang)와 배치 오차 몫.
+
+    ★ 0 이 아니면 대개 설정이 틀린 것이지 로봇이 틀린 게 아니다 — `PL_CONFIG_OVERLAY`
+      를 빼먹으면 팔레트가 1200×800 으로 잡혀 800×1200 씬의 박스가 죄다 삐져나온다.
+    """
+    n = 0
+    for b in boxes:
+        x0, x1, y0, y1 = _footprint(b)
+        if x0 < -tol or y0 < -tol or x1 > pw + tol or y1 > pd + tol:
+            n += 1
+    return n
+
+
 def _split_pallets(boxes):
     """시각 순으로 훑으며 **판이 갈린 자리**를 찾아 나눈다.
 
@@ -165,6 +179,13 @@ class Store:
             # ★ 진단: 판을 갈랐는데도 남은 겹침. 0 이 아니면 화면이 경고를 띄운다
             "overlaps": sum(1 for i, a in enumerate(cur) for b in cur[i + 1:]
                             if _hits(a, b)),
+            # ★ 진단: 박스가 팔레트 밖으로 나가나.
+            #   가장 흔한 원인은 **PL_CONFIG_OVERLAY 를 빼먹은 것**이다.
+            #   test_3 씬은 지선이 +Y 라 팔레트가 90° 돌아 있어 800×1200 인데,
+            #   오버레이 없이 읽으면 system.yaml 의 1200×800 이 잡힌다.
+            #   그러면 조용히 틀린 그림이 나온다 — 그걸 화면이 말하게 한다.
+            "out_of_pallet": _out_of_pallet(cur, pal["width_mm"], pal["depth_mm"]),
+            "overlay": os.environ.get("PL_CONFIG_OVERLAY", ""),
         }
 
     def unload(self, zone):

@@ -146,6 +146,18 @@ def serve(client, addr, hz):
 
     threading.Thread(target=reader, daemon=True).start()
     print(f"  붙음: {addr[0]}:{addr[1]}")
+
+    # ★★ 자기가 가짜라는 것을 **접속 즉시** 알린다 (2026-08-27).
+    #   실제로 사고가 났다 — 이 대역을 띄워 두고 잊은 채 진짜 관제탑을 올렸더니,
+    #   화면은 계속 이쪽 값을 초록 "실시간 연결" 로 표시했다. 카드 한 칸 안에서
+    #   적재 개수는 DB(진짜)인데 충전율·상태만 가짜인, 제일 헷갈리는 모양이 됐다.
+    #   rosbridge 프로토콜에 없는 op 라 진짜 rosbridge 는 절대 보내지 않는다
+    #   -> 화면은 이 한 줄이 오는지만 보면 가짜인지 안다.
+    _send(client, json.dumps({
+        "op": "fake_rosbridge",
+        "warning": "시험용 대역이다. 값은 전부 지어낸 것이다.",
+        "hint": "진짜는 ros-jazzy-rosbridge-suite 다.",
+    }))
     tick = 0
     try:
         while not stop.is_set():

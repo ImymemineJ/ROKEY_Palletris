@@ -136,3 +136,9 @@ h2{font-size:16px;font-weight:600;margin:0}
 .tl-row.ok::before{background:var(--ok)}
 .tl-row.bad::before{background:var(--bad)}
 .tl-t{color:var(--ink3);font-variant-numeric:tabular-nums;font-size:12px;margin-left:8px}
+
+/* ★ 시험용 대역(fake_rosbridge)에 붙었을 때. 진짜와 같은 초록으로 칠하면
+   구분이 안 돼 스크린샷을 실측으로 오독한다 — 실제로 겪었다. */
+.conn.fake{color:var(--warn)}
+.conn.fake .dot{background:var(--warn)}
+.state.fake{color:var(--warn)}
