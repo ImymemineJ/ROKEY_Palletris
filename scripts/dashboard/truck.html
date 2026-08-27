@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Palletris · 관제탑</title>
+<link rel="stylesheet" href="truck.css" />
+</head>
+<body>
+
+<header class="top">
+  <div class="title">
+    <h1>Palletris · 1대 트럭 · 팔레트 A/B/C 운영</h1>
+    <div class="run" id="run">실행 구간 —</div>
+  </div>
+  <div class="conn" id="conn"><span class="dot"></span><span id="conn-label">연결 확인 중</span></div>
+</header>
+
+<!-- 팔레트 카드 3장 -->
+<section class="cards" id="cards"></section>
+
+<section class="split">
+  <!-- 좌: 적재 상태 (3D / 히트맵 전환) -->
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>팔레트 <span id="sel-zone">B</span> · 적재 상태</h2>
+        <p class="sub" id="stack-sub">한 트럭에 실린 A/B/C 중 선택한 팔레트</p>
+      </div>
+      <div class="tabs">
+        <button class="tab on" data-view="iso">3D 박스</button>
+        <button class="tab" data-view="heat">높이 지도</button>
+      </div>
+    </div>
+    <div class="stage" id="stage"></div>
+    <div class="legend" id="legend"></div>
+    <div class="warn" id="stack-warn" hidden></div>
+  </div>
+
+  <!-- 우: 꺼낼 순서 / 사건 기록 -->
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <h2 id="right-title">꺼낼 순서 · 배송지</h2>
+        <p class="sub" id="right-sub">위에 아무것도 없는 것부터 한 겹씩</p>
+      </div>
+      <div class="tabs">
+        <button class="tab2 on" data-right="unload">꺼낼 순서</button>
+        <button class="tab2" data-right="events">사건 기록</button>
+      </div>
+    </div>
+    <div class="unload" id="unload"></div>
+    <div class="unload" id="events" hidden></div>
+  </div>
+</section>
+
+<!-- 박스 이력 (사건 클릭 시) -->
+<div class="modal" id="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="mb-title">박스</h2>
+      <button class="x" id="mb-close">✕</button>
+    </div>
+    <div id="mb-body"></div>
+  </div>
+</div>
+
+<!-- 지표 -->
+<section class="kpis" id="kpis"></section>
+
+<div class="note" id="note"></div>
+
+<script src="truck.js"></script>
+</body>
+</html>
