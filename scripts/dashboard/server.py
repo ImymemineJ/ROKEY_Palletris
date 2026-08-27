@@ -36,6 +36,7 @@ pip 설치를 요구하는 순간 위험이 늘기 때문이다.
    고쳐졌다 (2026-08-27). 응답에 `run` 을 실어 화면이 "언제부터의 값인가" 를 띄운다.
 """
 import argparse
+import errno
 import json
 import os
 import pathlib
@@ -370,7 +371,22 @@ def main():
     if os.environ.get("PL_CONFIG_OVERLAY"):
         print(f"  오버레이: {os.environ['PL_CONFIG_OVERLAY']}")
     print("  Ctrl+C 로 종료")
-    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+    try:
+        srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    except OSError as e:
+        # ★ 파이썬 traceback 을 그대로 뱉으면 "왜 안 되는지" 를 알기 어렵다.
+        #   실제로 걸렸다 — 이미 띄워 둔 서버를 잊고 다시 실행했을 때다.
+        if e.errno != errno.EADDRINUSE:
+            raise
+        sys.exit(
+            f"\n!! 포트 {a.port} 를 이미 누가 쓰고 있다.\n"
+            f"   쓰는 프로세스 보기 :  ss -ltnp | grep {a.port}\n"
+            f"   내리기             :  pkill -f 'dashboard/server.py'\n"
+            f"   아니면 다른 포트로 :  --port {a.port + 1}\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n종료")            # Ctrl+C 에 traceback 을 뱉지 않는다
 
 
 if __name__ == "__main__":
