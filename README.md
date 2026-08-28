@@ -30,7 +30,7 @@ Isaac Sim 5.1 + ROS 2 Jazzy · 두산 H2017 3대 · 다중 PC ROS 2 통신.
 | 의존성 | [§5 의존성](#5-의존성) · [`requirements.txt`](requirements.txt) |
 | 사용 설명 (launch 순서 · 스크립트) | [§6 설치](#6-설치--네-단계) · [§7 실행](#7-실행) |
 | 시뮬레이션 Python 코드 | [`src/`](src/) · [`scripts/`](scripts/) |
-| ROS 2 패키지 | [`src/`](src/) — 패키지 9개 |
+| ROS 2 패키지 | [`src/`](src/) — colcon 패키지 **8개** + Isaac 측 `packing_sim/` (내장 파이썬 3.11 로 도는 코드라 ROS 패키지가 아니다) |
 | 로봇 모델 (urdf) | [`src/packing_robot/urdf/`](src/packing_robot/urdf/) — `h2017.urdf` + 메시 21개 |
 | 시뮬레이션 에셋 · 메인 실행 파일 (usd) | **저장소 밖** — [§6-③](#step3) 참고 (바이너리라 git 에 넣지 않는다) |
 
