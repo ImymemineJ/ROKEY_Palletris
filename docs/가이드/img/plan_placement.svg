@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1230" width="1000" height="1230" role="img" aria-label="PlanPlacement 적재 알고리즘 — 후보 생성부터 세 가지 결과까지">
+  <title>적재 알고리즘 — PlanPlacement 안에서 일어나는 일</title>
+  <style>
+    text { font-family: "Noto Sans KR", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+  </style>
+  <defs>
+    <marker id="pa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8f8f9a"/>
+    </marker>
+  </defs>
+
+  <!-- 배경 — 다크 모드에서도 글씨가 보이게 흰 바탕을 깐다 -->
+  <rect x="0" y="0" width="1000" height="1230" fill="#ffffff"/>
+
+  <!-- ── 세로 화살표 ── -->
+  <g stroke="#8f8f9a" stroke-width="2">
+    <line x1="500" y1="134" x2="500" y2="166" marker-end="url(#pa)"/>
+    <line x1="500" y1="254" x2="500" y2="286" marker-end="url(#pa)"/>
+    <line x1="500" y1="374" x2="500" y2="406" marker-end="url(#pa)"/>
+    <line x1="500" y1="494" x2="500" y2="526" marker-end="url(#pa)"/>
+    <line x1="500" y1="614" x2="500" y2="646" marker-end="url(#pa)"/>
+    <line x1="500" y1="734" x2="500" y2="766" marker-end="url(#pa)"/>
+    <line x1="500" y1="854" x2="500" y2="886" marker-end="url(#pa)"/>
+  </g>
+
+  <!-- ── 단계 ── -->
+  <g>
+    <rect x="300" y="50" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="86" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">요청</text>
+    <text x="500" y="112" text-anchor="middle" font-size="13.5" fill="#6a63b8">zone · box_id · w · d · h</text>
+
+    <rect x="300" y="170" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="206" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">후보 생성</text>
+    <text x="500" y="232" text-anchor="middle" font-size="13.5" fill="#6a63b8">10 mm 격자 120 × 80 · yaw 0 / 90</text>
+
+    <rect x="300" y="290" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="326" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">① 높이 필터</text>
+    <text x="500" y="352" text-anchor="middle" font-size="13.5" fill="#6a63b8">윗면 ≤ max_stack (1300 mm)</text>
+
+    <rect x="300" y="410" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="442" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">② 지지율 필터</text>
+    <text x="500" y="465" text-anchor="middle" font-size="13.5" fill="#6a63b8">밑면 70 % 이상이 평평하게 받쳐지나</text>
+    <text x="500" y="484" text-anchor="middle" font-size="12.5" fill="#8b85c9">support_tol 10 mm — 실측 오차를 흡수</text>
+
+    <rect x="300" y="530" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="562" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">③ 수직 접근 통로 검사</text>
+    <text x="500" y="585" text-anchor="middle" font-size="13.5" fill="#6a63b8">그리퍼 몸통 Ø245 가 내려갈 수 있나</text>
+    <text x="500" y="604" text-anchor="middle" font-size="12.5" fill="#8b85c9">벽 ≤ 윗면 + 그리퍼 길이 150</text>
+
+    <rect x="300" y="650" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="682" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">④ 가중합 점수</text>
+    <text x="500" y="705" text-anchor="middle" font-size="13.5" fill="#6a63b8">w_height .6 · w_support .4 · w_wall .2</text>
+    <text x="500" y="724" text-anchor="middle" font-size="12.5" fill="#8b85c9">w_far .1 · w_level .05</text>
+
+    <rect x="300" y="770" width="400" height="84" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="500" y="802" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">⑤ 앞보기 rollout (선택)</text>
+    <text x="500" y="825" text-anchor="middle" font-size="13.5" fill="#6a63b8">상위 k 개 자리를 놓아 보고</text>
+    <text x="500" y="844" text-anchor="middle" font-size="12.5" fill="#8b85c9">뒤 박스를 굴려 미래 부피가 큰 쪽</text>
+
+    <rect x="330" y="890" width="340" height="72" rx="36" fill="#f3f1fd" stroke="#6c5fc7" stroke-width="2"/>
+    <text x="500" y="934" text-anchor="middle" font-size="18.5" font-weight="700" fill="#33307e">후보가 남았나?</text>
+  </g>
+
+  <!-- ── 결과 3갈래로 분기 ── -->
+  <g stroke="#8f8f9a" stroke-width="2" fill="none">
+    <path d="M 500 962 V 1000"/>
+    <path d="M 180 1000 H 820"/>
+    <path d="M 180 1000 V 1026" marker-end="url(#pa)"/>
+    <path d="M 500 1000 V 1026" marker-end="url(#pa)"/>
+    <path d="M 820 1000 V 1026" marker-end="url(#pa)"/>
+  </g>
+  <g font-size="13" font-weight="700" fill="#6b7280">
+    <text x="192" y="1018">예</text>
+    <text x="512" y="1018">아니오 — 최소 박스도 불가</text>
+    <text x="832" y="1018">아니오 — 이 박스만</text>
+  </g>
+
+  <!-- 성공 -->
+  <rect x="30" y="1030" width="300" height="96" rx="14" fill="#e6efe8" stroke="#6fa87d" stroke-width="1.8"/>
+  <text x="180" y="1064" text-anchor="middle" font-size="17" font-weight="700" fill="#2c6b41">message = OK</text>
+  <text x="180" y="1088" text-anchor="middle" font-size="13" fill="#4b8560">PlacePose 반환</text>
+  <text x="180" y="1108" text-anchor="middle" font-size="12.5" fill="#5f9673">x · y = 중심 / z = 밑면</text>
+
+  <!-- 팔레트 만재 -->
+  <rect x="350" y="1030" width="300" height="96" rx="14" fill="#f4f1e8" stroke="#b4ab93" stroke-width="1.8"/>
+  <text x="500" y="1064" text-anchor="middle" font-size="17" font-weight="700" fill="#6e6650">PALLET_FULL</text>
+  <text x="500" y="1088" text-anchor="middle" font-size="13" fill="#8d8468">가장 작은 박스로도 자리 없음</text>
+  <text x="500" y="1108" text-anchor="middle" font-size="12.5" fill="#9a9070">→ 트럭 상차 · 시나리오 종료</text>
+
+  <!-- 이 박스만 불가 -->
+  <rect x="670" y="1030" width="300" height="96" rx="14" fill="#f4f1e8" stroke="#b4ab93" stroke-width="1.8"/>
+  <text x="820" y="1064" text-anchor="middle" font-size="17" font-weight="700" fill="#6e6650">NO_FEASIBLE_POSE</text>
+  <text x="820" y="1088" text-anchor="middle" font-size="13" fill="#8d8468">이 박스만 자리 없음</text>
+  <text x="820" y="1108" text-anchor="middle" font-size="12.5" fill="#9a9070">→ CancelPlan · 계속 진행</text>
+
+  <!-- ── 주석 ── -->
+  <text x="500" y="1166" text-anchor="middle" font-size="14" fill="#55555f">★ 오른쪽 둘을 <tspan font-weight="700" fill="#2b2b33">같은 것으로 처리하면 안 된다</tspan> — 첫 NO_FEASIBLE_POSE 에서 멈추면 팔레트가 반만 찬 채 데모가 끝난다.</text>
+  <text x="500" y="1194" text-anchor="middle" font-size="14" fill="#55555f">★ ①~③ 은 <tspan font-weight="700" fill="#2b2b33">거르는</tspan> 단계, ④~⑤ 는 <tspan font-weight="700" fill="#2b2b33">고르는</tspan> 단계다. plan() 평균 <tspan font-weight="700" fill="#2b2b33">3.3 ms</tspan> (사양 200 ms).</text>
+</svg>

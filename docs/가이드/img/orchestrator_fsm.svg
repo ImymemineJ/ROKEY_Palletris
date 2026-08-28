@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 800" width="1400" height="800" role="img" aria-label="관제탑 상태머신 — IDLE에서 UPDATING까지 6상태와 이탈 경로">
+  <title>관제탑 상태머신 (구역당 1벌 · 총 3벌)</title>
+  <style>
+    text { font-family: "Noto Sans KR", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+  </style>
+  <defs>
+    <marker id="sa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8f8f9a"/>
+    </marker>
+    <marker id="sd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b4ab93"/>
+    </marker>
+  </defs>
+
+  <!-- 배경 — 다크 모드에서도 글씨가 보이게 흰 바탕을 깐다 -->
+  <rect x="0" y="0" width="1400" height="800" fill="#ffffff"/>
+
+  <!-- ── 주 경로 화살표 ── -->
+  <g stroke="#8f8f9a" stroke-width="2">
+    <line x1="440" y1="118" x2="440" y2="150" marker-end="url(#sa)"/>
+    <line x1="440" y1="212" x2="440" y2="244" marker-end="url(#sa)"/>
+    <line x1="440" y1="306" x2="440" y2="338" marker-end="url(#sa)"/>
+    <line x1="440" y1="400" x2="440" y2="432" marker-end="url(#sa)"/>
+    <line x1="440" y1="494" x2="440" y2="526" marker-end="url(#sa)"/>
+  </g>
+
+  <!-- ── 상태 6개 ── -->
+  <g>
+    <rect x="280" y="56" width="320" height="62" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="440" y="95" text-anchor="middle" font-size="20" font-weight="700" fill="#33307e">IDLE</text>
+
+    <rect x="280" y="150" width="320" height="62" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="440" y="189" text-anchor="middle" font-size="20" font-weight="700" fill="#33307e">FETCHING</text>
+
+    <rect x="280" y="244" width="320" height="62" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="440" y="283" text-anchor="middle" font-size="20" font-weight="700" fill="#33307e">PLANNING</text>
+
+    <rect x="280" y="338" width="320" height="62" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="440" y="377" text-anchor="middle" font-size="20" font-weight="700" fill="#33307e">PICKING</text>
+
+    <rect x="280" y="432" width="320" height="62" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="440" y="471" text-anchor="middle" font-size="20" font-weight="700" fill="#33307e">PLACING</text>
+
+    <rect x="280" y="526" width="320" height="62" rx="14" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+    <text x="440" y="565" text-anchor="middle" font-size="20" font-weight="700" fill="#33307e">UPDATING</text>
+  </g>
+
+  <!-- ── 전이 조건 (주 경로 오른쪽 · 이탈 레일 x=880 앞에서 끝난다) ── -->
+  <g font-size="13" fill="#6b7280">
+    <text x="618" y="139">BoxAtPickup(present = true)</text>
+    <text x="618" y="233">GetBoxInfo 성공 · 벨트 정지</text>
+    <text x="618" y="327">PlanPlacement ok = true</text>
+    <text x="618" y="421">RobotEvent(PICK, ok, seq 일치)</text>
+    <text x="618" y="515">RobotEvent(PLACE, has_actual)</text>
+  </g>
+
+  <!-- ── UPDATING → IDLE 복귀 (왼쪽 레일) ── -->
+  <path d="M 280 557 H 190 V 87 H 276" fill="none" stroke="#8f8f9a" stroke-width="2" marker-end="url(#sa)"/>
+  <text x="178" y="315" text-anchor="end" font-size="13" fill="#6b7280">UpdateHeightmap 성공</text>
+  <text x="178" y="335" text-anchor="end" font-size="13" fill="#6b7280">· 벨트 재가동</text>
+  <text x="178" y="367" text-anchor="end" font-size="13.5" font-weight="700" fill="#6c5fc7">박스마다 반복</text>
+
+  <!-- ── PLANNING → DONE ── -->
+  <line x1="600" y1="275" x2="916" y2="275" stroke="#8f8f9a" stroke-width="2" marker-end="url(#sa)"/>
+  <text x="758" y="265" text-anchor="middle" font-size="13" font-weight="700" fill="#6b7280">PALLET_FULL</text>
+  <rect x="920" y="244" width="220" height="62" rx="14" fill="#e6efe8" stroke="#6fa87d" stroke-width="1.8"/>
+  <text x="1030" y="283" text-anchor="middle" font-size="20" font-weight="700" fill="#2c6b41">DONE</text>
+
+  <!-- ── 이탈 경로 (점선) — FETCHING · PICKING · PLACING 에서 모인다 ── -->
+  <g stroke="#b4ab93" stroke-width="2" stroke-dasharray="7 6" fill="none">
+    <path d="M 600 181 H 880"/>
+    <path d="M 600 369 H 880"/>
+    <path d="M 600 463 H 880"/>
+    <path d="M 880 181 V 463"/>
+    <path d="M 880 418 H 916" marker-end="url(#sd)"/>
+  </g>
+  <rect x="920" y="330" width="370" height="176" rx="14" fill="#f4f1e8" stroke="#b4ab93" stroke-width="1.6"/>
+  <text x="1105" y="366" text-anchor="middle" font-size="16" font-weight="700" fill="#6e6650">이탈 · 예외 경로</text>
+  <g font-size="13" fill="#8d8468">
+    <text x="946" y="398">· DB 에 없음 — 인식 실패, 박스 폐기</text>
+    <text x="946" y="424">· NO_FEASIBLE_POSE — 이 박스만 폐기</text>
+    <text x="946" y="450">· 실패 / 20초 타임아웃</text>
+    <text x="946" y="484" font-weight="700" fill="#6e6650">셋 다 CancelPlan 호출 후 IDLE 복귀</text>
+  </g>
+
+  <!-- 이탈 → IDLE 복귀 (바깥 레일) -->
+  <path d="M 1290 418 H 1345 V 87 H 604" fill="none" stroke="#b4ab93" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#sd)"/>
+
+  <!-- ── 범례 · 주석 ── -->
+  <rect x="280" y="648" width="26" height="18" rx="5" fill="#eceafc" stroke="#6c5fc7" stroke-width="1.8"/>
+  <text x="318" y="663" font-size="14" fill="#55555f">정상 경로</text>
+  <line x1="452" y1="657" x2="492" y2="657" stroke="#b4ab93" stroke-width="2" stroke-dasharray="7 6"/>
+  <text x="504" y="663" font-size="14" fill="#55555f">이탈 경로 (CancelPlan 후 복귀)</text>
+
+  <text x="280" y="708" font-size="14" fill="#55555f">★ 관제탑은 <tspan font-weight="700" fill="#2b2b33">프로세스도 노드도 하나</tspan>다. 구역이 셋이어도 이 상태머신을 <tspan font-weight="700" fill="#2b2b33">3벌</tspan> 들고 있을 뿐이다.</text>
+  <text x="280" y="736" font-size="14" fill="#55555f">★ 어떤 이탈 경로에서도 <tspan font-weight="700" fill="#2b2b33">노드는 죽지 않는다</tspan> — 그래서 라인이 서지 않는다.</text>
+</svg>

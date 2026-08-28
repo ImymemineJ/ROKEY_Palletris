@@ -24,7 +24,7 @@ Isaac Sim 5.1 + ROS 2 Jazzy · 두산 H2017 3대 · 다중 PC ROS 2 통신.
 
 | 요구 항목 | 어디에 |
 |---|---|
-| 시스템 설계 · 플로우차트 | [§1 시스템 설계](#1-시스템-설계) · [§2 플로우 차트](#2-플로우-차트) — 도해 10장 + 순서도 2 |
+| 시스템 설계 · 플로우차트 | [§1 시스템 설계](#1-시스템-설계) · [§2 플로우 차트](#2-플로우-차트) — 도해 12장 |
 | 운영체제 환경 | [§3 운영체제 · 실행 환경](#3-운영체제--실행-환경) |
 | 사용한 장비 목록 | [§4 사용 장비](#4-사용-장비) |
 | 의존성 | [§5 의존성](#5-의존성) · [`requirements.txt`](requirements.txt) |
@@ -161,43 +161,18 @@ Isaac Sim 내장 파이썬은 **3.11**, ROS 2 Jazzy 는 **3.12** 다. 같은 프
 > 뒤는 가장 작은 박스로도 후보가 없다는 뜻이다. 첫 `NO_FEASIBLE_POSE` 에서
 > 종료하면 팔레트가 반만 찬 채 데모가 멈춘다.
 
-### 2-2. 관제탑 상태머신 (구역당 1개, 총 3개 인스턴스)
+### 2-2. 관제탑 상태머신 (구역당 1벌, 총 3벌)
 
-```mermaid
-stateDiagram-v2
-    [*] --> IDLE
-    IDLE --> FETCHING: BoxAtPickup(present=true)
-    FETCHING --> PLANNING: GetBoxInfo 성공 + 벨트 정지
-    PLANNING --> PICKING: PlanPlacement ok=true
-    PICKING --> PLACING: RobotEvent(PICK, ok, seq 일치)
-    PLACING --> UPDATING: RobotEvent(PLACE, ok, has_actual)
-    UPDATING --> IDLE: UpdateHeightmap 성공 · 벨트 재가동
-    PLANNING --> DONE: message = PALLET_FULL
-    PLANNING --> IDLE: message = NO_FEASIBLE_POSE · (CancelPlan → 박스 폐기)
-    FETCHING --> IDLE: DB 에 없음 (폐기)
-    PICKING --> IDLE: 실패 / 20초 타임아웃 · (CancelPlan)
-    PLACING --> IDLE: 실패 / 20초 타임아웃 · (CancelPlan)
-    DONE --> [*]
-```
+![관제탑 상태머신 — 6상태와 이탈 경로](docs/가이드/img/orchestrator_fsm.svg)
 
 **이탈 3경로** — `NO_FEASIBLE_POSE` · `PALLET_FULL` · 실패/타임아웃(**20 초**).
 셋 다 `CancelPlan` 을 호출한 뒤 복귀한다. **노드는 절대 죽지 않는다.**
 
 ### 2-3. 적재 알고리즘 (`PlanPlacement` 안에서 일어나는 일)
 
-```mermaid
-flowchart TD
-    A["요청: zone · box_id · w · d · h"] --> B["후보 생성<br/>10mm 격자 120x80 · yaw 0/90"]
-    B --> C["① 높이 필터<br/>윗면 ≤ max_stack(1300)"]
-    C --> D["② 지지율 필터<br/>밑면 ≥ 70% 가 평평하게 받쳐지나<br/>support_tol 10mm"]
-    D --> E["③ 통로 검사 _corridor_ok<br/>그리퍼 몸통 Ø245 가 내려갈 수 있나<br/>벽 ≤ 윗면 + 그리퍼길이 150"]
-    E --> F["④ 가중합 점수<br/>w_height .6 · w_support .4<br/>w_wall .2 · w_far .1 · w_level .05"]
-    F --> G["⑤ 앞보기 rollout (선택)<br/>상위 k개를 놓아 보고 뒤 박스를 굴려<br/>미래 부피가 큰 쪽"]
-    G --> H{"후보 있나?"}
-    H -- "예" --> I["PlacePose 반환 · message=OK<br/>x·y = 중심 / z = 밑면"]
-    H -- "아니오 · 최소 박스도 불가" --> J["message = PALLET_FULL"]
-    H -- "아니오 · 이 박스만 불가" --> K["message = NO_FEASIBLE_POSE"]
-```
+![적재 알고리즘 — 후보 생성부터 세 가지 결과까지](docs/가이드/img/plan_placement.svg)
+
+**①~③ 은 거르는 단계, ④~⑤ 는 고르는 단계다.** 아래는 그중 설명이 필요한 셋이다.
 
 #### heightmap — 무엇을 기록하나
 
