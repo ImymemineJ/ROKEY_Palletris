@@ -24,7 +24,7 @@ Isaac Sim 5.1 + ROS 2 Jazzy · 두산 H2017 3대 · 다중 PC ROS 2 통신.
 
 | 요구 항목 | 어디에 |
 |---|---|
-| 시스템 설계 · 플로우차트 | [§1 시스템 설계](#1-시스템-설계) · [§2 플로우 차트](#2-플로우-차트) — 순서도 3 + 도해 10장 |
+| 시스템 설계 · 플로우차트 | [§1 시스템 설계](#1-시스템-설계) · [§2 플로우 차트](#2-플로우-차트) — 도해 10장 + 순서도 2 |
 | 운영체제 환경 | [§3 운영체제 · 실행 환경](#3-운영체제--실행-환경) |
 | 사용한 장비 목록 | [§4 사용 장비](#4-사용-장비) |
 | 의존성 | [§5 의존성](#5-의존성) · [`requirements.txt`](requirements.txt) |
@@ -84,39 +84,8 @@ Isaac Sim 내장 파이썬은 **3.11**, ROS 2 Jazzy 는 **3.12** 다. 같은 프
 ![Palletris 시스템 아키텍처 — Isaac 안과 밖](docs/가이드/img/system_arch.svg)
 
 **구동은 그래프가, 판단은 전부 바깥 노드가** 맡는다. 안팎이 주고받는 것은 JSON
-문자열이 아니라 전용 타입(`packing_msgs`)이다.
-
-아래는 같은 구조를 토픽·서비스 이름까지 붙여 다시 그린 것이다.
-
-```mermaid
-flowchart LR
-    subgraph ISAAC["Isaac Sim 5.1 · Python 3.11 · 물리/렌더"]
-        direction TB
-        SCENE["USD 씬 test_3<br/>컨베이어 · 소터 · 팔레트 · 트럭"]
-        ROBOT3["로봇 3대 H2017<br/>Lula IK + 흡착 그리퍼"]
-        CAMS["카메라 4종<br/>cam1 · cam2 · pick_cam · wrist_cam"]
-        AG["Action Graph<br/>/clock · /tf · Image · 씬 서비스"]
-        SCENE --- ROBOT3 --- CAMS --- AG
-    end
-
-    subgraph ROS["Isaac 밖 · Python 3.12 · rclpy 노드 (판단 전부)"]
-        direction TB
-        ORCH["관제탑 orchestrator_node<br/>★ 로봇 명령의 유일한 발신자"]
-        VIS["인식 line_detector + zone_detector x3"]
-        ALGO["적재 algo_service_node<br/>heightmap 3장 소유"]
-        DB["DB db_service_node + 중재자<br/>palletris.db 유일 writer"]
-    end
-
-    AG -- "sensor_msgs/Image · /tf · /clock" --> VIS
-    VIS -- "packing_msgs/BoxAtPickup" --> ORCH
-    ORCH -- "packing_msgs/RobotCmd" --> AG
-    AG -- "packing_msgs/RobotEvent" --> ORCH
-    ORCH <-- "PlanPlacement · UpdateHeightmap" --> ALGO
-    ORCH <-- "GetBoxInfo · MarkPlaced · SetStatus" --> DB
-    VIS <-- "RegisterBox · VerifyBox · ReportMiss" --> DB
-    ORCH -- "SetVelocity · DespawnBox" --> AG
-    ORCH -- "ZoneStatus 2Hz" --> DB
-```
+문자열이 아니라 전용 타입(`packing_msgs`)이다. 어느 노드가 어떤 토픽·서비스로
+이어지는지는 [§1-3 인터페이스](#1-3-인터페이스--전용-타입만-쓴다)에 표로 있다.
 
 ### 1-2. 노드 구성
 
@@ -183,29 +152,10 @@ flowchart LR
 
 ![박스 처리 플로우 — 스폰부터 트럭 상차까지](docs/가이드/img/box_flow.svg)
 
-같은 흐름을 서비스 이름과 분기 조건까지 붙여 다시 그리면 이렇다.
-
-```mermaid
-flowchart TD
-    S1["① 박스 스폰<br/>랜덤 y ±150 · yaw ±15° · seed 42"] --> S2
-    S2["② 투입부 인식<br/>cam1 QR 판독 → RegisterBox<br/>cam2 재판독 → VerifyBox"] --> S3
-    S3{"③ 목적지 판단<br/>중재자 DiverterRequest<br/>0.6초 제한"}
-    S3 -- "A / B / C" --> S4
-    S3 -- "RETURN" --> R1["리턴 라인 순환<br/>retry_count++"]
-    R1 -- "3바퀴 초과" --> RX["/sim/despawn_box 로 폐기"]
-    R1 -- "재도전" --> S3
-    S4["④ 소터가 지선으로 분기<br/>스토퍼에서 정지"] --> S5
-    S5["⑤ pick_cam 픽업 좌표 실측<br/>→ BoxAtPickup(x·y·yaw)"] --> S6
-    S6["⑥ 벨트 정지<br/>SetVelocity(0)"] --> S7
-    S7{"⑦ 놓을 자리 계산<br/>PlanPlacement"}
-    S7 -- "NO_FEASIBLE_POSE" --> N1["★ 이 박스만 되돌림<br/>CancelPlan → 계속 진행"]
-    S7 -- "PALLET_FULL" --> F1["팔레트 반출 → 트럭 상차<br/>시나리오 종료"]
-    S7 -- "OK" --> S8
-    S8["⑧ RobotCmd PICK → PLACE<br/>RobotEvent 로 실측 pose 회신"] --> S9
-    S9["⑨ UpdateHeightmap(실측 pose)<br/>MarkPlaced"] --> S10
-    S10["⑩ 벨트 재가동 SetVelocity(0.7)"] --> S1
-    N1 --> S10
-```
+각 단계에서 오가는 서비스는 이렇다 — `RegisterBox` · `VerifyBox`(인식 → DB) →
+`DiverterRequest`(중재자, 0.6초 제한) → `BoxAtPickup`(인식 → 관제탑) →
+`SetVelocity(0)` → `PlanPlacement`(알고리즘) → `RobotCmd`/`RobotEvent`(로봇) →
+`UpdateHeightmap` · `MarkPlaced` → `SetVelocity(0.7)`.
 
 > **★ `NO_FEASIBLE_POSE` ≠ `PALLET_FULL`.** 앞은 *이 박스만* 자리가 없다는 뜻이고,
 > 뒤는 가장 작은 박스로도 후보가 없다는 뜻이다. 첫 `NO_FEASIBLE_POSE` 에서
