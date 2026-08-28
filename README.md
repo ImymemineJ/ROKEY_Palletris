@@ -425,24 +425,39 @@ ls -l palletris.db && ls qr_labels | wc -l      # 150 이 나와야 한다
 
 ### ③ Isaac 씬 배치
 
-USD 는 바이너리라 git 에 넣지 않는다(`.gitignore`). 씬 묶음
-`Collected_test_3/`(약 1.2 GB, 에셋 포함)을 받아서 이렇게 둔다:
+USD 는 바이너리라 git 에 넣지 않는다(`.gitignore`). 씬 묶음 `Collected_test_3/`
+(약 1.1 GB, 에셋 포함) 안의 **`test_3.usd` 가 시뮬레이션 메인 실행 파일**이다.
 
 ```
-~/isaac_scenes/Collected_test_3/test_3.usd          ← ★ 시뮬레이션 메인 실행 파일
-~/isaac_scenes/Collected_test_3/isaac_assets/...
-~/isaac_scenes/Collected_test_3/omniverse-content-production.../...
+Collected_test_3/test_3.usd                       ← ★ 메인 실행 파일 (220 KB)
+Collected_test_3/isaac_assets/...                 ← 우리 에셋
+Collected_test_3/omniverse-content-production.../ ← Isaac 기본 에셋 (약 1.1 GB)
 ```
 
-다른 경로에 두려면 `PL_STAGE` 로 지정한다:
+**제출본(zip)에는 이 폴더가 워크스페이스 안에 같이 들어 있다.** 그대로 쓰려면
+씬 경로를 한 번 지정해 준다:
 
 ```bash
-export PL_STAGE=/원하는/경로/test_3.usd
+cd ~/palletris_ws
+export PL_STAGE=$PWD/Collected_test_3/test_3.usd
 ```
+
+> ⚠ **이 한 줄을 빼면 씬을 못 찾는다.** 실행 스크립트의 기본 경로가
+> `~/isaac_scenes/Collected_test_3/test_3.usd` 라 워크스페이스 안을 보지 않는다.
+> 매번 export 하기 싫으면 폴더를 그쪽으로 옮겨도 된다:
+>
+> ```bash
+> mkdir -p ~/isaac_scenes && mv Collected_test_3 ~/isaac_scenes/
+> ```
+>
+> `PL_STAGE` 를 주면 `run_test3_ros.sh` · `run_all_local.sh` · `sim_main.py` 의
+> 기본값을 **전부** 덮어쓴다. 스크립트마다 기본 경로가 조금씩 달라서
+> (`Collected_test_3_share`, `/home/rokey/...`) `PL_STAGE` 로 고정하는 쪽이 확실하다.
 
 > ⚠ **에셋 폴더를 통째로 가져와야 한다.** `test_3.usd` 만 복사하면 참조가 안 풀려
 > 모든 프림이 `Selected Prim is not a Rigid Body` 로 죽고 로봇 아티큘레이션이
-> 사라진다. 팀 내부 배포는 `scripts/sync_scene.sh` (rsync) 를 쓴다.
+> 사라진다. `Collected_` 묶음은 참조가 **상대경로**로 박혀 있어서 폴더째 옮기는 건
+> 괜찮지만 안을 헤집으면 깨진다. 팀 내부 배포는 `scripts/sync_scene.sh` (rsync).
 
 <a id="step4"></a>
 
@@ -475,6 +490,7 @@ sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 ```bash
 # 터미널 1 — Isaac
 cd ~/palletris_ws && python3 scripts/kill_ros_nodes.py \
+  && export PL_STAGE=$PWD/Collected_test_3/test_3.usd \
   && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
   && PL_GTPICK=2 PL_CAMROS=2 PL_SPUR_STOP=2 PL_RENDER_EVERY=10 PL_METER=2 PL_SPAWN=8 \
      ./scripts/run_test3_ros.sh
@@ -610,7 +626,8 @@ ros2 topic echo /zone_a/status --once     # 관제탑 상태·적재 개수
 | 모든 박스가 3호로 축소 등록된다 | 같은 원인 — 배경 씬의 그늘. `PL_LIGHT=1` 로 `SIZE_MISMATCH` 137 → 20건 |
 | **박스가 흘러가는데 하나도 안 쌓인다 · 전 박스 RETURN** | **`qr_labels/` 또는 `palletris.db` 미생성** — [§6-②](#step2). 에러가 안 나므로 이걸 **가장 먼저** 의심할 것 |
 | 로드 중 `Killed` | GPU 메모리 부족 — `PL_BG=0` |
-| `Selected Prim is not a Rigid Body` 다발 | 씬 에셋 폴더 누락 (§6-③) |
+| **씬이 안 열린다 · 빈 화면** | **`PL_STAGE` 미설정** — 스크립트 기본 경로가 `~/isaac_scenes/...` 라 워크스페이스 안의 `Collected_test_3/` 을 안 본다 ([§6-③](#step3)) |
+| `Selected Prim is not a Rigid Body` 다발 | 씬 에셋 폴더 누락 · `Collected_test_3/` 안을 헤집었다 ([§6-③](#step3)) |
 | `database is locked` | `db_service_node` 외의 프로세스가 `.db` 를 열었다 |
 
 더 많은 증상·원인은 [`CLAUDE.md` §10](CLAUDE.md) 과 [`트러블슈팅.md`](트러블슈팅.md) 에 있다.
